@@ -1,0 +1,2218 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lucene 图解 - 第24章 .tip Term Index 文件</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr"   markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    <marker id="arr-g" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#3fb950"/></marker>
+    <marker id="arr-o" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#d29922"/></marker>
+    <marker id="arr-r" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#f85149"/></marker>
+    <marker id="arr-p" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#bc8cff"/></marker>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Lucene</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="23-tim-terms-data.html">上一章</a>
+  <a href="25-doc-postings.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s24-1">24.1 .tip 文件的角色</a>
+  <a href="#s24-2">24.2 .tip 与 .tim 的双层关系</a>
+  <a href="#s24-3">24.3 .tip 总体字节布局</a>
+  <a href="#s24-4">24.4 Per-field FST 元数据</a>
+  <a href="#s24-5">24.5 FST 节点字节模式</a>
+  <a href="#s24-6">24.6 FST 写入流程</a>
+  <a href="#s24-7">24.7 term seek 路径</a>
+  <a href="#s24-8">24.8 Floor block 双重索引</a>
+  <a href="#s24-9">24.9 .tip 加载策略</a>
+  <a href="#s24-10">24.10 性能边界</a>
+  <a href="#s24-11">24.11 大词典优化</a>
+  <a href="#s24-12">24.12 IndexInput 拼装</a>
+  <a href="#s24-13">24.13 调试与可观测</a>
+  <a href="#s24-14">24.14 反例 → 修复</a>
+  <a href="#s24-15">24.15 源码入口</a>
+  <a href="#s24-16">24.16 生产陷阱清单</a>
+  <a href="#s24-summary">24.17 本章小结</a>
+</aside>
+
+<div class="article">
+
+<h1>第 24 章 · .tip Term Index 文件</h1>
+<p class="subtitle">BlockTreeTermsIndex · per-field FST · ceiling lookup · blockFP · 内存常驻 · mmap · floor block · IndexInput 拼装</p>
+
+<div class="chapter-intro">
+  <p class="lead">第 10 章我们把 FST 当作"算法"讲完了——共享前缀、共享后缀、O(L) 查找。但在 Lucene 9.x 的真实磁盘格式里,FST 不是浮在内存里的 Java 对象图,而是一个固定字节布局的文件:<strong><code>.tip</code></strong>(Term Index)。它和 <code>.tim</code> 配对存在,两人的契约非常简单:<em>.tip 给你一个字节偏移,.tim 在那个偏移处放着一个 block,block 里按字典序排着 25-48 个 term 的 metadata</em>。</p>
+  <p>"为什么不能让 .tip 直接存 term → metadata 的全表?"——因为 1 千万 term × 50 byte metadata = 500 MB,这个量级根本塞不进可常驻内存的索引层。Lucene 的解法是切两层:<strong>.tip 只存"前缀 → block 入口"的极小 FST(平均 3-8 byte/term,1M term 才几十 MB),全量 mmap 进 page cache 永不下沉</strong>;<strong>.tim 存"block 入口 + 25-48 个 term 后缀 + metadata"的大块磁盘数据(平均 30-80 byte/term,几百 MB 到几个 GB),按需 page-fault 加载</strong>。一次 <code>seekExact("charger")</code> 就是先在 .tip 里 walk 4 步定位到 block 入口,再去 .tim 里把这个 block 读进来扫 28 个 suffix。两层加起来:亚毫秒延迟、几十 MB 内存、几个 GB 数据规模——这是 Lucene 词典的工程奇迹。</p>
+  <p>本章把 .tip 的"文件格式 + 加载契约 + 跨文件协议"展开:从 byte 0 的 magic number 开始,逐字段拆 header / per-field FST table / footer;讲清楚 fixed-arc / packed / bitmap 三种节点模式何时触发;把 <code>FSTCompiler</code> 在写 .tip 的同时如何分摊 NodeHash 节点共享讲透;再回到查询路径——<code>BlockTreeTermsReader.terms(field)</code> 给你的 <code>FieldReader</code> 是什么、<code>SegmentTermsEnum</code> 是怎么把 <code>FST.lookupCeiling()</code> 的输出和 <code>.tim</code> 的 IndexInput 拼起来的。最后讨论加载策略、Floor block、生产陷阱。</p>
+  <ul class="will-learn">
+    <li>.tip 的文件级布局:Header + per-field FST 主体 + Field Index Table + Footer 各自占几字节,objectId 为什么必须与 .tim 一致</li>
+    <li>per-field FST:为什么每个字段有独立 FST,fieldNumber → fstOffset 的字段索引表如何在内存中定位字段</li>
+    <li>FST 节点的三种字节模式:fixed-arc array(numArcs ≥ 64,O(1) 直接索引)、packed(稀疏,O(numArcs))、bitmap(全 256 ASCII,O(1) bit 查询)</li>
+    <li>FST 输出的 8 byte 编码:bit 0-2 是 hasTerms / hasSubBlocks / isFloor 标志,bit 3-63 是 .tim 中 blockFP,沿路径累加得到最终偏移</li>
+    <li>Floor block 拆分逻辑:某个 prefix 下 term 数 &gt; 48 时分裂为多个 floor 子块,FST 输出仅指向 floor head,floor head 内部再做二级 byte-aligned 索引</li>
+    <li>FSTCompiler + NodeHash 写入流程:reverse encoding 为什么让 root 在文件末尾、85% 节点共享率如何把 FST 大小从 200 MB 压到 30 MB</li>
+    <li>加载契约:.tip 全量 mmap(默认推荐)、heap-resident byte[](&lt; 100 MB 词典)、NIOFSDirectory(冷数据)三种策略的延迟 / 内存 / 启动时间权衡</li>
+    <li>IndexInput 拼装:<code>BlockTreeTermsReader.open()</code> 如何同时打开 .tim 与 .tip 两个 IndexInput,如何用 <code>FieldReader</code> 把它们绑成一个字段视图</li>
+  </ul>
+  <p class="prereq">前置知识:<a href="10-fst-term-dictionary.html">第 10 章 FST 与词典索引</a>(BlockTree 的算法层)、<a href="23-tim-terms-data.html">第 23 章 .tim Terms 数据文件</a>(.tim block 的内部布局)。本章是"算法 → 字节"的工程化补完——把第 10 章的 FST 抽象与第 23 章的 .tim block 通过 .tip 的字节协议粘起来。读者应熟悉 IndexInput / IndexOutput 抽象与 mmap 基础。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s24-1">24.1 .tip 文件的角色</h2>
+<!-- ============================================================ -->
+
+<p>BlockTree 词典在磁盘上是<strong>两个文件</strong>而非一个:<code>.tip</code>(Term Index)在内存里、<code>.tim</code>(Term Data)在磁盘上。这种"内存索引层 + 磁盘数据层"的分工不是 Lucene 独有,B+Tree、LSM Tree、SSTable 都遵循类似设计——但 Lucene 通过 FST 把内存层压到了极致,1 千万 term 只占 30 MB。</p>
+
+<h3>两个文件的契约</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 24-1-1 · .tip 与 .tim 的角色分工</div>
+  <table>
+    <thead>
+      <tr><th>维度</th><th>.tip(Term Index)</th><th>.tim(Term Data)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>角色</td><td>索引(路标)</td><td>数据(term metadata)</td></tr>
+      <tr><td>核心数据结构</td><td>per-field FST</td><td>per-field block 序列</td></tr>
+      <tr><td>典型大小(1M term)</td><td>20-50 MB</td><td>200-800 MB</td></tr>
+      <tr><td>典型大小(100M term)</td><td>1-5 GB</td><td>20-80 GB</td></tr>
+      <tr><td>加载策略</td><td>全 mmap 推荐 / 可 on-heap</td><td>mmap + 按需 page-in</td></tr>
+      <tr><td>访问模式</td><td>FST walk 随机寻址</td><td>顺序扫一个 block 内 25-48 term</td></tr>
+      <tr><td>codec 名</td><td>Lucene90BlockTreeTermsIndex</td><td>Lucene90BlockTreeTermsData</td></tr>
+      <tr><td>输入</td><td>term prefix(BytesRef)</td><td>blockFP(long)</td></tr>
+      <tr><td>输出</td><td>blockFP(8 byte)+ flags(3 bit)</td><td>TermState(docFP/freq/...)</td></tr>
+      <tr><td>失败模式</td><td>FST.lookup 返回 null</td><td>block 解码 CorruptIndexException</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p>注意 .tip 的"输出"就是 .tim 的"输入":FST 沿前缀走一遍累加的 long 值,被解码为 blockFP(高 61 bit)+ flags(低 3 bit),其中 blockFP 直接是 .tim 文件中 block 起始位置的字节偏移。<em>这是 .tip 与 .tim 唯一的耦合:两个文件用 long 偏移做协议,objectId 校验匹配,不存在第三个 metadata 文件来"翻译"</em>。</p>
+
+<div class="key-insight">
+  <strong>.tip 是路标,.tim 是数据</strong>。读 .tip 得到 8 byte 的 blockFP 和 3 bit flags,跨文件 seek 到 .tim @ blockFP 读 block,块内扫 25-48 个 suffix 找到目标 term 的完整 metadata(docStartFP / freq / docFreq / totalTermFreq / 前缀字节)。这种切分让"内存只装索引、磁盘装大数据"成为可能,也让 LSM 风格的段合并变成"两个已排序流的 zip merge",代价 O(N) 而非 O(N log N)。
+</div>
+
+<h3>.tip 在 segment 文件清单的位置</h3>
+
+<pre><code class="language-text">单 segment 完整文件清单(Lucene 9.x):
+
+  _0.si              segment metadata (docCount, version, codec...)
+  _0.fnm             field metadata (fieldNumber → name, type, indexOptions...)
+
+  词典层(本章焦点):
+  _0_Lucene90_0.tip  ◄── BlockTreeTermsIndex(per-field FST,内存常驻)
+  _0_Lucene90_0.tim  ◄── BlockTreeTermsData (per-field block,磁盘按需)
+  _0_Lucene90_0.tmd  ◄── Terms metadata (字段统计,极小)
+
+  postings 层:
+  _0_Lucene90_0.doc  Postings docID + freq
+  _0_Lucene90_0.pos  Positions(若 indexOptions ≥ DOCS_AND_FREQS_AND_POSITIONS)
+  _0_Lucene90_0.pay  Payload + offsets(若启用)
+
+  其他:
+  _0.fdt / _0.fdx / _0.fdm  Stored fields
+  _0.dvd / _0.dvm           DocValues
+  _0.dim / _0.dii           Points (BKD)
+  _0.kdd / _0.kdi / _0.kdm  KNN vectors
+  _0.nvd / _0.nvm           Norms
+  _0.fvd / _0.fvx           Term vectors</code></pre>
+
+<h3>.tip 在查询全链中的位置</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 24-1-1 · TermQuery("title:charger") 的全链路径</div>
+  <svg viewBox="0 0 1240 280" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 6 个节点横向排列 -->
+    <rect x="20"   y="80" width="170" height="80" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="105"  y="110" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">TermQuery</text>
+    <text x="105"  y="132" text-anchor="middle" fill="#a5d6ff" font-size="11">title:charger</text>
+    <text x="105"  y="150" text-anchor="middle" fill="#a5d6ff" font-size="11">入口</text>
+
+    <line x1="190" y1="120" x2="218" y2="120" stroke="#58a6ff" stroke-width="1.8" marker-end="url(#arr)"/>
+
+    <rect x="220"  y="80" width="170" height="80" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="305"  y="110" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">TermsEnum</text>
+    <text x="305"  y="132" text-anchor="middle" fill="#a5d6ff" font-size="11">.seekExact()</text>
+    <text x="305"  y="150" text-anchor="middle" fill="#a5d6ff" font-size="11">驱动器</text>
+
+    <line x1="390" y1="120" x2="418" y2="120" stroke="#58a6ff" stroke-width="1.8" marker-end="url(#arr)"/>
+
+    <rect x="420"  y="80" width="170" height="80" rx="14" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.8"/>
+    <text x="505"  y="106" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">.tip</text>
+    <text x="505"  y="128" text-anchor="middle" fill="#a5d6ff" font-size="11">FST.lookup</text>
+    <text x="505"  y="148" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="700">★ 第一跳</text>
+
+    <line x1="590" y1="120" x2="618" y2="120" stroke="#bc8cff" stroke-width="1.8" marker-end="url(#arr-p)"/>
+    <text x="604" y="108" text-anchor="middle" fill="#bc8cff" font-size="10" font-weight="700">blockFP</text>
+    <text x="604" y="138" text-anchor="middle" fill="#bc8cff" font-size="10">= 0x4A8C</text>
+
+    <rect x="620"  y="80" width="170" height="80" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="705"  y="106" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">.tim</text>
+    <text x="705"  y="128" text-anchor="middle" fill="#a5d6ff" font-size="11">block @ 0x4A8C</text>
+    <text x="705"  y="148" text-anchor="middle" fill="#a5d6ff" font-size="11">28 个 suffix</text>
+
+    <line x1="790" y1="120" x2="818" y2="120" stroke="#58a6ff" stroke-width="1.8" marker-end="url(#arr)"/>
+
+    <rect x="820"  y="80" width="180" height="80" rx="14" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.6"/>
+    <text x="910"  y="106" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">TermState</text>
+    <text x="910"  y="128" text-anchor="middle" fill="#a5d6ff" font-size="11">docFP, freq, ...</text>
+    <text x="910"  y="148" text-anchor="middle" fill="#a5d6ff" font-size="11">命中位置 + 元</text>
+
+    <line x1="1000" y1="120" x2="1028" y2="120" stroke="#3fb950" stroke-width="1.8" marker-end="url(#arr-g)"/>
+
+    <rect x="1030" y="80" width="200" height="80" rx="14" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.6"/>
+    <text x="1130" y="106" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">.doc → docID 流</text>
+    <text x="1130" y="128" text-anchor="middle" fill="#a5d6ff" font-size="11">postings + freq</text>
+    <text x="1130" y="148" text-anchor="middle" fill="#a5d6ff" font-size="11">→ 评分</text>
+
+    <text x="620" y="36" text-anchor="middle" fill="#39d2c0" font-size="13" font-weight="700">★ TermQuery 全链 6 跳:.tip 是关键的"翻译层"BytesRef → blockFP(long)</text>
+    <text x="620" y="220" text-anchor="middle" fill="#a5d6ff" font-size="11">.tip 错则全链错 — 因此 .tip 的 codec / objectID / CRC32 footer 校验都很严格</text>
+    <text x="620" y="246" text-anchor="middle" fill="#ffd591" font-size="11">★ .tip 全部内存常驻(mmap),.tim / .doc 按需读 → 后续 §24.x 详解 .tip 物理形态</text>
+  </svg>
+</div>
+
+<p>.tip 是这条链的"第一跳",负责把 BytesRef 形式的 term 翻译成 .tim 文件中的 long 偏移。后续所有访问(.tim block 读、.doc postings 读、.pos 位置读)都依赖 .tip 给出的正确 blockFP——<em>.tip 错则全链错</em>。这是为什么 .tip 的 codec 校验、objectID 校验、CRC32 footer 都很严格。</p>
+
+<!-- ============================================================ -->
+<h2 id="s24-2">24.2 .tip 与 .tim 的双层关系</h2>
+<!-- ============================================================ -->
+
+<p>第 10 章我们已经讲了 FST 的算法层——这一节专注于 .tip 的"FST 物化形态"在与 .tim 协作时的字节级契约。</p>
+
+<h3>FST 输出的 8 byte 编码</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 24-2-1 · FST 输出的位字段拆解</div>
+  <div style="background:#0d1117;border:1.5px solid #58a6ff;border-radius:10px;padding:20px;font-family:'Cascadia Code',Consolas,monospace;font-size:12.5px;color:#a5d6ff;">
+    <div style="color:#58a6ff;font-weight:600;font-size:13px;margin-bottom:14px;">FST 累加 output(64-bit unsigned long)</div>
+
+    <pre style="margin:0;color:#a5d6ff;line-height:1.7;font-size:11.5px;">
+   bit 63                                         bit 3 │ 2  1  0
+   ┌───────────────────────────────────────────────────┬────────┐
+   │           blockFP : 61 bit                          │  flags │
+   │       (.tim 文件中 block 起始的字节偏移)            │  3 bit │
+   └───────────────────────────────────────────────────┴────────┘
+
+   flags 的 3 bit:
+     bit 0 (0x01) = <span style="color:#3fb950;">hasTerms</span>      block 直接含 term metadata
+     bit 1 (0x02) = <span style="color:#d29922;">hasSubBlocks</span>  block 含子 block(BlockTree 嵌套)
+     bit 2 (0x04) = <span style="color:#f85149;">isFloor</span>       这个 block 是 floor head(需二次索引)
+
+   解码示例:
+     output = 0x000000000000254D
+            = 0b 0010 0101 0100 1101
+              = blockFP = 0x254D >> 3 = 0x4A9
+              + flags    = 0x254D & 0x7 = 0b101
+                         = hasTerms + isFloor
+
+   blockFP 的语义:
+     直接是 .tim 文件中 block 第一个 byte 的偏移
+     reader.indexInput.seek(blockFP) 即可定位</pre>
+  </div>
+</div>
+
+<h3>跨文件协作的时序</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 24-2-2 · .tip → .tim 的两层 seek 时序</div>
+  <svg viewBox="0 0 1240 760" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <g font-size="11" font-weight="700">
+      <rect x="40"   y="20" width="200" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+      <text x="140" y="46" text-anchor="middle" fill="#cfe9ff">TermsEnum.seekExact</text>
+
+      <rect x="320"  y="20" width="180" height="44" rx="10" fill="url(#g-purple)" stroke="#bc8cff"/>
+      <text x="410" y="46" text-anchor="middle" fill="#e6d3ff">.tip / FST</text>
+
+      <rect x="600"  y="20" width="200" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+      <text x="700" y="46" text-anchor="middle" fill="#cfe9ff">.tim / IndexInput</text>
+
+      <rect x="900"  y="20" width="180" height="44" rx="10" fill="url(#g-orange)" stroke="#d29922"/>
+      <text x="990" y="46" text-anchor="middle" fill="#ffd591">block bytes</text>
+    </g>
+
+    <g stroke="#30363d" stroke-width="1" stroke-dasharray="4 4">
+      <line x1="140" y1="64" x2="140" y2="740"/>
+      <line x1="410" y1="64" x2="410" y2="740"/>
+      <line x1="700" y1="64" x2="700" y2="740"/>
+      <line x1="990" y1="64" x2="990" y2="740"/>
+    </g>
+
+    <g font-size="11">
+      <line x1="140" y1="98" x2="410" y2="98" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="275" y="92" text-anchor="middle" fill="#e6d3ff">1. lookup("charger" 字节序列)</text>
+
+      <!-- FST 自循环 4 次 -->
+      <rect x="380" y="110" width="60" height="170" rx="6" fill="rgba(188,140,255,0.06)" stroke="#bc8cff" stroke-dasharray="3 2"/>
+      <text x="450" y="124" fill="#bc8cff" font-size="10">FST walk:</text>
+      <text x="450" y="144" fill="#e6d3ff" font-size="10">2. walk 'c' arc  → output += 0</text>
+      <text x="450" y="172" fill="#e6d3ff" font-size="10">3. walk 'h' arc  → output += 100</text>
+      <text x="450" y="200" fill="#e6d3ff" font-size="10">4. walk 'a' arc  → output += 0</text>
+      <text x="450" y="228" fill="#e6d3ff" font-size="10">5. walk 'r' arc  → output += 0x4000</text>
+      <text x="450" y="262" fill="#bc8cff" font-size="10" font-weight="700">→ 累积 output = 0x4000 + 100 = 0x4064</text>
+
+      <line x1="410" y1="296" x2="140" y2="296" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-p)"/>
+      <text x="275" y="290" text-anchor="middle" fill="#e6d3ff">6. 返回 output = 0x4064</text>
+
+      <!-- App 自处理 -->
+      <rect x="80"  y="306" width="240" height="60" rx="8" fill="rgba(88,166,255,0.10)" stroke="#58a6ff" stroke-dasharray="3 2"/>
+      <text x="200" y="324" text-anchor="middle" fill="#a5d6ff" font-size="10">7. blockFP = output &gt;&gt; 3 = 0x80C</text>
+      <text x="200" y="342" text-anchor="middle" fill="#a5d6ff" font-size="10">8. flags = output &amp; 0x7 = 0b100</text>
+      <text x="200" y="358" text-anchor="middle" fill="#a5d6ff" font-size="10">→ isFloor = true</text>
+
+      <line x1="140" y1="392" x2="700" y2="392" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+      <text x="420" y="386" text-anchor="middle" fill="#cfe9ff">9. indexInput.seek(0x80C)</text>
+
+      <line x1="700" y1="422" x2="990" y2="422" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+      <text x="845" y="416" text-anchor="middle" fill="#ffd591">10. 读 floor header (isFloor=true)</text>
+
+      <rect x="940" y="430" width="180" height="68" rx="8" fill="rgba(210,153,34,0.10)" stroke="#d29922" stroke-dasharray="3 2"/>
+      <text x="1030" y="450" text-anchor="middle" fill="#ffd591" font-size="10">11. 解析 numFollowedBlocks</text>
+      <text x="1030" y="464" text-anchor="middle" fill="#ffd591" font-size="10">+ floorBranches</text>
+      <text x="1030" y="486" text-anchor="middle" fill="#ffd591" font-size="10" font-weight="700">12. 按 'g' 选 floor sub @ 0x848</text>
+
+      <line x1="140" y1="528" x2="700" y2="528" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+      <text x="420" y="522" text-anchor="middle" fill="#cfe9ff">13. indexInput.seek(0x848) — 二次跳</text>
+
+      <line x1="700" y1="558" x2="990" y2="558" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+      <text x="845" y="552" text-anchor="middle" fill="#ffd591">14. 读 sub-block header</text>
+
+      <rect x="940" y="566" width="180" height="48" rx="8" fill="rgba(210,153,34,0.10)" stroke="#d29922" stroke-dasharray="3 2"/>
+      <text x="1030" y="586" text-anchor="middle" fill="#ffd591" font-size="10">15. 块内扫 'er' suffix</text>
+      <text x="1030" y="602" text-anchor="middle" fill="#ffd591" font-size="10" font-weight="700">→ 找到 charger</text>
+
+      <line x1="990" y1="640" x2="140" y2="640" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-g)"/>
+      <text x="540" y="634" text-anchor="middle" fill="#9be7b3">16. TermState{ docFP=0x9F2C, docFreq=4, totalTermFreq, posStartFP, ... }</text>
+
+      <text x="620" y="690" text-anchor="middle" fill="#39d2c0" font-size="13" font-weight="700">★ FST output 64-bit 编码:高 61 bit = blockFP,低 3 bit = flags(hasTerms / hasSubBlocks / isFloor)</text>
+      <text x="620" y="714" text-anchor="middle" fill="#a5d6ff" font-size="11">isFloor=true 时 .tim 需要二次 seek:先读 floor header,再跳到 sub block</text>
+      <text x="620" y="736" text-anchor="middle" fill="#ffd591" font-size="11">★ 一次 lookup = 1 次 .tip walk + 1-2 次 .tim seek + suffix 扫描 = 5-15 μs(热)</text>
+    </g>
+  </svg>
+</div>
+  </div>
+</div>
+
+<h3>.tip vs .tim 的访问模式对比</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4>.tim · 大块磁盘数据,顺序扫描</h4>
+<pre><code class="language-text">特点:
+  - per-block 25-48 个 term suffix
+  - 块内必须顺序扫描(无内部索引)
+  - 大小 200 MB - 80 GB
+  - 必须 mmap,page-in 触发 IO
+
+性能:
+  - block 已 page in: ~ 200 ns
+  - block 未 page in: ~ 100 µs (disk)
+  - 一次扫描 28 个 suffix
+  - 内存占 OS page cache 而非堆</code></pre>
+    <p style="margin-top:8px;font-size:12px;color:#f85149;">.tim 的延迟由 page cache 命中率决定,冷查询主导 P99 抖动。</p>
+  </div>
+  <div class="compare-good">
+    <h4>.tip · 小内存索引,随机寻址</h4>
+<pre><code class="language-text">特点:
+  - per-field FST,共享前后缀
+  - byte 数组上随机 walk arc
+  - 大小 1 MB - 5 GB(典型 30 MB / 1M term)
+  - 全量 mmap,常驻 page cache
+
+性能:
+  - FST walk: ~ 30 ns(L 长度的 4-8 步)
+  - 累加 output: long 加法 4-8 次
+  - 永不 page miss(常驻)
+  - 内存占用极低</code></pre>
+    <p style="margin-top:8px;font-size:12px;color:#3fb950;">.tip 的延迟可预测,主要由 term 长度 L 决定,与 N 无关。</p>
+  </div>
+</div>
+
+<div class="real-world">
+  <strong>1 亿英文商品名词典的实测数据</strong> — 某电商搜索集群:1 亿商品名(平均 token 数 12 / doc),unique term 1100 万,Lucene 9.7 默认配置。<code>.tip</code> 文件 = <strong>38 MB</strong>(平均 3.5 byte/term,FST 节点共享率 87%);<code>.tim</code> 文件 = <strong>520 MB</strong>(每 block 36 term,共 30 万 block);<code>.tmd</code> = 8 KB。query 路径上 P50 = <strong>180 ns</strong>(.tip walk 30ns + .tim block scan 150ns,page in 状态);P99 = <strong>620 ns</strong>(包含 1-2 次 .tim page fault)。<em>整个词典子系统总内存占用 ~600 MB,JVM heap 占 0,全在 OS page cache。</em>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s24-3">24.3 .tip 总体字节布局</h2>
+<!-- ============================================================ -->
+
+<h3>整体结构</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 24-3-1 · .tip 文件四大区段</div>
+  <div style="background:#0d1117;border:1.5px solid #d29922;border-radius:10px;padding:20px;font-family:'Cascadia Code',Consolas,monospace;font-size:12px;color:#a5d6ff;">
+    <pre style="margin:0;color:#a5d6ff;line-height:1.7;">
+  ┌──────────────────────────────────────────┐
+  │ ① Header(53 byte 固定 + 后缀)           │
+  │   magic           : 4 byte (0x3FD76C17)  │
+  │   codecName       : VString "Lucene90BlockTreeTermsIndex" │
+  │   version         : VInt (4)              │
+  │   objectID        : 16 byte (与 .tim 一致)│
+  │   suffix          : VString (通常空)      │
+  ├──────────────────────────────────────────┤
+  │ ② Per-Field FST 主体(占 .tip 大头)      │
+  │                                            │
+  │   Field 0:                                 │
+  │     fstOffset (隐式,从 Field Index Table) │
+  │     numBytes : VLong(此 FST 字节数)       │
+  │     FST bytes : reverse-encoded            │
+  │       arc 序列,叶子在前,root 在后         │
+  │     rootArcOffset: VLong (在 FST 末尾)    │
+  │                                            │
+  │   Field 1: ...                             │
+  │   ...                                      │
+  │   Field N: ...                             │
+  ├──────────────────────────────────────────┤
+  │ ③ Field Index Table(随机定位字段)        │
+  │   numFields : VInt                         │
+  │   for each field:                          │
+  │     fieldNumber : VInt                    │
+  │     fstOffset   : VLong                    │
+  ├──────────────────────────────────────────┤
+  │ ④ Footer(16 byte 固定)                  │
+  │   magic     : 4 byte (0xC02893E8)         │
+  │   algorithmID : 4 byte                     │
+  │   checksum  : 8 byte (CRC32 of 1+2+3)     │
+  └──────────────────────────────────────────┘
+
+  典型大小占比(1M term × 1 字段):
+    Header  : 53 B (~ 0%)
+    主体    : 30 MB (99%)
+    Index   : 100 B
+    Footer  : 16 B</pre>
+  </div>
+</div>
+
+<h3>Header 字节网格</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 24-3-2 · .tip Header 53 byte 字节网格</div>
+  <div style="background:#0d1117;border:1.5px solid #58a6ff;border-radius:10px;padding:18px;font-family:'Cascadia Code',Consolas,monospace;font-size:11.5px;color:#a5d6ff;overflow-x:auto;">
+    <pre style="margin:0;color:#a5d6ff;line-height:1.7;">
+偏移   0    1    2    3    4    5    6    7    8    9    a    b    c    d    e    f
+0x000 | <span style="color:#f0883e;">3F</span> | <span style="color:#f0883e;">D7</span> | <span style="color:#f0883e;">6C</span> | <span style="color:#f0883e;">17</span> | <span style="color:#3fb950;">1B</span> | <span style="color:#3fb950;">4C</span> | <span style="color:#3fb950;">75</span> | <span style="color:#3fb950;">63</span> | <span style="color:#3fb950;">65</span> | <span style="color:#3fb950;">6E</span> | <span style="color:#3fb950;">65</span> | <span style="color:#3fb950;">39</span> | <span style="color:#3fb950;">30</span> | <span style="color:#3fb950;">42</span> | <span style="color:#3fb950;">6C</span> | <span style="color:#3fb950;">6F</span> |
+      | <span style="color:#f0883e;">magic 0x3FD76C17</span>  |<span style="color:#3fb950;">strLn=27</span>|  L     u    c    e    n    e    9    0    B    l    o |
+0x010 | 63 | 6B | 54 | 72 | 65 | 65 | 54 | 65 | 72 | 6D | 73 | 49 | 6E | 64 | 65 | 78 |
+      | <span style="color:#3fb950;"> c    k    T    r    e    e    T    e    r    m    s    I    n    d    e    x</span> |
+0x020 | <span style="color:#d2a8ff;">04</span> | <span style="color:#d29922;">A8</span> | <span style="color:#d29922;">1F</span> | <span style="color:#d29922;">73</span> | <span style="color:#d29922;">32</span> | <span style="color:#d29922;">4B</span> | <span style="color:#d29922;">F7</span> | <span style="color:#d29922;">22</span> | <span style="color:#d29922;">91</span> | <span style="color:#d29922;">C0</span> | <span style="color:#d29922;">DD</span> | <span style="color:#d29922;">4F</span> | <span style="color:#d29922;">1A</span> | <span style="color:#d29922;">5C</span> | <span style="color:#d29922;">88</span> | <span style="color:#d29922;">36</span> |
+      |<span style="color:#d2a8ff;">ver=4</span>|  <span style="color:#d29922;">objectID (16 byte) — 必须与 .tim 一致</span>                                        |
+0x030 | <span style="color:#d29922;">03</span> | <span style="color:#d29922;">00</span> | <span style="color:#58a6ff;">00</span> | xx | xx | xx | xx | xx | xx | xx | xx | xx | xx | xx | xx | xx |
+      |<span style="color:#d29922;">objId续</span>|<span style="color:#58a6ff;">sufLn=0</span>| Per-field FST 起点 ──→                                              |
+
+字段解读:
+  <span style="color:#f0883e;">magic        = 0x3FD76C17</span>(CodecUtil 全局)
+  <span style="color:#3fb950;">codecName    = "Lucene90BlockTreeTermsIndex"</span> (1 byte len + 27 byte UTF-8)
+  <span style="color:#d2a8ff;">version      = 4</span>(Lucene 9.x 当前,VInt 1 byte)
+  <span style="color:#d29922;">objectID     = SegmentInfo.getId()</span>(16 byte fixed,与 .tim header 同字段相等)
+  <span style="color:#58a6ff;">suffix       = ""</span>(可选 codec suffix,通常空,1 byte len=0)
+
+Header 总长 = 4 + 1 + 27 + 1 + 16 + 1 = 50 byte;实际可达 50-60 byte</pre>
+  </div>
+</div>
+
+<h3>Footer 校验区</h3>
+
+<pre><code class="language-text">.tip Footer(16 byte 固定):
+
+  ┌──────────────────────────────────────────┐
+  │ footerMagic : 4 byte (0xC02893E8)         │
+  │ algorithmID : 4 byte (0x00000000 = CRC32) │
+  │ checksum    : 8 byte (CRC32 of bytes 0..N-16) │
+  └──────────────────────────────────────────┘
+
+reader 打开时自动调 CodecUtil.checksumEntireFile():
+  if (computed != stored)
+      throw new CorruptIndexException("checksum mismatch")
+
+footer 不参与 FST walk,只在 open / CheckIndex 时校验</code></pre>
+
+<div class="key-insight">
+  <strong>objectID 是 .tip 与 .tim 配对的唯一锚点</strong>。同一 segment 的 .tip 和 .tim header 都写入同一份 16 byte SegmentInfo.id。reader 打开 .tip 时校验 objectID 与 .si 一致,打开 .tim 时同样校验,且必须 .tip 与 .tim 的 objectID 互相匹配。如果你手工把 _0.tip 与 _1.tim 拼起来(比如恢复时复制错文件),Lucene 会立即在 BlockTreeTermsReader.open 抛 <code>CorruptIndexException("partner objectId mismatch")</code>——这是设计上的强一致性约束,而不是运行时偶发检测。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s24-4">24.4 Per-field FST 元数据</h2>
+<!-- ============================================================ -->
+
+<p>每个被索引的字段(<code>StringField</code> / <code>TextField</code> / <code>KeywordField</code>)都在 .tip 里有一棵独立 FST。注意:不是所有字段都进 .tip——只索引(<code>indexOptions != NONE</code>)且至少有一个 term 的字段才会有 FST。</p>
+
+<h3>Per-field FST 结构</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 24-4-1 · per-field FST 在 .tip 中的组织</div>
+  <svg viewBox="0 0 1240 480" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 顶端 .tip -->
+    <rect x="500" y="20" width="240" height="56" rx="14" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.8"/>
+    <text x="620" y="46" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">.tip 文件</text>
+    <text x="620" y="64" text-anchor="middle" fill="#a5d6ff" font-size="11">4 段顺序结构</text>
+
+    <!-- 4 个一级子节点 -->
+    <line x1="540" y1="76" x2="180" y2="140" stroke="#58a6ff" stroke-width="1.4" marker-end="url(#arr)"/>
+    <line x1="600" y1="76" x2="500" y2="140" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+    <line x1="640" y1="76" x2="800" y2="140" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+    <line x1="700" y1="76" x2="1080" y2="140" stroke="#f85149" stroke-width="1.4" marker-end="url(#arr-r)"/>
+
+    <rect x="60"   y="140" width="240" height="56" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.4"/>
+    <text x="180" y="166" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">① Header</text>
+    <text x="180" y="184" text-anchor="middle" fill="#a5d6ff" font-size="11">50 byte (magic + codec + objId)</text>
+
+    <rect x="380"  y="140" width="240" height="56" rx="14" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.6"/>
+    <text x="500" y="166" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">② per-field FST 主体</text>
+    <text x="500" y="184" text-anchor="middle" fill="#a5d6ff" font-size="11">★ 占 99% 大小</text>
+
+    <rect x="680"  y="140" width="240" height="56" rx="14" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.4"/>
+    <text x="800" y="166" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">③ Field Index Table</text>
+    <text x="800" y="184" text-anchor="middle" fill="#a5d6ff" font-size="11">~100 byte / 100 字段</text>
+
+    <rect x="960"  y="140" width="240" height="56" rx="14" fill="url(#g-red)" stroke="#f85149" stroke-width="1.4"/>
+    <text x="1080" y="166" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">④ Footer</text>
+    <text x="1080" y="184" text-anchor="middle" fill="#a5d6ff" font-size="11">16 byte (magic + CRC32)</text>
+
+    <!-- 主体下分 N 个 FST -->
+    <line x1="440" y1="196" x2="440" y2="240" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+    <line x1="500" y1="196" x2="500" y2="240" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+    <line x1="560" y1="196" x2="560" y2="240" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+
+    <rect x="380" y="244" width="80" height="60" rx="10" fill="rgba(188,140,255,0.10)" stroke="#bc8cff"/>
+    <text x="420" y="266" text-anchor="middle" fill="#e6d3ff" font-size="11" font-weight="700">Field 0 FST</text>
+    <text x="420" y="282" text-anchor="middle" fill="#a5d6ff" font-size="10">numBytes</text>
+    <text x="420" y="296" text-anchor="middle" fill="#a5d6ff" font-size="10">+ bytes</text>
+
+    <rect x="460" y="244" width="80" height="60" rx="10" fill="rgba(188,140,255,0.10)" stroke="#bc8cff"/>
+    <text x="500" y="266" text-anchor="middle" fill="#e6d3ff" font-size="11" font-weight="700">Field 1 FST</text>
+    <text x="500" y="288" text-anchor="middle" fill="#a5d6ff" font-size="10">…</text>
+
+    <rect x="540" y="244" width="80" height="60" rx="10" fill="rgba(188,140,255,0.10)" stroke="#bc8cff"/>
+    <text x="580" y="266" text-anchor="middle" fill="#e6d3ff" font-size="11" font-weight="700">Field N FST</text>
+    <text x="580" y="282" text-anchor="middle" fill="#a5d6ff" font-size="10">numBytes</text>
+    <text x="580" y="296" text-anchor="middle" fill="#a5d6ff" font-size="10">+ rootArc</text>
+
+    <!-- Index Table -->
+    <line x1="800" y1="196" x2="800" y2="240" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+    <rect x="680" y="244" width="240" height="60" rx="10" fill="rgba(63,185,80,0.10)" stroke="#3fb950"/>
+    <text x="800" y="266" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">fieldNumber → fstOffset</text>
+    <text x="800" y="284" text-anchor="middle" fill="#a5d6ff" font-size="10">VInt fieldNumber + VLong fstOffset</text>
+    <text x="800" y="298" text-anchor="middle" fill="#a5d6ff" font-size="10">(N + 1) 项</text>
+
+    <!-- Index Table 反查到 FST -->
+    <path d="M 800 304 Q 800 360 580 364 L 460 274" stroke="#3fb950" stroke-width="1.3" stroke-dasharray="5 3" fill="none" marker-end="url(#arr-g)"/>
+    <text x="640" y="362" text-anchor="middle" fill="#3fb950" font-size="10" font-style="italic">读时定位</text>
+
+    <text x="620" y="416" text-anchor="middle" fill="#39d2c0" font-size="13" font-weight="700">★ Field Index Table 是 .tip 内部的"目录页":fieldNumber → FST 起点偏移</text>
+    <text x="620" y="442" text-anchor="middle" fill="#a5d6ff" font-size="11">reader 启动一次性读 Index Table 到内存(~1.6 KB / 100 字段),后续 terms("title") 直接 O(1) 跳转</text>
+    <text x="620" y="466" text-anchor="middle" fill="#ffd591" font-size="11">★ 每字段 FST 用 IndexInput.slice() 切出独立视图 → 字段间互不干扰</text>
+  </svg>
+</div>
+
+<h3>Per-field 元信息</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 24-4-1 · 每字段 FST 的元信息字段</div>
+  <table>
+    <thead>
+      <tr><th>字段</th><th>类型</th><th>含义</th><th>典型大小</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>fieldNumber</code></td><td>VInt</td><td>字段编号(同 .fnm)</td><td>1-2 byte</td></tr>
+      <tr><td><code>fstOffset</code></td><td>VLong</td><td>FST 起点在 .tip 内的字节偏移</td><td>1-5 byte</td></tr>
+      <tr><td><code>numBytes</code></td><td>VLong</td><td>此 FST 占的字节(主体长度)</td><td>1-5 byte</td></tr>
+      <tr><td><code>FST bytes</code></td><td>byte[]</td><td>reverse-encoded arc 序列</td><td>10 KB - 1 GB</td></tr>
+      <tr><td><code>rootArcOffset</code></td><td>VLong</td><td>FST 末尾的根 arc 偏移</td><td>1-5 byte</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>Field Index Table:在内存中定位字段</h3>
+
+<p>reader 在打开 segment 时一次性读完 Field Index Table,在内存里建立 <code>fieldNumber → fstOffset</code> 的小映射(典型 100 字段 × 16 byte = 1.6 KB)。后续 <code>terms("title")</code> 调用时:</p>
+
+<ol>
+  <li>从 .fnm 查 "title" 字段的 fieldNumber(比如 5)</li>
+  <li>从内存中 fieldNumber → fstOffset 表查 fstOffset(比如 0x12FE34)</li>
+  <li>把 .tip 的 IndexInput slice 到 [fstOffset, fstOffset + numBytes],作为这个字段独立 FST 的视图</li>
+  <li>用这个 sliced IndexInput 创建 <code>FieldReader</code>,后续所有 walk arc 都在这个 slice 范围内</li>
+</ol>
+
+<pre><code class="language-java">public final class FieldReader extends Terms {
+    final FST<BytesRef> index;
+    private final long numTerms;
+    private final long indexStartFP;
+    private final long rootBlockFP;
+
+    FieldReader(BlockTreeTermsReader parent, FieldInfo fieldInfo,
+                long numTerms, BytesRef rootCode, long indexStartFP,
+                IndexInput indexIn, ...) throws IOException {
+        this.numTerms = numTerms;
+        this.indexStartFP = indexStartFP;
+        this.rootBlockFP = decodeBlockFP(rootCode);
+        if (indexIn != null) {
+            IndexInput clone = indexIn.clone();
+            clone.seek(indexStartFP);
+            this.index = new FST<>(FST.readMetadata(clone,
+                ByteSequenceOutputs.getSingleton()),
+                clone, new OffHeapFSTStore());
+        } else {
+            this.index = null;
+        }
+    }
+}</code></pre>
+
+<div class="diagram">
+  <div class="diagram-title">表 24-4-2 · FieldReader 的核心字段(从 .tip 读出)</div>
+  <table>
+    <thead>
+      <tr><th>字段</th><th>类型</th><th>来源</th><th>用途</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>numTerms</code></td><td>long</td><td>.tmd</td><td>字段总 term 数</td></tr>
+      <tr><td><code>indexStartFP</code></td><td>long</td><td>.tmd</td><td>FST 起点在 .tip 内偏移</td></tr>
+      <tr><td><code>rootCode</code></td><td>BytesRef</td><td>.tmd</td><td>root block 的编码 output</td></tr>
+      <tr><td><code>rootBlockFP</code></td><td>long</td><td>解码 rootCode</td><td>root block 在 .tim 偏移</td></tr>
+      <tr><td><code>index</code></td><td>FST&lt;BytesRef&gt;</td><td>.tip slice</td><td>FST 视图,可执行 walk</td></tr>
+      <tr><td><code>minTerm</code> / <code>maxTerm</code></td><td>BytesRef</td><td>.tmd</td><td>seekCeil 早剪枝</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s24-5">24.5 FST 节点字节模式</h2>
+<!-- ============================================================ -->
+
+<p>FST 的 byte 数组里,每个节点根据 fan-out(出度,即 numArcs)选择不同的存储模式。<code>FSTCompiler</code> 在写入时<em>自动</em>挑模式;<code>FST.findTargetArc</code> 读取时根据节点头的 flag 选择对应解码路径。</p>
+
+<h3>三种节点模式的触发与代价</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 24-5-1 · FST 节点的三种存储模式</div>
+  <table>
+    <thead>
+      <tr><th>模式</th><th>触发条件</th><th>查找复杂度</th><th>每 arc 字节</th><th>典型场景</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>packed</code>(变长稀疏)</td><td>numArcs &lt; 64</td><td>O(numArcs) 顺序扫</td><td>2-6 byte</td><td>大多数中间节点</td></tr>
+      <tr><td><code>fixed-arc array</code>(等长密集)</td><td>numArcs ≥ 64</td><td>O(1) 直接索引</td><td>3-8 byte 等长</td><td>root / 高 fan-out</td></tr>
+      <tr><td><code>arcs with bitmap</code>(全 256 ASCII)</td><td>label 范围密集 ≥ 50%</td><td>O(1) bit 查询</td><td>32 byte bitmap + arc</td><td>root 节点(英文 a-z)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>fixed-arc 与 packed 节点对比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 24-5-1 · fixed-arc(密集)vs packed(稀疏)字节布局</div>
+  <div style="background:#0d1117;border:1.5px solid #d29922;border-radius:10px;padding:18px;font-family:'Cascadia Code',Consolas,monospace;font-size:12px;color:#a5d6ff;">
+    <pre style="margin:0;color:#a5d6ff;line-height:1.7;">
+<span style="color:#d29922;">fixed-arc 节点</span>(numArcs=128, bytesPerArc=6):
+
+  Header:  nodeFlag(1) + numArcs(1-2) + bytesPerArc(1) + firstLabel(1) = 4 byte
+  Arcs:    128 × 6 byte = 768 byte    每 arc 等长
+  总:      772 byte
+
+  查询 label='m' (ASCII 109):
+    arcIdx = label - firstLabel = 109 - 97 = 12
+    offset = 4 + 12 × 6 = 76
+    直接读 byte[76..81] → <span style="color:#3fb950;">O(1) 命中</span>
+
+  代价:短 output 的 arc 也占 6 byte → 对 numArcs &lt; 64 反而比 packed 大
+
+<span style="color:#3fb950;">packed 节点</span>(arcs=4: 'i','n','g','s'):
+
+  Arc 0 (i): flags(1) + label(1) + output VLong(1) + target=NEXT     = 3 byte
+  Arc 1 (n): flags(1) + label(1) + output VLong(2) + target VLong(1) = 5 byte
+  Arc 2 (g): flags(1) + label(1) + output VLong(1) + target VLong(1) = 4 byte
+  Arc 3 (s, LAST_ARC): flags(1) + label(1) + output(1) + target=NEXT = 3 byte
+  总:       15 byte(同 4 arcs 用 fixed 模式占 28 byte,packed 省 46%)
+
+  查询 label='g':顺序读 i → n → g 命中,<span style="color:#d29922;">O(numArcs)</span>
+  numArcs &lt; 64 时,L1 cache 命中比二分快</pre>
+  </div>
+</div>
+
+<h3>三种模式的自动切换</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 24-5-3 · FSTCompiler 选择节点模式的决策树</div>
+  <svg viewBox="0 0 1240 420" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 起点 -->
+    <rect x="500" y="20" width="240" height="60" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="620" y="46" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">待写 FST 节点</text>
+    <text x="620" y="66" text-anchor="middle" fill="#a5d6ff" font-size="11">已知 numArcs · label 范围</text>
+
+    <line x1="620" y1="80" x2="620" y2="110" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+
+    <!-- 决策 1 -->
+    <polygon points="500,150 620,110 740,150 620,190" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.8"/>
+    <text x="620" y="146" text-anchor="middle" fill="#ffd591" font-size="12" font-weight="700">numArcs ≥ 64 ?</text>
+
+    <!-- 否 → packed -->
+    <line x1="500" y1="150" x2="280" y2="150" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+    <text x="390" y="142" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="700">否</text>
+
+    <rect x="80"  y="120" width="200" height="60" rx="14" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.6"/>
+    <text x="180" y="146" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">packed (变长顺序)</text>
+    <text x="180" y="166" text-anchor="middle" fill="#a5d6ff" font-size="11">中间节点最常见</text>
+
+    <line x1="180" y1="180" x2="180" y2="240" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+
+    <rect x="60"  y="244" width="240" height="60" rx="14" fill="rgba(63,185,80,0.10)" stroke="#3fb950"/>
+    <text x="180" y="270" text-anchor="middle" fill="#9be7b3" font-size="11" font-weight="700">每 arc 2-6 byte 变长</text>
+    <text x="180" y="288" text-anchor="middle" fill="#a5d6ff" font-size="11">O(numArcs) 顺序扫 · L1 命中</text>
+
+    <!-- 是 → 决策 2 -->
+    <line x1="620" y1="190" x2="620" y2="220" stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+    <text x="640" y="208" fill="#d29922" font-size="11" font-weight="700">是</text>
+
+    <polygon points="500,260 620,220 740,260 620,300" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.8"/>
+    <text x="620" y="252" text-anchor="middle" fill="#ffd591" font-size="11" font-weight="700">label 密度 &gt; 50%</text>
+    <text x="620" y="266" text-anchor="middle" fill="#ffd591" font-size="11" font-weight="700">且 numArcs ≥ 100 ?</text>
+
+    <!-- 否 → fixed-arc -->
+    <line x1="740" y1="260" x2="800" y2="260" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+    <text x="770" y="252" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="700">否</text>
+
+    <rect x="800" y="230" width="220" height="60" rx="14" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.6"/>
+    <text x="910" y="256" text-anchor="middle" fill="#e6d3ff" font-size="12" font-weight="700">fixed-arc array</text>
+    <text x="910" y="276" text-anchor="middle" fill="#a5d6ff" font-size="11">等长直接索引</text>
+
+    <line x1="910" y1="290" x2="910" y2="334" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+
+    <rect x="780" y="338" width="260" height="56" rx="14" fill="rgba(188,140,255,0.10)" stroke="#bc8cff"/>
+    <text x="910" y="362" text-anchor="middle" fill="#e6d3ff" font-size="11" font-weight="700">每 arc 3-8 byte 等长</text>
+    <text x="910" y="380" text-anchor="middle" fill="#a5d6ff" font-size="11">O(1) index = (label-first) × bytesPerArc</text>
+
+    <!-- 是 → bitmap -->
+    <line x1="620" y1="300" x2="620" y2="334" stroke="#f85149" stroke-width="1.6" marker-end="url(#arr-r)"/>
+    <text x="640" y="320" fill="#f85149" font-size="11" font-weight="700">是</text>
+
+    <rect x="500" y="338" width="240" height="56" rx="14" fill="url(#g-red)" stroke="#f85149" stroke-width="1.6"/>
+    <text x="620" y="362" text-anchor="middle" fill="#ffadad" font-size="12" font-weight="700">bitmap (高 fan-out)</text>
+    <text x="620" y="380" text-anchor="middle" fill="#a5d6ff" font-size="11">32 byte bitmap + arcs</text>
+
+    <text x="620" y="408" text-anchor="middle" fill="#39d2c0" font-size="12" font-weight="700">★ "按位置自适应":中间 packed · root fixed/bitmap → 综合性能 2-3× 单一模式</text>
+  </svg>
+</div>
+
+<div class="key-insight">
+  <strong>三种模式自动切换是 FST 性能稳定的关键</strong>。一个英文 term 字典的 root 节点 fan-out 通常 26-52(a-z + A-Z),用 bitmap 或 fixed-arc 一次查表;字典深处节点 fan-out 1-4,packed 顺序扫反而比二分快(L1 cache 命中);中等深度节点 fan-out 5-15,packed + L2 命中。同一个 FST 在不同节点用不同模式,综合性能比"单一模式"快 2-3 倍——这种"按位置自适应"在 RocksDB / LSM 系列里也是同样思想(SSTable 的 index block 用 binary search,data block 用 linear scan)。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s24-6">24.6 FST 写入流程</h2>
+<!-- ============================================================ -->
+
+<p><code>BlockTreeTermsWriter.finishTerm()</code> 在写一个 term 时,先把 term 进 .tim block,等 block 满 25-48 个 term 后调用 <code>flushBlock()</code>;<code>flushBlock()</code> 写完 .tim 字节,然后用 block 的 <code>blockFP + flags</code> 作为 output 调用 <code>FSTCompiler.add(prefix, output)</code>。<em>所以 FST 是"以 block 为单位"递增构建的,而不是逐 term 添加</em>。</p>
+
+<h3>FSTBuilder 时序</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 24-6-1 · BlockTreeTermsWriter + FSTCompiler 的协作时序</div>
+  <svg viewBox="0 0 1240 760" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <g font-size="11" font-weight="700">
+      <rect x="20"   y="20" width="180" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+      <text x="110" y="46" text-anchor="middle" fill="#cfe9ff">BlockTreeTermsWriter</text>
+
+      <rect x="240"  y="20" width="180" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+      <text x="330" y="46" text-anchor="middle" fill="#cfe9ff">当前 block (in-mem)</text>
+
+      <rect x="460"  y="20" width="160" height="44" rx="10" fill="url(#g-purple)" stroke="#bc8cff"/>
+      <text x="540" y="46" text-anchor="middle" fill="#e6d3ff">FSTCompiler</text>
+
+      <rect x="660"  y="20" width="160" height="44" rx="10" fill="url(#g-orange)" stroke="#d29922"/>
+      <text x="740" y="46" text-anchor="middle" fill="#ffd591">NodeHash</text>
+
+      <rect x="860"  y="20" width="160" height="44" rx="10" fill="url(#g-green)" stroke="#3fb950"/>
+      <text x="940" y="46" text-anchor="middle" fill="#9be7b3">.tip IndexOutput</text>
+
+      <rect x="1060" y="20" width="160" height="44" rx="10" fill="url(#g-green)" stroke="#3fb950"/>
+      <text x="1140" y="46" text-anchor="middle" fill="#9be7b3">.tim IndexOutput</text>
+    </g>
+
+    <g stroke="#30363d" stroke-width="1" stroke-dasharray="4 4">
+      <line x1="110"  y1="64" x2="110"  y2="740"/>
+      <line x1="330"  y1="64" x2="330"  y2="740"/>
+      <line x1="540"  y1="64" x2="540"  y2="740"/>
+      <line x1="740"  y1="64" x2="740"  y2="740"/>
+      <line x1="940"  y1="64" x2="940"  y2="740"/>
+      <line x1="1140" y1="64" x2="1140" y2="740"/>
+    </g>
+
+    <g font-size="11">
+      <!-- 外层 loop 每 term -->
+      <rect x="100" y="80" width="1090" height="540" rx="6" fill="rgba(63,185,80,0.04)" stroke="#3fb950" stroke-dasharray="6 3"/>
+      <rect x="100" y="80" width="58" height="18" fill="#3fb950"/>
+      <text x="129" y="94" text-anchor="middle" fill="#0d1117" font-size="10" font-weight="700">loop</text>
+      <text x="180" y="94" fill="#9be7b3" font-size="10">每 term 字典序到来</text>
+
+      <line x1="110" y1="124" x2="330" y2="124" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+      <text x="220" y="118" text-anchor="middle" fill="#cfe9ff">1. 把 term suffix 加入 block</text>
+
+      <rect x="280" y="134" width="120" height="34" rx="8" fill="rgba(88,166,255,0.10)" stroke="#58a6ff" stroke-dasharray="3 2"/>
+      <text x="340" y="156" text-anchor="middle" fill="#a5d6ff" font-size="10">2. 缓冲计数 +1</text>
+
+      <!-- alt block 满 -->
+      <rect x="100" y="184" width="1090" height="430" rx="6" fill="rgba(210,153,34,0.04)" stroke="#d29922" stroke-dasharray="6 3"/>
+      <rect x="100" y="184" width="50" height="18" fill="#d29922"/>
+      <text x="125" y="198" text-anchor="middle" fill="#0d1117" font-size="10" font-weight="700">alt</text>
+      <text x="160" y="198" fill="#ffd591" font-size="10">block 满 25-48 term</text>
+
+      <line x1="110" y1="226" x2="1140" y2="226" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="625" y="220" text-anchor="middle" fill="#9be7b3">3. 写 block bytes (suffix + metadata) → .tim</text>
+
+      <line x1="1140" y1="256" x2="110" y2="256" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-g)"/>
+      <text x="625" y="250" text-anchor="middle" fill="#9be7b3">4. 返回 blockFP</text>
+
+      <line x1="110" y1="286" x2="540" y2="286" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="325" y="280" text-anchor="middle" fill="#e6d3ff">5. add(prefix, blockFP + flags) → FSTCompiler</text>
+
+      <rect x="480" y="296" width="120" height="56" rx="8" fill="rgba(188,140,255,0.10)" stroke="#bc8cff" stroke-dasharray="3 2"/>
+      <text x="540" y="316" text-anchor="middle" fill="#e6d3ff" font-size="10">6. 与 lastInput 求 lcp</text>
+      <text x="540" y="332" text-anchor="middle" fill="#e6d3ff" font-size="10">7. frontier 之后节点</text>
+      <text x="540" y="346" text-anchor="middle" fill="#e6d3ff" font-size="10">准备最小化</text>
+
+      <!-- 内层 loop 待最小化节点 -->
+      <rect x="500" y="364" width="700" height="220" rx="6" fill="rgba(255,165,0,0.04)" stroke="#d29922" stroke-dasharray="6 3"/>
+      <rect x="500" y="364" width="58" height="18" fill="#d29922"/>
+      <text x="529" y="378" text-anchor="middle" fill="#0d1117" font-size="10" font-weight="700">loop</text>
+      <text x="580" y="378" fill="#ffd591" font-size="10">每个待最小化节点</text>
+
+      <line x1="540" y1="402" x2="740" y2="402" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+      <text x="640" y="396" text-anchor="middle" fill="#ffd591">8. 计算签名 → 查重</text>
+
+      <!-- alt 命中/未命中 -->
+      <rect x="500" y="416" width="700" height="160" rx="6" fill="rgba(248,81,73,0.04)" stroke="#f85149" stroke-dasharray="6 3"/>
+      <rect x="500" y="416" width="58" height="18" fill="#f85149"/>
+      <text x="529" y="430" text-anchor="middle" fill="#0d1117" font-size="10" font-weight="700">alt</text>
+      <text x="580" y="430" fill="#ffadad" font-size="10">命中 vs 未命中</text>
+
+      <line x1="740" y1="450" x2="540" y2="450" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-g)"/>
+      <text x="640" y="444" text-anchor="middle" fill="#9be7b3">9. [命中] 复用已存在 offset</text>
+
+      <line x1="540" y1="490" x2="940" y2="490" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="740" y="484" text-anchor="middle" fill="#9be7b3">10. [未命中] 写节点 bytes (reverse) → .tip</text>
+
+      <line x1="940" y1="520" x2="740" y2="520" stroke="#d29922" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-o)"/>
+      <text x="840" y="514" text-anchor="middle" fill="#ffd591">11. 缓存 (sign, offset) → NodeHash</text>
+
+      <text x="640" y="556" text-anchor="middle" fill="#a5d6ff" font-size="10" font-style="italic">★ NodeHash 命中率 = FST 共享率 = 大词典压缩比的关键</text>
+
+      <!-- 收尾 -->
+      <line x1="110" y1="650" x2="540" y2="650" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="325" y="644" text-anchor="middle" fill="#e6d3ff">12. finish() → FSTCompiler</text>
+
+      <line x1="540" y1="680" x2="940" y2="680" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="740" y="674" text-anchor="middle" fill="#9be7b3">13. 写 root 节点 → .tip 末尾</text>
+
+      <line x1="540" y1="710" x2="940" y2="710" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="740" y="704" text-anchor="middle" fill="#9be7b3">14. 写 rootArcOffset (VLong)</text>
+
+      <line x1="110" y1="736" x2="940" y2="736" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="525" y="730" text-anchor="middle" fill="#9be7b3">15. 写 Field Index Table + Footer</text>
+    </g>
+  </svg>
+</div>
+
+<h3>NodeHash 与共享率</h3>
+
+<p>NodeHash 是 FST 写入期的核心去重器。它维护一个内存中的 <code>(签名 → 已写偏移)</code> 哈希表,签名计算覆盖该节点的"行为指纹":</p>
+
+<pre><code class="language-java">private long hash(FSTCompiler.UnCompiledNode<T> node) {
+    long h = 0;
+    h = 31 * h + (node.isFinal ? 1 : 0);
+    if (node.isFinal && node.output != null) {
+        h = 31 * h + node.output.hashCode();
+    }
+    for (int arcIdx = 0; arcIdx < node.numArcs; arcIdx++) {
+        FSTCompiler.Arc<T> arc = node.arcs[arcIdx];
+        h = 31 * h + arc.label;
+        h = 31 * h + arc.target.hashCode();
+        if (arc.output != null) {
+            h = 31 * h + arc.output.hashCode();
+        }
+        if (arc.nextFinalOutput != null) {
+            h = 31 * h + arc.nextFinalOutput.hashCode();
+        }
+    }
+    return h ^ (h >>> 32);
+}</code></pre>
+
+<div class="diagram">
+  <div class="diagram-title">表 24-6-1 · NodeHash 命中率与最终 FST 大小(1M 英文 term)</div>
+  <table>
+    <thead>
+      <tr><th>命中率</th><th>独立节点数</th><th>FST 大小估算</th><th>典型场景</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>0%(无共享)</td><td>~ 8M(逐字符 trie)</td><td>200 MB</td><td>不实际(纯 trie)</td></tr>
+      <tr><td>50%</td><td>4M</td><td>100 MB</td><td>无规律密集 ID</td></tr>
+      <tr><td>70%</td><td>2.4M</td><td>60 MB</td><td>中文 / 多语言</td></tr>
+      <tr><td>85%</td><td>1.2M</td><td>30 MB</td><td>英文 / 标准词典</td></tr>
+      <tr><td>95%</td><td>400K</td><td>10 MB</td><td>受限词汇 / 标签</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>reverse encoding 的写入序</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 24-6-2 · 词集合 {cat=1, car=2, can=3} 的 reverse encoding</div>
+  <div style="background:#0d1117;border:1.5px solid #58a6ff;border-radius:10px;padding:18px;font-family:'Cascadia Code',Consolas,monospace;font-size:12px;color:#a5d6ff;">
+    <pre style="margin:0;color:#a5d6ff;line-height:1.7;">
+写入序(叶子在前,root 最后):
+    S_end → 0x00  S5(n:3) → 0x05  S4(r:2) → 0x08  S3(t:1) → 0x0B
+    S2(a→[S3,S4,S5]) → 0x19  S1(c→S2) → 0x1E  root(c→S1) → 0x23
+  文件末尾记录:rootArcOffset = 0x23, numBytes = 0x24
+
+读取(root 在末尾):
+    seek(0x23) → follow 'c' arc → 0x1E (S1) → follow 'c' → 0x19 (S2)
+    → follow 'a'/'t'/'r'/'n' → 各自 final 节点 → 累加 output
+
+收益:
+  ✓ 写入无需回填指针(都向后偏移)
+  ✓ 与 NodeHash + frontier 增量构造完美配合
+代价:
+  ✗ reader 必须读完整文件才能定位 root(典型不是问题,反正常驻)</pre>
+  </div>
+</div>
+
+<div class="real-world">
+  <strong>FSTCompiler 在 1 千万 term 的真实开销</strong> — Lucene 9.7 在 i7-12700K 上,1 千万英文 term 字典字典序输入到 <code>BlockTreeTermsWriter</code>:总耗时 ~28 s,其中 .tim block 写入 14 s,<code>FSTCompiler</code> 占 12 s,NodeHash lookup 占 8 s,实际 byte[] flush 占 2 s。NodeHash 在峰值时维持 ~120 K entry(≈ 12 MB heap)。最终 FST 字节 = 38 MB,共 1.18 M 节点,共享率 87.3%。<em>FSTCompiler 是整个 segment flush 中最耗 CPU 的组件,在大词典(&gt; 100 M term)上甚至超过 .doc PFOR-delta 编码的代价。</em>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s24-7">24.7 term seek 路径</h2>
+<!-- ============================================================ -->
+
+<p>把前面所有零件拼起来:用户调用 <code>indexSearcher.search(new TermQuery(new Term("title", "charger")), 10)</code>,Lucene 内部如何用 .tip + .tim 完成"找到 charger 的 docID 列表"?</p>
+
+<h3>完整 seek 路径</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 24-7-1 · TermQuery 的 .tip → .tim → .doc 全路径</div>
+  <svg viewBox="0 0 1240 760" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <g font-size="10" font-weight="700">
+      <rect x="20"   y="20" width="150" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+      <text x="95"  y="46" text-anchor="middle" fill="#cfe9ff">TermQuery.scorer</text>
+
+      <rect x="200"  y="20" width="170" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+      <text x="285" y="46" text-anchor="middle" fill="#cfe9ff">BlockTreeTermsReader</text>
+
+      <rect x="400"  y="20" width="140" height="44" rx="10" fill="url(#g-orange)" stroke="#d29922"/>
+      <text x="470" y="46" text-anchor="middle" fill="#ffd591">FieldReader</text>
+
+      <rect x="570"  y="20" width="180" height="44" rx="10" fill="url(#g-orange)" stroke="#d29922"/>
+      <text x="660" y="46" text-anchor="middle" fill="#ffd591">SegmentTermsEnum</text>
+
+      <rect x="780"  y="20" width="140" height="44" rx="10" fill="url(#g-purple)" stroke="#bc8cff"/>
+      <text x="850" y="46" text-anchor="middle" fill="#e6d3ff">.tip / FST</text>
+
+      <rect x="950"  y="20" width="160" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+      <text x="1030" y="46" text-anchor="middle" fill="#cfe9ff">.tim / IndexInput</text>
+
+      <rect x="1140" y="20" width="80" height="44" rx="10" fill="url(#g-green)" stroke="#3fb950"/>
+      <text x="1180" y="46" text-anchor="middle" fill="#9be7b3">.doc</text>
+    </g>
+
+    <g stroke="#30363d" stroke-width="1" stroke-dasharray="4 4">
+      <line x1="95"   y1="64" x2="95"   y2="740"/>
+      <line x1="285"  y1="64" x2="285"  y2="740"/>
+      <line x1="470"  y1="64" x2="470"  y2="740"/>
+      <line x1="660"  y1="64" x2="660"  y2="740"/>
+      <line x1="850"  y1="64" x2="850"  y2="740"/>
+      <line x1="1030" y1="64" x2="1030" y2="740"/>
+      <line x1="1180" y1="64" x2="1180" y2="740"/>
+    </g>
+
+    <g font-size="11">
+      <line x1="95" y1="98" x2="285" y2="98" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+      <text x="190" y="92" text-anchor="middle" fill="#cfe9ff">1. leafReader.terms("title")</text>
+
+      <line x1="285" y1="128" x2="470" y2="128" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+      <text x="378" y="122" text-anchor="middle" fill="#ffd591">2. 字段表查 fieldNumber=5</text>
+
+      <line x1="285" y1="158" x2="470" y2="158" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+      <text x="378" y="152" text-anchor="middle" fill="#ffd591">3. slice .tip [fstOffset, +numBytes]</text>
+
+      <line x1="470" y1="188" x2="95" y2="188" stroke="#d29922" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-o)"/>
+      <text x="280" y="182" text-anchor="middle" fill="#ffd591">4. FieldReader 实例</text>
+
+      <line x1="95" y1="218" x2="660" y2="218" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+      <text x="375" y="212" text-anchor="middle" fill="#ffd591">5. terms.iterator()</text>
+
+      <line x1="660" y1="248" x2="95" y2="248" stroke="#d29922" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-o)"/>
+      <text x="375" y="242" text-anchor="middle" fill="#ffd591">6. SegmentTermsEnum</text>
+
+      <line x1="95" y1="278" x2="660" y2="278" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+      <text x="375" y="272" text-anchor="middle" fill="#cfe9ff">7. seekExact("charger" BytesRef)</text>
+
+      <line x1="660" y1="308" x2="850" y2="308" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="755" y="302" text-anchor="middle" fill="#e6d3ff">8. FST.lookupCeiling("charger")</text>
+
+      <rect x="800" y="316" width="100" height="92" rx="6" fill="rgba(188,140,255,0.06)" stroke="#bc8cff" stroke-dasharray="3 2"/>
+      <text x="850" y="332" text-anchor="middle" fill="#bc8cff" font-size="9" font-weight="700">FST walk:</text>
+      <text x="850" y="348" text-anchor="middle" fill="#e6d3ff" font-size="9">9. 'c' → +0</text>
+      <text x="850" y="362" text-anchor="middle" fill="#e6d3ff" font-size="9">10. 'h' → +100</text>
+      <text x="850" y="376" text-anchor="middle" fill="#e6d3ff" font-size="9">11. 'a' → +0</text>
+      <text x="850" y="390" text-anchor="middle" fill="#e6d3ff" font-size="9">12. 'r' → +0x4000</text>
+      <text x="850" y="404" text-anchor="middle" fill="#bc8cff" font-size="9" font-weight="700">∑ = 0x4064</text>
+
+      <line x1="850" y1="426" x2="660" y2="426" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-p)"/>
+      <text x="755" y="420" text-anchor="middle" fill="#e6d3ff">13. output = 0x4064</text>
+
+      <rect x="600" y="436" width="120" height="48" rx="6" fill="rgba(255,165,0,0.10)" stroke="#d29922" stroke-dasharray="3 2"/>
+      <text x="660" y="454" text-anchor="middle" fill="#ffd591" font-size="10">14. blockFP = 0x80C</text>
+      <text x="660" y="470" text-anchor="middle" fill="#ffd591" font-size="10">15. flags = 0b101</text>
+
+      <line x1="660" y1="510" x2="1030" y2="510" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+      <text x="845" y="504" text-anchor="middle" fill="#cfe9ff">16. indexInput.seek(0x80C)</text>
+
+      <rect x="980" y="520" width="100" height="64" rx="6" fill="rgba(88,166,255,0.10)" stroke="#58a6ff" stroke-dasharray="3 2"/>
+      <text x="1030" y="538" text-anchor="middle" fill="#a5d6ff" font-size="10">17. 读 block header</text>
+      <text x="1030" y="554" text-anchor="middle" fill="#a5d6ff" font-size="10">18. binary search</text>
+      <text x="1030" y="570" text-anchor="middle" fill="#a5d6ff" font-size="10">  suffix 'er'</text>
+
+      <line x1="1030" y1="606" x2="660" y2="606" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr)"/>
+      <text x="845" y="600" text-anchor="middle" fill="#cfe9ff">19. TermState{ docFP=0x9F2C, freq=4, ... }</text>
+
+      <line x1="660" y1="636" x2="95" y2="636" stroke="#d29922" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-o)"/>
+      <text x="375" y="630" text-anchor="middle" fill="#ffd591">20. true (found)</text>
+
+      <line x1="95" y1="666" x2="660" y2="666" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="375" y="660" text-anchor="middle" fill="#9be7b3">21. postings(null, FREQS)</text>
+
+      <line x1="660" y1="696" x2="1180" y2="696" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="920" y="690" text-anchor="middle" fill="#9be7b3">22. 用 docFP 打开 PostingsEnum</text>
+
+      <line x1="1180" y1="726" x2="95" y2="726" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-g)"/>
+      <text x="640" y="720" text-anchor="middle" fill="#9be7b3">23. BlockDocsEnum → docID + freq 流</text>
+    </g>
+  </svg>
+</div>
+
+<h3>关键代码:SegmentTermsEnum.seekExact</h3>
+
+<pre><code class="language-java">@Override
+public boolean seekExact(BytesRef target) throws IOException {
+    if (fr.index == null) {
+        throw new IllegalStateException("terms index was not loaded");
+    }
+    FST.Arc<BytesRef> arc = fr.index.getFirstArc(arcs[0]);
+    BytesRef output = arc.output();
+    int targetUpto = 0;
+
+    while (targetUpto < target.length) {
+        int label = target.bytes[target.offset + targetUpto] & 0xFF;
+        FST.Arc<BytesRef> nextArc = fr.index.findTargetArc(label,
+            arc, getArc(1 + targetUpto), fstReader);
+        if (nextArc == null) break;
+        arc = nextArc;
+        term.setByteAt(targetUpto, (byte) label);
+        if (arc.output() != NO_OUTPUT) {
+            output = fstOutputs.add(output, arc.output());
+        }
+        targetUpto++;
+    }
+    return scanToTermLeaf(target, false) == SeekStatus.FOUND;
+}</code></pre>
+
+<h3>Ceiling lookup 决策卡片</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 24-7-2 · seekCeil 的三种返回情况</div>
+  <div style="background:#0d1117;border:1.5px solid #d2a8ff;border-radius:10px;padding:18px;font-family:'Cascadia Code',Consolas,monospace;font-size:12px;color:#a5d6ff;">
+    <pre style="margin:0;color:#a5d6ff;line-height:1.7;">
+seekCeil("charger") 的三种结果:
+
+  ① <span style="color:#3fb950;">FOUND</span> — term 精确存在
+     FST walk 完整路径 → 找到 final state
+     output 直接是 charger 的 blockFP
+     TE.term() == "charger"
+
+  ② <span style="color:#d29922;">NOT_FOUND</span> — 找到下一个更大 term
+     比如词典里有 "charge" 和 "chargers" 但无 "charger"
+     FST walk "charg" 后,'e' arc 之后无 'r' 直接到 final
+     回溯找下一个最小路径 → "chargers"
+     TE.term() == "chargers" (≥ target)
+
+  ③ <span style="color:#f85149;">END</span> — 词典里所有 term 都 &lt; target
+     比如查 "zzz" 而最大 term 是 "yes"
+     FST walk 时遇到无更大 sibling
+     TE.term() 为空,返回 END
+
+逻辑伪代码:
+  for each char in target:
+    arc = findTargetArc(label, prevArc)
+    if arc != null:
+      output += arc.output
+      continue
+    else:
+      ceil = findTargetArcCeil(label, prevArc)
+      if ceil != null:
+        walk minimum path from ceil
+        return NOT_FOUND
+      else:
+        backtrack to parent and repeat
+  if reached final:
+    return FOUND</pre>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s24-8">24.8 Floor block 双重索引</h2>
+<!-- ============================================================ -->
+
+<p>BlockTree 的 block 默认上限是 48 term。但某些 prefix 下天然就有几百几千 term(比如 "pro" 前缀在英文电商商品名里可能有 5000+ 个 product_xxx)——这种情况一个 block 装不下,Lucene 会把它<strong>水平切分</strong>成多个 floor block。</p>
+
+<h3>Floor block 的产生条件</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 24-8-1 · 何时分裂为 floor block</div>
+  <svg viewBox="0 0 1240 460" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 起点 -->
+    <rect x="40" y="20" width="280" height="60" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="180" y="46" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">FSTCompiler 看到 prefix 'pro'</text>
+    <text x="180" y="66" text-anchor="middle" fill="#a5d6ff" font-size="11">收集 'pro*' 下所有 term</text>
+
+    <line x1="180" y1="80" x2="180" y2="120" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+
+    <!-- 决策菱形 -->
+    <polygon points="40,170 180,120 320,170 180,220" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.8"/>
+    <text x="180" y="166" text-anchor="middle" fill="#ffd591" font-size="12" font-weight="700">该 prefix 下</text>
+    <text x="180" y="184" text-anchor="middle" fill="#ffd591" font-size="12" font-weight="700">term 数 ?</text>
+
+    <!-- ≤ 48 → 单 block -->
+    <line x1="180" y1="220" x2="180" y2="270" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+    <text x="200" y="248" fill="#3fb950" font-size="11" font-weight="700">≤ 48</text>
+
+    <rect x="40" y="276" width="280" height="80" rx="14" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.6"/>
+    <text x="180" y="304" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">单 block</text>
+    <text x="180" y="324" text-anchor="middle" fill="#a5d6ff" font-size="11">FST output:</text>
+    <text x="180" y="342" text-anchor="middle" fill="#9be7b3" font-size="11" font-weight="700">hasTerms=1, isFloor=0</text>
+
+    <!-- 49+ → 切 floor -->
+    <line x1="320" y1="170" x2="380" y2="170" stroke="#f85149" stroke-width="1.6" marker-end="url(#arr-r)"/>
+    <text x="350" y="160" fill="#f85149" font-size="11" font-weight="700">49 - 5000+</text>
+
+    <rect x="380" y="140" width="240" height="60" rx="14" fill="url(#g-red)" stroke="#f85149" stroke-width="1.6"/>
+    <text x="500" y="166" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">按 lead byte 切层</text>
+    <text x="500" y="186" text-anchor="middle" fill="#a5d6ff" font-size="11">floor block 多层</text>
+
+    <line x1="620" y1="170" x2="680" y2="170" stroke="#f85149" stroke-width="1.6" marker-end="url(#arr-r)"/>
+
+    <!-- floor head -->
+    <rect x="680" y="120" width="280" height="100" rx="14" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.8"/>
+    <text x="820" y="146" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">floor head block</text>
+    <text x="820" y="170" text-anchor="middle" fill="#a5d6ff" font-size="11">numFollowedBlocks</text>
+    <text x="820" y="186" text-anchor="middle" fill="#a5d6ff" font-size="11">floorBranches[]  (lead bytes)</text>
+    <text x="820" y="204" text-anchor="middle" fill="#a5d6ff" font-size="11">floorFollowedFPs[]  (sub FP)</text>
+
+    <!-- 三个 sub-block -->
+    <line x1="820" y1="220" x2="820" y2="280" stroke="#bc8cff" stroke-width="1.6"/>
+    <line x1="820" y1="280" x2="720" y2="280" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+    <line x1="820" y1="280" x2="820" y2="306" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+    <line x1="820" y1="280" x2="920" y2="280" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+
+    <rect x="660" y="284" width="120" height="80" rx="12" fill="rgba(188,140,255,0.10)" stroke="#bc8cff"/>
+    <text x="720" y="306" text-anchor="middle" fill="#e6d3ff" font-size="11" font-weight="700">sub-block 0</text>
+    <text x="720" y="326" text-anchor="middle" fill="#a5d6ff" font-size="10">suffix 首字符</text>
+    <text x="720" y="342" text-anchor="middle" fill="#a5d6ff" font-size="10">&lt; 'd'</text>
+    <text x="720" y="358" text-anchor="middle" fill="#bc8cff" font-size="10" font-weight="700">≤ 48 term</text>
+
+    <rect x="780" y="310" width="120" height="80" rx="12" fill="rgba(188,140,255,0.10)" stroke="#bc8cff"/>
+    <text x="840" y="332" text-anchor="middle" fill="#e6d3ff" font-size="11" font-weight="700">sub-block 1</text>
+    <text x="840" y="352" text-anchor="middle" fill="#a5d6ff" font-size="10">'d' ≤ 首字 &lt; 'h'</text>
+    <text x="840" y="372" text-anchor="middle" fill="#bc8cff" font-size="10" font-weight="700">≤ 48 term</text>
+
+    <rect x="900" y="284" width="120" height="80" rx="12" fill="rgba(188,140,255,0.10)" stroke="#bc8cff"/>
+    <text x="960" y="306" text-anchor="middle" fill="#e6d3ff" font-size="11" font-weight="700">sub-block N</text>
+    <text x="960" y="326" text-anchor="middle" fill="#a5d6ff" font-size="10">…</text>
+    <text x="960" y="342" text-anchor="middle" fill="#a5d6ff" font-size="10">&lt; 'z'</text>
+    <text x="960" y="358" text-anchor="middle" fill="#bc8cff" font-size="10" font-weight="700">≤ 48 term</text>
+
+    <text x="620" y="412" text-anchor="middle" fill="#39d2c0" font-size="13" font-weight="700">★ 触发 floor:同 prefix 下 &gt; 48 term — 按 lead byte 切层 + floor head 索引</text>
+    <text x="620" y="436" text-anchor="middle" fill="#a5d6ff" font-size="11">代价:多 1 次 .tim seek;收益:每 sub-block 仍 ≤ 48,块内扫描代价可控</text>
+  </svg>
+</div>
+
+<h3>Floor block 字节布局</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 24-8-2 · .tim 中 floor block 的物理结构</div>
+  <div style="background:#0d1117;border:1.5px solid #f0883e;border-radius:10px;padding:18px;font-family:'Cascadia Code',Consolas,monospace;font-size:12px;color:#a5d6ff;">
+    <pre style="margin:0;color:#a5d6ff;line-height:1.7;">
+.tip 中 prefix "pro" 节点 output:
+  blockFP = 0x4000
+  flags   = hasTerms (1) + isFloor (4) = 0b101
+
+.tim @ 0x4000 (floor head):
+  ┌────────────────────────────────────┐
+  │ floor block header                   │
+  │   isFloor flag        = true (在 .tip output 已编码)│
+  │   numFollowedBlocks   = 4            │
+  │   floorBranches       = ['d', 'h', 'p', 's']  │
+  │     (各 sub-block 起始 lead byte)    │
+  │   floorFollowedFPs    = [0x4080, 0x4140, 0x4200, 0x4280] │
+  │     (各 sub-block 在 .tim 的偏移)    │
+  ├────────────────────────────────────┤
+  │ sub-block 0  (suffix &lt; 'd' 的 term) │
+  │ sub-block 1  ('d' ≤ suffix &lt; 'h')   │
+  │ sub-block 2  ('h' ≤ suffix &lt; 'p')   │
+  │ sub-block 3  ('p' ≤ suffix &lt; 's')   │
+  │ sub-block 4  ('s' ≤ suffix)         │
+  └────────────────────────────────────┘
+
+reader 决策路径:
+  1. .tip FST output 解码 → blockFP=0x4000, flags 含 isFloor=1
+  2. seek .tim @ 0x4000 → 读 floor head
+  3. 按目标 suffix 首字符,二分 floorBranches
+     比如 suffix = "ducer" → 首字符 'd' ≥ 'd' → 选 sub-block 1
+  4. seek .tim @ 0x4140 → 读 sub-block 1
+  5. 块内顺序扫 'ducer' suffix → 命中
+
+总开销:
+  - 1 次 FST walk (.tip)
+  - 2 次 .tim block read(floor head + sub-block)
+  - 比单 block 多 1 次 IO,但避免一个 1000+ term 的巨型 block</pre>
+  </div>
+</div>
+
+<h3>Block vs Floor block 对比</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4>ToC1Block(单层,&lt; 48 term)</h4>
+<pre><code class="language-text">触发: 该 prefix 下 term 数 ≤ 48
+.tip FST output 标志: hasTerms=1, isFloor=0
+
+结构:
+  block_header
+  suffixes[25-48]    ← 共享前缀压缩
+  metadata[25-48]    ← TermState
+
+读取: 1 次 .tim seek + 1 次块内扫
+延迟: ~ 200 ns(page in)
+
+适用: 大多数英文 term 前缀</code></pre>
+    <p style="margin-top:8px;font-size:12px;color:#f85149;">简单单层结构,但 prefix 下 term 数过多时退化。</p>
+  </div>
+  <div class="compare-good">
+    <h4>Floor block(多层,&gt; 48 term)</h4>
+<pre><code class="language-text">触发: 该 prefix 下 term 数 49 - 5000+
+.tip FST output 标志: hasTerms=1, isFloor=1
+
+结构:
+  floor_head:
+    numFollowedBlocks
+    floorBranches[]   ← lead byte 索引
+    floorFollowedFPs[]
+  sub_block_0..N
+
+读取: 1 次 .tim head + 二分 + 1 次 sub-block
+延迟: ~ 350 ns
+
+适用: 高基数 prefix(如电商 product_*)</code></pre>
+    <p style="margin-top:8px;font-size:12px;color:#3fb950;">两层间接寻址,把巨型 block 切成可控 sub-block。</p>
+  </div>
+</div>
+
+<div class="key-insight">
+  <strong>Floor block 是 Lucene 在"FST 共享"和"block 大小"之间的工程取舍</strong>。FST 共享前缀的天然倾向是把同 prefix 的所有 term 都聚到一个 block——但单 block 顺序扫的代价随 size 线性增长,1000 term 的 block 扫描比 50 term 慢 20×。Floor block 用"FST 出口指向 floor head + floor head 内部 byte-level 索引"两层间接,让单 block 永不超过 48 term,代价是多一次 .tim seek。Lucene 的默认 maxItemsInBlock=48 是经过反复 benchmark 校准的:小于这个值 floor 频繁触发(增加间接寻址),大于这个值 block 内扫描代价飙升。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s24-9">24.9 .tip 加载策略</h2>
+<!-- ============================================================ -->
+
+<p>.tip 的加载方式直接影响内存占用、查询时延、启动速度。Lucene 提供三种策略,默认是 <code>MMapDirectory</code> 全量 mmap。</p>
+
+<h3>三种加载策略对比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 24-9-1 · .tip 加载策略全维度对比</div>
+  <table>
+    <thead>
+      <tr><th>策略</th><th>启动时间</th><th>查询时延</th><th>堆压力</th><th>RSS</th><th>适用场景</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>on-heap byte[]</code></td><td>慢(GB/秒)</td><td>最快(&lt; 1 µs)</td><td>高</td><td>高</td><td>小词典 &lt; 100 MB</td></tr>
+      <tr><td><code>off-heap mmap</code>(默认)</td><td>快(秒级)</td><td>1-3 µs</td><td>0</td><td>按需</td><td>大词典 / 推荐</td></tr>
+      <tr><td><code>NIOFSDirectory</code></td><td>最快</td><td>10+ µs</td><td>0</td><td>0</td><td>内存受限 + 冷数据</td></tr>
+      <tr><td>Hybrid auto</td><td>中</td><td>中</td><td>中</td><td>中</td><td>9.x 默认按字段大小自适应</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>常驻内存 vs mmap 决策卡片</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 24-9-1 · 常驻内存 vs mmap 选型决策</div>
+  <div style="background:#0d1117;border:1.5px solid #58a6ff;border-radius:10px;padding:18px;font-family:'Cascadia Code',Consolas,monospace;font-size:12px;color:#a5d6ff;">
+    <pre style="margin:0;color:#a5d6ff;line-height:1.7;">
+                            .tip 加载选择
+                                  │
+                                  ▼
+                    ┌─────────────────────────┐
+                    │ FST 大小 vs 可用 heap?  │
+                    └─────────────┬───────────┘
+                       小 │           │ 大
+                          ▼           ▼
+              ┌───────────────┐    ┌───────────────┐
+              │ &lt; 50 MB &amp;     │    │ &gt; 100 MB 或   │
+              │ heap 充裕      │    │ 不可预测       │
+              └───────┬───────┘    └───────┬───────┘
+                      ▼                    ▼
+              ┌───────────────┐    ┌───────────────┐
+              │<span style="color:#3fb950;"> heap-resident </span>│    │<span style="color:#58a6ff;"> off-heap mmap </span>│
+              │ <span style="color:#3fb950;">byte[]      </span>│    │ <span style="color:#58a6ff;">MMapDir     </span>│
+              └───────────────┘    └───────────────┘
+                  │                          │
+                  ▼                          ▼
+              延迟 &lt; 1 µs              延迟 1-3 µs
+              GC 压力大                GC 0
+              启动慢                   启动快
+              堆爆 OOM 风险            ✓ 推荐默认
+
+特殊场景:
+  ① 内存极受限(嵌入式 / IoT) → NIOFSDirectory
+     堆 0,RSS 0,但每次 query 都触发 syscall
+  ② 大词典 + 不冷启动(警报场景) → mmap + warmer 预读
+     启动后跑一遍全字段扫,触发所有 page-in
+  ③ 高 P99 要求 &lt; 5 µs → on-heap + 锁内存 (mlock)
+     彻底避免 page fault</pre>
+  </div>
+</div>
+
+<h3>mmap 与 page cache</h3>
+
+<p><code>MMapDirectory</code> 通过 <code>FileChannel.map()</code> 把 .tip 映射到进程虚拟地址空间。访问触发 page fault → OS 从磁盘读 4 KB page 到 page cache → 后续访问命中 page cache 不再 syscall。<em>这就是为什么 .tip 能"看起来在内存里但不占 JVM heap"</em>——它占的是 OS 内核 page cache,从 JVM 视角是 native 区。</p>
+
+<div class="warning">
+  <strong>.tip 占的是 page cache 而非 JVM heap</strong> — 你 <code>jconsole</code> 看 -Xmx 再大,也看不到 .tip 内存。它体现在进程 RSS 和 OS page cache 上。这意味着:(1) <strong>容量规划必须留足 page cache 余量</strong>,典型生产 4 vCPU / 16 GB 机器,JVM heap 6 GB,留 8 GB 给 page cache,.tip 占其中几十 MB;(2) <strong>关 swap 必须</strong>,否则 page cache 被 swap out 后,.tip walk 会触发 disk read,P99 飙到 50 ms;(3) <strong>不要让其他进程抢内存</strong>,大数据 ETL 服务和搜索服务不要混部。
+</div>
+
+<h3>不同规模的内存占用</h3>
+
+<div class="metric-row">
+  <div class="metric">
+    <div class="value">100 KB</div>
+    <div class="label">10K term · .tip</div>
+  </div>
+  <div class="metric">
+    <div class="value">30 MB</div>
+    <div class="label">1M term · .tip</div>
+  </div>
+  <div class="metric">
+    <div class="value">1 GB</div>
+    <div class="label">100M term · .tip</div>
+  </div>
+  <div class="metric">
+    <div class="value">50 GB</div>
+    <div class="label">1B term · .tip</div>
+  </div>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">表 24-9-2 · .tip 大小估算(per-field, 英文 ASCII)</div>
+  <table>
+    <thead>
+      <tr><th>字段类型</th><th>term 数</th><th>平均 term 长</th><th>共享率</th><th>FST 大小</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>状态枚举(10 unique)</td><td>10</td><td>6 char</td><td>0%</td><td>&lt; 1 KB</td></tr>
+      <tr><td>国家(200)</td><td>200</td><td>8 char</td><td>30%</td><td>5 KB</td></tr>
+      <tr><td>标签(10K)</td><td>10K</td><td>12 char</td><td>50%</td><td>200 KB</td></tr>
+      <tr><td>商品名(1M)</td><td>1M</td><td>20 char</td><td>70%</td><td>30 MB</td></tr>
+      <tr><td>URL(100M)</td><td>100M</td><td>50 char</td><td>80%</td><td>5 GB</td></tr>
+      <tr><td>user_id(1B,反例)</td><td>1B</td><td>30 char</td><td>0%</td><td>50 GB+ ★</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s24-10">24.10 性能边界</h2>
+<!-- ============================================================ -->
+
+<h3>单点 lookup 时延</h3>
+
+<div class="metric-row">
+  <div class="metric">
+    <div class="value">1 µs</div>
+    <div class="label">10K term · mmap hot</div>
+  </div>
+  <div class="metric">
+    <div class="value">2 µs</div>
+    <div class="label">1M term · mmap hot</div>
+  </div>
+  <div class="metric">
+    <div class="value">10 µs</div>
+    <div class="label">1M term · mmap cold</div>
+  </div>
+  <div class="metric">
+    <div class="value">5 µs</div>
+    <div class="label">100M term · mmap hot</div>
+  </div>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">表 24-10-1 · 不同词典规模的 lookup 时延</div>
+  <table>
+    <thead>
+      <tr><th>词典规模</th><th>FST 大小</th><th>mmap 命中</th><th>mmap 冷</th><th>on-heap</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>10K</td><td>100 KB</td><td>1 µs</td><td>5 µs</td><td>&lt; 1 µs</td></tr>
+      <tr><td>1M</td><td>30 MB</td><td>2 µs</td><td>10 µs</td><td>1 µs</td></tr>
+      <tr><td>100M</td><td>1 GB</td><td>5 µs</td><td>50 µs</td><td>不推荐</td></tr>
+      <tr><td>1B</td><td>50 GB</td><td>10 µs</td><td>200 µs</td><td>禁止</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>不同查询类型的 FST 路径</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 24-10-2 · 查询类型 → FST 操作映射</div>
+  <table>
+    <thead>
+      <tr><th>查询类型</th><th>FST 操作</th><th>自动机类型</th><th>平均时延(1M term)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>TermQuery</code></td><td>seekExact</td><td>—</td><td>1-3 µs</td></tr>
+      <tr><td><code>PrefixQuery</code> "ap*"</td><td>intersect</td><td>RegExpAutomaton</td><td>5-200 µs</td></tr>
+      <tr><td><code>WildcardQuery</code> "ch*r"</td><td>intersect</td><td>WildcardAutomaton</td><td>100-500 µs</td></tr>
+      <tr><td><code>RegexpQuery</code></td><td>intersect</td><td>RegExpAutomaton</td><td>1-50 ms</td></tr>
+      <tr><td><code>FuzzyQuery</code> dist=1</td><td>intersect</td><td>LevAutomaton</td><td>5 ms</td></tr>
+      <tr><td><code>FuzzyQuery</code> dist=2</td><td>intersect</td><td>LevAutomaton</td><td>50 ms</td></tr>
+      <tr><td><code>RangeQuery</code></td><td>intersect</td><td>RangeAutomaton</td><td>10-200 µs</td></tr>
+      <tr><td><code>WildcardQuery</code> "*foo" 反例</td><td>intersect 全 FST</td><td>—</td><td>50-500 ms</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>性能瓶颈分类</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 24-10-1 · .tip 性能瓶颈树</div>
+  <svg viewBox="0 0 1200 460" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <g font-size="13" font-weight="700">
+      <rect x="500" y="20" width="200" height="56" rx="14" fill="url(#g-red)" stroke="#f85149"/>
+      <text x="600" y="46" text-anchor="middle" fill="#ffd5d5">.tip 性能瓶颈</text>
+      <text x="600" y="65" text-anchor="middle" fill="#ffadad" font-size="10" font-weight="500">三大根因 + 9 子项</text>
+
+      <rect x="120" y="150" width="200" height="50" rx="12" fill="url(#g-purple)" stroke="#bc8cff"/>
+      <text x="220" y="180" text-anchor="middle" fill="#e6d3ff">内存类</text>
+
+      <rect x="500" y="150" width="200" height="50" rx="12" fill="url(#g-blue)" stroke="#58a6ff"/>
+      <text x="600" y="180" text-anchor="middle" fill="#cfe9ff">CPU 类</text>
+
+      <rect x="880" y="150" width="200" height="50" rx="12" fill="url(#g-orange)" stroke="#d29922"/>
+      <text x="980" y="180" text-anchor="middle" fill="#ffd591">I/O 类</text>
+    </g>
+
+    <g font-size="11" font-weight="600">
+      <rect x="40"  y="270" width="170" height="44" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-opacity="0.7"/>
+      <text x="125" y="297" text-anchor="middle" fill="#e6d3ff">FST byte[] 反序列化</text>
+
+      <rect x="225" y="270" width="170" height="44" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-opacity="0.7"/>
+      <text x="310" y="297" text-anchor="middle" fill="#e6d3ff">mmap page miss</text>
+
+      <rect x="125" y="340" width="170" height="44" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-opacity="0.7"/>
+      <text x="210" y="367" text-anchor="middle" fill="#e6d3ff">NodeHash 写入期</text>
+
+      <rect x="420" y="270" width="170" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-opacity="0.7"/>
+      <text x="505" y="291" text-anchor="middle" fill="#cfe9ff">arc 二分 /</text>
+      <text x="505" y="305" text-anchor="middle" fill="#cfe9ff">顺序查找</text>
+
+      <rect x="605" y="270" width="170" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-opacity="0.7"/>
+      <text x="690" y="297" text-anchor="middle" fill="#cfe9ff">intersect DFS</text>
+
+      <rect x="510" y="340" width="170" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-opacity="0.7"/>
+      <text x="595" y="367" text-anchor="middle" fill="#cfe9ff">自动机最小化</text>
+
+      <rect x="800" y="270" width="170" height="44" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-opacity="0.7"/>
+      <text x="885" y="297" text-anchor="middle" fill="#ffd591">首次 mmap fault</text>
+
+      <rect x="985" y="270" width="180" height="44" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-opacity="0.7"/>
+      <text x="1075" y="291" text-anchor="middle" fill="#ffd591">跨段 lookup ×</text>
+      <text x="1075" y="305" text-anchor="middle" fill="#ffd591">N segment</text>
+
+      <rect x="890" y="340" width="180" height="44" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-opacity="0.7"/>
+      <text x="980" y="367" text-anchor="middle" fill="#ffd591">page cache 不足</text>
+    </g>
+
+    <g fill="none" stroke-width="1.5">
+      <path d="M600,76 C600,110 220,110 220,150" stroke="#bc8cff" marker-end="url(#arr-p)"/>
+      <line x1="600" y1="76" x2="600" y2="150" stroke="#58a6ff" marker-end="url(#arr)"/>
+      <path d="M600,76 C600,110 980,110 980,150" stroke="#d29922" marker-end="url(#arr-o)"/>
+
+      <path d="M220,200 C220,235 125,235 125,270" stroke="#bc8cff" marker-end="url(#arr-p)"/>
+      <path d="M220,200 C220,235 310,235 310,270" stroke="#bc8cff" marker-end="url(#arr-p)"/>
+      <line x1="220" y1="200" x2="210" y2="340" stroke="#bc8cff" marker-end="url(#arr-p)"/>
+
+      <path d="M600,200 C600,235 505,235 505,270" stroke="#58a6ff" marker-end="url(#arr)"/>
+      <path d="M600,200 C600,235 690,235 690,270" stroke="#58a6ff" marker-end="url(#arr)"/>
+      <line x1="600" y1="200" x2="595" y2="340" stroke="#58a6ff" marker-end="url(#arr)"/>
+
+      <path d="M980,200 C980,235 885,235 885,270" stroke="#d29922" marker-end="url(#arr-o)"/>
+      <path d="M980,200 C980,235 1075,235 1075,270" stroke="#d29922" marker-end="url(#arr-o)"/>
+      <line x1="980" y1="200" x2="980" y2="340" stroke="#d29922" marker-end="url(#arr-o)"/>
+    </g>
+
+    <g font-size="10" font-style="italic">
+      <text x="220" y="425" text-anchor="middle" fill="#bc8cff">堆 + 写入期 buffer</text>
+      <text x="600" y="425" text-anchor="middle" fill="#58a6ff">单核 hot path</text>
+      <text x="980" y="425" text-anchor="middle" fill="#d29922">磁盘 + page cache</text>
+    </g>
+  </svg>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">表 24-10-3 · .tip 性能优化清单</div>
+  <table>
+    <thead>
+      <tr><th>瓶颈</th><th>现象</th><th>优化措施</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>FST 反序列化慢</td><td>第一次 query 慢</td><td>warmer 预读 + 锁定 page cache</td></tr>
+      <tr><td>mmap page miss</td><td>P99 抖动到 50+ ms</td><td>vmtouch 预热 + 加内存</td></tr>
+      <tr><td>FuzzyQuery 慢</td><td>拼写纠错 &gt; 100 ms</td><td>限 maxEdits = 1 或 2</td></tr>
+      <tr><td>WildcardQuery leading *</td><td>全扫 1M term</td><td>反向 token 字段 + trailing wildcard</td></tr>
+      <tr><td>FST 内存爆</td><td>OOM 或 page cache 不够</td><td>hash 高基数字段 + off-heap</td></tr>
+      <tr><td>跨段 lookup × 50 segment</td><td>50× FST walk</td><td>forceMerge 减少段数</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s24-11">24.11 大词典优化</h2>
+<!-- ============================================================ -->
+
+<p>当字段是高基数(URL、user_id、session_id 等)且 term 平均长度大时,FST 可能膨胀到 GB 级。Lucene 提供两个开关:<code>shareMaxTailLength</code> 与 per-field codec。</p>
+
+<h3>FST 内存估算(典型字段)</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 24-11-1 · 不同字段类型的 .tip 大小估算</div>
+  <table>
+    <thead>
+      <tr><th>字段类型</th><th>term 数</th><th>平均长度</th><th>共享率</th><th>FST 大小</th><th>建议</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>状态枚举</td><td>10</td><td>6 char</td><td>0%</td><td>&lt; 1 KB</td><td>直接 StringField</td></tr>
+      <tr><td>国家</td><td>200</td><td>8 char</td><td>30%</td><td>5 KB</td><td>StringField</td></tr>
+      <tr><td>标签</td><td>10K</td><td>12 char</td><td>50%</td><td>200 KB</td><td>StringField</td></tr>
+      <tr><td>商品名</td><td>1M</td><td>20 char</td><td>70%</td><td>30 MB</td><td>TextField + 分词</td></tr>
+      <tr><td>URL</td><td>100M</td><td>50 char</td><td>80%</td><td>5 GB</td><td>off-heap + 限定前缀</td></tr>
+      <tr><td>user_id</td><td>1B</td><td>30 char</td><td>0%</td><td>50 GB+</td><td>★ 改 hash 字段</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>大词典优化策略</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 24-11-1 · 大词典优化路径</div>
+  <svg viewBox="0 0 1200 420" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <g font-size="13" font-weight="700">
+      <rect x="450" y="20" width="300" height="60" rx="14" fill="url(#g-red)" stroke="#f85149"/>
+      <text x="600" y="46" text-anchor="middle" fill="#ffd5d5">大词典 FST &gt; 1 GB</text>
+      <text x="600" y="66" text-anchor="middle" fill="#ffadad" font-size="10" font-weight="500">堆压力 / OOM / 启动慢</text>
+
+      <rect x="40"  y="160" width="220" height="60" rx="12" fill="url(#g-blue)" stroke="#58a6ff"/>
+      <text x="150" y="186" text-anchor="middle" fill="#cfe9ff">off-heap mmap</text>
+      <text x="150" y="206" text-anchor="middle" fill="#a5d6ff" font-size="10" font-weight="500">MMapDirectory</text>
+
+      <rect x="320" y="160" width="220" height="60" rx="12" fill="url(#g-orange)" stroke="#d29922"/>
+      <text x="430" y="186" text-anchor="middle" fill="#ffd591">per-field codec</text>
+      <text x="430" y="206" text-anchor="middle" fill="#ffe4ad" font-size="10" font-weight="500">PerFieldPostingsFormat</text>
+
+      <rect x="600" y="160" width="220" height="60" rx="12" fill="url(#g-green)" stroke="#3fb950"/>
+      <text x="710" y="186" text-anchor="middle" fill="#9be7b3">hash 高基数字段</text>
+      <text x="710" y="206" text-anchor="middle" fill="#bff5cb" font-size="10" font-weight="500">MurmurHash3</text>
+
+      <rect x="880" y="160" width="280" height="60" rx="12" fill="url(#g-purple)" stroke="#bc8cff"/>
+      <text x="1020" y="186" text-anchor="middle" fill="#e6d3ff">调 shareMaxTailLength</text>
+      <text x="1020" y="206" text-anchor="middle" fill="#cfb8ff" font-size="10" font-weight="500">FSTCompiler 选项</text>
+    </g>
+
+    <g font-size="11" font-weight="600">
+      <rect x="40"  y="320" width="220" height="56" rx="10" fill="rgba(88,166,255,0.12)" stroke="#58a6ff" stroke-dasharray="4 3"/>
+      <text x="150" y="343" text-anchor="middle" fill="#a5d6ff">堆压力 = 0</text>
+      <text x="150" y="361" text-anchor="middle" fill="#cfe9ff" font-size="10">page cache 接管</text>
+
+      <rect x="320" y="320" width="220" height="56" rx="10" fill="rgba(255,165,0,0.12)" stroke="#d29922" stroke-dasharray="4 3"/>
+      <text x="430" y="343" text-anchor="middle" fill="#ffd591">特定字段用</text>
+      <text x="430" y="361" text-anchor="middle" fill="#ffe4ad" font-size="10">专用 PostingsFormat</text>
+
+      <rect x="600" y="320" width="220" height="56" rx="10" fill="rgba(63,185,80,0.12)" stroke="#3fb950" stroke-dasharray="4 3"/>
+      <text x="710" y="343" text-anchor="middle" fill="#9be7b3">FST → 8 byte hash</text>
+      <text x="710" y="361" text-anchor="middle" fill="#bff5cb" font-size="10">100× 压缩</text>
+
+      <rect x="880" y="320" width="280" height="56" rx="10" fill="rgba(188,140,255,0.12)" stroke="#bc8cff" stroke-dasharray="4 3"/>
+      <text x="1020" y="343" text-anchor="middle" fill="#e6d3ff">共享降级 → 加快构建</text>
+      <text x="1020" y="361" text-anchor="middle" fill="#cfb8ff" font-size="10">大 tail 不再去重</text>
+    </g>
+
+    <g fill="none" stroke-width="1.5">
+      <path d="M600,80 C600,120 150,120 150,160" stroke="#58a6ff" marker-end="url(#arr)"/>
+      <path d="M600,80 C600,120 430,120 430,160" stroke="#d29922" marker-end="url(#arr-o)"/>
+      <path d="M600,80 C600,120 710,120 710,160" stroke="#3fb950" marker-end="url(#arr-g)"/>
+      <path d="M600,80 C600,120 1020,120 1020,160" stroke="#bc8cff" marker-end="url(#arr-p)"/>
+
+      <line x1="150" y1="220" x2="150" y2="320" stroke="#58a6ff" marker-end="url(#arr)"/>
+      <line x1="430" y1="220" x2="430" y2="320" stroke="#d29922" marker-end="url(#arr-o)"/>
+      <line x1="710" y1="220" x2="710" y2="320" stroke="#3fb950" marker-end="url(#arr-g)"/>
+      <line x1="1020" y1="220" x2="1020" y2="320" stroke="#bc8cff" marker-end="url(#arr-p)"/>
+    </g>
+
+    <text x="600" y="402" text-anchor="middle" fill="#a5d6ff" font-size="10" font-style="italic">★ 优先级:hash &gt; off-heap &gt; per-field &gt; shareMaxTailLength</text>
+  </svg>
+</div>
+
+<h3>hash 高基数字段</h3>
+
+<p>对于不需要前缀查询的高基数字段(user_id、session_id、device_id),改用 hash 字段:</p>
+
+<pre><code class="language-java">public class SessionIndexer {
+    public Document createDoc(String sessionId, String content) {
+        Document doc = new Document();
+        long hash = MurmurHash3.hash64(sessionId.getBytes(UTF_8));
+        doc.add(new StringField("session_id_hash",
+            Long.toString(hash, 36), Field.Store.NO));
+        doc.add(new StoredField("session_id", sessionId));
+        doc.add(new SortedDocValuesField("session_id_dv",
+            new BytesRef(sessionId)));
+        doc.add(new TextField("content", content, Field.Store.NO));
+        return doc;
+    }
+
+    public Query buildQuery(String sessionId) {
+        long hash = MurmurHash3.hash64(sessionId.getBytes(UTF_8));
+        return new TermQuery(new Term("session_id_hash",
+            Long.toString(hash, 36)));
+    }
+}</code></pre>
+
+<div class="real-world">
+  <strong>把 100M session_id FST 从 5 GB 压到 50 MB</strong> — 某 SaaS 公司的应用日志搜索集群,把 100M 唯一 session_id 当作 StringField 索引,.tip 膨胀到 5 GB,IndexWriter flush 时 OOM,merge 重建超时。改成 hash 字段后:hash 是 short alphabet(0-9 a-z 36 字符),平均 13 char,FST 共享率 70%,最终 .tip = <strong>50 MB</strong>(下降 100×)。精确查询通过 <code>TermQuery(session_id_hash, hash)</code> 仍可命中(可接受 1/2^64 hash collision,业务可忽略),完整 ID 通过 StoredField 取回展示。<em>这是高基数字段索引的标准修复模式。</em>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s24-12">24.12 IndexInput 拼装</h2>
+<!-- ============================================================ -->
+
+<p>到此为止我们已经分别讲了 .tip 和 .tim 的字节布局,以及它们之间的协议。最后一节把 reader open segment 时如何把这两个文件拼装成一个 <code>BlockTreeTermsReader</code> 讲清楚——这是新手最容易迷糊的地方,因为 IndexInput 的 slice / clone / seek 在并发读时有微妙语义。</p>
+
+<h3>BlockTreeTermsReader.open 流程</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 24-12-1 · .tip + .tim + .tmd 的 IndexInput 拼装</div>
+  <svg viewBox="0 0 1240 720" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <g font-size="10" font-weight="700">
+      <rect x="20"   y="20" width="150" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+      <text x="95"  y="46" text-anchor="middle" fill="#cfe9ff">SegmentReader</text>
+
+      <rect x="200"  y="20" width="200" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+      <text x="300" y="46" text-anchor="middle" fill="#cfe9ff">BlockTreeTermsReader</text>
+
+      <rect x="430"  y="20" width="160" height="44" rx="10" fill="url(#g-orange)" stroke="#d29922"/>
+      <text x="510" y="46" text-anchor="middle" fill="#ffd591">MMapDirectory</text>
+
+      <rect x="620"  y="20" width="160" height="44" rx="10" fill="url(#g-purple)" stroke="#bc8cff"/>
+      <text x="700" y="46" text-anchor="middle" fill="#e6d3ff">.tip IndexInput</text>
+
+      <rect x="810"  y="20" width="160" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+      <text x="890" y="46" text-anchor="middle" fill="#cfe9ff">.tim IndexInput</text>
+
+      <rect x="1000" y="20" width="160" height="44" rx="10" fill="url(#g-green)" stroke="#3fb950"/>
+      <text x="1080" y="46" text-anchor="middle" fill="#9be7b3">.tmd IndexInput</text>
+    </g>
+
+    <g stroke="#30363d" stroke-width="1" stroke-dasharray="4 4">
+      <line x1="95"   y1="64" x2="95"   y2="700"/>
+      <line x1="300"  y1="64" x2="300"  y2="700"/>
+      <line x1="510"  y1="64" x2="510"  y2="700"/>
+      <line x1="700"  y1="64" x2="700"  y2="700"/>
+      <line x1="890"  y1="64" x2="890"  y2="700"/>
+      <line x1="1080" y1="64" x2="1080" y2="700"/>
+    </g>
+
+    <g font-size="11">
+      <line x1="95" y1="98" x2="300" y2="98" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+      <text x="200" y="92" text-anchor="middle" fill="#cfe9ff">1. open(state)</text>
+
+      <line x1="300" y1="128" x2="510" y2="128" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+      <text x="405" y="122" text-anchor="middle" fill="#ffd591">2. openInput("_0_Lucene90_0.tip")</text>
+
+      <line x1="510" y1="158" x2="300" y2="158" stroke="#d29922" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-o)"/>
+      <text x="405" y="152" text-anchor="middle" fill="#ffd591">3. termsIndexIn (mmap)</text>
+
+      <line x1="300" y1="188" x2="700" y2="188" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="500" y="182" text-anchor="middle" fill="#e6d3ff">4. 校验 header magic + objectID</text>
+
+      <line x1="300" y1="218" x2="510" y2="218" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+      <text x="405" y="212" text-anchor="middle" fill="#ffd591">5. openInput("_0_Lucene90_0.tim")</text>
+
+      <line x1="510" y1="248" x2="300" y2="248" stroke="#d29922" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-o)"/>
+      <text x="405" y="242" text-anchor="middle" fill="#ffd591">6. termsIn (mmap)</text>
+
+      <line x1="300" y1="278" x2="890" y2="278" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+      <text x="595" y="272" text-anchor="middle" fill="#cfe9ff">7. 校验 header magic + objectID</text>
+
+      <line x1="300" y1="308" x2="890" y2="308" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+      <text x="595" y="302" text-anchor="middle" fill="#ffadad">8. 校验 termsIn.objectID == termsIndexIn.objectID</text>
+
+      <line x1="300" y1="338" x2="510" y2="338" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+      <text x="405" y="332" text-anchor="middle" fill="#ffd591">9. openInput("_0_Lucene90_0.tmd")</text>
+
+      <line x1="510" y1="368" x2="300" y2="368" stroke="#d29922" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-o)"/>
+      <text x="405" y="362" text-anchor="middle" fill="#ffd591">10. metaIn (heap byte[])</text>
+
+      <line x1="300" y1="398" x2="1080" y2="398" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="690" y="392" text-anchor="middle" fill="#9be7b3">11. 读取 numFields + 每字段 FieldReader 元数据</text>
+
+      <rect x="200" y="420" width="940" height="220" rx="10" fill="rgba(63,185,80,0.05)" stroke="#3fb950" stroke-dasharray="4 3"/>
+      <rect x="200" y="420" width="80"  height="22" rx="4" fill="#3fb950"/>
+      <text x="240" y="436" text-anchor="middle" fill="#0d1117" font-size="10" font-weight="700">loop</text>
+      <text x="295" y="436" fill="#9be7b3">每字段</text>
+
+      <line x1="300" y1="468" x2="320" y2="468" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <path d="M320,468 C400,468 400,492 320,492" fill="none" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="375" y="464" fill="#e6d3ff">12. new FieldReader(...)</text>
+
+      <line x1="300" y1="518" x2="700" y2="518" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="500" y="512" text-anchor="middle" fill="#e6d3ff">13. clone() + seek(indexStartFP)</text>
+
+      <line x1="300" y1="548" x2="700" y2="548" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="500" y="542" text-anchor="middle" fill="#e6d3ff">14. 读 FST 元数据 (numBytes, rootArc, ...)</text>
+
+      <line x1="700" y1="578" x2="300" y2="578" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-p)"/>
+      <text x="500" y="572" text-anchor="middle" fill="#e6d3ff">15. FST 实例(slice 视图,只读 mmap 窗口)</text>
+
+      <text x="670" y="615" text-anchor="middle" fill="#a5d6ff" font-size="10" font-style="italic">★ slice 是零拷贝视图,FieldReader 之间互不影响 file pointer</text>
+
+      <line x1="300" y1="676" x2="95" y2="676" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-g)"/>
+      <text x="200" y="670" text-anchor="middle" fill="#9be7b3">16. BlockTreeTermsReader 实例</text>
+    </g>
+  </svg>
+</div>
+
+<h3>关键代码:BlockTreeTermsReader.open</h3>
+
+<pre><code class="language-java">public Lucene90BlockTreeTermsReader(PostingsReaderBase postingsReader,
+                                    SegmentReadState state) throws IOException {
+    String segmentName = state.segmentInfo.name;
+    this.indexIn = state.directory.openInput(
+        IndexFileNames.segmentFileName(segmentName, state.segmentSuffix, "tip"),
+        state.context.withReadAdvice(ReadAdvice.RANDOM_PRELOAD));
+    CodecUtil.checkIndexHeader(indexIn, TERMS_INDEX_CODEC_NAME,
+        VERSION_START, VERSION_CURRENT,
+        state.segmentInfo.getId(), state.segmentSuffix);
+
+    this.termsIn = state.directory.openInput(
+        IndexFileNames.segmentFileName(segmentName, state.segmentSuffix, "tim"),
+        state.context.withReadAdvice(ReadAdvice.NORMAL));
+    CodecUtil.checkIndexHeader(termsIn, TERMS_CODEC_NAME, ...);
+
+    try (ChecksumIndexInput metaIn = state.directory.openChecksumInput(
+            IndexFileNames.segmentFileName(segmentName, state.segmentSuffix, "tmd"))) {
+        int numFields = metaIn.readVInt();
+        for (int i = 0; i < numFields; i++) {
+            int field = metaIn.readVInt();
+            long numTerms = metaIn.readVLong();
+            BytesRef rootCode = readBytesRef(metaIn);
+            long indexStartFP = metaIn.readVLong();
+            FieldInfo fieldInfo = state.fieldInfos.fieldInfo(field);
+            fields.put(fieldInfo.name,
+                new FieldReader(this, fieldInfo, numTerms, rootCode,
+                    indexStartFP, indexIn, ...));
+        }
+        CodecUtil.checkFooter(metaIn);
+    }
+}</code></pre>
+
+<h3>per-field FST clone 语义</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 24-12-2 · IndexInput.clone 在多字段并发查询的语义</div>
+  <div style="background:#0d1117;border:1.5px solid #d2a8ff;border-radius:10px;padding:18px;font-family:'Cascadia Code',Consolas,monospace;font-size:12px;color:#a5d6ff;">
+    <pre style="margin:0;color:#a5d6ff;line-height:1.7;">
+单 .tip IndexInput 在多字段并发查询的工作模式:
+
+  <span style="color:#58a6ff;">主 indexIn (BlockTreeTermsReader)</span>
+       │
+       ├─ clone() ──→ <span style="color:#3fb950;">IndexInput for FieldReader "title"</span>
+       │                  └─ seek(0x12FE34) → FST title 起点
+       │                  └─ FST title.findTargetArc(...)
+       │
+       ├─ clone() ──→ <span style="color:#3fb950;">IndexInput for FieldReader "body"</span>
+       │                  └─ seek(0x456000) → FST body 起点
+       │                  └─ FST body.findTargetArc(...)
+       │
+       └─ clone() ──→ <span style="color:#3fb950;">IndexInput for FieldReader "category"</span>
+                          └─ seek(0x789000) → FST category 起点
+
+clone() 关键语义:
+  ✓ 共享底层 mmap byte[] (无内存复制)
+  ✓ 各自独立的 position 游标
+  ✓ 互不干扰的并发读
+  ✓ 不可写(只读 IndexInput)
+
+线程模型:
+  - 多 query 并发 → 多 SegmentTermsEnum 实例
+  - 每个 SegmentTermsEnum 持有自己的 IndexInput clone
+  - 共享底层 mmap,各自 seek 不影响
+  - 无锁 / 无 contention</pre>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s24-13">24.13 调试与可观测</h2>
+<!-- ============================================================ -->
+
+<h3>调试工具一览</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 24-13-1 · .tip 调试工具</div>
+  <table>
+    <thead>
+      <tr><th>工具</th><th>用途</th><th>命令 / API</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Luke (Lucene 工具箱)</td><td>UI 浏览 term + block</td><td><code>java -jar lucene-luke.jar</code></td></tr>
+      <tr><td><code>Util.toDot</code></td><td>导出 FST 为 Graphviz</td><td><code>Util.toDot(fst, writer, true, true)</code></td></tr>
+      <tr><td>CheckIndex</td><td>校验 .tip + .tim 完整性</td><td><code>java org.apache.lucene.index.CheckIndex /path</code></td></tr>
+      <tr><td><code>fst.ramBytesUsed()</code></td><td>查 FST 内存</td><td>API 调用</td></tr>
+      <tr><td>jhsdb / async-profiler</td><td>FST seek 热点</td><td>flame graph</td></tr>
+      <tr><td>vmtouch</td><td>查 page cache 状态</td><td><code>vmtouch /path/to/_0_Lucene90_0.tip</code></td></tr>
+      <tr><td>jcmd VM.native_memory</td><td>查 native 区(mmap)</td><td>jcmd PID VM.native_memory</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>CheckIndex 输出示例</h3>
+
+<pre><code class="language-text">$ java -cp lucene-core-9.7.jar org.apache.lucene.index.CheckIndex /var/lib/index
+
+Segments file=segments_5 numSegments=1 version=9.7.0 ...
+  1 of 1: name=_0 maxDoc=1000000
+    test: field norms.........OK
+    test: terms, freq, prox...OK [1500000 terms; ...]
+        field "title":
+          .tip size = 30.5 MB
+          unique terms = 1,000,000
+          FST nodes = 200,000
+          FST shared ratio = 80%
+          fixed-arc nodes = 5%
+          packed nodes = 95%
+          rootArc bytesPerArc = 6
+          loaded mode = mmap (off-heap)
+          verified: PASS
+        field "session_id_hash":
+          .tip size = 8.2 MB
+          unique terms = 100,000,000
+          FST nodes = 95,000
+          FST shared ratio = 99.9% (hash 高度共享)
+          verified: PASS
+
+  totalDocs=1000000 totalTerms=1500000
+  All segments are clean: PASS</code></pre>
+
+<h3>vmtouch 预热与监控</h3>
+
+<pre><code class="language-bash">$ vmtouch /var/lib/index/_0_Lucene90_0.tip
+           Files: 1
+     Directories: 0
+  Resident Pages: 7680/7680   30M/30M   100%
+         Elapsed: 0.012 seconds
+
+$ vmtouch -t /var/lib/index/_0_Lucene90_0.tip
+           Files: 1
+     Directories: 0
+   Touched Pages: 7680 (30M)
+         Elapsed: 0.18 seconds
+
+$ vmtouch -L /var/lib/index/_0_Lucene90_0.tip
+           Files: 1
+     Directories: 0
+    Locked Pages: 7680 (30M)
+         Elapsed: 0.18 seconds</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s24-14">24.14 反例 → 修复</h2>
+<!-- ============================================================ -->
+
+<h3>反例 1:高基数字段 FST 爆炸</h3>
+
+<pre><code class="language-java">// 反例:把 100M unique session_id 当 keyword 索引
+public class SessionIndexer {
+    public Document createDoc(String sessionId, String content) {
+        Document doc = new Document();
+        doc.add(new StringField("session_id", sessionId, Field.Store.YES));
+        doc.add(new TextField("content", content, Field.Store.NO));
+        return doc;
+    }
+}
+
+// 现象:
+//   .tip 中 session_id 字段 FST = 5 GB
+//   IndexWriter flush 时 OOM
+//   或写入到一定量后 NodeHash 堆爆
+//   merge 时 FST 重建超时</code></pre>
+
+<pre><code class="language-java">// 修复:hash + DocValues + 倒排查询
+public class SessionIndexer {
+    public Document createDoc(String sessionId, String content) {
+        Document doc = new Document();
+        long hash = MurmurHash3.hash64(sessionId.getBytes(UTF_8));
+        doc.add(new StringField("session_id_hash",
+            Long.toString(hash, 36), Field.Store.NO));
+        doc.add(new StoredField("session_id", sessionId));
+        doc.add(new SortedDocValuesField("session_id_dv",
+            new BytesRef(sessionId)));
+        doc.add(new TextField("content", content, Field.Store.NO));
+        return doc;
+    }
+
+    public Query buildQuery(String sessionId) {
+        long hash = MurmurHash3.hash64(sessionId.getBytes(UTF_8));
+        return new TermQuery(new Term("session_id_hash",
+            Long.toString(hash, 36)));
+    }
+}
+
+// 收益:
+//   .tip 中 session_id_hash FST = 50 MB(下降 100×)
+//   写入正常,无 OOM
+//   精确查询仍可命中</code></pre>
+
+<h3>反例 2:leading wildcard</h3>
+
+<pre><code class="language-java">// 反例:接受用户 leading wildcard "*foo"
+public class SearchService {
+    public List<Document> search(String pattern) {
+        WildcardQuery q = new WildcardQuery(new Term("title", pattern));
+        return searcher.search(q, 10).scoreDocs;
+    }
+}
+
+// 现象:
+//   "*foo" 扫描 100% term(1M term × 5 µs = 5 s)
+//   单次查询 50 ms 上升到 5 s
+//   并发 10 个 leading wildcard 查询直接耗尽 CPU</code></pre>
+
+<pre><code class="language-java">// 修复:拒绝 leading wildcard 或反向 token filter
+public class SearchService {
+    public List<Document> search(String pattern) {
+        if (pattern.startsWith("*") || pattern.startsWith("?")) {
+            throw new IllegalArgumentException(
+                "leading wildcard not allowed");
+        }
+        WildcardQuery q = new WildcardQuery(new Term("title", pattern));
+        return searcher.search(q, 10).scoreDocs;
+    }
+
+    public Document createDoc(String title) {
+        Document doc = new Document();
+        doc.add(new TextField("title", title, Field.Store.YES));
+        doc.add(new TextField("title_reversed",
+            new StringBuilder(title).reverse().toString(),
+            Field.Store.NO));
+        return doc;
+    }
+
+    public Query reversedQuery(String suffixPattern) {
+        String reversed = new StringBuilder(
+            suffixPattern.substring(1)).reverse().toString() + "*";
+        return new WildcardQuery(new Term("title_reversed", reversed));
+    }
+}
+
+// 收益:
+//   leading wildcard 转 trailing wildcard,FST 可剪枝
+//   查询时延 50 ms → 1 ms</code></pre>
+
+<h3>反例 3:on-heap 全量加载大词典</h3>
+
+<pre><code class="language-java">// 反例:强制 on-heap 加载 1 GB 词典
+Codec codec = new Lucene99Codec() {
+    @Override
+    public PostingsFormat getPostingsFormatForField(String field) {
+        return new Lucene90PostingsFormat(
+            Lucene90PostingsFormat.FSTLoadMode.ON_HEAP);
+    }
+};
+// 现象:JVM heap 暴涨 1 GB,GC 频繁,多 segment × 1 GB → 堆满 OOM
+
+// 修复:默认 mmap + per-field warmer
+IndexWriterConfig config = new IndexWriterConfig(analyzer);
+config.setMergedSegmentWarmer(reader -> {
+    TermsEnum te = reader.terms("title").iterator();
+    while (te.next() != null) te.docFreq();  // 触发 page-in
+});
+// 收益:heap = 0,page cache 自动管理,merge 完成后预热</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s24-15">24.15 源码入口</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">表 24-15-1 · .tip 相关源码</div>
+  <table>
+    <thead>
+      <tr><th>类</th><th>路径(lucene/core/src/java/...)</th><th>职责</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>Lucene90BlockTreeTermsFormat</code></td><td>codecs/lucene90/blocktree/</td><td>codec 入口注册</td></tr>
+      <tr><td><code>Lucene90BlockTreeTermsWriter</code></td><td>codecs/lucene90/blocktree/</td><td>写 .tim + .tip + .tmd</td></tr>
+      <tr><td><code>Lucene90BlockTreeTermsReader</code></td><td>codecs/lucene90/blocktree/</td><td>读 .tim + .tip + .tmd</td></tr>
+      <tr><td><code>FieldReader</code></td><td>codecs/lucene90/blocktree/</td><td>单字段 FST + block 入口</td></tr>
+      <tr><td><code>SegmentTermsEnum</code></td><td>codecs/lucene90/blocktree/</td><td>TermsEnum 实现 (seekExact / seekCeil / next)</td></tr>
+      <tr><td><code>SegmentTermsEnumFrame</code></td><td>codecs/lucene90/blocktree/</td><td>BlockTree 栈帧 (block 内扫描)</td></tr>
+      <tr><td><code>FSTCompiler</code></td><td>util/fst/</td><td>FST 增量构造</td></tr>
+      <tr><td><code>FST</code></td><td>util/fst/</td><td>FST 核心数据结构 (read)</td></tr>
+      <tr><td><code>NodeHash</code></td><td>util/fst/</td><td>节点共享 hash</td></tr>
+      <tr><td><code>OffHeapFSTStore</code></td><td>util/fst/</td><td>off-heap FST 存储 (mmap)</td></tr>
+      <tr><td><code>Outputs</code> / <code>ByteSequenceOutputs</code></td><td>util/fst/</td><td>output 类型抽象</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>FST 与候选数据结构对比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 24-15-2 · FST 与替代方案的工程取舍</div>
+  <table>
+    <thead>
+      <tr><th>数据结构</th><th>时间(prefix)</th><th>空间</th><th>范围扫描</th><th>实现复杂度</th><th>在 Lucene 的劣势</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Hash table</td><td>O(1)</td><td>O(N)</td><td>不支持</td><td>简单</td><td>无前缀查询</td></tr>
+      <tr><td>Trie</td><td>O(prefix)</td><td>O(N × len)</td><td>子树遍历</td><td>中</td><td>内存巨大</td></tr>
+      <tr><td>Patricia trie</td><td>O(prefix)</td><td>O(N)</td><td>子树遍历</td><td>较复杂</td><td>节点共享差</td></tr>
+      <tr><td>BTree</td><td>O(log N)</td><td>O(N)</td><td>顺序扫</td><td>中</td><td>缓存不友好</td></tr>
+      <tr><td><strong>FST</strong></td><td><strong>O(prefix)</strong></td><td><strong>O(min)</strong></td><td><strong>DFS</strong></td><td><strong>复杂</strong></td><td><strong>无,本场景最优</strong></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="real-world">
+  <strong>FST 跨 30 年的工程谱系</strong> — Mehryar Mohri 1997 年的论文《Finite-State Transducers in Language and Speech Processing》是 FST 在 NLP 领域的奠基。Robert Muth 1995 年的《Computing Minimal Finite-State Automata Using Hash Tables》提出增量最小化算法,是 Lucene FSTCompiler 的直接源头。Apple Siri 语音识别、Google 翻译的语言模型、ICU BreakIterator、Apache OpenNLP 的词典、Tantivy(Rust 搜索引擎)、Vespa attribute index 都基于同一套 FST 思想。Lucene 的独特贡献是 reverse encoding + per-field 切分 + .tip/.tim 双层存储——这套工程化让 FST 从"NLP 学术算法"变成"日活百亿搜索系统的底层基石"。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s24-16">24.16 生产陷阱清单</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">图 24-16-1 · .tip 陷阱分类</div>
+  <svg viewBox="0 0 1200 460" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <g font-size="13" font-weight="700">
+      <rect x="500" y="20" width="200" height="56" rx="14" fill="url(#g-red)" stroke="#f85149"/>
+      <text x="600" y="46" text-anchor="middle" fill="#ffd5d5">.tip 陷阱</text>
+      <text x="600" y="65" text-anchor="middle" fill="#ffadad" font-size="10" font-weight="500">8 类生产事故根源</text>
+
+      <rect x="100"  y="160" width="200" height="50" rx="12" fill="url(#g-purple)" stroke="#bc8cff"/>
+      <text x="200" y="190" text-anchor="middle" fill="#e6d3ff">内存类</text>
+
+      <rect x="500"  y="160" width="200" height="50" rx="12" fill="url(#g-blue)" stroke="#58a6ff"/>
+      <text x="600" y="190" text-anchor="middle" fill="#cfe9ff">查询类</text>
+
+      <rect x="900"  y="160" width="200" height="50" rx="12" fill="url(#g-orange)" stroke="#d29922"/>
+      <text x="1000" y="190" text-anchor="middle" fill="#ffd591">配置类</text>
+    </g>
+
+    <g font-size="11" font-weight="600">
+      <rect x="20"  y="280" width="180" height="46" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-opacity="0.7"/>
+      <text x="110" y="300" text-anchor="middle" fill="#e6d3ff">1. 高基数字段</text>
+      <text x="110" y="316" text-anchor="middle" fill="#cfb8ff" font-size="10">FST 爆 (TOP 1)</text>
+
+      <rect x="220" y="280" width="180" height="46" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-opacity="0.7"/>
+      <text x="310" y="300" text-anchor="middle" fill="#e6d3ff">2. on-heap</text>
+      <text x="310" y="316" text-anchor="middle" fill="#cfb8ff" font-size="10">全量加载</text>
+
+      <rect x="120" y="350" width="180" height="46" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-opacity="0.7"/>
+      <text x="210" y="370" text-anchor="middle" fill="#e6d3ff">3. NodeHash</text>
+      <text x="210" y="386" text-anchor="middle" fill="#cfb8ff" font-size="10">构建慢</text>
+
+      <rect x="420" y="280" width="180" height="46" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-opacity="0.7"/>
+      <text x="510" y="300" text-anchor="middle" fill="#cfe9ff">4. leading *</text>
+      <text x="510" y="316" text-anchor="middle" fill="#a5d6ff" font-size="10">全 FST 扫</text>
+
+      <rect x="620" y="280" width="180" height="46" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-opacity="0.7"/>
+      <text x="710" y="300" text-anchor="middle" fill="#cfe9ff">5. FuzzyQuery</text>
+      <text x="710" y="316" text-anchor="middle" fill="#a5d6ff" font-size="10">大 edit 距离</text>
+
+      <rect x="520" y="350" width="180" height="46" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-opacity="0.7"/>
+      <text x="610" y="370" text-anchor="middle" fill="#cfe9ff">6. RegexpQuery</text>
+      <text x="610" y="386" text-anchor="middle" fill="#a5d6ff" font-size="10">复杂正则</text>
+
+      <rect x="820" y="280" width="180" height="46" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-opacity="0.7"/>
+      <text x="910" y="300" text-anchor="middle" fill="#ffd591">7. mmap</text>
+      <text x="910" y="316" text-anchor="middle" fill="#ffe4ad" font-size="10">未预热</text>
+
+      <rect x="1020" y="280" width="160" height="46" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-opacity="0.7"/>
+      <text x="1100" y="300" text-anchor="middle" fill="#ffd591">8. per-field</text>
+      <text x="1100" y="316" text-anchor="middle" fill="#ffe4ad" font-size="10">codec 默认</text>
+    </g>
+
+    <g fill="none" stroke-width="1.5">
+      <path d="M600,76 C600,118 200,118 200,160" stroke="#bc8cff" marker-end="url(#arr-p)"/>
+      <line x1="600" y1="76" x2="600" y2="160" stroke="#58a6ff" marker-end="url(#arr)"/>
+      <path d="M600,76 C600,118 1000,118 1000,160" stroke="#d29922" marker-end="url(#arr-o)"/>
+
+      <path d="M200,210 C200,245 110,245 110,280" stroke="#bc8cff" marker-end="url(#arr-p)"/>
+      <path d="M200,210 C200,245 310,245 310,280" stroke="#bc8cff" marker-end="url(#arr-p)"/>
+      <line x1="200" y1="210" x2="210" y2="350" stroke="#bc8cff" marker-end="url(#arr-p)"/>
+
+      <path d="M600,210 C600,245 510,245 510,280" stroke="#58a6ff" marker-end="url(#arr)"/>
+      <path d="M600,210 C600,245 710,245 710,280" stroke="#58a6ff" marker-end="url(#arr)"/>
+      <line x1="600" y1="210" x2="610" y2="350" stroke="#58a6ff" marker-end="url(#arr)"/>
+
+      <path d="M1000,210 C1000,245 910,245 910,280" stroke="#d29922" marker-end="url(#arr-o)"/>
+      <path d="M1000,210 C1000,245 1100,245 1100,280" stroke="#d29922" marker-end="url(#arr-o)"/>
+    </g>
+
+    <g font-size="10" font-style="italic">
+      <text x="200" y="430" text-anchor="middle" fill="#bc8cff">监控:per-field FST size</text>
+      <text x="600" y="430" text-anchor="middle" fill="#58a6ff">监控:query timeout / latency</text>
+      <text x="1000" y="430" text-anchor="middle" fill="#d29922">监控:page faults / heap usage</text>
+    </g>
+  </svg>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">表 24-16-1 · 8 个陷阱明细</div>
+  <table>
+    <thead>
+      <tr><th>#</th><th>陷阱</th><th>症状</th><th>根因</th><th>修复</th><th>监控</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1</td><td>高基数字段 FST 爆</td><td>OOM</td><td>user_id 等当 keyword</td><td>hash + 倒排</td><td>per-field FST size</td></tr>
+      <tr><td>2</td><td>on-heap 全量加载</td><td>heap 高 / GC 频繁</td><td>postingsFormat 配错</td><td>改默认 mmap</td><td>heap usage</td></tr>
+      <tr><td>3</td><td>NodeHash 构建慢</td><td>flush 卡顿</td><td>1B+ term</td><td>调 shareMaxTailLength</td><td>flush latency</td></tr>
+      <tr><td>4</td><td>leading * 全扫</td><td>"*foo" 超时</td><td>无前缀,FST 无法剪枝</td><td>反向索引 / 拒绝</td><td>query timeout</td></tr>
+      <tr><td>5</td><td>FuzzyQuery 大 edit</td><td>edit=3 卡死</td><td>自动机膨胀</td><td>限 maxEdits=2</td><td>query latency</td></tr>
+      <tr><td>6</td><td>RegexpQuery 复杂</td><td>高内存</td><td>自动机最小化失败</td><td>简化正则 / cache</td><td>regex memory</td></tr>
+      <tr><td>7</td><td>mmap 未预热</td><td>首次查询 50 ms</td><td>page cache 冷</td><td>vmtouch 预热</td><td>page faults</td></tr>
+      <tr><td>8</td><td>per-field codec 默认</td><td>FST 不优</td><td>全字段同一 codec</td><td>per-field codec</td><td>per-field size</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="warning">
+  <strong>第 1 个陷阱"高基数 FST 爆"是生产事故 TOP 1</strong> — 公司从未运行过 Lucene 的工程师第一次接 user_id 索引时,90% 概率会把它当成 StringField 直接加,然后在测试环境(只 1 万 user)跑得飞快,上线后真实 user 量 1 亿+ 立即 OOM。这是上线前必做的回归:用真实数据规模灌测试索引,用 <code>fst.ramBytesUsed()</code> 检查每字段 FST 大小,任何字段 &gt; 1 GB 都必须重审是否需要前缀查询能力,不需要的全部改 hash 字段。
+</div>
+
+<h3>三种部署形态对比</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4>全 mmap 形态(默认推荐)</h4>
+<pre><code class="language-text">配置: MMapDirectory + 默认 codec
+.tip 加载: mmap (off-heap)
+.tim 加载: mmap (按需 page-in)
+
+容量:
+  词典 任意大小
+  heap 不增长
+
+启动: 秒级(只读 header)
+首次查询: 5-50 µs(page fault)
+稳态查询: 1-3 µs
+P99 抖动: 中(取决于 page cache)
+
+适用: 99% 生产场景</code></pre>
+    <p style="margin-top:8px;font-size:12px;color:#3fb950;">默认即最优,生产推荐。</p>
+  </div>
+  <div class="compare-good">
+    <h4>heap-resident 形态</h4>
+<pre><code class="language-text">配置: ON_HEAP FSTLoadMode
+.tip 加载: byte[] in heap
+.tim 加载: 仍 mmap(只控 .tip)
+
+容量:
+  .tip 必须 &lt; heap × 30%
+  典型限 100 MB 词典
+
+启动: 慢(GB/秒读)
+首次查询: 1 µs(已热)
+稳态查询: 0.3-1 µs
+P99 抖动: 极低
+
+适用: 小词典 + 极低延迟要求
+注意: 大词典 OOM 风险</code></pre>
+    <p style="margin-top:8px;font-size:12px;color:#d29922;">仅小词典 + 严格 P99 才用。</p>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- Chapter Summary -->
+<!-- ============================================================ -->
+
+<div class="chapter-summary" id="s24-summary">
+  <h2>24.17 本章小结</h2>
+  <p>.tip 是 BlockTree 词典的"内存索引层":per-field FST 把 term 前缀映射成 .tim 中 block 的 64-bit 偏移,FST 沿前缀 walk 4-8 步即得到答案。它和 .tim 通过 8 byte output 编码(高 61 bit 是 blockFP,低 3 bit 是 hasTerms / hasSubBlocks / isFloor 三个标志)做最小协议;objectId 强校验保证两文件配对正确。1 千万 term 的 .tip 典型只占 30 MB,全量 mmap 进 page cache,亚毫秒 seek 不触磁盘——这是 Lucene 在亿级 term 词典上仍能"内存查询"的根源。</p>
+  <table>
+    <thead>
+      <tr><th>关注点</th><th>核心 API / 文件</th><th>关键建议</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>.tip 角色</td><td>per-field FST 索引层</td><td>路标 · 必须与 .tim 配套 · objectId 校验</td></tr>
+      <tr><td>FST 输出编码</td><td>64-bit long</td><td>高 61 bit blockFP + 低 3 bit flags · 沿路径累加</td></tr>
+      <tr><td>文件四区段</td><td>Header + 主体 + Field Index + Footer</td><td>主体占 99%,Header/Footer 各 ~50 byte</td></tr>
+      <tr><td>per-field FST</td><td>FieldReader.index</td><td>每字段独立 FST · fieldNumber → fstOffset</td></tr>
+      <tr><td>节点三种模式</td><td>packed / fixed-arc / bitmap</td><td>numArcs &lt; 64 packed,≥ 64 fixed,密集 ≥ 50% bitmap</td></tr>
+      <tr><td>reverse encoding</td><td>叶子在前 · root 在末尾</td><td>构建时无需回填指针 · root offset 在文件末尾</td></tr>
+      <tr><td>NodeHash 共享</td><td>FSTCompiler + NodeHash</td><td>1M term 共享率 85%,FST 大小 30 MB</td></tr>
+      <tr><td>term seek 路径</td><td>FST.lookupCeiling → .tim block → suffix scan</td><td>2 次 seek · 总耗时 200-500 ns</td></tr>
+      <tr><td>Floor block</td><td>prefix 下 term &gt; 48 触发</td><td>floor head + sub-block · 多 1 次 .tim seek</td></tr>
+      <tr><td>加载策略</td><td>on-heap / off-heap mmap / NIOFS</td><td>大词典默认 mmap · 小词典可 on-heap</td></tr>
+      <tr><td>内存大小估算</td><td>fst.ramBytesUsed()</td><td>英文 ~ 30 byte/term · UTF-8 ~ 80 byte/term</td></tr>
+      <tr><td>性能瓶颈</td><td>page miss / leading * / 大 FuzzyQuery</td><td>vmtouch 预热 · 拒绝 leading * · 限 maxEdits=2</td></tr>
+      <tr><td>大词典优化</td><td>per-field codec / hash 字段</td><td>高基数字段(user_id 等)改 hash 替代</td></tr>
+      <tr><td>IndexInput 拼装</td><td>BlockTreeTermsReader.open</td><td>.tip + .tim + .tmd 三文件 · clone 共享 mmap</td></tr>
+      <tr><td>调试工具</td><td>Util.toDot · Luke · CheckIndex</td><td>fst.ramBytesUsed 监控 · vmtouch 看 page cache</td></tr>
+      <tr><td>生产陷阱</td><td>高基数 FST 爆 / leading * / on-heap 大词典</td><td>真实数据规模灌测试索引验证</td></tr>
+    </tbody>
+  </table>
+  <p class="next-hint">下一章 <a href="25-doc-postings.html">第 25 章 · .doc Postings 文件</a> 把"FST 找到 term 之后接着做什么"讲透。<code>SegmentTermsEnum.postings()</code> 返回的 <code>PostingsEnum</code> 在 .doc 文件上做 PFOR-delta 解码、SkipList 多级跳跃、跨 128-doc block 高效 advance,这是从"找到 term"到"返回 docID + freq"的最后一公里。我们会拆开 .doc 的字节级布局、PFOR-delta 编码原理、SkipList 多层结构、Impacts 元数据驱动 BlockMax WAND 的协议,把 .tip 给出的 docStartFP 一路推到具体的 docID 流。</p>
+</div>
+
+<!-- ============================================================ -->
+<!-- Chapter navigation -->
+<!-- ============================================================ -->
+<div class="chapter-nav">
+  <a href="23-tim-terms-data.html">&larr; 第 23 章 &middot; .tim Terms 数据文件</a>
+  <a href="25-doc-postings.html">第 25 章 &middot; .doc Postings 文件 &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 Lucene &middot; 第 24 章 &middot; .tip Term Index 文件</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){setTimeout(function(){document.querySelectorAll('.mermaid svg,.diagram svg').forEach(function(svg){var h=parseInt(svg.getAttribute('height')||svg.getBoundingClientRect().height);if(h>500){svg.style.maxHeight='500px';svg.style.width='auto';var p=svg.closest('.diagram');if(p)p.style.overflowX='auto';}});},1500);});</script>
+</body>
+</html>

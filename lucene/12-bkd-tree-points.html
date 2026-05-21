@@ -1,0 +1,1309 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.12 BKD-tree 与数值范围索引 — 图解 Lucene</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr"   markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    <marker id="arr-g" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#3fb950"/></marker>
+    <marker id="arr-o" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#d29922"/></marker>
+    <marker id="arr-r" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#f85149"/></marker>
+    <marker id="arr-p" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#bc8cff"/></marker>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Lucene</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="11-postings-skip-iterator.html">上一章</a>
+  <a href="13-docvalues-packedints.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s12-1">12.1 多维空间与 Point 字段</a>
+  <a href="#s12-2">12.2 K-D 切分思想</a>
+  <a href="#s12-3">12.3 BKD 与传统 K-D 的区别</a>
+  <a href="#s12-4">12.4 构造算法</a>
+  <a href="#s12-5">12.5 .dim 文件结构</a>
+  <a href="#s12-6">12.6 .dii 文件结构</a>
+  <a href="#s12-7">12.7 字节级布局</a>
+  <a href="#s12-8">12.8 IntersectVisitor 接口</a>
+  <a href="#s12-9">12.9 PointRangeQuery 实现</a>
+  <a href="#s12-10">12.10 多维与距离查询</a>
+  <a href="#s12-11">12.11 PointInSet 查询</a>
+  <a href="#s12-12">12.12 性能调优</a>
+  <a href="#s12-13">12.13 与 DocValues 配合</a>
+  <a href="#s12-14">12.14 调试与可观测</a>
+  <a href="#s12-15">12.15 性能场景与量化</a>
+  <a href="#s12-16">12.16 反例 → 修复对照</a>
+  <a href="#s12-17">12.17 源码入口</a>
+  <a href="#s12-18">12.18 生产陷阱</a>
+  <a href="#s12-summary">12.19 本章小结</a>
+</aside>
+
+<div class="article">
+
+<h1>第 12 章 · BKD-tree 与数值范围索引</h1>
+<p class="subtitle">K-D Tree · BKD 不可变 · IntersectVisitor · CELL_INSIDE/OUTSIDE/CROSSES · LongPoint · LatLonPoint · 距离查询</p>
+
+<div class="chapter-intro">
+  <p class="lead">订单搜索里有一类查询倒排索引解不了:<code>amountCents BETWEEN 100 AND 10000</code>、<code>paidAt BETWEEN epoch1 AND epoch2</code>、<code>距离北京 5km 内</code>。这些<strong>多维范围查询</strong>用倒排会爆——每个具体值是一个独立的 term,1 千万种金额值就是 1 千万个 term,效率毁灭性下降。Lucene 给出的答案是 <strong>BKD-tree(K-Dimensional Block tree)</strong>:把数值空间递归二分,叶子节点保存若干点的紧凑列表,内部节点保存维度切分线,查询时通过 <code>IntersectVisitor</code> 三态(INSIDE / OUTSIDE / CROSSES)递归剪枝——<em>窄区间命中只访问几个叶子,1 ms 出结果</em>。</p>
+  <p>BKD 与倒排是两套<strong>独立机制</strong>:倒排适合等值与文本,BKD 适合范围与多维。一个订单的 <code>amountCents</code> 既能用 LongPoint 范围查询,又能用 NumericDocValues 排序与脚本评分,但<strong>必须双写</strong>——Lucene 不会自动从 BKD 推 DocValues。这一章拆解 BKD 的构造算法、<code>.dim</code> 与 <code>.dii</code> 两个文件的字节级布局、查询执行流程、性能取舍,以及 8 个生产陷阱。对应 Lucene 9.x 的 <code>Lucene90PointsFormat</code>。</p>
+  <ul class="will-learn">
+    <li>K-D tree 的核心思想:递归二分多维空间,每层选一个维度切中位数</li>
+    <li>BKD 与传统 K-D 的关键区别:不可变、bulk-load、叶子 1024 点、磁盘友好</li>
+    <li>BKDWriter 的 add → spill → sort → build 四阶段构造流程</li>
+    <li>.dim(叶子点数据)与 .dii(内部节点索引)的物理布局,docID 与维度值如何 delta + ZigZag 压缩</li>
+    <li>IntersectVisitor 的 3 种 cell 关系:CELL_INSIDE_QUERY / CELL_OUTSIDE_QUERY / CELL_CROSSES_QUERY</li>
+    <li>visit(docID) vs visit(docID, packedValue) 的代价差异:批量 vs 逐点</li>
+    <li>PointRangeQuery / newSetQuery / newDistanceQuery 三种查询的内部展开</li>
+    <li>LongPoint 与 NumericDocValues 必须双写的原因,以及缺一个就抛 <code>IllegalStateException</code> 的场景</li>
+  </ul>
+  <p class="prereq">前置知识:第 1 章字段建模(知道 LongPoint 是 4 种访问路径之一);第 4 章 BooleanQuery 求交;第 9 章源码阅读路径(本章会引用 BKDWriter / BKDReader 等具体类)。读者需要熟悉二分搜索与递归数据结构。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-1">12.1 多维空间与 Point 字段类型</h2>
+<!-- ============================================================ -->
+
+<p>"Point"在 Lucene 里是一个 K 维空间中的点。1 维 LongPoint 就是单个 long 值(金额、时间戳);2 维 LatLonPoint 是经纬度对;K 维 DoublePoint 是任意多个 double。</p>
+
+<h3>不同维度的可视化</h3>
+
+<pre><code class="language-text">1 维: LongPoint amountCents
+  数据点: 100, 250, 500, 1000, 2500, 5000, 10000
+
+2 维: LatLonPoint(纬度, 经度)
+  数据点:
+    (39.9, 116.4)  北京
+    (31.2, 121.5)  上海
+    (23.1, 113.3)  广州
+
+K 维: DoublePoint 多维
+  数据点:
+    (1.0, 2.0, 3.0, 4.0)
+    (1.5, 2.5, 3.5, 4.5)</code></pre>
+
+<h3>Lucene 内置的 6 种 Point 类型</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 12-1-1 · Point 字段类型清单</div>
+  <table>
+    <thead>
+      <tr><th>类型</th><th>维度</th><th>字节/维度</th><th>典型用途</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>IntPoint</code></td><td>1+</td><td>4</td><td>整数值(年龄 / 库存)</td></tr>
+      <tr><td><code>LongPoint</code></td><td>1+</td><td>8</td><td>时间戳 / 金额(分单位)</td></tr>
+      <tr><td><code>FloatPoint</code></td><td>1+</td><td>4</td><td>浮点(评分 / 价格)</td></tr>
+      <tr><td><code>DoublePoint</code></td><td>1+</td><td>8</td><td>双精度(科学计算)</td></tr>
+      <tr><td><code>LatLonPoint</code></td><td>2(固定)</td><td>4 + 4</td><td>经纬度(GIS)</td></tr>
+      <tr><td><code>BinaryPoint</code></td><td>1+</td><td>任意</td><td>自定义编码</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>真实订单字段的映射</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 12-1-2 · 订单业务字段 → Point 类型映射</div>
+  <table>
+    <thead>
+      <tr><th>业务字段</th><th>Point 类型</th><th>维度</th><th>备注</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>amountCents</code></td><td>LongPoint</td><td>1</td><td>订单金额(分),避免浮点精度</td></tr>
+      <tr><td><code>paidAt</code></td><td>LongPoint</td><td>1</td><td>支付时间(epoch ms)</td></tr>
+      <tr><td><code>storeLocation</code></td><td>LatLonPoint</td><td>2</td><td>门店经纬度</td></tr>
+      <tr><td><code>productId + variantId</code></td><td>LongPoint(2D)</td><td>2</td><td>不推荐;优先 BooleanQuery</td></tr>
+      <tr><td><code>priceRange + ratingRange</code></td><td>DoublePoint</td><td>2</td><td>商品筛选(2D 范围)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key-insight">
+  <strong>不要用倒排索引存数值字段</strong>。如果把 <code>amountCents</code> 当作 StringField 索引,1 千万订单就是 1 千万种独立 term,词典暴涨,范围查询 (BETWEEN) 无法表达。BKD 为数值范围而生:递归二分 + 叶子 block,实现窄区间 ms 级、宽区间百 ms 级的可预测性能。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-2">12.2 K-D 切分思想</h2>
+<!-- ============================================================ -->
+
+<h3>2 维点云递归切分</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 12-2-1 · 2D 点云的递归切分(手绘)</div>
+  <div style="background:#0d1117;border:1.5px solid #58a6ff;border-radius:10px;padding:18px;font-family:'Cascadia Code','SFMono-Regular',Consolas,monospace;font-size:12.5px;color:#a5d6ff;">
+    <div style="color:#58a6ff;font-weight:600;font-size:13px;margin-bottom:12px;">2 维点云的 K-D 切分(每层换维度)</div>
+
+    <pre style="margin:0;color:#a5d6ff;line-height:1.5;font-size:11.5px;">
+    y
+    │
+ 50 ┤  •         •
+    │      •
+ 40 ┤    <span style="color:#3fb950;">•─────────────────</span>     ← <span style="color:#3fb950;">第 1 层切 y=40</span>
+    │  •     •
+ 30 ┤      •
+    │  •         •
+ 20 ┤<span style="color:#d29922;">────│────│─────────</span>     ← <span style="color:#d29922;">第 2 层切 x=10 / x=30</span>
+    │  • │  • │
+ 10 ┤  • │    │•  •
+    │    │    │
+  0 └────┴────┴───────────►
+      0   10   20   30   40   50    x
+    </pre>
+
+    <div style="margin-top:14px;color:#d2a8ff;font-weight:600;">树结构(前序展开):</div>
+    <pre style="margin-top:6px;color:#a5d6ff;line-height:1.6;font-size:11.5px;">
+                 y=40 ?
+                ╱       ╲
+          y &lt;40           y &gt;=40
+            │                │
+         x=10 ?           x=20 ?
+         ╱   ╲             ╱   ╲
+       x&lt;10  x&gt;=10      x&lt;20  x&gt;=20
+        │     │           │     │
+      leaf  leaf        leaf  leaf
+    </pre>
+  </div>
+</div>
+
+<h3>4 种切分策略对比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 12-2 · 切分策略对比</div>
+  <table>
+    <thead>
+      <tr><th>策略</th><th>选维度</th><th>切分点</th><th>适合场景</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>标准 K-D</td><td>轮转维度</td><td>中位数</td><td>内存,等密度数据</td></tr>
+      <tr><td>BKD</td><td>按值分布选维度</td><td>中位数</td><td>磁盘,bulk-load</td></tr>
+      <tr><td>Ball-tree</td><td>距离</td><td>中位距离</td><td>高维聚类</td></tr>
+      <tr><td>R-tree</td><td>矩形</td><td>重心</td><td>GIS 空间索引</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-3">12.3 BKD 与传统 K-D 的关键区别</h2>
+<!-- ============================================================ -->
+
+<p>BKD-tree 由 Procopiuc 等人 2003 年提出,核心创新是把<strong>叶子做成 block</strong>(默认 1024 点),便于磁盘 IO 与 page cache。Lucene 的实现是<strong>不可变 BKD</strong>,只在 segment flush 时构造,不支持单点插入;所有 segment 上的 BKD 在合并时重建。</p>
+
+<div class="compare-grid">
+  <div class="compare-card">
+    <div class="compare-title" style="color:#f85149;">传统 K-D Tree</div>
+    <div class="compare-body">
+      <strong>存储</strong>:全内存<br>
+      <strong>构造</strong>:逐点插入(支持 add)<br>
+      <strong>平衡</strong>:难保证(需要旋转)<br>
+      <strong>叶子</strong>:单点<br>
+      <strong>典型用例</strong>:内存中的 KNN 搜索<br>
+      <strong>不适合</strong>:Lucene segment(需磁盘 + 不可变)
+    </div>
+  </div>
+  <div class="compare-card">
+    <div class="compare-title" style="color:#3fb950;">BKD Tree(Lucene 实现)</div>
+    <div class="compare-body">
+      <strong>存储</strong>:磁盘友好(.dim + .dii)<br>
+      <strong>构造</strong>:bulk-load(全量排序后构建)<br>
+      <strong>平衡</strong>:始终平衡(中位数切分)<br>
+      <strong>叶子</strong>:1024 点 block<br>
+      <strong>典型用例</strong>:Lucene segment 上的 K-D<br>
+      <strong>限制</strong>:不可变,合并时重建
+    </div>
+  </div>
+</div>
+
+<h3>不可变带来的代价与收益</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 12-3 · 不可变 BKD 的取舍</div>
+  <table>
+    <thead>
+      <tr><th>维度</th><th>收益</th><th>代价</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>写入</td><td>bulk-load 比逐点插入快 5-10×</td><td>必须等 segment flush 才可查</td></tr>
+      <tr><td>读取</td><td>叶子 block 连续,IO 友好</td><td>无法增量更新</td></tr>
+      <tr><td>合并</td><td>merge 时重建,重新平衡</td><td>merge 成本与 segment 大小成正比</td></tr>
+      <tr><td>删除</td><td>通过 LiveDocs 过滤(简单)</td><td>BKD 树不感知删除,可能多读</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-4">12.4 构造算法</h2>
+<!-- ============================================================ -->
+
+<h3>BKDWriter 的 4 阶段</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 12-4-1 · BKDWriter 的构造流程</div>
+  <svg viewBox="0 0 1240 720" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 阶段 1: 写入 -->
+    <text x="180" y="36" text-anchor="middle" fill="#39d2c0" font-size="14" font-weight="700">阶段 ① 写入 (per addDocument)</text>
+    <rect x="40" y="50" width="280" height="240" rx="14" fill="rgba(63,185,80,0.06)" stroke="#3fb950" stroke-width="1.4" stroke-dasharray="6 3"/>
+
+    <rect x="80" y="80" width="200" height="56" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="180" y="106" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">add point(values, docID)</text>
+    <text x="180" y="124" text-anchor="middle" fill="#a5d6ff" font-size="11">addDocument 时调用</text>
+
+    <rect x="80" y="160" width="200" height="56" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="180" y="186" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">缓冲到内存数组</text>
+    <text x="180" y="204" text-anchor="middle" fill="#a5d6ff" font-size="11">RAM PointWriter</text>
+
+    <polygon points="180,235 280,260 180,285 80,260" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.4"/>
+    <text x="180" y="265" text-anchor="middle" fill="#ffd591" font-size="12" font-weight="700">满 16 MB?</text>
+
+    <!-- 阶段 2: spill -->
+    <rect x="380" y="170" width="240" height="76" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="1.5"/>
+    <text x="500" y="198" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">→ spill 到磁盘</text>
+    <text x="500" y="218" text-anchor="middle" fill="#a5d6ff" font-size="11">OfflinePointWriter</text>
+    <text x="500" y="236" text-anchor="middle" fill="#a5d6ff" font-size="11">tmp 文件</text>
+
+    <!-- 阶段 3: finalize -->
+    <text x="690" y="36" text-anchor="middle" fill="#bc8cff" font-size="14" font-weight="700">阶段 ② finalize (segment flush 触发)</text>
+    <rect x="380" y="50" width="620" height="320" rx="14" fill="rgba(189,140,255,0.06)" stroke="#bc8cff" stroke-width="1.4" stroke-dasharray="6 3"/>
+
+    <rect x="420" y="80" width="240" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="540" y="106" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">finalize() — 进入构树</text>
+    <text x="540" y="124" text-anchor="middle" fill="#a5d6ff" font-size="11">DWPT.flush 触发</text>
+
+    <rect x="700" y="80" width="270" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="835" y="106" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">全量按维度排序</text>
+    <text x="835" y="124" text-anchor="middle" fill="#a5d6ff" font-size="11">in-memory / 多路归并</text>
+
+    <rect x="420" y="170" width="240" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="540" y="196" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">递归 build 树</text>
+    <text x="540" y="214" text-anchor="middle" fill="#a5d6ff" font-size="11">分治</text>
+
+    <rect x="700" y="170" width="270" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="835" y="196" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">每节点选中位数切分</text>
+    <text x="835" y="214" text-anchor="middle" fill="#a5d6ff" font-size="11">splitDim / splitValue</text>
+
+    <rect x="420" y="260" width="550" height="80" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="695" y="286" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">递归子树: 左 ≤ splitValue · 右 &gt; splitValue</text>
+    <text x="695" y="306" text-anchor="middle" fill="#a5d6ff" font-size="11">叶子 ≤ 1024 点时停止递归 → 写一个 leaf block</text>
+    <text x="695" y="324" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">树结构 → .dii · 叶子 → .dim</text>
+
+    <!-- 输出 -->
+    <text x="1080" y="36" text-anchor="middle" fill="#3fb950" font-size="14" font-weight="700">阶段 ③ 输出</text>
+    <rect x="1020" y="80" width="200" height="290" rx="14" fill="rgba(30,95,58,0.10)" stroke="#3fb950" stroke-width="1.6"/>
+    <text x="1120" y="120" text-anchor="middle" fill="#9be7b3" font-size="14" font-weight="700">.dim</text>
+    <text x="1120" y="140" text-anchor="middle" fill="#a5d6ff" font-size="11">叶子点数据</text>
+    <text x="1120" y="158" text-anchor="middle" fill="#a5d6ff" font-size="11">PackedInts 编码</text>
+
+    <line x1="1090" y1="170" x2="1150" y2="170" stroke="#3fb950" stroke-width="1" stroke-dasharray="3 3"/>
+    <text x="1120" y="200" text-anchor="middle" fill="#9be7b3" font-size="14" font-weight="700">.dii</text>
+    <text x="1120" y="220" text-anchor="middle" fill="#a5d6ff" font-size="11">索引结构</text>
+    <text x="1120" y="238" text-anchor="middle" fill="#a5d6ff" font-size="11">树节点 + minMax box</text>
+
+    <text x="1120" y="280" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">查询时:</text>
+    <text x="1120" y="300" text-anchor="middle" fill="#a5d6ff" font-size="11">.dii 内存常驻</text>
+    <text x="1120" y="318" text-anchor="middle" fill="#a5d6ff" font-size="11">.dim 按需 mmap</text>
+
+    <g fill="none">
+      <line x1="180" y1="136" x2="180" y2="158" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+      <line x1="180" y1="216" x2="180" y2="234" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+
+      <!-- 满 → spill, 否 → 回 buffer -->
+      <line x1="280" y1="260" x2="378" y2="208" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+      <text x="320" y="245" fill="#f85149" font-size="11" font-weight="700">是</text>
+      <path d="M 80 260 Q 30 220 78 188" stroke="#3fb950" stroke-width="1.4" fill="none" marker-end="url(#arr-g)"/>
+      <text x="20" y="220" fill="#3fb950" font-size="11" font-weight="700">否</text>
+
+      <!-- spill + buffer 都汇入 finalize -->
+      <line x1="500" y1="170" x2="500" y2="138" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <line x1="180" y1="285" x2="540" y2="138" stroke="#bc8cff" stroke-width="1.4" stroke-dasharray="6 3" marker-end="url(#arr-p)"/>
+      <text x="350" y="320" fill="#39d2c0" font-size="11" font-weight="700">commit/flush 触发 finalize ↑</text>
+
+      <!-- finalize → 排序 → build -->
+      <line x1="660" y1="110" x2="698" y2="110" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <line x1="540" y1="140" x2="540" y2="168" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <line x1="660" y1="200" x2="698" y2="200" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+      <line x1="540" y1="230" x2="540" y2="258" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+
+      <!-- recur → leaf → 输出 -->
+      <line x1="970" y1="300" x2="1018" y2="200" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+    </g>
+
+    <!-- 注 -->
+    <text x="620" y="410" text-anchor="middle" fill="#39d2c0" font-size="13" font-weight="700">关键约束: 叶子 ≤ 1024 点 — 大于 maxPointsInLeafNode 必须继续切</text>
+    <text x="620" y="432" text-anchor="middle" fill="#a5d6ff" font-size="11">树深度 = ⌈log₂(N / 1024)⌉; 1 亿 doc → 深度 ≈ 17</text>
+
+    <!-- BKD 与 BSP 区别 -->
+    <rect x="40" y="465" width="1180" height="220" rx="14" fill="rgba(212,153,34,0.05)" stroke="#d29922" stroke-width="1.4" stroke-dasharray="6 3"/>
+    <text x="630" y="490" text-anchor="middle" fill="#d29922" font-size="13" font-weight="700">为什么不直接用 KD-tree? — BKD 引入 "bulk-loading + 块化"</text>
+
+    <text x="60" y="520" fill="#a5d6ff" font-size="12" font-weight="700">普通 KD-tree:</text>
+    <text x="60" y="540" fill="#a5d6ff" font-size="11">· 每点一个内部节点, 千万级点 → 几百万节点</text>
+    <text x="60" y="558" fill="#a5d6ff" font-size="11">· 节点指针 + 边界值散乱 → 缓存不友好</text>
+    <text x="60" y="576" fill="#a5d6ff" font-size="11">· 删除 / 插入退化为 O(N), 必须重平衡</text>
+
+    <text x="640" y="520" fill="#9be7b3" font-size="12" font-weight="700">BKD-tree (Block KD-tree):</text>
+    <text x="640" y="540" fill="#a5d6ff" font-size="11">· 叶子是 1024-点 block, 内部节点 = ⌈N / 1024⌉ × 2</text>
+    <text x="640" y="558" fill="#a5d6ff" font-size="11">· 静态构建 + 不可变 — 只在 segment flush 时建一次</text>
+    <text x="640" y="576" fill="#a5d6ff" font-size="11">· 块化 → mmap-friendly, leaf 解码 SIMD 加速</text>
+
+    <text x="630" y="615" text-anchor="middle" fill="#39d2c0" font-size="12" font-weight="700">实测: 1 亿 long point 构造 ~30s, 1 ms 范围查询返回 1 万 doc</text>
+    <text x="630" y="640" text-anchor="middle" fill="#a5d6ff" font-size="11">树深 17 + 叶子 SIMD 解码 → 范围查询 P99 &lt; 5ms (in-cache)</text>
+    <text x="630" y="666" text-anchor="middle" fill="#d29922" font-size="11" font-weight="700">代价: 不支持原地更新, segment 内不可变 — 更新走 delete + add 然后 merge</text>
+  </svg>
+</div>
+
+<h3>BKDWriter 关键参数</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 12-4 · BKDWriter 参数</div>
+  <table>
+    <thead>
+      <tr><th>参数</th><th>默认</th><th>说明</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>maxPointsInLeafNode</code></td><td>1024</td><td>叶子最大点数</td></tr>
+      <tr><td><code>maxMBSortInHeap</code></td><td>16</td><td>内存排序上限(超出 spill 到磁盘)</td></tr>
+      <tr><td>维度数</td><td>1-8</td><td>业务决定;通常 1-2</td></tr>
+      <tr><td><code>bytesPerDim</code></td><td>4 / 8</td><td>每维字节(int=4 / long=8)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>递归构造伪代码</h3>
+
+<pre><code class="language-text">buildBKD(points, depth, dimensions):
+    if len(points) &lt;= maxPointsInLeafNode:
+        emit leaf node with points    # 1024 点直接当叶子
+        return
+
+    dim = depth % dimensions          # 维度轮转
+    sort points by dim                # O(N log N) 但只在该维度
+    mid = len(points) / 2
+    splitValue = points[mid][dim]
+
+    leftPoints  = points[0..mid-1]    # ≤ splitValue
+    rightPoints = points[mid..len-1]  # &gt;  splitValue
+
+    leftChild  = buildBKD(leftPoints, depth+1, dimensions)
+    rightChild = buildBKD(rightPoints, depth+1, dimensions)
+
+    emit internal node:
+        splitDim   = dim
+        splitValue = splitValue
+        left       = leftChild
+        right      = rightChild</code></pre>
+
+<h3>1 千万订单的实际开销</h3>
+
+<pre><code class="language-text">1000 万订单的 amountCents BKD 构造(参考量级):
+
+  add 阶段:
+    每文档 add 点 → in-memory PointArray
+    1 字段 8 字节 + 4 字节 docID = 12 字节/点
+    1000 万点 ≈ 120 MB
+
+  spill 阶段(若超 maxMBSortInHeap=16):
+    OfflinePointReader / OfflinePointWriter 用临时文件
+    分片排序 + 多路归并
+
+  build 阶段:
+    全量按维度排序
+    深度 = log2(N / maxPointsInLeafNode)
+            = log2(10000000 / 1024)
+            ≈ 14 层
+    叶子数 ≈ 9766
+
+  时间:
+    内存场景: 5-15 s
+    spill 场景: 30-90 s
+
+  输出:
+    .dim 大小 ≈ 100-150 MB(含压缩)
+    .dii 大小 ≈ 200 KB(只是内部节点索引)</code></pre>
+
+<div class="key-insight">
+  <strong>14 层 = 9766 叶子,不是直觉的"百万级节点"</strong>。BKD 是平衡树,深度恒定 log₂(N/1024) ≈ 14;每个叶子 1024 点是核心 IO 单位,叶子内部用 PFOR + ZigZag 压缩。整棵树的"有意义"节点数只有 ~10 K,内部节点信息全部装进 .dii 文件(约 200 KB),内存可全量加载。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-5">12.5 .dim 文件结构</h2>
+<!-- ============================================================ -->
+
+<h3>整体布局</h3>
+
+<pre><code class="language-text">.dim 文件结构:
+
+  ┌──────────────────────────────────────────┐
+  │ Header                                    │
+  │   magic + codec name + version            │
+  ├──────────────────────────────────────────┤
+  │ Per-Field Points                          │
+  │   field A:                                 │
+  │     leaves (sorted by node order)          │
+  │       leaf 0: ≤ 1024 point                 │
+  │       leaf 1: ...                          │
+  │     metadata                               │
+  │   field B:                                 │
+  │     ...                                    │
+  ├──────────────────────────────────────────┤
+  │ Footer (CRC32)                            │
+  └──────────────────────────────────────────┘</code></pre>
+
+<h3>Leaf 内部布局(手绘卡片)</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 12-5-1 · Leaf 节点的内部物理结构</div>
+  <div style="background:#0d1117;border:1.5px solid #d29922;border-radius:10px;padding:18px;font-family:'Cascadia Code','SFMono-Regular',Consolas,monospace;font-size:12.5px;color:#a5d6ff;">
+    <div style="color:#d29922;font-weight:600;font-size:13px;margin-bottom:12px;">Leaf Block(默认 ≤ 1024 点)</div>
+
+    <div style="background:#161b22;border-left:3px solid #58a6ff;padding:10px 12px;margin-bottom:8px;border-radius:4px;">
+      <div style="color:#58a6ff;font-weight:600;margin-bottom:4px;">▼ Header 区</div>
+      <div style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+        numPoints (VInt)         <span style="color:#6e7681;">// 实际点数 ≤ 1024</span>
+      </div>
+    </div>
+
+    <div style="background:#161b22;border-left:3px solid #3fb950;padding:10px 12px;margin-bottom:8px;border-radius:4px;">
+      <div style="color:#3fb950;font-weight:600;margin-bottom:4px;">▼ Common Prefix(前缀压缩)</div>
+      <div style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+        prefixLength             <span style="color:#6e7681;">// 共享前缀长度</span><br>
+        prefixBytes[]            <span style="color:#6e7681;">// 共享前缀(只存一份)</span><br>
+        <span style="color:#3fb950;">▸ 节省: 1024 个点共享 4-6 字节前缀,省 4-6 KiB</span>
+      </div>
+    </div>
+
+    <div style="background:#161b22;border-left:3px solid #d2a8ff;padding:10px 12px;margin-bottom:8px;border-radius:4px;">
+      <div style="color:#d2a8ff;font-weight:600;margin-bottom:4px;">▼ Delta-encoded Values</div>
+      <div style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+        每个点的维度值 = prefix + delta from previous<br>
+        delta 用 ZigZag + VByte 编码<br>
+        <span style="color:#d2a8ff;">▸ 1024 点平均每点压缩到 1-3 字节</span>
+      </div>
+    </div>
+
+    <div style="background:#161b22;border-left:3px solid #f0883e;padding:10px 12px;border-radius:4px;">
+      <div style="color:#f0883e;font-weight:600;margin-bottom:4px;">▼ Per-Point docIDs</div>
+      <div style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+        每点对应的 docID(PFOR-delta 压缩)<br>
+        若 segment 内 doc 顺序与排序顺序相关性高,压缩比更好<br>
+        <span style="color:#f0883e;">▸ 平均每 docID 1-2 字节</span>
+      </div>
+    </div>
+
+    <div style="margin-top:12px;padding:10px;background:rgba(210,153,34,0.08);border-left:3px solid #d29922;border-radius:4px;">
+      <strong style="color:#d29922;">总大小估算(LongPoint 1024 点):</strong>
+      <span style="color:#8b949e;font-size:11.5px;">
+      原始 = 1024 × (8 字节值 + 4 字节 docID) = 12 KiB;<br>
+      压缩后 ≈ 4-8 KiB(50-65% 压缩率)。
+      </span>
+    </div>
+  </div>
+</div>
+
+<h3>不同维度配置的 Leaf 大小</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 12-5 · Leaf 大小估算</div>
+  <table>
+    <thead>
+      <tr><th>维度</th><th>bytesPerDim</th><th>叶子点数</th><th>叶子大小(压缩后)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1</td><td>8</td><td>1024</td><td>4-8 KiB</td></tr>
+      <tr><td>2</td><td>4</td><td>1024</td><td>4-8 KiB</td></tr>
+      <tr><td>4</td><td>4</td><td>1024</td><td>8-16 KiB</td></tr>
+      <tr><td>8</td><td>8</td><td>1024</td><td>16-32 KiB</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-6">12.6 .dii 文件结构</h2>
+<!-- ============================================================ -->
+
+<pre><code class="language-text">.dii 文件结构(BKD 内部节点索引):
+
+  ┌──────────────────────────────────────────┐
+  │ Header                                    │
+  │   magic + codec name + version            │
+  ├──────────────────────────────────────────┤
+  │ Per-Field Index                           │
+  │   field A:                                 │
+  │     numLeaves (VInt)                       │
+  │     fieldStats                             │
+  │     packed index data                      │
+  │       internal nodes (split values + dim)  │
+  │       leaf pointers (file offsets)         │
+  │   field B:                                 │
+  │     ...                                    │
+  ├──────────────────────────────────────────┤
+  │ DirOffset(8B)                             │
+  ├──────────────────────────────────────────┤
+  │ Footer (CRC32)                            │
+  └──────────────────────────────────────────┘</code></pre>
+
+<h3>内部节点的紧凑编码</h3>
+
+<pre><code class="language-text">每个内部节点:
+    splitDim    (1 byte)         ← 切分的维度索引(1D 时省略)
+    splitValue  (bytesPerDim)    ← 切分点(8B for LongPoint)
+    leftCount   (VInt)            ← 子树叶子数
+    leftOffset  (delta)           ← 左子树在 .dim 的相对偏移
+
+  右子树 = 父节点偏移 + leftSize
+  以此实现"前序遍历"的紧凑序列化</code></pre>
+
+<div class="key-insight">
+  <strong>.dii 完全可 mmap 进内存</strong>。1 千万 doc 的索引,叶子约 9766 个,内部节点约 9765 个,每个内部节点编码 12-16 字节,总 .dii 大小 200-300 KB——比 page size 还小。Lucene 启动时一次性把整个 .dii 加载进 BKDReader,后续 BKD 树遍历完全在内存中,不触磁盘 IO。<em>每次磁盘 IO 都是叶子访问(.dim 文件的 4-8 KiB block 顺序读),这是 BKD 性能的关键。</em>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-7">12.7 字节级布局(LongPoint 示例)</h2>
+<!-- ============================================================ -->
+
+<pre><code class="language-text">.dim 文件叶子区字节网格(LongPoint 1 维示例):
+
+偏移   0    1    2    3    4    5    6    7    8    9    a    b    c    d    e    f
+0x000 | 3F | D7 | 6C | 17 | 42 | 4B | 44 | 5F | 70 | 6F | 69 | 6E | 74 | 73 | 00 | 09 |
+      | magic 0x3FD76C17  | "BKD_points"                              | version=9 |
+0x010 | 80 | 08 | 00 | 00 | 00 | 64 | 00 | 00 | 00 | 00 | 00 | 00 | 00 | 0F | 00 | 00 |
+      |numPoints=128    | val 0x64=100             | docID=15           |
+0x020 | 00 | F2 | 00 | 00 | 00 | 00 | 00 | 00 | 00 | 18 | 00 | 00 | 00 | 01 | F4 | 00 |
+      |val 0xF2=242                |docID=24            |val 0x01F4=500     |
+0x030 | 00 | 00 | 00 | 00 | 00 | 00 | 22 | 00 | 00 | 00 | ...
+
+字段说明:
+  magic        : 0x3FD76C17(Lucene Codec 通用 magic)
+  codec name   : "BKD_points"
+  version      : VInt(当前 9)
+  numPoints    : 叶子内点数(VInt,通常 128 ≤ count ≤ 1024)
+  val(8B)      : LongPoint 8 字节大端编码
+  docID(VInt)  : 每点对应文档 ID</code></pre>
+
+<pre><code class="language-text">.dii 文件内部节点字节网格(1 维 LongPoint):
+
+偏移   0    1    2    3    4    5    6    7
+0x00 | 00 | 00 | 00 | 00 | 00 | 00 | 03 | E8 |
+     | splitValue 大端 8 字节 = 0x3E8 = 1000   |
+0x08 | 00 | 0A | 00 | 00 | 00 | 80 | ...      |
+     | leftCount=10 | leftOffset delta to .dim|
+0x10 | 00 | 00 | 00 | 00 | 00 | 00 | 19 | 64 |
+     | nextNode splitValue = 0x1964 = 6500    |
+0x18 | 00 | 04 | 00 | 00 | 01 | 90 | ...      |
+     | leftCount=4 | leftOffset delta         |
+
+注意:1 维场景 splitDim 省略;多维需在每节点加 1 byte 表示维度索引</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s12-8">12.8 IntersectVisitor 接口</h2>
+<!-- ============================================================ -->
+
+<p>BKD 查询的核心接口是 <code>IntersectVisitor</code>。它通过<strong>三种 cell 关系</strong>(INSIDE / OUTSIDE / CROSSES)递归剪枝:整 cell 在查询范围内则批量收集,完全在外则剪枝,部分相交则递归子树或逐点判断。</p>
+
+<h3>三种 cell 关系(决策树)</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 12-8-1 · BKD cell 与查询范围的三种关系(手绘)</div>
+  <div style="background:#0d1117;border:1.5px solid #d2a8ff;border-radius:10px;padding:18px;font-family:'Cascadia Code','SFMono-Regular',Consolas,monospace;font-size:12.5px;color:#a5d6ff;">
+    <div style="color:#d2a8ff;font-weight:600;font-size:13px;margin-bottom:12px;">查询 [qMin=100, qMax=1000] vs cell [min, max]</div>
+
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;">
+      <div style="background:#161b22;border:1.5px solid #3fb950;border-radius:6px;padding:12px;">
+        <div style="color:#3fb950;font-weight:600;font-size:13px;margin-bottom:8px;">① CELL_INSIDE</div>
+        <pre style="margin:0;color:#a5d6ff;font-size:10.5px;line-height:1.5;">
+qMin=100  qMax=1000
+   │         │
+   ├─[200,800]──┤  cell
+   │         │</pre>
+        <div style="color:#3fb950;font-size:11px;margin-top:8px;line-height:1.6;">
+          cell 完全在 q 内<br>
+          <strong>批量 visit(docID)</strong><br>
+          不做值比较
+        </div>
+      </div>
+
+      <div style="background:#161b22;border:1.5px solid #f85149;border-radius:6px;padding:12px;">
+        <div style="color:#f85149;font-weight:600;font-size:13px;margin-bottom:8px;">② CELL_OUTSIDE</div>
+        <pre style="margin:0;color:#a5d6ff;font-size:10.5px;line-height:1.5;">
+qMin=100  qMax=1000
+   │         │
+   │         │  ├─[2000,5000]──┤
+   │         │</pre>
+        <div style="color:#f85149;font-size:11px;margin-top:8px;line-height:1.6;">
+          cell 完全在 q 外<br>
+          <strong>整子树剪枝</strong><br>
+          不递归不读叶子
+        </div>
+      </div>
+
+      <div style="background:#161b22;border:1.5px solid #d29922;border-radius:6px;padding:12px;">
+        <div style="color:#d29922;font-weight:600;font-size:13px;margin-bottom:8px;">③ CELL_CROSSES</div>
+        <pre style="margin:0;color:#a5d6ff;font-size:10.5px;line-height:1.5;">
+qMin=100  qMax=1000
+   │         │
+   ├─[600,1500]─────┤  cell
+   │         │</pre>
+        <div style="color:#d29922;font-size:11px;margin-top:8px;line-height:1.6;">
+          cell 部分重叠 q<br>
+          <strong>递归子树 / 叶子内逐点</strong><br>
+          visit(docID, packedValue)
+        </div>
+      </div>
+    </div>
+
+    <div style="margin-top:14px;padding:10px;background:rgba(210,168,255,0.08);border-left:3px solid #d2a8ff;border-radius:4px;color:#8b949e;font-size:11.5px;line-height:1.7;">
+      <strong style="color:#d2a8ff;">优化原理:</strong>
+      ① INSIDE 的整 cell(可能 1024 点)用一次批量 visit,不需要值比较 — 跳过的工作量是 visit 总成本的 80% 以上;② OUTSIDE 让整子树根本不被打开;③ CROSSES 是真正的"硬开销",所有 BKD 调优都是为了把 INSIDE/OUTSIDE 的比例做大。
+    </div>
+  </div>
+</div>
+
+<h3>IntersectVisitor Java 接口</h3>
+
+<pre><code class="language-java">public abstract class IntersectVisitor {
+    public abstract void visit(int docID) throws IOException;
+    public abstract void visit(int docID, byte[] packedValue) throws IOException;
+    public abstract Relation compare(byte[] minPackedValue, byte[] maxPackedValue);
+}
+
+public enum Relation {
+    CELL_INSIDE_QUERY,
+    CELL_OUTSIDE_QUERY,
+    CELL_CROSSES_QUERY
+}</code></pre>
+
+<h3>遍历 BKD 的协作时序</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 12-8-2 · BKD intersect 的协作流程</div>
+  <svg viewBox="0 0 1240 660" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 三泳道 -->
+    <rect x="40"  y="40" width="350" height="60" rx="10" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="215" y="68" text-anchor="middle" fill="#cfe9ff" font-size="14" font-weight="700">PointRangeQuery (Q)</text>
+    <text x="215" y="88" text-anchor="middle" fill="#a5d6ff" font-size="11">查询 driver — 把范围条件传进去</text>
+
+    <rect x="445" y="40" width="350" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="620" y="68" text-anchor="middle" fill="#e6d3ff" font-size="14" font-weight="700">IntersectVisitor (V)</text>
+    <text x="620" y="88" text-anchor="middle" fill="#a5d6ff" font-size="11">业务回调 — 决定 box / point 是否命中</text>
+
+    <rect x="850" y="40" width="350" height="60" rx="10" fill="url(#g-green)"  stroke="#3fb950" stroke-width="1.5"/>
+    <text x="1025" y="68" text-anchor="middle" fill="#9be7b3" font-size="14" font-weight="700">BKDReader (R)</text>
+    <text x="1025" y="88" text-anchor="middle" fill="#a5d6ff" font-size="11">.dii 内存树 + .dim 叶子读取</text>
+
+    <!-- 三条生命线 -->
+    <line x1="215"  y1="100" x2="215"  y2="640" stroke="#58a6ff" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="620"  y1="100" x2="620"  y2="640" stroke="#bc8cff" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="1025" y1="100" x2="1025" y2="640" stroke="#3fb950" stroke-width="1" stroke-dasharray="4 4"/>
+
+    <!-- 1. Q→R intersect -->
+    <line x1="215" y1="135" x2="1023" y2="135" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+    <text x="620" y="128" text-anchor="middle" fill="#cfe9ff" font-size="12" font-weight="700">① intersect(visitor) — 入口</text>
+
+    <!-- 2. R→V compare(rootMin, rootMax) -->
+    <line x1="1025" y1="175" x2="622" y2="175" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+    <text x="820" y="168" text-anchor="middle" fill="#9be7b3" font-size="12">② compare(rootMin, rootMax)</text>
+
+    <!-- 3. V→R CELL_CROSSES -->
+    <line x1="620" y1="210" x2="1023" y2="210" stroke="#bc8cff" stroke-width="1.6" stroke-dasharray="6 3" marker-end="url(#arr-p)"/>
+    <text x="820" y="203" text-anchor="middle" fill="#e6d3ff" font-size="12">③ CELL_CROSSES — 部分命中, 需要继续</text>
+
+    <!-- 4. R 递归左子树 self-call -->
+    <path d="M 1025 240 Q 1090 240 1090 260 Q 1090 280 1027 280" stroke="#3fb950" stroke-width="1.6" fill="none" marker-end="url(#arr-g)"/>
+    <text x="1110" y="263" fill="#9be7b3" font-size="11">④ 递归左子树</text>
+
+    <!-- 5. R→V compare(leftMin, leftMax) -->
+    <line x1="1025" y1="315" x2="622" y2="315" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+    <text x="820" y="308" text-anchor="middle" fill="#9be7b3" font-size="12">⑤ compare(leftMin, leftMax)</text>
+
+    <!-- 6. V→R CELL_INSIDE -->
+    <line x1="620" y1="350" x2="1023" y2="350" stroke="#bc8cff" stroke-width="1.6" stroke-dasharray="6 3" marker-end="url(#arr-p)"/>
+    <text x="820" y="343" text-anchor="middle" fill="#39d2c0" font-size="12" font-weight="700">⑥ CELL_INSIDE — box 完全在范围内 (最优)</text>
+
+    <!-- 7. R→V visit(docID) — leaf -->
+    <line x1="1025" y1="390" x2="622" y2="390" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+    <text x="820" y="383" text-anchor="middle" fill="#9be7b3" font-size="12">⑦ visit(docID) × leaf points — 不再 compare 直接收集</text>
+
+    <!-- 8. R 递归右子树 -->
+    <path d="M 1025 420 Q 1090 420 1090 440 Q 1090 460 1027 460" stroke="#3fb950" stroke-width="1.6" fill="none" marker-end="url(#arr-g)"/>
+    <text x="1110" y="443" fill="#9be7b3" font-size="11">⑧ 递归右子树</text>
+
+    <!-- 9. R→V compare(rightMin, rightMax) -->
+    <line x1="1025" y1="495" x2="622" y2="495" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+    <text x="820" y="488" text-anchor="middle" fill="#9be7b3" font-size="12">⑨ compare(rightMin, rightMax)</text>
+
+    <!-- 10. V→R CELL_OUTSIDE -->
+    <line x1="620" y1="530" x2="1023" y2="530" stroke="#bc8cff" stroke-width="1.6" stroke-dasharray="6 3" marker-end="url(#arr-p)"/>
+    <text x="820" y="523" text-anchor="middle" fill="#f85149" font-size="12" font-weight="700">⑩ CELL_OUTSIDE — box 完全不相交</text>
+
+    <!-- 11. R skip self -->
+    <path d="M 1025 560 Q 1090 560 1090 580 Q 1090 600 1027 600" stroke="#f85149" stroke-width="1.6" fill="none" marker-end="url(#arr-r)"/>
+    <text x="1110" y="583" fill="#f85149" font-size="11" font-weight="700">⑪ skip 整个右子树</text>
+    <text x="1110" y="600" fill="#a5d6ff" font-size="10">(不读 .dim, 节省 IO)</text>
+
+    <!-- 状态注释框 -->
+    <rect x="40" y="240" width="170" height="380" rx="10" fill="rgba(57,210,192,0.06)" stroke="#39d2c0" stroke-width="1.4" stroke-dasharray="4 3"/>
+    <text x="125" y="262" text-anchor="middle" fill="#39d2c0" font-size="12" font-weight="700">三种 cell 状态</text>
+
+    <text x="55" y="290" fill="#bc8cff" font-size="11" font-weight="700">CELL_CROSSES</text>
+    <text x="55" y="307" fill="#a5d6ff" font-size="10">box 与 query 部分相交</text>
+    <text x="55" y="322" fill="#a5d6ff" font-size="10">→ 递归继续切分</text>
+
+    <text x="55" y="355" fill="#39d2c0" font-size="11" font-weight="700">CELL_INSIDE  ⚡</text>
+    <text x="55" y="372" fill="#a5d6ff" font-size="10">box 完全被 query 包含</text>
+    <text x="55" y="387" fill="#a5d6ff" font-size="10">→ 直接 visit 全部 docs</text>
+    <text x="55" y="402" fill="#a5d6ff" font-size="10">→ 不再 per-point 判断</text>
+
+    <text x="55" y="435" fill="#f85149" font-size="11" font-weight="700">CELL_OUTSIDE  ⚡</text>
+    <text x="55" y="452" fill="#a5d6ff" font-size="10">box 与 query 不相交</text>
+    <text x="55" y="467" fill="#a5d6ff" font-size="10">→ skip 整个子树</text>
+    <text x="55" y="482" fill="#a5d6ff" font-size="10">→ 不读 .dim 文件</text>
+
+    <text x="125" y="520" text-anchor="middle" fill="#d29922" font-size="11" font-weight="700">关键优化:</text>
+    <text x="125" y="538" text-anchor="middle" fill="#a5d6ff" font-size="10">.dii 提供每节点的</text>
+    <text x="125" y="553" text-anchor="middle" fill="#a5d6ff" font-size="10">minMax box → 不读</text>
+    <text x="125" y="568" text-anchor="middle" fill="#a5d6ff" font-size="10">.dim 就能 prune 子树</text>
+    <text x="125" y="595" text-anchor="middle" fill="#39d2c0" font-size="10" font-weight="700">复杂度: O(√N) 范围查询</text>
+  </svg>
+</div>
+
+<h3>visit / compare 的成本对比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 12-8 · BKD 操作的成本</div>
+  <table>
+    <thead>
+      <tr><th>操作</th><th>时间复杂度</th><th>主要成本</th><th>调用频率</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>compare</code></td><td>O(d) (d=维度)</td><td>内部节点访问,内存比较</td><td>每内部节点 1 次</td></tr>
+      <tr><td><code>visit(docID)</code></td><td>O(1)</td><td>DocIdSetBuilder 添加</td><td>每命中 doc 1 次</td></tr>
+      <tr><td><code>visit(docID, packedValue)</code></td><td>O(d)</td><td>全维度比较再决定</td><td>仅 CROSSES 叶子的每个点</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-9">12.9 PointRangeQuery 实现</h2>
+<!-- ============================================================ -->
+
+<pre><code class="language-java">Query q = LongPoint.newRangeQuery("amountCents", 1000L, 100000L);
+TopDocs top = searcher.search(q, 100);</code></pre>
+
+<pre><code class="language-text">内部展开:
+  1. createWeight 不收集统计量(范围查询不评分)
+  2. scorer:
+     - 通过 PointValues.intersect(visitor) 遍历 BKD-tree
+     - visit 每个匹配 docID
+     - 收集成 DocIdSet(FixedBitSet 或 RoaringDocIdSet)
+  3. ConstantScoreScorer 包装为 docID iterator,score=1.0(常量)</code></pre>
+
+<h3>命中比与延迟的关系</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 12-9 · Range Query 性能(1 千万 doc 量级)</div>
+  <table>
+    <thead>
+      <tr><th>查询范围</th><th>命中比</th><th>访问叶子数</th><th>延迟</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>[极小, 极大]</td><td>100%</td><td>全部 ~9766</td><td>200-500 ms</td></tr>
+      <tr><td>中等区间</td><td>50%</td><td>半数 ~5000</td><td>50-150 ms</td></tr>
+      <tr><td>窄区间</td><td>1%</td><td>~100</td><td>1-5 ms</td></tr>
+      <tr><td>单点匹配</td><td>&lt; 0.01%</td><td>1-2</td><td>&lt; 1 ms</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="real-world">
+  <strong>窄区间查询 1 ms 级,宽区间百 ms 级</strong>。某电商订单搜索最常见的"30 天内 100-1000 元订单"实测 P99 = 8ms,因为 30 天窗口在全数据中只占 5% × 0.5% = 0.025% 命中。但如果用户翻 1 年内全部订单,BKD 几乎全树扫,P99 飙到 380ms。<em>这就是为什么订单搜索默认时间窗口要约束在 30-90 天:让 BKD 始终走窄区间路径。</em>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-10">12.10 多维与距离查询</h2>
+<!-- ============================================================ -->
+
+<pre><code class="language-java">// 矩形查询(LatLonPoint)
+Query q = LatLonPoint.newBoxQuery("location",
+    minLat, maxLat, minLon, maxLon);
+
+// 距离查询(中心点 + 半径)
+Query distQ = LatLonPoint.newDistanceQuery("location",
+    39.9, 116.4,    // 中心: 北京
+    5000.0);         // 半径 5 km</code></pre>
+
+<h3>2 维剪枝示例</h3>
+
+<pre><code class="language-text">2 维查询 LatLonPoint 城市矩形 [(39, 116), (40, 117)]:
+
+  根节点 cell: 全球范围
+  → CELL_CROSSES → 进入
+
+  左子: lat &lt; 0 cell
+  → CELL_OUTSIDE → 剪枝
+
+  右子: lat &gt;= 0 cell
+  → CELL_CROSSES → 进入
+
+  右子的左子: 0 &lt;= lat &lt; 30
+  → CELL_OUTSIDE → 剪枝
+
+  右子的右子: 30 &lt;= lat &lt; 60
+  → CELL_CROSSES → 进入
+
+  ... 递归到叶子 ...
+
+  最终仅访问几个叶子,大量剪枝</code></pre>
+
+<p>距离查询内部仍是 BKD 矩形查询(取最小外接矩形,MBR),再在 visitor 里加 Haversine 距离过滤。剪枝效率取决于半径与 cell 大小的比值——半径越小,MBR 越窄,剪枝越好。</p>
+
+<!-- ============================================================ -->
+<h2 id="s12-11">12.11 PointInSet 查询</h2>
+<!-- ============================================================ -->
+
+<pre><code class="language-java">Query q = LongPoint.newSetQuery("storeId",
+    new long[] {1001L, 1005L, 1010L, 1023L});</code></pre>
+
+<p>PointInSet 内部按值排序后,对每个点单独走一次 BKD 单点查找。集合较小(&lt; 1000)时效率高于 N 次 RangeQuery,因为可以共享 BKDReader 状态。</p>
+
+<div class="diagram">
+  <div class="diagram-title">表 12-11 · 4 种 Point 查询的对比</div>
+  <table>
+    <thead>
+      <tr><th>类型</th><th>用途</th><th>实现</th><th>适用规模</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>newRangeQuery</code></td><td>区间</td><td>BKD intersect</td><td>任意</td></tr>
+      <tr><td><code>newSetQuery</code></td><td>集合</td><td>排序后逐点 BKD</td><td>集合 &lt; 10k</td></tr>
+      <tr><td><code>newExactQuery</code></td><td>单点</td><td>BKD intersect 单点</td><td>任意</td></tr>
+      <tr><td><code>newDistanceQuery</code></td><td>经纬度距离</td><td>LatLon BKD + Haversine</td><td>半径越小越好</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-12">12.12 性能调优</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">表 12-12 · BKD 调优维度</div>
+  <table>
+    <thead>
+      <tr><th>调优点</th><th>影响</th><th>推荐</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>maxPointsInLeafNode</code></td><td>大 → 叶子大、扫描多;小 → 树深、IO 多</td><td>默认 1024,通常不调</td></tr>
+      <tr><td>字段维度</td><td>越多 → 树越复杂</td><td>1D 最快;2D 加 GIS;&gt; 4D 谨慎</td></tr>
+      <tr><td><code>bytesPerDim</code></td><td>8B 比 4B 慢约 30%</td><td>必要时 IntPoint 替代 LongPoint</td></tr>
+      <tr><td><code>forceMerge</code></td><td>减少 segment 数,大 BKD 加速</td><td>离线索引可强制 1</td></tr>
+      <tr><td>仅范围用</td><td>omit 倒排,只用 Point</td><td>节省 30-50% 索引大小</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>LongPoint 是否始终优于已废弃的 NumericRangeQuery?</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 12-12-2 · LongPoint(BKD)vs NumericRangeQuery(已废弃)</div>
+  <table>
+    <thead>
+      <tr><th>场景</th><th>LongPoint(BKD)</th><th>NRQ(已废弃)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1000 万范围 50% 命中</td><td>~80 ms</td><td>~200 ms</td></tr>
+      <tr><td>100 段查询(combined ranges)</td><td>单次构建</td><td>多 token 合并</td></tr>
+      <tr><td>高基数等值</td><td>~5 ms</td><td>~10 ms</td></tr>
+      <tr><td>极宽范围(99%)</td><td>~250 ms</td><td>~500 ms</td></tr>
+      <tr><td>索引大小</td><td>较大(BKD)</td><td>较小(term tree)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-13">12.13 与 DocValues 配合(必须双写)</h2>
+<!-- ============================================================ -->
+
+<p>这是 BKD 最大的"非显然"陷阱:LongPoint 只支持范围查询,不支持排序;排序需要 NumericDocValues;两者必须同时写。</p>
+
+<h3>Range + Sort 的执行流程</h3>
+
+<pre><code class="language-text">完整的范围查询 + 排序:
+
+  Query q = LongPoint.newRangeQuery("paidAt", t1, t2);
+  Sort sort = new Sort(new SortField("paidAt_dv",
+      SortField.Type.LONG, true));
+
+  执行流程:
+    1. BKD intersect → DocIdSet 候选(范围内 doc)
+    2. 候选过 LiveDocs 过滤(已删除)
+    3. 用 NumericDocValues 取每候选的 paidAt_dv
+    4. TopFieldCollector 维护小顶堆排序
+
+  注意:
+    - LongPoint 用于 range,DocValues 用于 sort
+    - 两者必须双写
+    - LongPoint 有 .dim,DocValues 有 .dvd</code></pre>
+
+<h3>双写的字段建模</h3>
+
+<pre><code class="language-java">Document doc = new Document();
+doc.add(new StoredField("orderId", orderId));
+
+// LongPoint:支持范围查询 (写入 .dim/.dii)
+doc.add(new LongPoint("amountCents", amountCents));
+doc.add(new LongPoint("paidAt", paidAtMillis));
+
+// NumericDocValues:支持排序与脚本 (写入 .dvd/.dvm)
+doc.add(new NumericDocValuesField("amountCents", amountCents));
+doc.add(new NumericDocValuesField("paidAt", paidAtMillis));
+
+// 倒排:支持等值过滤(如 status, 写入 .tim/.tip/.doc)
+doc.add(new StringField("status", status, Field.Store.NO));
+
+writer.addDocument(doc);</code></pre>
+
+<div class="warning">
+  <strong>漏掉 NumericDocValuesField 直接抛 IllegalStateException</strong>:<code>searcher.search(query, n, sort)</code> 时报 <code>unexpected docvalues type NONE for field 'paidAt'</code>。Lucene <strong>不会</strong>从 BKD 自动推 DV——这俩是物理上独立的文件。生产里第一次跑 sort 抛此异常,几乎 100% 是字段建模忘了双写,而不是查询写错。
+</div>
+
+<h3>LongPoint 与 NumericDocValues 的区别</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 12-13 · 两个独立结构的对比</div>
+  <table>
+    <thead>
+      <tr><th>维度</th><th>LongPoint (.dim)</th><th>NumericDocValues (.dvd)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>用途</td><td>范围查询</td><td>排序 + 脚本评分</td></tr>
+      <tr><td>文件</td><td>.dim + .dii</td><td>.dvd + .dvm</td></tr>
+      <tr><td>访问方式</td><td>BKD-tree(对数级)</td><td>顺序 / 随机(列存)</td></tr>
+      <tr><td>大小</td><td>较大(含 BKD 索引)</td><td>较小(列存压缩)</td></tr>
+      <tr><td>必须双写</td><td>是</td><td>是</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-14">12.14 调试与可观测</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">表 12-14 · BKD 调试工具</div>
+  <table>
+    <thead>
+      <tr><th>工具</th><th>用途</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>PointValues.size()</code></td><td>字段总点数</td></tr>
+      <tr><td><code>PointValues.getMinPackedValue()</code></td><td>最小值</td></tr>
+      <tr><td><code>PointValues.getMaxPackedValue()</code></td><td>最大值</td></tr>
+      <tr><td><code>CheckIndex --verbose</code></td><td>BKD 完整性校验</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<pre><code class="language-bash">java -cp lucene-core-9.x.jar org.apache.lucene.index.CheckIndex /path/to/index --verbose</code></pre>
+
+<pre><code class="language-text">输出片段:
+
+test: points..............OK [10000000 points across 9766 leaves]
+  field "amountCents":
+    minValue=100, maxValue=99999800
+    leafCount=9766, depth=14
+    bytesPerDim=8, numDims=1</code></pre>
+
+<p>如果 <code>leafCount * 1024 / size &gt; 1.5</code>,说明叶子利用率低,通常因为 spill 与 merge 不充分,可考虑 forceMerge。</p>
+
+<!-- ============================================================ -->
+<h2 id="s12-15">12.15 性能场景与量化</h2>
+<!-- ============================================================ -->
+
+<h3>场景 1:订单金额范围查询</h3>
+
+<pre><code class="language-text">索引: 1 亿订单
+字段: amountCents (LongPoint + NumericDocValues)
+查询: amountCents BETWEEN 5000 AND 10000  (1% 命中, 100 万订单)
+Top 100, sort by paidAt DESC
+
+执行 breakdown(参考量级):
+  1. BKD intersect:
+     - 访问 ~100 个叶子(1% × 9766)
+     - 收集 ~1 M 候选 DocIds
+     - 耗时 30-50 ms
+
+  2. LiveDocs 过滤:
+     - 移除已删除文档
+     - 耗时 5-10 ms
+
+  3. NumericDocValues 取 paidAt:
+     - 1 M 次随机访问 .dvd
+     - 耗时 100-200 ms
+
+  4. TopFieldCollector 排序:
+     - 100 容量小顶堆
+     - 耗时 50-100 ms
+
+  Total: 200-360 ms
+
+对比:无 NumericDocValues 直接报错</code></pre>
+
+<h3>场景 2:LatLon 距离查询</h3>
+
+<pre><code class="language-text">索引: 1000 万门店
+字段: location (LatLonPoint)
+查询: 距离 (39.9, 116.4) 5 km 内
+
+执行:
+  1. 计算最小外接矩形(MBR):
+     - lat ± 0.045°, lon ± 0.058°(约 5km)
+
+  2. BKD intersect MBR:
+     - 访问 ~50 个叶子
+     - 收集 ~5000 候选(MBR 大于实际圆)
+     - 耗时 5-10 ms
+
+  3. visitor 过滤:
+     - 对每个候选计算 Haversine 距离
+     - 距离 &gt; 5 km 的剔除
+     - 耗时 2-5 ms
+
+  4. 最终命中: ~3000 门店
+
+  Total: 10-20 ms</code></pre>
+
+<h3>场景 3:索引大小估算</h3>
+
+<pre><code class="language-text">1 亿订单 amountCents (LongPoint 1D, 8 bytes/point):
+
+  原始数据: 100M × 8B = 800 MB
+  BKD 索引大小:
+    .dim ≈ 600-800 MB(含 docID + 压缩后值)
+    .dii ≈ 2-5 MB(内部节点很少)
+
+  对比:
+    NumericDocValues .dvd ≈ 200-400 MB(列存压缩)
+    倒排 (StringField 表示金额): 不可行(高基数)
+
+  结论:
+    范围查询建 LongPoint
+    排序建 NumericDocValues
+    高基数不要用倒排</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s12-16">12.16 反例 → 修复对照</h2>
+<!-- ============================================================ -->
+
+<h3>反例 1:漏写 NumericDocValues</h3>
+
+<pre><code class="language-java">// 反例:只写 LongPoint
+Document doc = new Document();
+doc.add(new LongPoint("paidAt", paidAtMillis));
+writer.addDocument(doc);
+
+// 查询:要按 paidAt 排序
+Query q = LongPoint.newRangeQuery("paidAt", t1, t2);
+Sort sort = new Sort(new SortField("paidAt", SortField.Type.LONG, true));
+TopDocs top = searcher.search(q, 100, sort);
+// 抛: IllegalStateException: unexpected docvalues type NONE for field 'paidAt'
+
+// 修复:同时写 LongPoint 和 NumericDocValues
+Document fixed = new Document();
+fixed.add(new LongPoint("paidAt", paidAtMillis));
+fixed.add(new NumericDocValuesField("paidAt", paidAtMillis));
+writer.addDocument(fixed);</code></pre>
+
+<h3>反例 2:用 LongPoint 表达字符串区间</h3>
+
+<pre><code class="language-java">// 反例:把字符串"哈希成 long"再范围查询
+long startHash = "ABC".hashCode();
+long endHash = "XYZ".hashCode();
+Query q = LongPoint.newRangeQuery("status", startHash, endHash);
+
+// 后果:
+// 1. hashCode 不保序,startHash 可能 &gt; endHash
+// 2. 不同字符串可能 hash 冲突
+// 3. 查询语义完全错
+
+// 修复:用 TermRangeQuery + StringField
+Query fixed = TermRangeQuery.newStringRange(
+    "status", "active", "pending", true, true);</code></pre>
+
+<h3>反例 3:维度膨胀</h3>
+
+<pre><code class="language-java">// 反例:把 4 个独立字段塞成 4D Point
+doc.add(new LongPoint("metrics",
+    cpu, memory, disk, network));  // 4D LongPoint
+
+// 后果:
+// 1. .dim 大小 ~4× 单维
+// 2. 范围查询 1 个维度也得遍历 4D BKD
+// 3. CELL_CROSSES 比例显著提高
+// 4. 查询延迟 5-10× 单维
+
+// 修复:每字段独立 1D LongPoint + BooleanQuery
+doc.add(new LongPoint("cpu", cpu));
+doc.add(new LongPoint("memory", memory));
+doc.add(new LongPoint("disk", disk));
+doc.add(new LongPoint("network", network));
+
+BooleanQuery.Builder bq = new BooleanQuery.Builder();
+bq.add(LongPoint.newRangeQuery("cpu", 80, 100), Occur.MUST);
+bq.add(LongPoint.newRangeQuery("memory", 80, 100), Occur.MUST);
+// ... 多 BKD 并行剪枝,延迟显著低于 4D</code></pre>
+
+<h3>反例 4:极宽范围未加 filter</h3>
+
+<pre><code class="language-java">// 反例:范围查询命中 99% 文档
+Query q = LongPoint.newRangeQuery("amountCents", 1L, Long.MAX_VALUE);
+// 然后期待返回 Top 100 by paidAt
+// 后果:BKD 几乎全表扫,1 亿 doc 延迟 1-2 s
+
+// 修复:加业务 filter 缩小范围
+BooleanQuery.Builder bq = new BooleanQuery.Builder();
+bq.add(new TermQuery(new Term("status", "completed")), Occur.MUST);  // 缩到 30%
+bq.add(LongPoint.newRangeQuery("amountCents", 1000L, 100000L), Occur.MUST);  // 1%
+bq.add(LongPoint.newRangeQuery("paidAt", t1, t2), Occur.MUST);  // 时间窗口
+// 联合 filter 后命中 &lt; 1%,延迟 &lt; 100 ms</code></pre>
+
+<div class="real-world">
+  <strong>多 BKD 并行剪枝远优于多维 BKD</strong>。某监控系统把 (cpu, memory, disk, network) 4 维度合并成一个 4D LongPoint,查询"cpu &gt; 80 AND memory &gt; 80"的延迟从 200ms 直接飙到 1.8s。改成 4 个独立 1D LongPoint + BooleanQuery 后,延迟降到 35ms — <em>BooleanQuery 让每个 BKD 独立剪枝,然后 leapfrog 求交,远比一棵 4D 树同时切 4 个维度高效。</em>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-17">12.17 源码入口</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">表 12-17 · BKD 相关源码</div>
+  <table>
+    <thead>
+      <tr><th>类</th><th>路径</th><th>职责</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>BKDWriter</code></td><td>core/.../bkd/BKDWriter.java</td><td>构造 BKD,写 .dim/.dii</td></tr>
+      <tr><td><code>BKDReader</code></td><td>core/.../bkd/BKDReader.java</td><td>读 BKD,实现 intersect</td></tr>
+      <tr><td><code>Lucene90PointsFormat</code></td><td>core/.../codecs/lucene90/</td><td>Codec 入口</td></tr>
+      <tr><td><code>PointValues</code></td><td>core/.../index/PointValues.java</td><td>抽象访问接口</td></tr>
+      <tr><td><code>PointRangeQuery</code></td><td>core/.../search/PointRangeQuery.java</td><td>范围查询实现</td></tr>
+      <tr><td><code>IntersectVisitor</code></td><td>PointValues 内部类</td><td>三态访问者接口</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>自定义 IntersectVisitor 示例</h3>
+
+<pre><code class="language-java">PointValues pv = leafReader.getPointValues("amountCents");
+pv.intersect(new IntersectVisitor() {
+    DocIdSetBuilder builder = new DocIdSetBuilder(maxDoc);
+
+    @Override
+    public Relation compare(byte[] minPackedValue, byte[] maxPackedValue) {
+        long min = LongPoint.decodeDimension(minPackedValue, 0);
+        long max = LongPoint.decodeDimension(maxPackedValue, 0);
+        if (min &gt; queryMax || max &lt; queryMin) return CELL_OUTSIDE_QUERY;
+        if (min &gt;= queryMin &amp;&amp; max &lt;= queryMax) return CELL_INSIDE_QUERY;
+        return CELL_CROSSES_QUERY;
+    }
+
+    @Override
+    public void visit(int docID) {
+        builder.grow(1).add(docID);  // INSIDE 时:直接收集,无需值比较
+    }
+
+    @Override
+    public void visit(int docID, byte[] packedValue) {
+        long val = LongPoint.decodeDimension(packedValue, 0);
+        if (val &gt;= queryMin &amp;&amp; val &lt;= queryMax) {
+            builder.grow(1).add(docID);  // CROSSES 叶子:逐点判断
+        }
+    }
+});</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s12-18">12.18 生产陷阱:8 个真实案例</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">表 12-18 · BKD 相关的 8 个生产陷阱</div>
+  <table>
+    <thead>
+      <tr><th>#</th><th>陷阱</th><th>现象</th><th>根因</th><th>修复</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1</td><td>LongPoint 未双写 DV</td><td>TopField 抛 IllegalStateException</td><td>缺 NumericDocValues</td><td>双写 LongPoint + NumericDocValuesField</td></tr>
+      <tr><td>2</td><td>极宽范围</td><td>查询 1-2 s</td><td>BKD 近全树扫</td><td>联合其他 filter 缩小命中</td></tr>
+      <tr><td>3</td><td>维度过多</td><td>索引 4× + 慢 5×</td><td>bytesPerDim × dim 过大</td><td>拆字段 + BooleanQuery</td></tr>
+      <tr><td>4</td><td>字符串范围误用</td><td>查询不命中或乱命中</td><td>hashCode 不保序</td><td>用 TermRangeQuery + StringField</td></tr>
+      <tr><td>5</td><td>1 千万 doc 全扫</td><td>慢</td><td>maxPointsInLeafNode 默认</td><td>一般无需调,优先压缩范围</td></tr>
+      <tr><td>6</td><td>LiveDocs 过滤</td><td>实际命中少于估计</td><td>BKD 不感知删除</td><td>算入候选过滤</td></tr>
+      <tr><td>7</td><td>forceMerge 太频繁</td><td>写入吞吐降</td><td>BKD 重建成本高</td><td>仅离线 ETL 才 forceMerge</td></tr>
+      <tr><td>8</td><td>LatLonPoint 距离过大</td><td>全球级查询慢</td><td>MBR 接近全图</td><td>业务限制最大半径(如 100km)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<!-- Chapter Summary -->
+<!-- ============================================================ -->
+
+<div class="chapter-summary" id="s12-summary">
+  <h2>本章小结</h2>
+  <table>
+    <thead>
+      <tr><th>关注点</th><th>核心 API / 概念</th><th>关键建议</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>BKD 数据结构</td><td>K-D Block tree, 叶子 1024 点</td><td>不可变,只在 segment flush 时构造,合并时重建</td></tr>
+      <tr><td>构造算法</td><td>add → spill → sort → build</td><td>1 千万 doc 14 层 9766 叶子,5-90s 取决是否 spill</td></tr>
+      <tr><td>.dim 文件</td><td>叶子 block + delta + ZigZag</td><td>压缩到原始 50-65%,典型 4-8 KiB/leaf</td></tr>
+      <tr><td>.dii 文件</td><td>内部节点紧凑序列化</td><td>200 KB 级,可 mmap 全量内存</td></tr>
+      <tr><td>IntersectVisitor 三态</td><td>INSIDE / OUTSIDE / CROSSES</td><td>INSIDE 批量 visit,OUTSIDE 整子树剪枝,CROSSES 逐点</td></tr>
+      <tr><td>visit 成本</td><td><code>visit(docID)</code> O(1) vs <code>visit(docID, val)</code> O(d)</td><td>所有调优都是为了让 INSIDE 比例最大</td></tr>
+      <tr><td>查询性能</td><td>命中比 vs 延迟</td><td>窄区间 1-5ms;宽区间 100-500ms</td></tr>
+      <tr><td>双写约束</td><td>LongPoint + NumericDocValues</td><td>缺 DV 直接抛 IllegalStateException</td></tr>
+      <tr><td>维度选择</td><td>1D 最快;多维拆字段更优</td><td>4D Point 比 4 个 1D + BooleanQuery 慢 5-10×</td></tr>
+      <tr><td>距离查询</td><td>LatLonPoint + MBR + Haversine</td><td>半径越小剪枝越好;限制最大半径</td></tr>
+      <tr><td>极宽范围反模式</td><td>命中 &gt; 80% 的范围</td><td>必加业务 filter 缩范围;时间窗口 30-90 天</td></tr>
+      <tr><td>调试工具</td><td>CheckIndex --verbose / PointValues</td><td>检查 leafCount × 1024 / size 是否 &lt; 1.5</td></tr>
+      <tr><td>核心源码</td><td>BKDWriter / BKDReader / IntersectVisitor</td><td>Lucene90PointsFormat 是入口</td></tr>
+    </tbody>
+  </table>
+  <p class="next-hint">下一章 <a href="13-docvalues-packedints.html">第 13 章 · DocValues 与 PackedInts</a> 把"列式存储"展开。订单的 amountCents、paidAt 等字段需要排序、聚合、脚本评分,Lucene 用 DocValues 提供这些能力——它和 BKD、倒排都是独立的物理结构。.dvd 文件用 PackedInts 实现紧凑表示,本章拆解 NumericDV / SortedDV / SortedSetDV 各自的存储格式和访问 API,以及为什么"排序必须用 DV、不能用 StoredField"。</p>
+</div>
+
+<!-- ============================================================ -->
+<!-- Chapter navigation -->
+<!-- ============================================================ -->
+<div class="chapter-nav">
+  <a href="11-postings-skip-iterator.html">&larr; 第 11 章 &middot; Postings 与跳跃迭代</a>
+  <a href="13-docvalues-packedints.html">第 13 章 &middot; DocValues 与 PackedInts &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 Lucene &middot; 第 12 章 &middot; BKD-tree 与数值范围索引</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){setTimeout(function(){document.querySelectorAll('.mermaid svg,.diagram svg').forEach(function(svg){var h=parseInt(svg.getAttribute('height')||svg.getBoundingClientRect().height);if(h>500){svg.style.maxHeight='500px';svg.style.width='auto';var p=svg.closest('.diagram');if(p)p.style.overflowX='auto';}});},1500);});</script>
+</body>
+</html>

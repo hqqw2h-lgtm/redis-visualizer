@@ -1,0 +1,1470 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.20 I/O 多路复用 — 图解 Redis</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="d-purple" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-purple-fill-start)"/><stop offset="100%" stop-color="var(--diagram-purple-fill-end)"/></linearGradient>
+    <linearGradient id="d-green" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-green-fill-start)"/><stop offset="100%" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <linearGradient id="d-blue" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-blue-fill-start)"/><stop offset="100%" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <linearGradient id="d-orange" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-orange-fill-start)"/><stop offset="100%" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+    <linearGradient id="d-red" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-red-fill-start)"/><stop offset="100%" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+    <filter id="d-shadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="var(--diagram-text)" flood-opacity="0.4"/></filter>
+    <marker id="d-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-muted)"/></marker>
+    <marker id="d-arr-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-green-stroke)"/></marker>
+    <marker id="d-arr-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-red-stroke)"/></marker>
+    <marker id="d-arr-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-blue-stroke)"/></marker>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Redis</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="19-ae-eventloop.html">上一章</a>
+  <a href="21-resp.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s20-1">20.1 C10K 问题</a>
+  <a href="#s20-2">20.2 select</a>
+  <a href="#s20-3">20.3 poll</a>
+  <a href="#s20-4">20.4 epoll</a>
+  <a href="#s20-5">20.5 LT 与 ET</a>
+  <a href="#s20-6">20.6 平台变体</a>
+  <a href="#s20-7">20.7 ae 抽象层</a>
+  <a href="#s20-8">20.8 fd 容量与诊断</a>
+  <a href="#s20-9">20.9 性能边界</a>
+  <a href="#s20-10">20.10 源码深潜</a>
+  <a href="#s20-summary">20.11 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 20 章 · I/O 多路复用</h1>
+<p class="subtitle">C10K · select / poll / epoll / kqueue · LT vs ET · ae 抽象层 · Reactor 模型</p>
+
+<div class="chapter-intro">
+  <p class="lead">Redis 主线程以单进程单线程方式处理所有命令,其性能上限的关键约束有二:其一,<strong>命令执行路径必须保持串行</strong>,以维持数据结构的强一致语义;其二,<strong>事件循环对成千上万个客户端连接的等待成本必须接近常数</strong>。第二项约束的工程解决方案即为 I/O 多路复用——由内核维护"哪些 fd 已就绪",事件循环只处理就绪 fd,空闲连接不消耗主线程时间。</p>
+  <p>主流操作系统提供的多路复用 API 包括 <code>select</code> / <code>poll</code> / <code>epoll</code> / <code>kqueue</code> / <code>evport</code> 等。Redis 通过 <code>ae.c</code> 抽象层在编译期选择平台最优后端,上层 <code>networking.c</code> 只依赖统一接口。该抽象使得上层代码无需感知平台差异,但运维必须通过 <code>INFO server</code> 的 <code>multiplexing_api</code> 字段确认实际后端。</p>
+  <ul class="will-learn">
+    <li>C10K 问题的本质:三种连接处理模型(线程/轮询/多路复用)的成本对比</li>
+    <li><code>select</code> 的三大约束:FD_SETSIZE、全量拷贝、O(N) 线性扫描</li>
+    <li><code>poll</code> 解决了什么、未解决什么——为什么 Redis 主线 ae 不使用 poll</li>
+    <li><code>epoll</code> 内核数据结构:红黑树兴趣集合 + 双向就绪链表 → O(ready)</li>
+    <li>水平触发(LT)与边缘触发(ET)的语义差异和 Redis 选择 LT 的工程依据</li>
+    <li><code>kqueue</code> 的 filter 抽象与 Solaris <code>evport</code> 的差异</li>
+    <li>Reactor vs Proactor:为何 Redis 不采用 IOCP / io_uring 主线模型</li>
+    <li><code>ae.c</code> 编译期后端选择优先级:evport → epoll → kqueue → select 兜底</li>
+    <li>fd 容量诊断:<code>ulimit</code>、<code>maxclients + 32</code>、<code>fs.file-max</code>、<code>somaxconn</code></li>
+    <li>性能边界:多路复用何时是瓶颈,何时不是</li>
+    <li>从 accept 到命令执行的完整调用链(ae + networking + server.c)</li>
+  </ul>
+  <p class="prereq">前置知识:第 19 章 ae 事件循环(知道有 <code>aeProcessEvents</code> / <code>aeApiPoll</code>);第 21 章 RESP(知道事件回调内做了什么);Linux/POSIX 文件描述符与 socket 编程基础。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s20-0">20.0 章首速览</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">图 20-0-1 · I/O 多路复用全景</div>
+  <svg viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="460" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="370" y="14" width="200" height="44" rx="10" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="470" y="38" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">I/O 多路复用</text>
+      <text x="470" y="52" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">7 个模块导览</text>
+
+      <line x1="470" y1="58" x2="120" y2="100" stroke="var(--diagram-border)" stroke-width="1"/>
+      <line x1="470" y1="58" x2="280" y2="100" stroke="var(--diagram-border)" stroke-width="1"/>
+      <line x1="470" y1="58" x2="440" y2="100" stroke="var(--diagram-border)" stroke-width="1"/>
+      <line x1="470" y1="58" x2="580" y2="100" stroke="var(--diagram-border)" stroke-width="1"/>
+      <line x1="470" y1="58" x2="720" y2="100" stroke="var(--diagram-border)" stroke-width="1"/>
+      <line x1="470" y1="58" x2="820" y2="100" stroke="var(--diagram-border)" stroke-width="1"/>
+
+      <rect x="20"  y="100" width="200" height="40" rx="6" fill="url(#d-red)"/>
+      <text x="120" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">§20.1 C10K 问题</text>
+
+      <rect x="240" y="100" width="200" height="40" rx="6" fill="url(#d-blue)"/>
+      <text x="340" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">§20.2-20.4 三代 API</text>
+
+      <rect x="460" y="100" width="160" height="40" rx="6" fill="url(#d-orange)"/>
+      <text x="540" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">§20.5 触发模式</text>
+
+      <rect x="640" y="100" width="160" height="40" rx="6" fill="url(#d-green)"/>
+      <text x="720" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">§20.6 平台</text>
+
+      <rect x="820" y="100" width="100" height="40" rx="6" fill="url(#d-purple)"/>
+      <text x="870" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="10" font-weight="800">§20.7 ae</text>
+
+      <rect x="240" y="160" width="200" height="40" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="340" y="180" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">select</text>
+      <text x="340" y="194" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">bitmap · O(N)</text>
+
+      <rect x="240" y="206" width="200" height="40" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="340" y="226" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">poll</text>
+      <text x="340" y="240" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">pollfd 数组 · O(N)</text>
+
+      <rect x="240" y="252" width="200" height="46" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/>
+      <text x="340" y="272" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="800">epoll ★</text>
+      <text x="340" y="286" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">红黑树 + 就绪链表</text>
+      <text x="340" y="296" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">O(ready)</text>
+
+      <rect x="460" y="160" width="160" height="40" rx="4" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="540" y="180" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">LT 水平触发</text>
+      <text x="540" y="194" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">缓冲非空持续通知</text>
+
+      <rect x="460" y="206" width="160" height="40" rx="4" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="540" y="226" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">ET 边缘触发</text>
+      <text x="540" y="240" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">状态变化通知一次</text>
+
+      <rect x="640" y="160" width="160" height="36" rx="4" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="720" y="183" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">kqueue(BSD/macOS)</text>
+
+      <rect x="640" y="200" width="160" height="36" rx="4" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="720" y="223" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">evport(Solaris)</text>
+
+      <rect x="640" y="240" width="160" height="42" rx="4" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="720" y="258" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">IOCP / io_uring</text>
+      <text x="720" y="272" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">Redis 不采用</text>
+
+      <rect x="820" y="160" width="100" height="36" rx="4" fill="var(--diagram-red-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="870" y="183" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">aeCreateFile</text>
+
+      <rect x="820" y="200" width="100" height="36" rx="4" fill="var(--diagram-red-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="870" y="223" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">aeApiPoll</text>
+
+      <rect x="820" y="240" width="100" height="36" rx="4" fill="var(--diagram-red-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="870" y="258" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">编译期切后端</text>
+
+      <rect x="20" y="320" width="900" height="40" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="470" y="342" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="800">关键洞察 · select/poll 全量扫描 → 成本与总连接数线性相关</text>
+      <text x="470" y="356" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">epoll/kqueue 内核维护就绪集合 → 成本只与就绪 fd 数量线性相关</text>
+
+      <rect x="20" y="376" width="900" height="40" rx="8" fill="var(--diagram-red-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="470" y="398" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="12" font-weight="800">Redis 的处理 · ae.c 编译期选择最优后端</text>
+      <text x="470" y="412" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">优先级 · evport &gt; epoll &gt; kqueue &gt; select(最差兜底)</text>
+
+      <rect x="20" y="426" width="900" height="26" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="470" y="444" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="800">§20.8-20.9 容量约束 / §20.10 源码深潜</text>
+    </g>
+  </svg>
+</div>
+
+<p>本章的逻辑主线:<code>select</code> 与 <code>poll</code> 是<strong>全量扫描模型</strong>,成本与总连接数线性相关;<code>epoll</code> 与 <code>kqueue</code> 通过<strong>内核维护兴趣集合</strong>,成本与就绪连接数线性相关。Redis 通过 <code>ae.c</code> 屏蔽平台差异,上层无需感知后端。</p>
+
+<!-- ============================================================ -->
+<h2 id="s20-1">20.1 C10K 问题的本质</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">图 20-1-1 · 三种处理 N 个连接的模型对比</div>
+  <svg viewBox="0 0 940 380" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="380" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="370" y="14" width="200" height="44" rx="10" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="470" y="38" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">10000 个客户端连接</text>
+      <text x="470" y="52" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">C10K 问题</text>
+
+      <line x1="470" y1="58" x2="160" y2="100" stroke="var(--diagram-border)" stroke-width="1.5"/>
+      <line x1="470" y1="58" x2="470" y2="100" stroke="var(--diagram-border)" stroke-width="1.5"/>
+      <line x1="470" y1="58" x2="780" y2="100" stroke="var(--diagram-border)" stroke-width="1.5"/>
+
+      <rect x="40"  y="100" width="240" height="44" rx="8" fill="url(#d-red)"/>
+      <text x="160" y="120" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">A · 一连接一线程</text>
+      <text x="160" y="136" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">每连接独立线程,阻塞式</text>
+
+      <rect x="350" y="100" width="240" height="44" rx="8" fill="url(#d-orange)"/>
+      <text x="470" y="120" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">B · 单线程非阻塞轮询</text>
+      <text x="470" y="136" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">所有 fd 设 O_NONBLOCK 后轮询</text>
+
+      <rect x="660" y="100" width="240" height="44" rx="8" fill="url(#d-green)"/>
+      <text x="780" y="120" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">C · I/O 多路复用 ★</text>
+      <text x="780" y="136" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">epoll/kqueue,内核维护就绪集</text>
+
+      <g font-size="10">
+        <rect x="40" y="160" width="240" height="44" rx="4" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+        <text x="160" y="178" text-anchor="middle" fill="var(--diagram-red-text)" font-weight="700">10000 个线程</text>
+        <text x="160" y="194" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">栈内存 ~10 GB(每个 1 MB)</text>
+
+        <rect x="40" y="210" width="240" height="44" rx="4" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+        <text x="160" y="228" text-anchor="middle" fill="var(--diagram-red-text)" font-weight="700">上下文切换 + 调度开销</text>
+        <text x="160" y="244" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">CPU 大量浪费在 ctx switch</text>
+
+        <rect x="40" y="260" width="240" height="44" rx="4" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+        <text x="160" y="278" text-anchor="middle" fill="var(--diagram-red-text)" font-weight="700">共享状态锁竞争</text>
+        <text x="160" y="294" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">命令串行性难保证</text>
+
+        <rect x="350" y="160" width="240" height="44" rx="4" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+        <text x="470" y="178" text-anchor="middle" fill="var(--diagram-orange-text)" font-weight="700">单线程</text>
+        <text x="470" y="194" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">无线程开销</text>
+
+        <rect x="350" y="210" width="240" height="44" rx="4" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+        <text x="470" y="228" text-anchor="middle" fill="var(--diagram-orange-text)" font-weight="700">每轮 read 所有 fd</text>
+        <text x="470" y="244" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">大部分返回 EAGAIN(空轮询)</text>
+
+        <rect x="350" y="260" width="240" height="44" rx="4" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+        <text x="470" y="278" text-anchor="middle" fill="var(--diagram-orange-text)" font-weight="700">CPU 100% 空转</text>
+        <text x="470" y="294" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">活跃 fd 越少越浪费</text>
+
+        <rect x="660" y="160" width="240" height="44" rx="4" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="780" y="178" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="700">单线程</text>
+        <text x="780" y="194" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">无线程切换</text>
+
+        <rect x="660" y="210" width="240" height="44" rx="4" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="780" y="228" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="700">epoll_wait 阻塞</text>
+        <text x="780" y="244" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">无事件 → 内核休眠当前线程</text>
+
+        <rect x="660" y="260" width="240" height="44" rx="4" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="780" y="278" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="700">仅处理就绪 fd</text>
+        <text x="780" y="294" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">CPU 与活跃连接数线性相关</text>
+      </g>
+
+      <rect x="40" y="320" width="860" height="44" rx="8" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="470" y="340" text-anchor="middle" fill="var(--diagram-green-text)" font-size="12" font-weight="800">✓ Redis 选择 C 模型</text>
+      <text x="470" y="356" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">10000 连接 + 仅 10 个活跃 → epoll 只处理那 10 个,select/poll 仍要扫全部 10000 个</text>
+    </g>
+  </svg>
+</div>
+
+<p>C10K 问题的核心命题是:<strong>在单机 10,000 连接规模下,等待 I/O 的开销必须低于命令执行开销</strong>。模型 A 的线程开销随连接数线性增长,模型 B 在大量空闲连接下产生持续轮询开销,只有模型 C 将"等待"卸载给内核。</p>
+
+<div class="key-insight">
+  <strong>选择多路复用的真实原因:</strong> 不只是性能,更是<strong>命令串行化的简化</strong>。所有命令在主线程顺序执行,数据结构无需考虑并发修改的语义复杂性——这一点甚至比性能本身更关键。
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">表 20-1-1 · 三种连接处理模型成本对比</div>
+  <table>
+    <thead><tr><th>维度</th><th>一连接一线程</th><th>非阻塞轮询</th><th>多路复用</th></tr></thead>
+    <tbody>
+      <tr><td>线程数</td><td>N</td><td>1</td><td>1</td></tr>
+      <tr><td>栈内存</td><td>N × 1-8 MB</td><td>单栈</td><td>单栈</td></tr>
+      <tr><td>上下文切换</td><td>与活跃线程数相关</td><td>无</td><td>无</td></tr>
+      <tr><td>CPU 在空闲连接上</td><td>阻塞,无开销</td><td>持续轮询,~100%</td><td>接近零</td></tr>
+      <tr><td>命令执行串行性</td><td>难保证</td><td>易保证</td><td>易保证</td></tr>
+      <tr><td>Redis 是否采用</td><td>否</td><td>否</td><td><strong>是</strong></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<pre><code class="language-bash"># 查询当前后端
+$ redis-cli INFO server | grep multiplexing_api
+multiplexing_api:epoll
+
+# 编译期决定的后端
+# Linux:           epoll  (HAVE_EPOLL)
+# macOS / BSD:     kqueue (HAVE_KQUEUE)
+# Solaris:         evport (HAVE_EVPORT)
+# 其他平台:        select (兜底)
+
+# 查询连接规模
+$ redis-cli INFO clients | grep -E 'connected_clients|maxclients'
+connected_clients:8560
+maxclients:10000</code></pre>
+
+<div class="warning">
+  <strong>诊断信号:</strong> <code>multiplexing_api</code> 是诊断网络性能问题时的<strong>第一确认项</strong>。生产 Linux 实例上看到 <code>select</code> 通常意味着编译异常或库依赖缺失,需要立即排查。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s20-2">20.2 select:第一代多路复用 API</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">图 20-2-1 · select 的工作模型 — 4 个 O(N) 步骤</div>
+  <svg viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="460" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-monospace,Consolas">
+      <rect x="60"  y="14" width="220" height="34" rx="6" fill="url(#d-blue)"/>
+      <text x="170" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">应用(Redis)</text>
+      <line x1="170" y1="48" x2="170" y2="450" stroke="var(--diagram-blue-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="660" y="14" width="220" height="34" rx="6" fill="url(#d-orange)"/>
+      <text x="770" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">内核</text>
+      <line x1="770" y1="48" x2="770" y2="450" stroke="var(--diagram-orange-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <path d="M170,80 C 130,80 130,100 170,100" stroke="var(--diagram-blue-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-b)"/>
+      <text x="380" y="92" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10" font-weight="700">① FD_ZERO(&amp;rfds) + FD_SET(fd1..fdN)</text>
+      <text x="380" y="106" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">用户态准备 bitmap · O(N)</text>
+
+      <path d="M180,138 L760,138" stroke="var(--diagram-red-stroke)" stroke-width="3" marker-end="url(#d-arr-r)"/>
+      <text x="470" y="132" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="800">② select(N+1, &amp;rfds, ...) 系统调用</text>
+
+      <path d="M770,170 C 730,170 730,192 770,192" stroke="var(--diagram-orange-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+      <text x="610" y="184" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">③ 拷贝用户 bitmap 到内核空间</text>
+      <text x="610" y="198" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">copy_from_user · O(N)</text>
+
+      <path d="M770,222 C 730,222 730,260 770,260" stroke="var(--diagram-orange-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+      <text x="610" y="234" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">④ 遍历每个 fd 检查 poll() 状态</text>
+      <text x="610" y="248" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">内核扫描 · O(N)</text>
+
+      <path d="M770,290 C 730,290 730,310 770,310" stroke="var(--diagram-orange-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+      <text x="610" y="302" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">⑤ 修改 bitmap,标记就绪 fd</text>
+      <text x="610" y="316" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">改写就地 bitmap</text>
+
+      <path d="M760,344 L180,344" stroke="var(--diagram-orange-stroke)" stroke-width="3" stroke-dasharray="5 3" marker-end="url(#d-arr)"/>
+      <text x="470" y="338" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="800">⑥ 拷贝结果 bitmap 回用户 + 返回就绪计数</text>
+      <text x="470" y="358" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">copy_to_user · O(N)</text>
+
+      <path d="M170,380 C 130,380 130,402 170,402" stroke="var(--diagram-blue-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-b)"/>
+      <text x="380" y="392" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10" font-weight="700">⑦ FD_ISSET 逐个检查所有 fd</text>
+      <text x="380" y="406" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">用户态扫描结果 · O(N) · 找出就绪的少数</text>
+
+      <rect x="40" y="426" width="880" height="22" rx="4" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="480" y="442" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="800">★ 即使只有 1 个 fd 就绪,4 个 O(N) 步骤一个不能少 — 这是 select 的根本瓶颈</text>
+    </g>
+  </svg>
+</div>
+
+<p><code>select</code> 的开销结构:<strong>用户态准备 bitmap O(N) + 内核拷贝 bitmap O(N) + 内核扫描 bitmap O(N) + 用户态扫描结果 O(N)</strong>。即使只有少量 fd 就绪,所有四个 O(N) 步骤仍需执行。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 20-2-2 · select 的三项硬约束</div>
+<div class="compare-grid">
+  <div class="compare-item bad">
+    <div class="compare-title">约束 1: FD_SETSIZE 上限</div>
+    <ul style="margin: 6px 0 0 18px; color: var(--text); font-size: 13px;">
+      <li><code>fd_set</code> 是固定大小 bitmap, <code>FD_SETSIZE</code> 默认 <strong>1024</strong></li>
+      <li>需要扩大时必须<strong>重编译</strong> libc 或应用</li>
+      <li>连接数超过 1024 时 <code>select</code> <span style="color:var(--red)">直接不可用</span></li>
+    </ul>
+  </div>
+  <div class="compare-item bad">
+    <div class="compare-title">约束 2: 全量数据传递</div>
+    <ul style="margin: 6px 0 0 18px; color: var(--text); font-size: 13px;">
+      <li>每次调用都需要传递完整的 <code>fd_set</code></li>
+      <li>fd 集合稳定时, 内核必须<strong>重复扫描相同集合</strong></li>
+      <li>事件循环每秒数千次调用, 拷贝开销显著</li>
+    </ul>
+  </div>
+  <div class="compare-item bad">
+    <div class="compare-title">约束 3: 线性扫描</div>
+    <ul style="margin: 6px 0 0 18px; color: var(--text); font-size: 13px;">
+      <li>内核遍历整个 <code>[0, max_fd]</code> 检查就绪状态</li>
+      <li>就绪 fd 占比越低, 无效检查越多</li>
+      <li><code>N=10000, ready=3</code> 时, <span style="color:var(--red)"><strong>9997 次检查无意义</strong></span></li>
+    </ul>
+  </div>
+</div>
+</div>
+
+<pre><code class="language-c">fd_set rfds;
+int maxfd = 0;
+
+FD_ZERO(&amp;rfds);
+FD_SET(listenfd, &amp;rfds);
+if (listenfd &gt; maxfd) maxfd = listenfd;
+
+for (int i = 0; i &lt; n_clients; i++) {
+    FD_SET(clients[i].fd, &amp;rfds);
+    if (clients[i].fd &gt; maxfd) maxfd = clients[i].fd;
+}
+
+struct timeval timeout = {1, 0};
+int n = select(maxfd + 1, &amp;rfds, NULL, NULL, &amp;timeout);
+
+for (int fd = 0; fd &lt;= maxfd; fd++) {
+    if (FD_ISSET(fd, &amp;rfds)) {
+        handle_ready(fd);
+    }
+}</code></pre>
+
+<div class="diagram">
+  <div class="diagram-title">表 20-2-1 · N=10000, ready=3 时 select 成本剖析</div>
+  <table>
+    <thead><tr><th>操作</th><th>工作量</th></tr></thead>
+    <tbody>
+      <tr><td>FD_SET 调用 N 次</td><td>O(N)</td></tr>
+      <tr><td>内核拷贝 bitmap</td><td>O(N) 字节</td></tr>
+      <tr><td>内核扫描 bitmap</td><td>O(N) 比特</td></tr>
+      <tr><td>内核拷贝结果回用户</td><td>O(N) 字节</td></tr>
+      <tr><td>FD_ISSET 检查 N 次</td><td>O(N)</td></tr>
+      <tr><td>实际处理 ready 数</td><td>O(3)</td></tr>
+      <tr><td><strong>无效操作占比</strong></td><td><strong>≈ (N - ready) / N ≈ 99.97%</strong></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s20-3">20.3 poll:取消 fd 上限</h2>
+<!-- ============================================================ -->
+
+<pre><code class="language-c">struct pollfd fds[N];
+fds[0].fd = listenfd;
+fds[0].events = POLLIN;
+
+for (int i = 0; i &lt; n_clients; i++) {
+    fds[i+1].fd = clients[i].fd;
+    fds[i+1].events = POLLIN | POLLOUT;
+}
+
+int n = poll(fds, n_clients + 1, 1000);
+
+for (int i = 0; i &lt;= n_clients; i++) {
+    if (fds[i].revents &amp; POLLIN)  handle_read(fds[i].fd);
+    if (fds[i].revents &amp; POLLOUT) handle_write(fds[i].fd);
+}</code></pre>
+
+<div class="compare-grid">
+  <div class="compare-good">
+    <div class="compare-label">✅ 改进</div>
+    <ul>
+      <li>取消 FD_SETSIZE 上限,fd 数量仅受系统资源限制</li>
+      <li>events 与 revents 字段分离,请求与结果不共用同一 bitmap</li>
+      <li>事件类型更丰富(POLLPRI / POLLRDHUP / POLLERR)</li>
+    </ul>
+  </div>
+  <div class="compare-bad">
+    <div class="compare-label">❌ 未解决</div>
+    <ul>
+      <li>仍需传递完整 pollfd 数组,O(N) 用户/内核拷贝</li>
+      <li>内核仍需线性扫描每个 pollfd,O(N) 检查</li>
+      <li>用户仍需遍历整个数组找就绪项,O(N) 用户扫描</li>
+      <li>与活跃连接数无关的成本仍然存在</li>
+    </ul>
+  </div>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">表 20-3-1 · select / poll / epoll 算法复杂度对比</div>
+  <table>
+    <thead><tr><th>API</th><th>注册 fd 复杂度</th><th>等待复杂度</th><th>用户处理复杂度</th><th>总复杂度</th></tr></thead>
+    <tbody>
+      <tr><td>select</td><td>O(1) (FD_SET)</td><td>O(N) 内核扫描 + O(N) 拷贝</td><td>O(N) FD_ISSET</td><td>O(N)</td></tr>
+      <tr><td>poll</td><td>O(1) (设置 pollfd)</td><td>O(N) 内核扫描 + O(N) 拷贝</td><td>O(N) 遍历</td><td>O(N)</td></tr>
+      <tr><td><strong>epoll</strong></td><td><strong>O(log N)</strong></td><td><strong>O(ready)</strong></td><td><strong>O(ready)</strong></td><td><strong>O(ready)</strong></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p>Redis 主线 ae 后端<strong>不使用 poll</strong>。<code>poll</code> 在概念上是 <code>select</code> 与 <code>epoll</code> 之间的过渡,实际部署中要么使用 <code>select</code>(兜底,极少数平台),要么使用 <code>epoll</code> / <code>kqueue</code> / <code>evport</code>(主流生产平台)。</p>
+
+<!-- ============================================================ -->
+<h2 id="s20-4">20.4 epoll:常数复杂度的就绪通知</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">图 20-4-1 · epoll 的内核数据结构</div>
+<svg class="svg-diagram" viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="ep-arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 z" fill="var(--diagram-blue-stroke)"/>
+    </marker>
+    <marker id="ep-cb" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 z" fill="var(--diagram-orange-stroke)"/>
+    </marker>
+  </defs>
+
+  <!-- epoll 实例容器 -->
+  <rect x="280" y="20" width="360" height="280" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/>
+  <text x="460" y="44" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="14" font-weight="bold">epoll 实例 (epfd)</text>
+  <line x1="280" y1="55" x2="640" y2="55" stroke="var(--diagram-border)"/>
+
+  <!-- 兴趣集合: 红黑树 -->
+  <text x="295" y="78" fill="var(--diagram-blue-text)" font-size="12" font-weight="bold">兴趣集合 (红黑树)</text>
+  <text x="295" y="94" fill="var(--diagram-muted)" font-size="10">插入/查找/删除均 O(log N)</text>
+  <g>
+    <circle cx="460" cy="135" r="22" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="2"/>
+    <text x="460" y="139" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">fd₁</text>
+    <circle cx="395" cy="180" r="22" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="2"/>
+    <text x="395" y="184" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">fd₂</text>
+    <circle cx="525" cy="180" r="22" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="2"/>
+    <text x="525" y="184" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">fd₃</text>
+    <line x1="447" y1="153" x2="408" y2="165" stroke="var(--diagram-purple-stroke)"/>
+    <line x1="473" y1="153" x2="512" y2="165" stroke="var(--diagram-purple-stroke)"/>
+  </g>
+
+  <!-- 分割线 -->
+  <line x1="295" y1="220" x2="625" y2="220" stroke="var(--diagram-border)" stroke-dasharray="4 3"/>
+
+  <!-- 就绪链表 -->
+  <text x="295" y="243" fill="var(--diagram-blue-text)" font-size="12" font-weight="bold">就绪链表 (双向链表)</text>
+  <text x="295" y="258" fill="var(--diagram-muted)" font-size="10">epoll_wait 直接返回该链表</text>
+  <g>
+    <rect x="370" y="268" width="50" height="26" rx="4" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+    <text x="395" y="285" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">fd₁</text>
+    <path d="M420 281 L460 281" stroke="var(--diagram-green-stroke)" marker-end="url(#ep-arr)"/>
+    <rect x="465" y="268" width="50" height="26" rx="4" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+    <text x="490" y="285" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">fd₃</text>
+  </g>
+
+  <!-- 网卡/协议栈 + 回调 -->
+  <rect x="350" y="345" width="220" height="50" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)" stroke-width="2"/>
+  <text x="460" y="365" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="13" font-weight="bold">网卡 / 协议栈</text>
+  <text x="460" y="382" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">数据到达时主动 callback</text>
+  <path d="M460 340 L460 305" stroke="var(--diagram-orange-stroke)" stroke-width="2" marker-end="url(#ep-cb)" stroke-dasharray="3 3"/>
+  <text x="635" y="320" fill="var(--diagram-orange-text)" font-size="11">状态变化</text>
+  <text x="635" y="334" fill="var(--diagram-orange-text)" font-size="11">→ 加入就绪链表</text>
+
+  <!-- 左侧 API 列表 -->
+  <rect x="30" y="20" width="220" height="380" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+  <text x="140" y="42" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="14" font-weight="bold">epoll API</text>
+  <line x1="40" y1="55" x2="240" y2="55" stroke="var(--diagram-border)"/>
+  <g font-size="11" font-family="ui-monospace, monospace">
+    <text x="45" y="85" fill="var(--diagram-blue-text)">epoll_create1</text>
+    <text x="55" y="102" fill="var(--diagram-muted)">创建 epfd</text>
+    <text x="45" y="135" fill="var(--diagram-blue-text)">epoll_ctl ADD</text>
+    <text x="55" y="152" fill="var(--diagram-muted)">兴趣集合插入</text>
+    <text x="55" y="167" fill="var(--diagram-muted)">红黑树节点</text>
+    <text x="45" y="200" fill="var(--diagram-blue-text)">epoll_ctl MOD</text>
+    <text x="55" y="217" fill="var(--diagram-muted)">修改节点 events</text>
+    <text x="45" y="250" fill="var(--diagram-blue-text)">epoll_ctl DEL</text>
+    <text x="55" y="267" fill="var(--diagram-muted)">移除节点</text>
+    <text x="45" y="300" fill="var(--diagram-green-text)" font-weight="bold">epoll_wait</text>
+    <text x="55" y="317" fill="var(--diagram-muted)">读取就绪链表,</text>
+    <text x="55" y="332" fill="var(--diagram-muted)">返回就绪 fd</text>
+    <text x="55" y="347" fill="var(--diagram-green-text)">→ O(ready)</text>
+  </g>
+
+  <!-- 右侧总结 -->
+  <rect x="670" y="20" width="230" height="380" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+  <text x="785" y="42" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="14" font-weight="bold">设计要点</text>
+  <line x1="680" y1="55" x2="900" y2="55" stroke="var(--diagram-border)"/>
+  <g font-size="11">
+    <text x="685" y="80" fill="var(--diagram-blue-text)" font-weight="bold">① 长驻兴趣集合</text>
+    <text x="695" y="97" fill="var(--diagram-muted)">注册一次,不再传 fd</text>
+    <text x="685" y="125" fill="var(--diagram-blue-text)" font-weight="bold">② 内核主动维护</text>
+    <text x="695" y="142" fill="var(--diagram-muted)">协议栈回调入链表</text>
+    <text x="685" y="170" fill="var(--diagram-blue-text)" font-weight="bold">③ O(ready) 返回</text>
+    <text x="695" y="187" fill="var(--diagram-muted)">仅与活跃数相关</text>
+    <text x="685" y="215" fill="var(--diagram-blue-text)" font-weight="bold">④ 红黑树查询</text>
+    <text x="695" y="232" fill="var(--diagram-muted)">O(log N) 注册修改</text>
+    <text x="685" y="265" fill="var(--diagram-green-text)" font-weight="bold">vs select/poll</text>
+    <text x="695" y="282" fill="var(--diagram-muted)">不再 O(N) 全量扫描</text>
+    <text x="695" y="297" fill="var(--diagram-muted)">不再用户/内核拷贝</text>
+  </g>
+
+  <!-- 底部说明 -->
+  <text x="460" y="440" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="13" font-weight="bold">事件驱动:select/poll 是应用主动检查 → epoll 是内核主动通知</text>
+</svg>
+</div>
+
+<p>epoll 将 select 的"<strong>每次全量传 fd</strong>"改为"<strong>长期维护兴趣集合</strong>"。fd 注册一次后驻留内核兴趣集合,等待时仅返回已就绪的 fd 子集。</p>
+
+<pre><code class="language-c">int epfd = epoll_create1(0);
+
+struct epoll_event ev;
+ev.events = EPOLLIN;
+ev.data.fd = clientfd;
+epoll_ctl(epfd, EPOLL_CTL_ADD, clientfd, &amp;ev);
+
+struct epoll_event events[1024];
+int n = epoll_wait(epfd, events, 1024, timeout_ms);
+
+for (int i = 0; i &lt; n; i++) {
+    int fd = events[i].data.fd;
+    if (events[i].events &amp; EPOLLIN)  handle_read(fd);
+    if (events[i].events &amp; EPOLLOUT) handle_write(fd);
+}</code></pre>
+
+<div class="diagram">
+  <div class="diagram-title">表 20-4-1 · N=10000, ready=3 时 epoll 成本</div>
+  <table>
+    <thead><tr><th>操作</th><th>工作量</th></tr></thead>
+    <tbody>
+      <tr><td>epoll_ctl ADD(建立连接时)</td><td>O(log N)</td></tr>
+      <tr><td>epoll_wait 返回(连接稳定后)</td><td>O(ready)</td></tr>
+      <tr><td>遍历就绪事件</td><td>O(3)</td></tr>
+      <tr><td><strong>事件循环成本</strong></td><td><strong>与 N 无关,仅与活跃连接数相关</strong></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">图 20-4-2 · epoll_wait 的内核路径 — 主动通知模型</div>
+  <svg viewBox="0 0 940 480" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="480" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-monospace,Consolas">
+      <rect x="40"  y="14" width="200" height="34" rx="6" fill="url(#d-blue)"/>
+      <text x="140" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Redis 主线程</text>
+      <line x1="140" y1="48" x2="140" y2="470" stroke="var(--diagram-blue-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="370" y="14" width="200" height="34" rx="6" fill="url(#d-purple)"/>
+      <text x="470" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">内核 epoll 子系统</text>
+      <line x1="470" y1="48" x2="470" y2="470" stroke="var(--diagram-purple-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="700" y="14" width="200" height="34" rx="6" fill="url(#d-orange)"/>
+      <text x="800" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">网络协议栈</text>
+      <line x1="800" y1="48" x2="800" y2="470" stroke="var(--diagram-orange-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <path d="M145,76 L465,76" stroke="var(--diagram-blue-stroke)" stroke-width="2" marker-end="url(#d-arr-b)"/>
+      <text x="305" y="70" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10" font-weight="700">① epoll_wait(epfd, events, 1024, -1)</text>
+
+      <rect x="40" y="92" width="860" height="22" rx="4" fill="var(--diagram-red-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="470" y="108" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">分支 A — 就绪链表非空(快速路径)</text>
+
+      <path d="M465,138 L145,138" stroke="var(--diagram-green-stroke)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#d-arr-g)"/>
+      <text x="305" y="132" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10" font-weight="700">② 直接返回就绪 fd 数组(零等待)</text>
+
+      <rect x="40" y="160" width="860" height="22" rx="4" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="470" y="176" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10" font-weight="700">分支 B — 就绪链表为空(等待路径)</text>
+
+      <rect x="40" y="194" width="200" height="40" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="140" y="214" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">③ 主线程进入睡眠</text>
+      <text x="140" y="228" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">不消耗 CPU,等被唤醒</text>
+
+      <path d="M800,256 C 770,256 770,278 800,278" stroke="var(--diagram-orange-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+      <text x="650" y="270" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">④ 数据包到达网卡(IRQ 中断)</text>
+
+      <path d="M795,308 L475,308" stroke="var(--diagram-orange-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <text x="635" y="302" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">⑤ TCP 协议栈触发 sock_def_readable 回调</text>
+
+      <path d="M465,336 C 435,336 435,358 465,358" stroke="var(--diagram-purple-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+      <text x="305" y="350" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">⑥ 将 fd 加入就绪链表(rdllist)</text>
+
+      <path d="M465,386 L145,386" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+      <text x="305" y="380" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10" font-weight="700">⑦ wake_up_interruptible 唤醒主线程</text>
+
+      <path d="M465,420 L145,420" stroke="var(--diagram-green-stroke)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#d-arr-g)"/>
+      <text x="305" y="414" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10" font-weight="700">⑧ 返回就绪 fd 数组</text>
+
+      <rect x="40" y="438" width="860" height="26" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="470" y="456" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="800">★ 与 select 的根本区别 — 内核主动通知,不需要应用轮询; 0 个就绪 fd 时主线程不消耗 CPU</text>
+    </g>
+  </svg>
+</div>
+
+<div class="key-insight">
+  <strong>epoll vs select 的根本区别:</strong> <code>epoll_wait</code> 的睡眠/唤醒由<strong>内核协议栈直接驱动</strong>,不需要轮询。这是 epoll 与 select/poll 在系统层面最根本的差异:select/poll 是"<strong>应用主动检查</strong>",epoll 是"<strong>内核主动通知</strong>"。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s20-5">20.5 LT 与 ET 触发模式</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">图 20-5-1 · 水平触发与边缘触发的语义</div>
+<svg class="svg-diagram" viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="lt-fill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="var(--diagram-green-fill-start)"/>
+      <stop offset="100%" stop-color="var(--diagram-green-fill-end)"/>
+    </linearGradient>
+    <linearGradient id="et-fill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="var(--diagram-orange-fill-start)"/>
+      <stop offset="100%" stop-color="var(--diagram-orange-fill-end)"/>
+    </linearGradient>
+  </defs>
+
+  <!-- LT 面板 -->
+  <rect x="20" y="20" width="430" height="320" rx="10" fill="url(#lt-fill)" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
+  <text x="235" y="48" text-anchor="middle" fill="var(--diagram-green-text)" font-size="15" font-weight="bold">水平触发 (Level-Triggered, LT)</text>
+  <text x="235" y="68" text-anchor="middle" fill="var(--diagram-muted)" font-size="11">条件: 缓冲区"非空" = 持续通知</text>
+
+  <!-- LT 时间轴 -->
+  <line x1="50" y1="180" x2="420" y2="180" stroke="var(--diagram-border)"/>
+  <text x="50" y="170" fill="var(--diagram-muted)" font-size="10">t=0</text>
+  <text x="420" y="170" fill="var(--diagram-muted)" font-size="10" text-anchor="end">time</text>
+
+  <!-- LT 事件 (持续通知) -->
+  <g>
+    <rect x="80" y="110" width="40" height="60" fill="var(--diagram-green-fill)" opacity="0.8"/>
+    <text x="100" y="105" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">数据到</text>
+    <path d="M100 110 L100 95" stroke="var(--diagram-green-stroke)" stroke-width="1.5"/>
+    <circle cx="100" cy="93" r="3" fill="var(--diagram-green-fill)"/>
+    <text x="100" y="80" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10" font-weight="bold">通知</text>
+
+    <rect x="80" y="125" width="200" height="55" fill="var(--diagram-green-fill)" opacity="0.5"/>
+    <text x="180" y="220" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">应用读一部分</text>
+    <text x="180" y="234" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">缓冲区仍有数据</text>
+    <path d="M180 180 L180 200" stroke="var(--diagram-green-stroke)" stroke-width="1.5"/>
+
+    <path d="M220 180 L220 95" stroke="var(--diagram-green-stroke)" stroke-width="1.5" stroke-dasharray="3 3"/>
+    <circle cx="220" cy="93" r="3" fill="var(--diagram-green-fill)"/>
+    <text x="220" y="80" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10" font-weight="bold">再次通知</text>
+
+    <rect x="80" y="155" width="200" height="25" fill="var(--diagram-green-fill)" opacity="0.25"/>
+    <text x="300" y="220" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">再读一部分</text>
+    <path d="M280 180 L280 200" stroke="var(--diagram-green-stroke)" stroke-width="1.5"/>
+
+    <path d="M300 180 L300 95" stroke="var(--diagram-green-stroke)" stroke-width="1.5" stroke-dasharray="3 3"/>
+    <circle cx="300" cy="93" r="3" fill="var(--diagram-green-fill)"/>
+    <text x="300" y="80" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10" font-weight="bold">再次通知</text>
+
+    <text x="370" y="270" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">直到读完</text>
+    <text x="370" y="284" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">才停止通知</text>
+  </g>
+
+  <text x="60" y="310" fill="var(--diagram-blue-text)" font-size="11">✓ 漏处理也不丢: 下次循环再通知</text>
+  <text x="60" y="326" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">Redis 默认使用 LT</text>
+
+  <!-- ET 面板 -->
+  <rect x="470" y="20" width="430" height="320" rx="10" fill="url(#et-fill)" stroke="var(--diagram-orange-stroke)" stroke-width="2"/>
+  <text x="685" y="48" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="15" font-weight="bold">边缘触发 (Edge-Triggered, ET)</text>
+  <text x="685" y="68" text-anchor="middle" fill="var(--diagram-muted)" font-size="11">条件: 状态"由空→非空"才通知一次</text>
+
+  <line x1="500" y1="180" x2="870" y2="180" stroke="var(--diagram-border)"/>
+  <text x="500" y="170" fill="var(--diagram-muted)" font-size="10">t=0</text>
+  <text x="870" y="170" fill="var(--diagram-muted)" font-size="10" text-anchor="end">time</text>
+
+  <g>
+    <rect x="530" y="110" width="40" height="60" fill="var(--diagram-orange-fill)" opacity="0.8"/>
+    <text x="550" y="105" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">边缘 ↑</text>
+    <path d="M550 110 L550 95" stroke="var(--diagram-orange-stroke)" stroke-width="1.5"/>
+    <circle cx="550" cy="93" r="3" fill="var(--diagram-orange-fill)"/>
+    <text x="550" y="80" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10" font-weight="bold">通知一次</text>
+
+    <rect x="530" y="125" width="200" height="55" fill="var(--diagram-orange-fill)" opacity="0.5"/>
+    <text x="630" y="220" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">应用读一部分</text>
+    <text x="630" y="234" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">仍有数据但不再通知</text>
+
+    <rect x="530" y="155" width="200" height="25" fill="var(--diagram-orange-fill)" opacity="0.25"/>
+
+    <text x="780" y="155" fill="var(--diagram-red-text)" font-size="11" font-weight="bold">3072 字节</text>
+    <text x="780" y="170" fill="var(--diagram-red-text)" font-size="11" font-weight="bold">永久阻塞</text>
+    <path d="M770 165 L740 165" stroke="var(--diagram-red-stroke)" marker-end="url(#ep-cb)"/>
+
+    <text x="820" y="270" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">应用必须 drain</text>
+    <text x="820" y="284" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">至 EAGAIN</text>
+  </g>
+
+  <text x="510" y="310" fill="var(--diagram-blue-text)" font-size="11">✗ 漏处理 = fd 假死, 需断开重连</text>
+  <text x="510" y="326" fill="var(--diagram-orange-text)" font-size="11" font-weight="bold">实现复杂度高,Redis 不采用</text>
+</svg>
+</div>
+
+<h3>20.5.1 反例 → 修复对照(ET 模式)</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <div class="compare-label">❌ 错误:仅读一次就退出</div>
+<pre><code class="language-c">if (events[i].events &amp; EPOLLIN) {
+    int n = read(fd, buf, sizeof(buf));
+    process(buf, n);
+}
+/* ET 下:
+ * 数据 4096 → 应用读 1024
+ * 剩余 3072 永远无法读取
+ * 连接进入假死状态 */</code></pre>
+  </div>
+  <div class="compare-good">
+    <div class="compare-label">✅ 正确:循环读至 EAGAIN</div>
+<pre><code class="language-c">while (1) {
+    int n = read(fd, buf, sizeof(buf));
+    if (n &gt; 0)       process(buf, n);
+    else if (n == 0) { close(fd); break; }
+    else if (errno == EAGAIN ||
+             errno == EWOULDBLOCK) break;
+    else             { close(fd); break; }
+}
+/* ET 必须 drain 至 EAGAIN */</code></pre>
+  </div>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">图 20-5-2 · ET 错误处理的失败时间线</div>
+<p style="color:var(--text-muted); font-size:12px; margin:8px 0;">场景: socket 接收缓冲 4096 字节, 应用 buf 1024 字节</p>
+<table class="data-table">
+  <thead><tr><th>时刻</th><th>事件</th><th>内核 rcv_buf</th><th>就绪链表</th><th>应用状态</th></tr></thead>
+  <tbody>
+    <tr><td>t=0</td><td>数据到达</td><td><code>4096</code></td><td><code>{fd}</code></td><td>epoll_wait 返回</td></tr>
+    <tr><td>t=1</td><td>触发 <strong>ET</strong> 通知</td><td><code>4096</code></td><td>(已弹出)</td><td>处理回调</td></tr>
+    <tr><td>t=2</td><td>read 1024 字节</td><td><code>3072</code></td><td>空</td><td>仅处理 1024</td></tr>
+    <tr><td>t=3</td><td>下次 epoll_wait</td><td><code>3072</code></td><td>空(无新边缘)</td><td><span style="color:var(--red)">永久阻塞</span></td></tr>
+  </tbody>
+</table>
+<div class="warning">
+  <strong>剩余 3072 字节 → 永远无法读取</strong><br>
+  连接进入<strong>假死状态</strong>, 客户端等待响应直至 keepalive 超时才被检测。
+  <strong>修复:</strong> ET 模式下必须 <code>while(read() &gt; 0)</code> drain 至 <code>EAGAIN</code>。
+</div>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">表 20-5-1 · Redis 选择 LT 的依据</div>
+  <table>
+    <thead><tr><th>维度</th><th>LT</th><th>ET</th></tr></thead>
+    <tbody>
+      <tr><td>通知次数</td><td>较多</td><td>较少</td></tr>
+      <tr><td>实现复杂度</td><td>简单</td><td>复杂(必须 drain 至 EAGAIN)</td></tr>
+      <tr><td>漏处理后果</td><td>下次循环再通知,数据不丢</td><td>fd 假死,需断开重连</td></tr>
+      <tr><td>Redis 命令路径</td><td>单次 read 一批,下次循环继续</td><td>必须循环 read 直至 EAGAIN</td></tr>
+      <tr><td><strong>Redis 选择</strong></td><td><strong>默认</strong></td><td>不采用</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="real-world">
+  <strong>选 LT 的根本原因:</strong> <strong>命令处理的可中断性</strong>。命令执行串行,单次 <code>readQueryFromClient</code> 处理一批数据后退出事件回调,下次循环继续处理剩余数据。LT 自然支持该模型;ET 则需要在事件回调内 drain 全部数据,违背了"事件循环让出主线程"的基本原则。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s20-6">20.6 平台变体:kqueue / evport / IOCP</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">表 20-6-1 · 四种 Reactor / Proactor 模型对比</div>
+  <table>
+    <thead><tr><th>机制</th><th>模型</th><th>通知语义</th><th>平台</th><th>Redis 后端</th></tr></thead>
+    <tbody>
+      <tr><td>epoll</td><td>Reactor</td><td>fd 就绪,应用自己 read/write</td><td>Linux</td><td>ae_epoll.c</td></tr>
+      <tr><td>kqueue</td><td>Reactor</td><td>filter 事件就绪,语义更通用</td><td>BSD/macOS</td><td>ae_kqueue.c</td></tr>
+      <tr><td>evport</td><td>Reactor</td><td>event ports 就绪</td><td>Solaris/Illumos</td><td>ae_evport.c</td></tr>
+      <tr><td>IOCP</td><td>Proactor</td><td>I/O 操作已完成</td><td>Windows</td><td>不采用</td></tr>
+      <tr><td>io_uring</td><td>Proactor 倾向</td><td>submit/completion 队列</td><td>Linux 5.1+</td><td>不采用</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p>Reactor 与 Proactor 的本质差异:Reactor 通知"<strong>可以做了</strong>",应用自己执行 I/O;Proactor 通知"<strong>已经做完了</strong>",I/O 由内核完成,应用读取结果。Redis ae 是 Reactor 模型,与 epoll/kqueue/evport 天然契合。</p>
+
+<pre><code class="language-c">int kq = kqueue();
+
+struct kevent change;
+EV_SET(&amp;change, fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
+
+struct kevent events[64];
+struct timespec ts = {1, 0};
+int n = kevent(kq, &amp;change, 1, events, 64, &amp;ts);
+
+for (int i = 0; i &lt; n; i++) {
+    if (events[i].filter == EVFILT_READ) {
+        handle_read(events[i].ident);
+    }
+}</code></pre>
+
+<div class="diagram">
+  <div class="diagram-title">表 20-6-2 · kqueue filter 类型一览</div>
+  <table>
+    <thead><tr><th>Filter</th><th>语义</th></tr></thead>
+    <tbody>
+      <tr><td><code>EVFILT_READ</code></td><td>socket 可读</td></tr>
+      <tr><td><code>EVFILT_WRITE</code></td><td>socket 可写</td></tr>
+      <tr><td><code>EVFILT_VNODE</code></td><td>文件系统事件</td></tr>
+      <tr><td><code>EVFILT_PROC</code></td><td>进程状态变化</td></tr>
+      <tr><td><code>EVFILT_SIGNAL</code></td><td>信号</td></tr>
+      <tr><td><code>EVFILT_TIMER</code></td><td>定时器</td></tr>
+      <tr><td><code>EVFILT_USER</code></td><td>用户自定义事件</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p>epoll 仅处理 fd 就绪;kqueue 通过 filter 抽象统一处理多类事件。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 20-6-1 · 为什么 Redis 不采用 IOCP / io_uring</div>
+  <svg viewBox="0 0 940 380" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="380" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="40"  y="14" width="380" height="44" rx="10" fill="url(#d-blue)" filter="url(#d-shadow)"/>
+      <text x="230" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">Redis 命令路径核心约束</text>
+      <text x="230" y="50" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">单线程串行执行的"承诺"</text>
+
+      <rect x="520" y="14" width="380" height="44" rx="10" fill="url(#d-red)" filter="url(#d-shadow)"/>
+      <text x="710" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">Proactor 模型(IOCP / io_uring)</text>
+      <text x="710" y="50" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">I/O 完成回调由内核异步触发</text>
+
+      <rect x="40" y="80" width="380" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="230" y="100" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">C1 · 命令执行必须串行</text>
+      <text x="230" y="116" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">call() 在主线程串行,无锁数据结构</text>
+
+      <rect x="40" y="132" width="380" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="230" y="152" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">C2 · 数据结构无并发安全保证</text>
+      <text x="230" y="168" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">dict / quicklist / skiplist 全部非线程安全</text>
+
+      <rect x="40" y="184" width="380" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="230" y="204" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">C3 · 事务/脚本/复制语义依赖串行</text>
+      <text x="230" y="220" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">MULTI/EXEC、Lua、WAIT 都假设单线程命令边界</text>
+
+      <rect x="520" y="80" width="380" height="44" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="710" y="100" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="700">P1 · I/O 完成由内核异步执行</text>
+      <text x="710" y="116" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">read/write 提交后立刻返回,完成事件后报</text>
+
+      <rect x="520" y="132" width="380" height="44" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="710" y="152" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="700">P2 · 回调可能在任意线程触发</text>
+      <text x="710" y="168" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">io_uring SQPOLL / IOCP 工作池都是多线程</text>
+
+      <rect x="520" y="184" width="380" height="44" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="710" y="204" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="700">P3 · 与命令串行化模型冲突</text>
+      <text x="710" y="220" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">命令执行边界模糊 → 事务/复制语义破坏</text>
+
+      <path d="M420,102 L520,154" stroke="var(--diagram-red-stroke)" stroke-width="2.5" stroke-dasharray="4 3" marker-end="url(#d-arr-r)"/>
+      <text x="470" y="120" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="800">冲突</text>
+
+      <path d="M420,154 L520,206" stroke="var(--diagram-red-stroke)" stroke-width="2.5" stroke-dasharray="4 3" marker-end="url(#d-arr-r)"/>
+      <text x="470" y="172" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="800">冲突</text>
+
+      <path d="M420,206 L520,206" stroke="var(--diagram-red-stroke)" stroke-width="2.5" stroke-dasharray="4 3" marker-end="url(#d-arr-r)"/>
+      <text x="470" y="200" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="800">冲突</text>
+
+      <rect x="40" y="246" width="860" height="48" rx="8" fill="var(--diagram-red-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="470" y="266" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="12" font-weight="800">★ 本质原因不是性能问题,而是"语义不兼容"</text>
+      <text x="470" y="284" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">epoll/kqueue 是 Reactor 模型 — 内核仅"通知就绪",I/O 仍由主线程同步执行</text>
+
+      <rect x="40" y="306" width="860" height="60" rx="8" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="470" y="326" text-anchor="middle" fill="var(--diagram-green-text)" font-size="12" font-weight="800">Redis 6 的妥协 · 多 I/O 线程做读写,命令执行仍在主线程</text>
+      <text x="470" y="344" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">read 阶段并行化 → call() 仍串行 → write 阶段并行化</text>
+      <text x="470" y="360" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">这种设计保留了"命令串行"的语义承诺,同时缓解 I/O 瓶颈</text>
+    </g>
+  </svg>
+</div>
+
+<div class="key-insight">
+  Redis 不以 Proactor 模型为主线的<strong>本质原因不是性能,而是命令串行化约束</strong>。Proactor 模型下 I/O 完成回调可能在任意线程触发,与"所有命令在主线程顺序执行"的核心承诺相违背。Redis 6 引入的 I/O 多线程仅<strong>辅助网络读写</strong>,命令执行仍保持单线程串行。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s20-7">20.7 Redis ae 抽象层</h2>
+<!-- ============================================================ -->
+
+<pre><code class="language-c">/* src/ae.c 的后端选择优先级 */
+#ifdef HAVE_EVPORT
+#include "ae_evport.c"
+#else
+    #ifdef HAVE_EPOLL
+    #include "ae_epoll.c"
+    #else
+        #ifdef HAVE_KQUEUE
+        #include "ae_kqueue.c"
+        #else
+        #include "ae_select.c"
+        #endif
+    #endif
+#endif</code></pre>
+
+<div class="diagram">
+  <div class="diagram-title">表 20-7-1 · ae 后端优先级</div>
+  <table>
+    <thead><tr><th>优先级</th><th>后端</th><th>平台</th><th>实现文件</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>evport</td><td>Solaris/Illumos</td><td><code>ae_evport.c</code></td></tr>
+      <tr><td>2</td><td>epoll</td><td>Linux</td><td><code>ae_epoll.c</code></td></tr>
+      <tr><td>3</td><td>kqueue</td><td>BSD/macOS</td><td><code>ae_kqueue.c</code></td></tr>
+      <tr><td>4</td><td>select</td><td>兜底</td><td><code>ae_select.c</code></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<pre><code class="language-c">/* src/ae.h 暴露给上层的接口 */
+int  aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
+                       aeFileProc *proc, void *clientData);
+void aeDeleteFileEvent(aeEventLoop *eventLoop, int fd, int mask);
+int  aeProcessEvents(aeEventLoop *eventLoop, int flags);
+
+/* 各后端实现的私有接口 */
+static int  aeApiCreate(aeEventLoop *eventLoop);
+static int  aeApiAddEvent(aeEventLoop *eventLoop, int fd, int mask);
+static void aeApiDelEvent(aeEventLoop *eventLoop, int fd, int mask);
+static int  aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp);</code></pre>
+
+<div class="diagram">
+  <div class="diagram-title">表 20-7-2 · ae 上层接口 → 后端实现映射</div>
+  <table>
+    <thead><tr><th>接口</th><th>上层调用方</th><th>后端实现</th></tr></thead>
+    <tbody>
+      <tr><td><code>aeCreateFileEvent</code></td><td>networking.c(注册客户端读写)</td><td><code>aeApiAddEvent</code></td></tr>
+      <tr><td><code>aeDeleteFileEvent</code></td><td>networking.c(注销 fd)</td><td><code>aeApiDelEvent</code></td></tr>
+      <tr><td><code>aeProcessEvents</code></td><td>server.c 主循环</td><td><code>aeApiPoll</code></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<pre><code class="language-c">/* src/ae_epoll.c (简化) */
+typedef struct aeApiState {
+    int epfd;
+    struct epoll_event *events;
+} aeApiState;
+
+static int aeApiAddEvent(aeEventLoop *eventLoop, int fd, int mask) {
+    aeApiState *state = eventLoop-&gt;apidata;
+    struct epoll_event ee = {0};
+
+    int op = eventLoop-&gt;events[fd].mask == AE_NONE ?
+             EPOLL_CTL_ADD : EPOLL_CTL_MOD;
+
+    ee.events = 0;
+    int merged = mask | eventLoop-&gt;events[fd].mask;
+    if (merged &amp; AE_READABLE) ee.events |= EPOLLIN;
+    if (merged &amp; AE_WRITABLE) ee.events |= EPOLLOUT;
+    ee.data.fd = fd;
+
+    if (epoll_ctl(state-&gt;epfd, op, fd, &amp;ee) == -1) return -1;
+    return 0;
+}
+
+static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
+    aeApiState *state = eventLoop-&gt;apidata;
+    int retval, numevents = 0;
+
+    retval = epoll_wait(state-&gt;epfd, state-&gt;events, eventLoop-&gt;setsize,
+        tvp ? (tvp-&gt;tv_sec*1000 + (tvp-&gt;tv_usec + 999)/1000) : -1);
+    if (retval &gt; 0) {
+        numevents = retval;
+        for (int j = 0; j &lt; numevents; j++) {
+            int mask = 0;
+            struct epoll_event *e = state-&gt;events + j;
+            if (e-&gt;events &amp; EPOLLIN)  mask |= AE_READABLE;
+            if (e-&gt;events &amp; EPOLLOUT) mask |= AE_WRITABLE;
+            if (e-&gt;events &amp; EPOLLERR) mask |= AE_WRITABLE | AE_READABLE;
+            if (e-&gt;events &amp; EPOLLHUP) mask |= AE_WRITABLE | AE_READABLE;
+            eventLoop-&gt;fired[j].fd = e-&gt;data.fd;
+            eventLoop-&gt;fired[j].mask = mask;
+        }
+    }
+    return numevents;
+}</code></pre>
+
+<p><code>aeApiPoll</code> 将平台原生事件结构(<code>epoll_event</code>)转换为 ae 统一的 <code>aeFiredEvent</code> 结构,屏蔽了平台差异。<code>AE_READABLE</code> / <code>AE_WRITABLE</code> 是上层使用的统一掩码,各后端按各自语义映射。</p>
+
+<!-- ============================================================ -->
+<h2 id="s20-8">20.8 fd 容量与诊断</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">图 20-8-1 · 连接数的四层约束</div>
+  <svg viewBox="0 0 940 380" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="380" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="40"  y="14" width="200" height="60" rx="8" fill="url(#d-blue)"/>
+      <text x="140" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">L1 · 进程 fd 软上限</text>
+      <text x="140" y="50" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">ulimit -n</text>
+      <text x="140" y="65" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">默认 1024 / 生产 65535+</text>
+
+      <rect x="260" y="14" width="200" height="60" rx="8" fill="url(#d-purple)"/>
+      <text x="360" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">L2 · Redis 配置</text>
+      <text x="360" y="50" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">maxclients</text>
+      <text x="360" y="65" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">默认 10000</text>
+
+      <rect x="480" y="14" width="200" height="60" rx="8" fill="url(#d-orange)"/>
+      <text x="580" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">L3 · 系统全局 fd</text>
+      <text x="580" y="50" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">fs.file-max</text>
+      <text x="580" y="65" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">/proc/sys/fs/file-max</text>
+
+      <rect x="700" y="14" width="200" height="60" rx="8" fill="url(#d-green)"/>
+      <text x="800" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">L4 · 内核 socket 队列</text>
+      <text x="800" y="50" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">net.core.somaxconn</text>
+      <text x="800" y="65" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">accept 队列长度</text>
+
+      <path d="M140,74 L140,116" stroke="var(--diagram-blue-stroke)" stroke-width="2" marker-end="url(#d-arr-b)"/>
+      <path d="M360,74 L360,116" stroke="var(--diagram-purple-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <path d="M580,74 L580,116" stroke="var(--diagram-orange-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <path d="M800,74 L800,116" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+
+      <rect x="40" y="116" width="200" height="46" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="140" y="134" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10" font-weight="700">硬约束 — 进程级</text>
+      <text x="140" y="150" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">超过 → EMFILE 错误</text>
+
+      <rect x="260" y="116" width="200" height="46" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="360" y="134" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">应用配置上限</text>
+      <text x="360" y="150" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">超过 → -ERR max clients</text>
+
+      <rect x="480" y="116" width="200" height="46" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="580" y="134" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">系统总配额</text>
+      <text x="580" y="150" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">超过 → ENFILE 错误</text>
+
+      <rect x="700" y="116" width="200" height="46" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="800" y="134" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10" font-weight="700">accept 队列溢出</text>
+      <text x="800" y="150" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">客户端 RST / SYN drop</text>
+
+      <path d="M140,162 L450,200" stroke="var(--diagram-blue-stroke)" stroke-width="2" stroke-dasharray="3 3" marker-end="url(#d-arr)"/>
+      <path d="M360,162 L460,200" stroke="var(--diagram-purple-stroke)" stroke-width="2" stroke-dasharray="3 3" marker-end="url(#d-arr)"/>
+      <path d="M580,162 L490,200" stroke="var(--diagram-orange-stroke)" stroke-width="2" stroke-dasharray="3 3" marker-end="url(#d-arr)"/>
+      <path d="M800,162 L500,200" stroke="var(--diagram-green-stroke)" stroke-width="2" stroke-dasharray="3 3" marker-end="url(#d-arr-g)"/>
+
+      <rect x="280" y="200" width="380" height="56" rx="10" fill="url(#d-red)" filter="url(#d-shadow)"/>
+      <text x="470" y="222" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">实际可接受连接数 = min(L1, L2)</text>
+      <text x="470" y="240" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">且 L1 ≥ L2 + 32(AOF/RDB/cluster bus 预留)</text>
+      <text x="470" y="252" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">若 L1 不够,Redis 自动调低 L2 并打印 WARNING</text>
+
+      <rect x="40" y="276" width="860" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="470" y="294" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="800">生产配置三件套</text>
+      <text x="470" y="310" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">ulimit -n 65535 / maxclients 50000 / sysctl -w fs.file-max=2097152 / net.core.somaxconn=4096</text>
+
+      <rect x="40" y="328" width="860" height="40" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="470" y="346" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="800">诊断三步</text>
+      <text x="470" y="362" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">cat /proc/PID/limits → ss -s 看 socket 数 → INFO clients 看 connected_clients</text>
+    </g>
+  </svg>
+</div>
+
+<p>Redis 启动时执行 <code>adjustOpenFilesLimit()</code>,自动尝试将进程 fd 软上限调整到 <code>maxclients + 32</code>(预留 AOF / RDB / cluster bus / 监听 socket / pidfile / 日志)。若调整失败,Redis 会降低 <code>maxclients</code> 并打印警告。</p>
+
+<h3>20.8.1 fd 不足的三类症状</h3>
+
+<div class="warning">
+  <strong>症状 1 · 启动警告:</strong>
+<pre><code class="language-bash">$ redis-server redis.conf
+WARNING: You requested maxclients of 10000 requiring at least 10032 max
+file descriptors. Server can't set maximum open files to 10032 because
+of OS error: Operation not permitted. Current maximum open files is 1024.
+maxclients has been reduced to 992 to compensate for low ulimit.</code></pre>
+  → 立即修复:<code>ulimit -n 65535</code>,重启 Redis
+</div>
+
+<div class="warning">
+  <strong>症状 2 · 拒绝新连接:</strong>
+<pre><code class="language-bash">$ redis-cli ping
+Could not connect to Redis at 127.0.0.1:6379: Connection refused
+
+$ redis-cli -p 6379 INFO clients | grep connected
+connected_clients:9999  ← 接近 maxclients</code></pre>
+  → 不是 epoll 问题,是<strong>容量问题</strong>
+</div>
+
+<div class="warning">
+  <strong>症状 3 · accept 失败:</strong>
+<pre><code class="language-bash">Error accepting a client connection: errno=24 (Too many open files)</code></pre>
+  → <code>fs.file-max</code> 或 <code>ulimit</code> 不足
+</div>
+
+<pre><code class="language-bash"># 1. 确认事件循环后端
+redis-cli INFO server | grep -E 'multiplexing_api|tcp_port|process_id'
+
+# 2. 当前连接规模
+redis-cli INFO clients | grep -E \
+  'connected_clients|blocked_clients|client_recent_max'
+
+# 3. 容量配置
+redis-cli CONFIG GET 'maxclients'
+redis-cli CONFIG GET 'tcp-backlog'
+redis-cli CONFIG GET 'timeout'
+redis-cli CONFIG GET 'tcp-keepalive'
+
+# 4. 系统层 fd
+ulimit -n
+cat /proc/$(pidof redis-server)/limits | grep "open files"
+ls /proc/$(pidof redis-server)/fd | wc -l
+
+# 5. 网络层
+ss -tan state established '( sport = :6379 )' | wc -l
+ss -tan state listen '( sport = :6379 )'
+
+# 6. 慢命令是否影响事件循环
+redis-cli SLOWLOG GET 10</code></pre>
+
+<div class="diagram">
+  <div class="diagram-title">表 20-8-1 · 现象 → 优先排查方向</div>
+  <table>
+    <thead><tr><th>现象</th><th>优先排查方向</th></tr></thead>
+    <tbody>
+      <tr><td><code>connected_clients</code> 接近 <code>maxclients</code></td><td>容量或连接泄漏,与 epoll 无关</td></tr>
+      <tr><td><code>client_recent_max_output_buffer</code> 增长</td><td>慢消费者或大回复</td></tr>
+      <tr><td><code>blocked_clients &gt; 0</code></td><td>BLPOP/XREAD/WAIT 阻塞,与事件循环无关</td></tr>
+      <tr><td>SLOWLOG 频繁 O(N) 命令</td><td>命令复杂度问题,不是事件后端问题</td></tr>
+      <tr><td><code>multiplexing_api=select</code> 在 Linux</td><td>编译异常,排查构建环境</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s20-9">20.9 性能边界与基线</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">表 20-9-1 · 多路复用的性能贡献基线</div>
+  <table>
+    <thead><tr><th>测试场景</th><th>使用 epoll 主线程 CPU</th><th>模拟 select 主线程 CPU</th></tr></thead>
+    <tbody>
+      <tr><td>1000 空闲连接 + 10 活跃</td><td>~ 5%</td><td>~ 25%</td></tr>
+      <tr><td>10000 空闲连接 + 100 活跃</td><td>~ 8%</td><td>~ 60%</td></tr>
+    </tbody>
+  </table>
+  <p style="margin-top:8px"><em>基准:Redis 7.2, Linux NVMe, 单实例</em></p>
+</div>
+
+<p>epoll 的优势在<strong>"高总连接数 + 低活跃比例"</strong>场景最显著。所有连接都活跃的极端场景下,epoll 与 select 的差异较小,因为 select 需要扫描的 fd 与 epoll 需要返回的就绪 fd 数量相同。</p>
+
+<pre><code class="language-bash">$ redis-benchmark -c 1000 -n 1000000 -d 128 -t set,get -P 16
+SET:  186000.45 requests per second, p50=0.711 msec, p99=2.103 msec
+GET:  192450.12 requests per second, p50=0.682 msec, p99=1.944 msec</code></pre>
+
+<div class="diagram">
+  <div class="diagram-title">图 20-9-1 · benchmark 数字测量的完整路径</div>
+<svg class="svg-diagram" viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="bm-arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 z" fill="var(--diagram-blue-stroke)"/>
+    </marker>
+  </defs>
+
+  <!-- 标题 -->
+  <text x="460" y="28" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="14" font-weight="bold">benchmark 数字 = 完整路径耗时, 非 epoll 单独性能</text>
+
+  <!-- 路径流程图 (10 个环节横向 + 自动换行) -->
+  <g font-size="11" fill="var(--diagram-blue-text)">
+    <rect x="20"  y="55" width="105" height="40" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="72"  y="80" text-anchor="middle">客户端编码</text>
+    <path d="M125 75 L145 75" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#bm-arr)"/>
+
+    <rect x="150" y="55" width="125" height="40" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="212" y="80" text-anchor="middle">网络栈 (loopback)</text>
+    <path d="M275 75 L295 75" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#bm-arr)"/>
+
+    <rect x="300" y="55" width="125" height="40" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
+    <text x="362" y="73" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="bold">epoll_wait</text>
+    <text x="362" y="88" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">本章主角</text>
+    <path d="M425 75 L445 75" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#bm-arr)"/>
+
+    <rect x="450" y="55" width="160" height="40" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="530" y="80" text-anchor="middle">readQueryFromClient</text>
+    <path d="M610 75 L630 75" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#bm-arr)"/>
+
+    <rect x="635" y="55" width="115" height="40" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="692" y="80" text-anchor="middle">RESP 解析</text>
+    <path d="M750 75 L770 75" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#bm-arr)"/>
+
+    <rect x="775" y="55" width="125" height="40" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="837" y="80" text-anchor="middle">processCommand</text>
+
+    <!-- 换行向下 -->
+    <path d="M837 95 L837 125" stroke="var(--diagram-blue-stroke)" stroke-width="1.5"/>
+    <path d="M837 125 L20 125 L20 145" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#bm-arr)"/>
+
+    <rect x="20"  y="155" width="135" height="40" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="87"  y="180" text-anchor="middle">数据结构操作</text>
+    <path d="M155 175 L175 175" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#bm-arr)"/>
+
+    <rect x="180" y="155" width="150" height="40" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="255" y="173" text-anchor="middle">addReply</text>
+    <text x="255" y="188" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">输出缓冲</text>
+    <path d="M330 175 L350 175" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#bm-arr)"/>
+
+    <rect x="355" y="155" width="160" height="40" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="435" y="180" text-anchor="middle">sendReplyToClient</text>
+    <path d="M515 175 L535 175" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#bm-arr)"/>
+
+    <rect x="540" y="155" width="115" height="40" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="597" y="180" text-anchor="middle">客户端解析</text>
+  </g>
+
+  <!-- 结论框 -->
+  <rect x="20" y="225" width="430" height="120" rx="8" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+  <text x="35" y="248" fill="var(--diagram-green-text)" font-size="13" font-weight="bold">Pipeline 视角</text>
+  <text x="35" y="270" fill="var(--diagram-blue-text)" font-size="12"><tspan font-family="ui-monospace, monospace">pipeline=16</tspan> 时一次 epoll_wait 处理 16 条命令</text>
+  <text x="35" y="290" fill="var(--diagram-blue-text)" font-size="12">实际 epoll_wait 次数 = <tspan font-family="ui-monospace, monospace" fill="var(--diagram-green-text)">ops / 16</tspan></text>
+  <text x="35" y="318" fill="var(--diagram-green-text)" font-size="12" font-weight="bold">→ epoll 几乎不占主线程时间</text>
+
+  <rect x="470" y="225" width="430" height="120" rx="8" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+  <text x="485" y="248" fill="var(--diagram-red-text)" font-size="13" font-weight="bold">真实瓶颈所在</text>
+  <text x="485" y="270" fill="var(--diagram-blue-text)" font-size="12">• epoll 本身可处理<tspan font-weight="700">百万级 ops</tspan> 事件分发</text>
+  <text x="485" y="290" fill="var(--diagram-blue-text)" font-size="12">• 瓶颈通常在 <tspan font-family="ui-monospace, monospace" fill="var(--diagram-orange-text)">processCommand</tspan> / 网络 / 输出缓冲</text>
+  <text x="485" y="318" fill="var(--diagram-red-text)" font-size="12" font-weight="bold">→ bench 数字 ≠ epoll 上限</text>
+</svg>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">表 20-9-2 · 何时多路复用是瓶颈</div>
+  <table>
+    <thead><tr><th>现象</th><th>是多路复用瓶颈?</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>总连接数 &lt; 1000,延迟高</td><td>否</td><td>检查命令、网络、客户端</td></tr>
+      <tr><td>总连接数 10000+,CPU 100% 在 select</td><td><strong>是</strong></td><td>升级到 epoll/kqueue</td></tr>
+      <tr><td>大量 BLPOP/XREAD 阻塞客户端</td><td>否</td><td>阻塞命令独立路径</td></tr>
+      <tr><td>tcp-keepalive = 0</td><td>间接相关</td><td>死连接占 fd,但不影响 epoll 性能</td></tr>
+      <tr><td>CPU 高且 connected_clients 稳定</td><td>否</td><td>命令路径或数据结构问题</td></tr>
+      <tr><td>频繁 epoll_ctl ADD/DEL</td><td>罕见</td><td>短连接场景,长连接复用可缓解</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="real-world">
+  多路复用在 Redis 中是<strong>"就绪 fd 通知"机制</strong>,其性能上限远高于命令执行上限。<strong>绝大多数生产性能问题不在多路复用层</strong>,而在命令执行 / 网络栈 / 输出缓冲。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s20-10">20.10 源码深潜</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">图 20-10-1 · 从 accept 到命令执行的完整调用链</div>
+  <svg viewBox="0 0 940 620" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="620" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-monospace,Consolas">
+      <rect x="20"  y="14" width="160" height="32" rx="6" fill="url(#d-orange)"/>
+      <text x="100" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">内核 epoll</text>
+      <line x1="100" y1="46" x2="100" y2="610" stroke="var(--diagram-orange-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="200" y="14" width="160" height="32" rx="6" fill="url(#d-purple)"/>
+      <text x="280" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">ae.c 事件循环</text>
+      <line x1="280" y1="46" x2="280" y2="610" stroke="var(--diagram-purple-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="380" y="14" width="160" height="32" rx="6" fill="url(#d-blue)"/>
+      <text x="460" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">networking.c</text>
+      <line x1="460" y1="46" x2="460" y2="610" stroke="var(--diagram-blue-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="560" y="14" width="160" height="32" rx="6" fill="url(#d-red)"/>
+      <text x="640" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">server.c / 命令</text>
+      <line x1="640" y1="46" x2="640" y2="610" stroke="var(--diagram-red-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="740" y="14" width="180" height="32" rx="6" fill="url(#d-green)"/>
+      <text x="830" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">数据结构 dict/...</text>
+      <line x1="830" y1="46" x2="830" y2="610" stroke="var(--diagram-green-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="20" y="62" width="900" height="22" rx="4" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="470" y="78" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">阶段 1 · 客户端 connect 到来</text>
+
+      <path d="M105,104 L275,104" stroke="var(--diagram-orange-stroke)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#d-arr)"/>
+      <text x="190" y="98" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">① listen_fd 就绪</text>
+
+      <path d="M285,128 L455,128" stroke="var(--diagram-purple-stroke)" stroke-width="2" marker-end="url(#d-arr-b)"/>
+      <text x="370" y="122" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">② acceptTcpHandler</text>
+
+      <path d="M455,152 C 425,152 425,170 455,170" stroke="var(--diagram-blue-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-b)"/>
+      <text x="370" y="164" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">③ anetTcpAccept</text>
+
+      <path d="M455,196 C 425,196 425,214 455,214" stroke="var(--diagram-blue-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-b)"/>
+      <text x="370" y="208" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">④ createClient(client_fd)</text>
+
+      <path d="M455,238 L285,238" stroke="var(--diagram-blue-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <text x="370" y="232" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">⑤ aeCreateFileEvent + readQueryFromClient</text>
+
+      <path d="M275,262 L105,262" stroke="var(--diagram-purple-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <text x="190" y="256" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">⑥ epoll_ctl ADD client_fd</text>
+
+      <rect x="20" y="282" width="900" height="22" rx="4" fill="var(--diagram-red-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="470" y="298" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">阶段 2 · 客户端发送命令字节</text>
+
+      <path d="M105,322 L275,322" stroke="var(--diagram-orange-stroke)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#d-arr)"/>
+      <text x="190" y="316" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">⑦ client_fd 可读</text>
+
+      <path d="M285,346 L455,346" stroke="var(--diagram-purple-stroke)" stroke-width="2" marker-end="url(#d-arr-b)"/>
+      <text x="370" y="340" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">⑧ readQueryFromClient</text>
+
+      <path d="M455,370 C 425,370 425,388 455,388" stroke="var(--diagram-blue-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-b)"/>
+      <text x="370" y="382" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">⑨ read → querybuf</text>
+
+      <path d="M455,412 C 425,412 425,430 455,430" stroke="var(--diagram-blue-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-b)"/>
+      <text x="370" y="424" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">⑩ processInputBuffer + RESP 解析</text>
+
+      <path d="M465,454 L635,454" stroke="var(--diagram-red-stroke)" stroke-width="2" marker-end="url(#d-arr-r)"/>
+      <text x="550" y="448" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">⑪ processCommand</text>
+
+      <path d="M645,478 L825,478" stroke="var(--diagram-red-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+      <text x="735" y="472" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">⑫ 调用 t_string.c 等命令实现</text>
+
+      <path d="M825,502 L645,502" stroke="var(--diagram-green-stroke)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#d-arr-r)"/>
+      <text x="735" y="496" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">⑬ 返回结果</text>
+
+      <path d="M635,526 L465,526" stroke="var(--diagram-red-stroke)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#d-arr-b)"/>
+      <text x="550" y="520" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">⑭ addReply(client, result)</text>
+
+      <rect x="20" y="544" width="900" height="22" rx="4" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="470" y="560" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10" font-weight="700">阶段 3 · beforeSleep 合并写 → fd 可写时回写 socket</text>
+
+      <path d="M455,584 L105,584" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+      <text x="280" y="578" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10" font-weight="700">⑮ sendReplyToClient → write(client_fd, reply)</text>
+
+      <rect x="20" y="594" width="900" height="20" rx="4" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="470" y="608" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10" font-weight="800">★ 整条链路 ⑪⑫⑬⑭ 都在主线程串行,这是 Redis 单线程的保证</text>
+    </g>
+  </svg>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">表 20-10-1 · 核心源码入口</div>
+  <table>
+    <thead><tr><th>文件</th><th>关键函数</th><th>运行时职责</th></tr></thead>
+    <tbody>
+      <tr><td><code>src/ae.c</code></td><td><code>aeCreateEventLoop</code></td><td>创建事件循环结构</td></tr>
+      <tr><td><code>src/ae.c</code></td><td><code>aeCreateFileEvent</code></td><td>注册文件事件,转发至 aeApiAddEvent</td></tr>
+      <tr><td><code>src/ae.c</code></td><td><code>aeProcessEvents</code></td><td>主循环单次迭代,调用 aeApiPoll</td></tr>
+      <tr><td><code>src/ae.c</code></td><td><code>aeMain</code></td><td>主循环入口,server.c 调用</td></tr>
+      <tr><td><code>src/ae_epoll.c</code></td><td><code>aeApiCreate</code></td><td>epoll_create1 + 分配 events 数组</td></tr>
+      <tr><td><code>src/ae_epoll.c</code></td><td><code>aeApiAddEvent</code></td><td>epoll_ctl ADD/MOD</td></tr>
+      <tr><td><code>src/ae_epoll.c</code></td><td><code>aeApiPoll</code></td><td>epoll_wait + 转换为 aeFiredEvent</td></tr>
+      <tr><td><code>src/networking.c</code></td><td><code>acceptTcpHandler</code></td><td>处理 listen fd 就绪,接受新连接</td></tr>
+      <tr><td><code>src/networking.c</code></td><td><code>readQueryFromClient</code></td><td>客户端读事件回调</td></tr>
+      <tr><td><code>src/networking.c</code></td><td><code>sendReplyToClient</code></td><td>客户端写事件回调</td></tr>
+      <tr><td><code>src/server.c</code></td><td><code>beforeSleep</code></td><td>事件循环前的预处理</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<pre><code class="language-c">/* src/server.c: aeMain 主循环 */
+void aeMain(aeEventLoop *eventLoop) {
+    eventLoop-&gt;stop = 0;
+    while (!eventLoop-&gt;stop) {
+        aeProcessEvents(eventLoop, AE_ALL_EVENTS|
+                                    AE_CALL_BEFORE_SLEEP|
+                                    AE_CALL_AFTER_SLEEP);
+    }
+}
+
+/* src/ae.c: aeProcessEvents 单次迭代 */
+int aeProcessEvents(aeEventLoop *eventLoop, int flags) {
+    int processed = 0, numevents;
+
+    if (eventLoop-&gt;beforesleep != NULL &amp;&amp; flags &amp; AE_CALL_BEFORE_SLEEP)
+        eventLoop-&gt;beforesleep(eventLoop);
+
+    numevents = aeApiPoll(eventLoop, tvp);
+
+    if (eventLoop-&gt;aftersleep != NULL &amp;&amp; flags &amp; AE_CALL_AFTER_SLEEP)
+        eventLoop-&gt;aftersleep(eventLoop);
+
+    for (int j = 0; j &lt; numevents; j++) {
+        aeFileEvent *fe = &amp;eventLoop-&gt;events[eventLoop-&gt;fired[j].fd];
+        int mask = eventLoop-&gt;fired[j].mask;
+        int fd = eventLoop-&gt;fired[j].fd;
+
+        if (fe-&gt;mask &amp; mask &amp; AE_READABLE) {
+            fe-&gt;rfileProc(eventLoop, fd, fe-&gt;clientData, mask);
+        }
+        if (fe-&gt;mask &amp; mask &amp; AE_WRITABLE) {
+            fe-&gt;wfileProc(eventLoop, fd, fe-&gt;clientData, mask);
+        }
+        processed++;
+    }
+
+    return processed;
+}</code></pre>
+
+<h3>20.10.1 设计取舍</h3>
+
+<div class="key-insight">
+  <strong>抽象层的代价与收益:</strong> Redis 选择 ae 抽象层的根本原因是<strong>平台中立性</strong>。Linux 的 epoll、BSD/macOS 的 kqueue、Solaris 的 evport 在 API 形态、事件语义、错误处理上各有差异,但本质都是 Reactor 模型。<code>ae.c</code> 提供统一的 <code>aeCreateFileEvent</code> / <code>aeApiPoll</code> 抽象,上层 networking.c 与 server.c 完全不感知后端,代价是抽象层引入了一次函数调用开销(<code>aeApiPoll</code> 内部转换事件结构)。该开销相对系统调用与命令执行<strong>可忽略</strong>。
+</div>
+
+<p><strong>LT 优于 ET 的选择依据是命令处理的可中断性。</strong>命令执行需要让出主线程以处理时间事件、AOF flush、cluster bus 等其他任务,事件回调内不应 drain 全部数据。LT 模式下 <code>readQueryFromClient</code> 处理一批数据后退出,下次循环继续,自然契合事件循环的轮转模型。ET 强制 drain 至 EAGAIN,违背该模型。</p>
+
+<p><strong>I/O 多线程(Redis 6+)将网络 I/O 卸载到辅助线程,但命令执行仍保持单线程串行</strong>,这一选择维持了数据结构无并发安全保证的约束。Proactor 模型(IOCP / io_uring)的 I/O 完成回调在任意线程触发,与 Redis 命令串行化不兼容,因此不进入 ae 主线。</p>
+
+<!-- ============================================================ -->
+<h2 id="s20-summary">20.11 本章要点</h2>
+<!-- ============================================================ -->
+
+<div class="chapter-summary">
+
+<div class="diagram">
+  <div class="diagram-title">表 20-11-1 · I/O 多路复用关键事实</div>
+  <table>
+    <thead><tr><th>#</th><th>要点</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>I/O 多路复用解决"等待 I/O 的成本随连接数增长"问题,使主线程 CPU 仅与活跃连接数相关</td></tr>
+      <tr><td>2</td><td>select 的开销 O(N) 来自 bitmap 全量拷贝与扫描,FD_SETSIZE 上限通常 1024</td></tr>
+      <tr><td>3</td><td>poll 取消 fd 上限,但仍是 O(N) 内核扫描与用户遍历,Redis 主线 ae 不使用 poll</td></tr>
+      <tr><td>4</td><td>epoll 通过红黑树兴趣集合 + 就绪链表,将事件等待复杂度降至 O(ready),与总连接数无关</td></tr>
+      <tr><td>5</td><td>LT 缓冲非空持续通知,ET 仅在状态变化时通知一次,Redis 默认 LT 以契合事件回调可中断模型</td></tr>
+      <tr><td>6</td><td>kqueue 通过 filter 抽象统一处理 fd / 进程 / 信号 / 定时器多类事件,evport 是 Solaris 等价物</td></tr>
+      <tr><td>7</td><td>Reactor 模型(epoll/kqueue)与 Proactor 模型(IOCP/io_uring)的根本区别在于回调时机与命令串行化兼容性</td></tr>
+      <tr><td>8</td><td><code>multiplexing_api</code> 是诊断网络性能的第一确认项,Linux 上 select 通常意味着编译异常</td></tr>
+      <tr><td>9</td><td><code>maxclients + 32</code> 是 Redis 启动时尝试的 fd 软上限,系统 ulimit 必须高于该值</td></tr>
+      <tr><td>10</td><td>多路复用是事件分发机制,绝大多数生产性能问题不在 ae 层,而在命令执行 / 网络栈 / 输出缓冲</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>20.11.1 下一章预告</h3>
+
+<p>第 21 章 RESP 协议将分析 Redis 客户端-服务器之间的<strong>线协议</strong>:Inline 命令格式、Multi-Bulk 命令格式、5 类回复(简单字符串/错误/整数/批量字符串/数组)、RESP3 引入的 Map / Set / Push / Big Number / Verbatim String 等新类型,以及 <code>processInputBuffer</code> 状态机如何在 ae 事件回调中增量解析。该协议是 ae 事件回调中 <code>readQueryFromClient</code> 与 <code>sendReplyToClient</code> 处理的<strong>实际数据格式</strong>。</p>
+
+</div><!-- /chapter-summary -->
+
+</div><!-- /article -->
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script>
+  hljs.highlightAll();
+</script>
+
+</body>
+</html>

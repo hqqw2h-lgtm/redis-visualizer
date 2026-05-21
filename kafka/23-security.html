@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.23 安全体系 — 图解 Kafka</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Kafka</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="22-kafka-streams.html">上一章</a>
+  <a href="24-elr.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s23-0">23.0 章首速览</a>
+  <a href="#s23-1">23.1 四层安全模型</a>
+  <a href="#s23-2">23.2 Listener 隔离</a>
+  <a href="#s23-3">23.3 TLS 加密</a>
+  <a href="#s23-4">23.4 SASL 认证</a>
+  <a href="#s23-5">23.5 ACL 授权</a>
+  <a href="#s23-6">23.6 Audit 审计</a>
+  <a href="#s23-7">23.7 证书轮换</a>
+  <a href="#s23-8">23.8 性能影响</a>
+  <a href="#s23-9">23.9 反例与排障</a>
+  <a href="#s23-summary">23.10 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 23 章 · 安全体系</h1>
+<p class="subtitle">TLS · SASL/SCRAM · mTLS · OAUTHBEARER · ACL · StandardAuthorizer · Audit · Listener 隔离 · 证书轮换</p>
+
+<div class="chapter-intro">
+  <p class="lead">"<em>Kafka 集群对内网开放</em>" — 这句话在生产事故复盘里出现得太多了。一个不开认证的 Kafka 集群,任何能 ping 通 9092 的进程都能 produce / consume / 删 topic。Kafka 的安全不是"<em>能连上</em>",而是每一次连接、读写、管理操作都能回答四个问题:<strong>是谁、从哪里来、能不能做、做了什么</strong>。这四件事分别对应:认证(Authentication)、网络层访问控制、授权(Authorization)、审计(Audit)。</p>
+  <p>本章按"威胁模型 → 四层安全 → Listener 隔离 → TLS → SASL → ACL → Audit → 证书轮换 → 性能 → 反例"组织,对应 Apache Kafka 3.7 的 <code>StandardAuthorizer</code>、<code>SaslServerAuthenticator</code>、<code>SslTransportLayer</code> 实现。生产部署的目标是"<em>每一层都可独立验证</em>"。</p>
+  <ul class="will-learn">
+    <li>四层安全:加密 / 认证 / 授权 / 审计</li>
+    <li>Listener 隔离 — INTERNAL/EXTERNAL/CONTROLLER 各走不同协议</li>
+    <li>TLS 协议(传输加密 + 可选 mTLS)</li>
+    <li>SASL 四种机制:PLAIN / SCRAM-SHA-256 / GSSAPI(Kerberos) / OAUTHBEARER</li>
+    <li>StandardAuthorizer + ACL 资源模型(Topic / Group / Cluster / TransactionalId)</li>
+    <li>"<em>默认拒绝</em>" vs "<em>默认放行</em>" 的安全含义</li>
+    <li>证书/密码轮换的具体步骤</li>
+    <li>SSL CPU 飙升 + 如何卸载到 LB</li>
+  </ul>
+  <p class="prereq">TLS 1.3 基础;Kerberos / OAuth 概念;RBAC vs ABAC;基本网络安全(防火墙、零信任);第 15 章 SocketServer / Listener。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s23-0">23.0 章首速览</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">图 23-0 · Kafka 安全请求链路</div>
+<svg viewBox="0 0 900 360" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="360" fill="#0f172a" rx="8"/>
+
+  <rect x="20" y="150" width="140" height="60" rx="8" fill="url(#g-purple)"/>
+  <text x="90" y="178" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">Client</text>
+  <text x="90" y="195" text-anchor="middle" fill="#e9d5ff" font-size="10">producer/consumer/admin</text>
+
+  <rect x="190" y="150" width="140" height="60" rx="8" fill="url(#g-blue)"/>
+  <text x="260" y="178" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">① TLS Handshake</text>
+  <text x="260" y="195" text-anchor="middle" fill="#dbeafe" font-size="10">encrypt + opt mTLS</text>
+
+  <rect x="360" y="150" width="140" height="60" rx="8" fill="url(#g-orange)"/>
+  <text x="430" y="178" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">② SASL Auth</text>
+  <text x="430" y="195" text-anchor="middle" fill="#fef3c7" font-size="10">principal=User:abc</text>
+
+  <rect x="530" y="150" width="140" height="60" rx="8" fill="url(#g-red)"/>
+  <text x="600" y="178" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">③ Authorizer</text>
+  <text x="600" y="195" text-anchor="middle" fill="#fecaca" font-size="10">StandardAuthorizer</text>
+
+  <rect x="700" y="100" width="180" height="50" rx="8" fill="url(#g-green)"/>
+  <text x="790" y="125" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">ALLOWED → handle</text>
+  <text x="790" y="142" text-anchor="middle" fill="#dcfce7" font-size="10">Produce / Fetch / Admin</text>
+
+  <rect x="700" y="210" width="180" height="50" rx="8" fill="url(#g-red)"/>
+  <text x="790" y="235" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">DENIED → reject</text>
+  <text x="790" y="252" text-anchor="middle" fill="#fecaca" font-size="10">AuthorizationException</text>
+
+  <rect x="300" y="280" width="300" height="50" rx="8" fill="#0d1117" stroke="#94a3b8"/>
+  <text x="450" y="305" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">④ Audit logger</text>
+  <text x="450" y="322" text-anchor="middle" fill="#cbd5e1" font-size="10">每次决策落 SIEM</text>
+
+  <path d="M160 180 L190 180" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M330 180 L360 180" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M500 180 L530 180" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M670 170 L700 125" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M670 190 L700 235" stroke="#ef4444" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M600 210 L450 280" stroke="#94a3b8" stroke-width="1.5" fill="none" marker-end="url(#arr)" stroke-dasharray="3 3"/>
+</svg>
+</div>
+
+<table>
+  <thead><tr><th>层</th><th>解决</th><th>机制</th><th>验收</th></tr></thead>
+  <tbody>
+    <tr><td>加密</td><td>传输被窃听/篡改</td><td>TLS/SSL</td><td>抓包看不到明文</td></tr>
+    <tr><td>认证</td><td>客户端伪装</td><td>SASL / mTLS</td><td>broker 日志能看到稳定 principal</td></tr>
+    <tr><td>授权</td><td>合法用户越权</td><td>ACL / StandardAuthorizer</td><td>无 ACL 时默认拒绝</td></tr>
+    <tr><td>审计</td><td>事后无法追责</td><td>authorizer logger + SIEM</td><td>按 principal 搜索 ALLOWED/DENIED</td></tr>
+  </tbody>
+</table>
+
+<div class="diagram">
+  <div class="diagram-title">图 23-0-1 · 三句话</div>
+<pre><code>1 TLS 解决"看不到", SASL 解决"我是谁"
+  ACL 解决"能不能做", Audit 解决"做了什么"
+  四件事缺一不可
+
+2 默认拒绝是生产安全的可见失败
+  default allow 是把漏配变成静默安全洞
+  allow.everyone.if.no.acl.found=false 是底线
+
+3 DENY 只做应急封禁
+  长期用 DENY 维护例外会让权限模型不可推理
+  最小 ALLOW + 网络隔离才是生产基线</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s23-1">23.1 四层安全模型</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>威胁</th><th>对策层</th><th>落地配置</th></tr></thead>
+  <tbody>
+    <tr><td>中间人嗅探</td><td>加密</td><td><code>SASL_SSL</code> listener + 公司 CA</td></tr>
+    <tr><td>客户端伪装</td><td>认证</td><td>SASL/SCRAM、mTLS、OAUTHBEARER + JWT</td></tr>
+    <tr><td>横向越权</td><td>授权</td><td>StandardAuthorizer + 最小 ALLOW</td></tr>
+    <tr><td>内部威胁</td><td>审计</td><td>authorizer logger 集中采集,90+ 天</td></tr>
+    <tr><td>凭据泄露</td><td>轮换</td><td>证书 + SCRAM 密码 + OAuth key 周期性轮换</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s23-2">23.2 Listener 隔离</h2>
+<!-- ============================================================ -->
+
+<p>把不同流量走<em>不同 listener</em>,各 listener 配不同安全协议。这是 Kafka 最简单也最有效的隔离手段。</p>
+
+<pre><code class="language-bash">listeners=INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:9093,CONTROLLER://0.0.0.0:9094
+listener.security.protocol.map=INTERNAL:SASL_PLAINTEXT,EXTERNAL:SASL_SSL,CONTROLLER:SSL
+inter.broker.listener.name=INTERNAL
+controller.listener.names=CONTROLLER
+advertised.listeners=INTERNAL://broker-1.internal:9092,EXTERNAL://kafka.company.com:9093</code></pre>
+
+<table>
+  <thead><tr><th>Listener</th><th>协议</th><th>用途</th></tr></thead>
+  <tbody>
+    <tr><td>INTERNAL</td><td>SASL_PLAINTEXT</td><td>broker 间 + follower fetch(同 VPC,信任网络)</td></tr>
+    <tr><td>EXTERNAL</td><td>SASL_SSL</td><td>外部 client(需要 TLS + 认证)</td></tr>
+    <tr><td>CONTROLLER</td><td>SSL(+ mTLS)</td><td>KRaft 控制面(最敏感,锁死)</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s23-3">23.3 TLS 加密</h2>
+<!-- ============================================================ -->
+
+<pre><code class="language-bash"># broker 端
+listeners=EXTERNAL://0.0.0.0:9093
+listener.security.protocol.map=EXTERNAL:SSL
+ssl.keystore.location=/etc/kafka/ssl/server.keystore.jks
+ssl.keystore.password=...
+ssl.key.password=...
+ssl.truststore.location=/etc/kafka/ssl/server.truststore.jks
+ssl.truststore.password=...
+ssl.client.auth=required          # mTLS, 强制客户端证书
+ssl.enabled.protocols=TLSv1.3,TLSv1.2
+ssl.cipher.suites=TLS_AES_128_GCM_SHA256,TLS_AES_256_GCM_SHA384</code></pre>
+
+<div class="warning">
+TLS 握手在 Network Thread 上做,会消耗 CPU(参见 15 章 SSL 握手生产惨案)。生产场景:① 长连接复用减少握手次数;② 在 LB 层卸载 TLS;③ 适当增加 <code>num.network.threads</code>。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s23-4">23.4 SASL 认证</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>机制</th><th>含义</th><th>适合</th></tr></thead>
+  <tbody>
+    <tr><td>SASL/PLAIN</td><td>用户名密码明文(需要 SSL 配合)</td><td>简单场景,与 LDAP 集成</td></tr>
+    <tr><td>SASL/SCRAM-SHA-256</td><td>挑战-响应,密码哈希</td><td>无外部依赖,生产推荐</td></tr>
+    <tr><td>SASL/GSSAPI(Kerberos)</td><td>Kerberos ticket</td><td>已有 Kerberos 基础设施</td></tr>
+    <tr><td>SASL/OAUTHBEARER</td><td>OAuth2 JWT</td><td>云原生,与 IdP 集成</td></tr>
+    <tr><td>mTLS</td><td>客户端证书</td><td>服务间,无密码</td></tr>
+  </tbody>
+</table>
+
+<h3>SCRAM 配置(生产最常用)</h3>
+
+<pre><code class="language-bash"># broker
+sasl.enabled.mechanisms=SCRAM-SHA-256
+sasl.mechanism.inter.broker.protocol=SCRAM-SHA-256
+listener.security.protocol.map=EXTERNAL:SASL_SSL
+
+# 添加用户
+kafka-configs --bootstrap-server ... --alter \
+  --add-config 'SCRAM-SHA-256=[password=secret123]' \
+  --entity-type users --entity-name order-svc
+
+# 客户端
+sasl.mechanism=SCRAM-SHA-256
+sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required \
+  username="order-svc" password="secret123";
+security.protocol=SASL_SSL</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s23-5">23.5 ACL 授权</h2>
+<!-- ============================================================ -->
+
+<p>Kafka 4.x 后默认 Authorizer 是 <code>StandardAuthorizer</code>(KRaft 原生,ACL 存在 metadata 里)。Kafka 3.x ZK 版用 <code>AclAuthorizer</code>。</p>
+
+<table>
+  <thead><tr><th>资源</th><th>操作</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td>Topic</td><td>Read / Write / Create / Delete / Alter / Describe / DescribeConfigs / AlterConfigs</td><td>主要业务资源</td></tr>
+    <tr><td>Group</td><td>Read(consume)/ Describe / Delete</td><td>Consumer Group</td></tr>
+    <tr><td>Cluster</td><td>Create / Alter / Describe / IdempotentWrite / ClusterAction(broker 间)</td><td>集群级</td></tr>
+    <tr><td>TransactionalId</td><td>Write / Describe</td><td>EOS 事务</td></tr>
+    <tr><td>DelegationToken</td><td>Describe</td><td>委托认证</td></tr>
+  </tbody>
+</table>
+
+<pre><code class="language-bash"># 给 order-svc 配 Produce + Consume 权限
+kafka-acls --bootstrap-server ... --add \
+  --allow-principal User:order-svc \
+  --operation Write --topic orders
+
+kafka-acls --bootstrap-server ... --add \
+  --allow-principal User:order-svc \
+  --operation Read --topic orders \
+  --operation Read --group order-consumer-group
+
+# 通配符
+kafka-acls --bootstrap-server ... --add \
+  --allow-principal User:metrics-collector \
+  --operation Describe --topic '*'</code></pre>
+
+<div class="key-insight">
+<strong>默认拒绝</strong>:配 <code>allow.everyone.if.no.acl.found=false</code>(Kafka 4.x 默认)。这样未授权操作会立即报错(可见的失败),而不是默默放行(静默漏洞)。生产环境绝不打开 default allow。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s23-6">23.6 Audit 审计</h2>
+<!-- ============================================================ -->
+
+<pre><code class="language-xml">&lt;!-- log4j2.xml --&gt;
+&lt;Logger name="kafka.authorizer.logger" level="INFO" additivity="false"&gt;
+  &lt;AppenderRef ref="authorizerAppender"/&gt;
+&lt;/Logger&gt;
+&lt;Appender name="authorizerAppender" type="File"
+          fileName="${kafka.logs.dir}/kafka-authorizer.log"&gt;
+  &lt;PatternLayout pattern="[%d] %p %m (%c)%n"/&gt;
+&lt;/Appender&gt;</code></pre>
+
+<p>每次 ALLOWED / DENIED 都会打到这个 logger。生产场景把它接到 SIEM(Splunk / ELK / Datadog),保留 90+ 天用于合规审计。</p>
+
+<!-- ============================================================ -->
+<h2 id="s23-7">23.7 证书轮换</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">图 23-7 · 滚动证书轮换</div>
+<svg viewBox="0 0 900 280" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="280" fill="#0f172a" rx="8"/>
+
+  <g font-size="11">
+    <rect x="40" y="40" width="180" height="60" rx="8" fill="url(#g-purple)"/>
+    <text x="130" y="65" text-anchor="middle" fill="#fff" font-weight="700">① 准备新 CA + 新证书</text>
+    <text x="130" y="85" text-anchor="middle" fill="#e9d5ff">不影响现网</text>
+
+    <rect x="240" y="40" width="180" height="60" rx="8" fill="url(#g-blue)"/>
+    <text x="330" y="65" text-anchor="middle" fill="#fff" font-weight="700">② 滚动 truststore</text>
+    <text x="330" y="85" text-anchor="middle" fill="#dbeafe">新旧 CA 都信任</text>
+
+    <rect x="440" y="40" width="180" height="60" rx="8" fill="url(#g-orange)"/>
+    <text x="530" y="65" text-anchor="middle" fill="#fff" font-weight="700">③ 滚动 keystore</text>
+    <text x="530" y="85" text-anchor="middle" fill="#fef3c7">broker 用新证书</text>
+
+    <rect x="640" y="40" width="220" height="60" rx="8" fill="url(#g-green)"/>
+    <text x="750" y="65" text-anchor="middle" fill="#fff" font-weight="700">④ 客户端切证书</text>
+    <text x="750" y="85" text-anchor="middle" fill="#dcfce7">应用滚动</text>
+
+    <rect x="240" y="150" width="180" height="60" rx="8" fill="url(#g-red)"/>
+    <text x="330" y="175" text-anchor="middle" fill="#fff" font-weight="700">⑤ 撤旧 CA</text>
+    <text x="330" y="195" text-anchor="middle" fill="#fecaca">truststore 不再信任</text>
+  </g>
+
+  <path d="M220 70 L240 70" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M420 70 L440 70" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M620 70 L640 70" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M750 100 Q500 130 330 150" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+  <text x="450" y="250" text-anchor="middle" fill="#fbbf24" font-size="12" font-weight="700">关键:第 2 步要让两 CA 同时被信任,否则会有窗口期客户端连不上</text>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s23-8">23.8 性能影响</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>项</th><th>影响</th></tr></thead>
+  <tbody>
+    <tr><td>TLS 1.3 握手</td><td>RTT 1 次(比 TLS 1.2 少一次),CPU 主要在密钥协商</td></tr>
+    <tr><td>SSL 数据帧</td><td>AES-GCM 硬件加速,CPU 影响 5-15%</td></tr>
+    <tr><td>SSL 失效 sendfile</td><td>fetch CPU 翻倍,吞吐降 30-50%</td></tr>
+    <tr><td>SCRAM 认证</td><td>每连接一次,可忽略</td></tr>
+    <tr><td>ACL 查询</td><td>StandardAuthorizer 内存哈希,sub-μs</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s23-9">23.9 反例与排障</h2>
+<!-- ============================================================ -->
+
+<pre><code>反例 1: "allow.everyone.if.no.acl.found=true"
+  现象: 漏配 topic 的 ACL → 所有人能读写
+  修复: 改成 false, 现网逐 topic 补 ACL
+
+反例 2: "用 DENY 当封禁"
+  现象: 几百条 ACL 包含 DENY, 权限不可推理
+  修复: 删除 DENY, 改用 ALLOW 显式列举
+
+反例 3: "证书过期才发现"
+  现象: ssl handshake error 突然爆
+  修复: 监控 cert expiration, 提前 90 天告警
+
+反例 4: "INTERNAL listener 也走 SSL"
+  现象: broker 间 SSL CPU 飙
+  修复: 内网 listener 用 PLAINTEXT (信任网络)</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s23-summary">23.10 本章要点</h2>
+<!-- ============================================================ -->
+
+<div class="chapter-summary">
+  <h3>本章小结</h3>
+  <p>Kafka 安全是一个"<em>四层栈</em>" — 缺任何一层都不算"<em>安全集群</em>"。<strong>加密</strong>用 TLS,<strong>认证</strong>用 SASL/SCRAM 或 mTLS,<strong>授权</strong>用 StandardAuthorizer + ACL,<strong>审计</strong>用 authorizer logger + SIEM。生产实践三条铁律:① 默认拒绝(<code>allow.everyone.if.no.acl.found=false</code>);② DENY 只做应急封禁,长期用 ALLOW;③ Listener 隔离 — INTERNAL 走 PLAINTEXT(内网信任),EXTERNAL 走 SASL_SSL,CONTROLLER 锁死 mTLS。下一章我们看 <strong>Eligible Leader Replicas (ELR)</strong>,这是 KIP-966 引入的、解决"<em>unclean leader election 数据丢失</em>"的新机制。</p>
+</div>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script>hljs.highlightAll();</script>
+
+</body>
+</html>

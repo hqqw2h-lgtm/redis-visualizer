@@ -1,0 +1,1861 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 23 章 · Spring Security 过滤器链 — 图解 Spring Boot</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="g-blue" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1e3a8a"/><stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="g-green" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#14532d"/><stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="g-orange" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7c2d12"/><stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="g-red" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7f1d1d"/><stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="g-purple" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4c1d95"/><stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8b949e"/>
+    </marker>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Spring Boot</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="ch22-jms.html">上一章 ch22-jms</a>
+  <a href="ch24-email.html">下一章 ch24-email</a>
+</nav>
+
+<aside class="toc">
+<a href="#23.1-servlet-filter-桥接到-spring-security">23.1 Servlet Filter 桥接到 Spring Security</a>
+<a href="#23.2-过滤器链逐层图解">23.2 过滤器链逐层图解</a>
+<a href="#23.3-认证架构">23.3 认证架构</a>
+<a href="#23.4-oauth2-authorization-code-flow">23.4 OAuth2 Authorization Code Flow</a>
+<a href="#23.5-jwt-深度解析">23.5 JWT 深度解析</a>
+<a href="#23.6-csrf-防护">23.6 CSRF 防护</a>
+<a href="#23.7-securitycontext-传播">23.7 SecurityContext 传播</a>
+<a href="#23.8-方法级安全">23.8 方法级安全</a>
+<a href="#23.9-陷阱与限制">23.9 陷阱与限制</a>
+<a href="#23.10-源码入口与扩展边界">23.10 源码入口与扩展边界</a>
+<a href="#23.11-本章小结">23.11 本章小结</a>
+</aside>
+
+<div class="article">
+
+<h1>第 23 章 · Spring Security 过滤器链</h1>
+<p class="subtitle">v7 图解版 · 自动从 v6 markdown 生成 · Mermaid 图原样保留</p>
+<div class="chapter-intro"><p>安全机制不是"功能完成后再附加"的边角组件,而是每个 HTTP 请求必须穿越的一条管线。在 Spring Boot 3.x 默认 <code>HttpSecurity</code> 配置下,这条管线由约 14 个 Servlet 过滤器组成,实际数量随启用的安全特性(OAuth2、Remember-Me、Session 管理、CSRF 模式等)而变化。Spring Security 的核心价值在于:即使应用一行配置都不写,默认就开启了 CSRF 防护、Session 固定攻击防护、安全响应头与基础认证。</p>
+<p>本章按"Servlet 桥接 → 过滤器逐层 → 认证体系 → OAuth2 流程 → JWT 验签 → CSRF 防护 → SecurityContext 传播 → 方法级安全 → 陷阱与限制"的顺序展开。前置知识:第 5 章 AOP 帮助理解责任链模式,第 14 章 Spring MVC 帮助理解 Servlet 过滤器执行位置。</p>
+</div>
+<h2 id="23.1-servlet-filter-桥接到-spring-security">23.1 Servlet Filter 桥接到 Spring Security</h2>
+<p>Servlet 规范定义了 <code>jakarta.servlet.Filter</code> 接口,用于在请求到达 Servlet 之前进行拦截处理。Spring Security 没有直接向 Servlet 容器注册十几个独立的 Filter 实例,而是通过一个"桥接"设计将所有安全过滤器封装在自己的过滤器链中。</p>
+<h3>23.1.1 DelegatingFilterProxy 桥接架构</h3>
+<p><code>DelegatingFilterProxy</code> 是注册在 Servlet 容器中的标准 Filter,它的唯一职责是把请求转发给 Spring <code>ApplicationContext</code> 中名为 <code>springSecurityFilterChain</code> 的 Bean(即 <code>FilterChainProxy</code> 实例)。这种间接性使 Spring Security 的所有过滤器都能享受依赖注入、生命周期管理与 Bean 后置处理。</p>
+<div class="diagram">
+<div class="diagram-title">图 23-1 · DelegatingFilterProxy 三层桥接架构</div>
+<svg viewBox="0 0 920 320" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="22" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">Servlet 容器层 → Spring 上下文层 → 业务安全链层</text>
+
+  <rect x="20" y="60" width="120" height="50" rx="6" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1"/>
+  <text x="80" y="80" text-anchor="middle" fill="#e9d5ff" font-size="11" font-weight="bold">HTTP 请求</text>
+  <text x="80" y="98" text-anchor="middle" fill="#bc8cff" font-size="10">Servlet 容器入口</text>
+
+  <rect x="180" y="60" width="140" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1"/>
+  <text x="250" y="80" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">Servlet FilterChain</text>
+  <text x="250" y="98" text-anchor="middle" fill="#58a6ff" font-size="10">容器内置过滤器栈</text>
+
+  <rect x="360" y="50" width="160" height="70" rx="6" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="440" y="74" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">★ DelegatingFilterProxy</text>
+  <text x="440" y="92" text-anchor="middle" fill="#dbeafe" font-size="10">容器侧的标准 Filter</text>
+  <text x="440" y="108" text-anchor="middle" fill="#dbeafe" font-size="10">桥接到 Spring 容器</text>
+
+  <rect x="560" y="60" width="170" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="1"/>
+  <text x="645" y="80" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">ApplicationContext</text>
+  <text x="645" y="98" text-anchor="middle" fill="#3fb950" font-size="10">查找 Bean 名称</text>
+
+  <rect x="770" y="60" width="130" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="835" y="78" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">★ FilterChainProxy</text>
+  <text x="835" y="96" text-anchor="middle" fill="#bbf7d0" font-size="10">springSecurityFilterChain</text>
+
+  <rect x="240" y="180" width="220" height="60" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="1"/>
+  <text x="350" y="202" text-anchor="middle" fill="#fed7aa" font-size="11" font-weight="bold">SecurityFilterChain[]</text>
+  <text x="350" y="220" text-anchor="middle" fill="#fed7aa" font-size="10">按 RequestMatcher 选择</text>
+  <text x="350" y="234" text-anchor="middle" fill="#fed7aa" font-size="10">优先匹配第一条</text>
+
+  <rect x="520" y="180" width="220" height="60" rx="6" fill="url(#g-red)" stroke="#f87171" stroke-width="1"/>
+  <text x="630" y="202" text-anchor="middle" fill="#fecaca" font-size="11" font-weight="bold">DispatcherServlet</text>
+  <text x="630" y="220" text-anchor="middle" fill="#fecaca" font-size="10">通过过滤器后转交业务</text>
+  <text x="630" y="234" text-anchor="middle" fill="#fecaca" font-size="10">Controller 层处理</text>
+
+  <path d="M140,85 L180,85" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M320,85 L360,85" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M520,85 L560,85" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M730,85 L770,85" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M835,115 L835,160 L460,160 L350,180" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M460,210 L520,210" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <text x="20" y="280" fill="#fed7aa" font-size="10">★ 关键设计:Servlet 容器只看到一个 Filter,Spring 内部却管理整条安全链,享受 IoC + AOP + 生命周期</text>
+  <text x="20" y="296" fill="#fed7aa" font-size="10">★ 桥接的代价:多一层方法调用,但带来整条链的可测试性与可扩展性</text>
+</svg>
+</div>
+<p><code>FilterChainProxy</code> 内部维护一个 <code>List&lt;SecurityFilterChain&gt;</code>,每个 <code>SecurityFilterChain</code> 绑定一个 <code>RequestMatcher</code>。当请求匹配时,该链中的所有过滤器依次执行。只有第一个匹配的链会被执行——这就是"优先匹配"策略,这个特性带来的最大风险就是顺序错误。</p>
+<h3>23.1.2 FilterChainProxy 匹配决策</h3>
+<div class="diagram">
+<div class="diagram-title">图 23-2 · FilterChainProxy 匹配决策流程</div>
+<svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="22" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">优先匹配:第一条命中的链就执行,后续链全部跳过</text>
+
+  <rect x="380" y="40" width="160" height="40" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="460" y="64" text-anchor="middle" fill="#e9d5ff" font-size="11" font-weight="bold">HTTP 请求进入</text>
+
+  <polygon points="460,110 540,140 460,170 380,140" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="460" y="138" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">匹配 /api/**?</text>
+  <text x="460" y="154" text-anchor="middle" fill="#58a6ff" font-size="10">RequestMatcher</text>
+
+  <rect x="40" y="195" width="200" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="140" y="215" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">★ Chain 1 · 无状态 JWT 链</text>
+  <text x="140" y="232" text-anchor="middle" fill="#3fb950" font-size="10">oauth2ResourceServer</text>
+
+  <polygon points="460,200 540,230 460,260 380,230" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="460" y="228" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">匹配 /admin/**?</text>
+  <text x="460" y="244" text-anchor="middle" fill="#58a6ff" font-size="10">RequestMatcher</text>
+
+  <rect x="40" y="285" width="200" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="140" y="305" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">Chain 2 · FormLogin + RBAC</text>
+  <text x="140" y="322" text-anchor="middle" fill="#3fb950" font-size="10">authorizeHttpRequests</text>
+
+  <polygon points="460,290 540,320 460,350 380,320" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="460" y="318" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">匹配 /**?</text>
+
+  <rect x="40" y="375" width="200" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="140" y="400" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">Chain 3 · 默认链(兜底)</text>
+
+  <rect x="700" y="375" width="180" height="40" rx="6" fill="url(#g-red)" stroke="#f87171"/>
+  <text x="790" y="400" text-anchor="middle" fill="#fecaca" font-size="11" font-weight="bold">直接放行(无安全)</text>
+
+  <rect x="640" y="200" width="240" height="160" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="1" opacity="0.4"/>
+  <text x="760" y="222" text-anchor="middle" fill="#fed7aa" font-size="11" font-weight="bold">DispatcherServlet</text>
+  <text x="760" y="240" text-anchor="middle" fill="#fed7aa" font-size="10">所有命中的链最终</text>
+  <text x="760" y="254" text-anchor="middle" fill="#fed7aa" font-size="10">汇入业务派发</text>
+
+  <path d="M460,80 L460,110" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M380,140 L240,220" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="290" y="180" fill="#bbf7d0" font-size="10">是</text>
+  <path d="M460,170 L460,200" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="475" y="188" fill="#fecaca" font-size="10">否</text>
+  <path d="M380,230 L240,310" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="290" y="270" fill="#bbf7d0" font-size="10">是</text>
+  <path d="M460,260 L460,290" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="475" y="278" fill="#fecaca" font-size="10">否</text>
+  <path d="M380,320 L240,395" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="290" y="360" fill="#bbf7d0" font-size="10">是</text>
+  <path d="M540,320 L700,395" stroke="#f87171" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="600" y="360" fill="#fecaca" font-size="10">否</text>
+  <path d="M240,220 L640,260" stroke="#3fb950" stroke-width="1" stroke-dasharray="3,2" fill="none"/>
+  <path d="M240,310 L640,290" stroke="#3fb950" stroke-width="1" stroke-dasharray="3,2" fill="none"/>
+  <path d="M240,395 L640,330" stroke="#3fb950" stroke-width="1" stroke-dasharray="3,2" fill="none"/>
+
+  <text x="20" y="440" fill="#fed7aa" font-size="10">★ 顺序错误的代价:把 /** 放在 /api/** 之前,所有 API 请求都被通配链捕获,API 安全策略立即失效</text>
+</svg>
+</div>
+<p>定义多个 <code>SecurityFilterChain</code> 时,更具体的路径规则(如 <code>/api/**</code>)必须排在通配规则(<code>/**</code>)之前,否则所有请求都会被通配链捕获,导致 API 安全策略失效。<code>@Order</code> 注解用于控制 Bean 的优先级。</p>
+<h3>23.1.3 多链配置案例</h3>
+<p>下面这段配置把 API 请求与后台页面拆成两条安全链。读代码时不能只看 <code>authorizeHttpRequests</code>,还要看 <code>securityMatcher</code> 与 <code>@Order</code>——它们决定请求先落到哪条链。</p>
+<pre><code class="language-java">@Bean
+@Order(1)
+SecurityFilterChain apiChain(HttpSecurity http) throws Exception {
+    return http
+        .securityMatcher(&quot;/api/**&quot;)
+        .sessionManagement(session -&gt;
+            session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+        .csrf(AbstractHttpConfigurer::disable)
+        .oauth2ResourceServer(oauth2 -&gt; oauth2.jwt(Customizer.withDefaults()))
+        .authorizeHttpRequests(auth -&gt; auth
+            .requestMatchers(HttpMethod.GET, &quot;/api/public/**&quot;).permitAll()
+            .anyRequest().authenticated()
+        )
+        .build();
+}
+
+@Bean
+@Order(2)
+SecurityFilterChain webChain(HttpSecurity http) throws Exception {
+    return http
+        .securityMatcher(&quot;/**&quot;)
+        .formLogin(Customizer.withDefaults())
+        .authorizeHttpRequests(auth -&gt; auth
+            .requestMatchers(&quot;/&quot;, &quot;/login&quot;, &quot;/assets/**&quot;).permitAll()
+            .requestMatchers(&quot;/admin/**&quot;).hasRole(&quot;ADMIN&quot;)
+            .anyRequest().authenticated()
+        )
+        .build();
+}
+</code></pre>
+<p>开启 <code>logging.level.org.springframework.security=DEBUG</code> 后,访问 <code>/api/orders</code> 应只命中第一条链,不会再落入 <code>/**</code> 兜底链:</p>
+<pre><code class="language-text">DEBUG o.s.security.web.FilterChainProxy : Securing GET /api/orders
+DEBUG o.s.security.web.FilterChainProxy : Invoking BearerTokenAuthenticationFilter (7 12)
+DEBUG o.s.security.web.FilterChainProxy : Invoking AuthorizationFilter (12 12)
+DEBUG o.s.security.web.FilterChainProxy : Secured GET /api/orders
+</code></pre>
+<p>如请求未携带 Bearer Token,这条无状态 API 链会返回认证挑战,而非跳转登录页:</p>
+<pre><code class="language-text">GET /api/orders HTTP/1.1
+Host: localhost:8080
+
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer
+Cache-Control: no-cache, no-store, max-age=0, must-revalidate
+</code></pre>
+<h2 id="23.2-过滤器链逐层图解">23.2 过滤器链逐层图解</h2>
+<p>一个典型的 <code>SecurityFilterChain</code>(Spring Boot 3.x 默认配置)包含约 14 个过滤器,每一层负责一项安全职责。请求从上到下依次通过,任何一层都可以中止请求或发起认证挑战。实际过滤器数量取决于启用的安全特性,可通过 <code>DEBUG</code> 日志查看。</p>
+<h3>23.2.1 默认过滤器全景</h3>
+<div class="diagram">
+<div class="diagram-title">图 23-3 · 默认 SecurityFilterChain 典型过滤器全景(14 层)</div>
+<svg viewBox="0 0 920 540" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="22" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">从上到下依次执行,任意一层都可中止请求或发起认证挑战</text>
+
+  <rect x="380" y="40" width="160" height="32" rx="4" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="460" y="60" text-anchor="middle" fill="#e9d5ff" font-size="11" font-weight="bold">HTTP Request</text>
+
+  <g font-size="10">
+    <rect x="60" y="92" width="380" height="30" rx="4" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="80" y="111" fill="#dbeafe" font-weight="bold">1 DisableEncodeUrlFilter</text>
+    <text x="430" y="111" text-anchor="end" fill="#58a6ff">阻止 URL 暴露 SessionID</text>
+
+    <rect x="60" y="126" width="380" height="30" rx="4" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="80" y="145" fill="#dbeafe" font-weight="bold">2 WebAsyncManagerIntegrationFilter</text>
+    <text x="430" y="145" text-anchor="end" fill="#58a6ff">异步请求 Context 传播</text>
+
+    <rect x="60" y="160" width="380" height="30" rx="4" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="80" y="179" fill="#bbf7d0" font-weight="bold">★ 3 SecurityContextHolderFilter</text>
+    <text x="430" y="179" text-anchor="end" fill="#bbf7d0">从 Repository 加载 Context</text>
+
+    <rect x="60" y="194" width="380" height="30" rx="4" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="80" y="213" fill="#dbeafe" font-weight="bold">4 HeaderWriterFilter</text>
+    <text x="430" y="213" text-anchor="end" fill="#58a6ff">写入安全响应头</text>
+
+    <rect x="60" y="228" width="380" height="30" rx="4" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="80" y="247" fill="#fed7aa" font-weight="bold">★ 5 CsrfFilter</text>
+    <text x="430" y="247" text-anchor="end" fill="#fed7aa">验证 CSRF Token</text>
+
+    <rect x="60" y="262" width="380" height="30" rx="4" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="80" y="281" fill="#dbeafe" font-weight="bold">6 LogoutFilter</text>
+    <text x="430" y="281" text-anchor="end" fill="#58a6ff">匹配登出 URL</text>
+
+    <rect x="480" y="92" width="380" height="30" rx="4" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="500" y="111" fill="#e9d5ff" font-weight="bold">★ 7 UsernamePasswordAuthenticationFilter</text>
+    <text x="850" y="111" text-anchor="end" fill="#e9d5ff">表单登录入口</text>
+
+    <rect x="480" y="126" width="380" height="30" rx="4" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="500" y="145" fill="#dbeafe" font-weight="bold">8 DefaultLoginPageGeneratingFilter</text>
+    <text x="850" y="145" text-anchor="end" fill="#58a6ff">生成默认登录页</text>
+
+    <rect x="480" y="160" width="380" height="30" rx="4" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="500" y="179" fill="#e9d5ff" font-weight="bold">★ 9 BasicAuthenticationFilter</text>
+    <text x="850" y="179" text-anchor="end" fill="#e9d5ff">HTTP Basic 认证</text>
+
+    <rect x="480" y="194" width="380" height="30" rx="4" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="500" y="213" fill="#dbeafe" font-weight="bold">10 RequestCacheAwareFilter</text>
+    <text x="850" y="213" text-anchor="end" fill="#58a6ff">恢复登录前请求</text>
+
+    <rect x="480" y="228" width="380" height="30" rx="4" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="500" y="247" fill="#dbeafe" font-weight="bold">11 SecurityContextHolderAwareRequestFilter</text>
+    <text x="850" y="247" text-anchor="end" fill="#58a6ff">包装 Request</text>
+
+    <rect x="480" y="262" width="380" height="30" rx="4" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="500" y="281" fill="#dbeafe" font-weight="bold">12 AnonymousAuthenticationFilter</text>
+    <text x="850" y="281" text-anchor="end" fill="#58a6ff">匿名身份兜底</text>
+
+    <rect x="60" y="320" width="800" height="32" rx="4" fill="url(#g-red)" stroke="#f87171" stroke-width="2"/>
+    <text x="80" y="340" fill="#fecaca" font-weight="bold">★ 13 ExceptionTranslationFilter</text>
+    <text x="850" y="340" text-anchor="end" fill="#fecaca">捕获下游异常 → AuthException 走 EntryPoint,AccessDenied 走 Handler</text>
+
+    <rect x="60" y="356" width="800" height="32" rx="4" fill="url(#g-red)" stroke="#f87171" stroke-width="2"/>
+    <text x="80" y="376" fill="#fecaca" font-weight="bold">★ 14 AuthorizationFilter</text>
+    <text x="850" y="376" text-anchor="end" fill="#fecaca">最终授权检查 → AuthorizationManager 决策</text>
+  </g>
+
+  <rect x="380" y="410" width="160" height="36" rx="4" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="460" y="432" text-anchor="middle" fill="#fed7aa" font-size="11" font-weight="bold">DispatcherServlet</text>
+
+  <path d="M460,72 L250,92" stroke="#58a6ff" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M460,72 L670,92" stroke="#bc8cff" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M250,292 L460,320" stroke="#f87171" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M670,292 L460,320" stroke="#f87171" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M460,388 L460,410" stroke="#f87171" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <text x="20" y="475" fill="#fed7aa" font-size="10">★ 必读 5 层(标★):3 加载 Context · 5 防 CSRF · 7/9 实际认证 · 13 异常分流 · 14 终审授权</text>
+  <text x="20" y="492" fill="#fed7aa" font-size="10">★ 实际数量随启用特性变化(OAuth2/Remember-Me/Session 管理),可通过 DEBUG 日志查看完整列表</text>
+  <text x="20" y="509" fill="#fed7aa" font-size="10">★ 顺序固定:Spring Security 内部用 FilterOrderRegistration 维护;不要自己 hack 顺序</text>
+  <text x="20" y="526" fill="#fed7aa" font-size="10">★ 任何一层都能"短路"链:抛 AuthenticationException 立刻跳到第 13 层翻译为 401/302</text>
+</svg>
+</div>
+<h3>23.2.2 关键过滤器职责矩阵</h3>
+<table>
+<thead>
+<tr>
+<th>序号</th>
+<th>过滤器</th>
+<th>触发条件</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>3</td>
+<td><code>SecurityContextHolderFilter</code></td>
+<td>每个请求</td>
+<td>从 <code>SecurityContextRepository</code> 加载 <code>SecurityContext</code> 到 <code>ThreadLocal</code></td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>CsrfFilter</code></td>
+<td>POST PUT DELETE</td>
+<td>验证 CSRF Token 一致性,GET HEAD 跳过</td>
+</tr>
+<tr>
+<td>7</td>
+<td><code>UsernamePasswordAuthenticationFilter</code></td>
+<td>POST 登录路径</td>
+<td>提取用户名密码 → Token → <code>AuthenticationManager</code></td>
+</tr>
+<tr>
+<td>9</td>
+<td><code>BasicAuthenticationFilter</code></td>
+<td>含 Basic 凭据</td>
+<td>解析 <code>Authorization: Basic ...</code> 并触发认证</td>
+</tr>
+<tr>
+<td>13</td>
+<td><code>ExceptionTranslationFilter</code></td>
+<td>下游抛出异常</td>
+<td><code>AuthenticationException</code> → 入口点;<code>AccessDeniedException</code> → 403</td>
+</tr>
+<tr>
+<td>14</td>
+<td><code>AuthorizationFilter</code></td>
+<td>每个请求</td>
+<td>调用 <code>AuthorizationManager</code> 做 URL 级授权检查</td>
+</tr>
+</tbody>
+</table>
+<h3>23.2.3 启动期日志验证</h3>
+<p>启动时也可以从日志中确认当前应用实际装配了哪些过滤器。下面的输出比"默认 14 层"更可靠,因为它来自当前依赖、当前配置与当前 Spring Boot 版本:</p>
+<pre><code class="language-text">DEBUG o.s.s.web.DefaultSecurityFilterChain : Will secure any request with [
+  org.springframework.security.web.session.DisableEncodeUrlFilter,
+  org.springframework.security.web.context.request.async.WebAsyncManagerIntegrationFilter,
+  org.springframework.security.web.context.SecurityContextHolderFilter,
+  org.springframework.security.web.header.HeaderWriterFilter,
+  org.springframework.security.web.csrf.CsrfFilter,
+  org.springframework.security.web.authentication.logout.LogoutFilter,
+  org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter,
+  org.springframework.security.web.authentication.ui.DefaultLoginPageGeneratingFilter,
+  org.springframework.security.web.authentication.www.BasicAuthenticationFilter,
+  org.springframework.security.web.savedrequest.RequestCacheAwareFilter,
+  org.springframework.security.web.servletapi.SecurityContextHolderAwareRequestFilter,
+  org.springframework.security.web.authentication.AnonymousAuthenticationFilter,
+  org.springframework.security.web.access.ExceptionTranslationFilter,
+  org.springframework.security.web.access.intercept.AuthorizationFilter
+]
+</code></pre>
+<h3>23.2.4 ExceptionTranslationFilter 的两路分流</h3>
+<p><code>ExceptionTranslationFilter</code> 是过滤器链中最容易被忽视但最重要的一层。它捕获下游过滤器(主要是 <code>AuthorizationFilter</code>)抛出的两类异常,并将其转化为不同的 HTTP 响应。</p>
+<table>
+<thead>
+<tr>
+<th>异常类型</th>
+<th>含义</th>
+<th>默认处理</th>
+<th>HTTP 状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>AuthenticationException</code></td>
+<td>当前请求未认证或认证已失效</td>
+<td>调用 <code>AuthenticationEntryPoint</code></td>
+<td>401 或登录页</td>
+</tr>
+<tr>
+<td><code>AccessDeniedException</code></td>
+<td>已认证但权限不足</td>
+<td>调用 <code>AccessDeniedHandler</code></td>
+<td>403</td>
+</tr>
+</tbody>
+</table>
+<p>不同认证模式的 <code>EntryPoint</code> 不同:表单登录链使用 <code>LoginUrlAuthenticationEntryPoint</code>(返回 302 跳转登录页);JWT 资源服务器链使用 <code>BearerTokenAuthenticationEntryPoint</code>(返回 401 加 <code>WWW-Authenticate: Bearer</code>)。</p>
+<h2 id="23.3-认证架构">23.3 认证架构</h2>
+<p>Spring Security 的认证核心由三个组件组成:<code>AuthenticationManager</code> 是入口接口,<code>ProviderManager</code> 是默认实现,<code>AuthenticationProvider</code> 是实际执行认证的策略。</p>
+<h3>23.3.1 AuthenticationManager 与 ProviderManager</h3>
+<div class="diagram">
+<div class="diagram-title">图 23-4 · AuthenticationManager 三层认证架构</div>
+<svg viewBox="0 0 920 480" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="22" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">接口 → 默认实现 → 多策略遍历:多种认证协议在同一容器内共存</text>
+
+  <rect x="340" y="40" width="240" height="44" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="460" y="62" text-anchor="middle" fill="#e9d5ff" font-size="11" font-weight="bold">AuthenticationFilter</text>
+  <text x="460" y="78" text-anchor="middle" fill="#bc8cff" font-size="10">表单/Basic/JWT 各类入口过滤器</text>
+
+  <rect x="340" y="120" width="240" height="44" rx="6" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="460" y="142" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">★ AuthenticationManager(接口)</text>
+  <text x="460" y="158" text-anchor="middle" fill="#58a6ff" font-size="10">authenticate(Authentication) → Authentication</text>
+
+  <rect x="340" y="200" width="240" height="44" rx="6" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="460" y="222" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">★ ProviderManager(默认实现)</text>
+  <text x="460" y="238" text-anchor="middle" fill="#58a6ff" font-size="10">遍历 List&lt;AuthenticationProvider&gt;</text>
+
+  <rect x="710" y="200" width="180" height="44" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="800" y="222" text-anchor="middle" fill="#fed7aa" font-size="11" font-weight="bold">parent ProviderManager</text>
+  <text x="800" y="238" text-anchor="middle" fill="#fed7aa" font-size="10">全局共享父级</text>
+
+  <rect x="20" y="290" width="200" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="120" y="310" text-anchor="middle" fill="#bbf7d0" font-size="10" font-weight="bold">DaoAuthenticationProvider</text>
+  <text x="120" y="326" text-anchor="middle" fill="#3fb950" font-size="9">用户名 + 密码</text>
+
+  <rect x="240" y="290" width="200" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="340" y="310" text-anchor="middle" fill="#bbf7d0" font-size="10" font-weight="bold">JwtAuthenticationProvider</text>
+  <text x="340" y="326" text-anchor="middle" fill="#3fb950" font-size="9">Bearer Token</text>
+
+  <rect x="460" y="290" width="220" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="570" y="310" text-anchor="middle" fill="#bbf7d0" font-size="10" font-weight="bold">OidcAuthorizationCodeProvider</text>
+  <text x="570" y="326" text-anchor="middle" fill="#3fb950" font-size="9">OpenID Connect</text>
+
+  <rect x="700" y="290" width="200" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="800" y="310" text-anchor="middle" fill="#bbf7d0" font-size="10" font-weight="bold">自定义 Provider</text>
+  <text x="800" y="326" text-anchor="middle" fill="#3fb950" font-size="9">短信/生物识别</text>
+
+  <rect x="20" y="380" width="200" height="44" rx="6" fill="url(#g-red)" stroke="#f87171"/>
+  <text x="120" y="400" text-anchor="middle" fill="#fecaca" font-size="10" font-weight="bold">UserDetailsService</text>
+  <text x="120" y="416" text-anchor="middle" fill="#fecaca" font-size="9">数据库 / LDAP</text>
+
+  <rect x="240" y="380" width="200" height="44" rx="6" fill="url(#g-red)" stroke="#f87171"/>
+  <text x="340" y="400" text-anchor="middle" fill="#fecaca" font-size="10" font-weight="bold">PasswordEncoder</text>
+  <text x="340" y="416" text-anchor="middle" fill="#fecaca" font-size="9">BCrypt / Argon2</text>
+
+  <path d="M460,84 L460,120" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="500" y="105" fill="#bc8cff" font-size="10">authenticate(token)</text>
+  <path d="M460,164 L460,200" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M580,222 L710,222" stroke="#58a6ff" stroke-width="1" stroke-dasharray="4,2" marker-end="url(#arr)" fill="none"/>
+  <text x="640" y="216" fill="#fed7aa" font-size="9">parent</text>
+  <path d="M380,244 L120,290" stroke="#3fb950" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M420,244 L340,290" stroke="#3fb950" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M500,244 L570,290" stroke="#3fb950" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M540,244 L800,290" stroke="#3fb950" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M120,340 L120,380" stroke="#f87171" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M140,340 L340,380" stroke="#f87171" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <text x="20" y="455" fill="#fed7aa" font-size="10">★ ProviderManager 调用 supports(Class) 找匹配 Provider;第一个成功返回则结束遍历</text>
+  <text x="20" y="471" fill="#fed7aa" font-size="10">★ 多 Provider 同支持一种 Token 时,顺序敏感,诊断困难——保持 Token 与 Provider 一对一</text>
+</svg>
+</div>
+<p><code>ProviderManager</code> 遍历所有 <code>AuthenticationProvider</code>,调用其 <code>supports(Class)</code> 方法判断是否能处理当前 Token 类型。第一个认证成功的 Provider 会返回结果;如某个 Provider 不支持当前 Token,则继续尝试下一个。认证失败通常会记录为最后一个异常,某些账户状态类异常会立即中止链路。实际项目中通常让一种 Token 类型只对应一个明确的 Provider,避免诊断困难。</p>
+<h3>23.3.2 用户名密码认证的最小可运行示例</h3>
+<p>最小可运行认证示例通常由 <code>UserDetailsService</code>、<code>PasswordEncoder</code> 与默认表单登录组成。认证成功后,服务端会建立 <code>SecurityContext</code> 并把会话标识写回浏览器。</p>
+<pre><code class="language-java">@Bean
+UserDetailsService users(PasswordEncoder encoder) {
+    UserDetails admin = User.withUsername(&quot;admin&quot;)
+        .password(encoder.encode(&quot;secret&quot;))
+        .roles(&quot;ADMIN&quot;)
+        .build();
+    return new InMemoryUserDetailsManager(admin);
+}
+
+@Bean
+PasswordEncoder passwordEncoder() {
+    return new BCryptPasswordEncoder();
+}
+</code></pre>
+<p>表单登录成功时,默认行为是 302 跳转并下发 <code>JSESSIONID</code>:</p>
+<pre><code class="language-text">POST /login HTTP/1.1
+Content-Type: application/x-www-form-urlencoded
+
+username=admin and password=secret
+
+HTTP/1.1 302 Found
+Set-Cookie: JSESSIONID=7C1A3E8F0F1C0E5E9A1D4C8B8B7F1A20; Path= ; HttpOnly; SameSite=Lax
+Location: /
+</code></pre>
+<p>密码错误时,<code>DaoAuthenticationProvider</code> 会抛出 <code>BadCredentialsException</code>,随后由失败处理器转成登录失败响应:</p>
+<pre><code class="language-text">DEBUG o.s.s.a.ProviderManager : Authenticating request with DaoAuthenticationProvider
+DEBUG o.s.s.a.d.DaoAuthenticationProvider : Failed to authenticate since password does not match stored value
+DEBUG o.s.s.web.DefaultRedirectStrategy : Redirecting to /login?error
+</code></pre>
+<h3>23.3.3 PasswordEncoder 选型</h3>
+<table>
+<thead>
+<tr>
+<th>算法</th>
+<th>安全等级</th>
+<th>计算开销</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>BCrypt</code></td>
+<td>高</td>
+<td>中(可调强度)</td>
+<td>默认推荐,Spring Security 5+ 内置</td>
+</tr>
+<tr>
+<td><code>Argon2</code></td>
+<td>极高</td>
+<td>高(内存密集)</td>
+<td>新项目首选,防 GPU 攻击</td>
+</tr>
+<tr>
+<td><code>PBKDF2</code></td>
+<td>中</td>
+<td>中</td>
+<td>FIPS 合规场景</td>
+</tr>
+<tr>
+<td><code>SCrypt</code></td>
+<td>高</td>
+<td>高</td>
+<td>内存密集型场景</td>
+</tr>
+<tr>
+<td><code>NoOpPasswordEncoder</code></td>
+<td>无</td>
+<td>极低</td>
+<td>仅用于测试,生产环境严禁</td>
+</tr>
+</tbody>
+</table>
+<p><code>DelegatingPasswordEncoder</code> 是 Spring Security 5+ 的默认实现,它通过密码前缀(如 <code>{bcrypt}$2a$10$...</code>)识别算法,支持密码算法的平滑升级——旧密码继续用旧算法验证,新密码用新算法加密。</p>
+<h3>23.3.4 URL 授权决策</h3>
+<p>授权发生在认证之后。下面的规则允许普通用户访问 <code>/account/me</code>,但只有 <code>ADMIN</code> 能进入 <code>/admin/**</code>:</p>
+<pre><code class="language-java">@Bean
+SecurityFilterChain authorizationChain(HttpSecurity http) throws Exception {
+    return http
+        .authorizeHttpRequests(auth -&gt; auth
+            .requestMatchers(&quot;/account/me&quot;).hasAnyRole(&quot;USER&quot;, &quot;ADMIN&quot;)
+            .requestMatchers(&quot;/admin/**&quot;).hasRole(&quot;ADMIN&quot;)
+            .anyRequest().authenticated()
+        )
+        .formLogin(Customizer.withDefaults())
+        .build();
+}
+</code></pre>
+<p>用户 <code>alice</code> 只有 <code>ROLE_USER</code> 时,访问个人接口成功:</p>
+<pre><code class="language-text">GET /account/me HTTP/1.1
+Cookie: JSESSIONID=7C1A3E8F0F1C0E5E9A1D4C8B8B7F1A20
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{&quot;status&quot;:200, &quot;principal&quot;:&quot;alice&quot;, &quot;authorities&quot;:[&quot;ROLE_USER&quot;]}
+</code></pre>
+<p>同一个用户访问后台接口会被 <code>AuthorizationFilter</code> 拦截,最终由 <code>ExceptionTranslationFilter</code> 输出 403:</p>
+<pre><code class="language-text">GET /admin/reports HTTP/1.1
+Cookie: JSESSIONID=7C1A3E8F0F1C0E5E9A1D4C8B8B7F1A20
+
+HTTP/1.1 403 Forbidden
+Content-Type: application/json
+
+{&quot;status&quot;:403, &quot;error&quot;:&quot;Forbidden&quot;, &quot;path&quot;:&quot;/admin/reports&quot;}
+</code></pre>
+<h2 id="23.4-oauth2-authorization-code-flow">23.4 OAuth2 Authorization Code Flow</h2>
+<p>OAuth2 授权码模式是最安全的 OAuth2 授权流程,适用于有后端服务器的 Web 应用。整个流程涉及浏览器、客户端应用、授权服务器与资源服务器四方交互。</p>
+<h3>23.4.1 授权码完整流程</h3>
+<div class="diagram">
+<div class="diagram-title">图 23-5 · OAuth2 授权码完整流程(浏览器/客户端/授权服务器/资源服务器 四方时序)</div>
+<svg viewBox="0 0 920 540" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="22" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">12 步完整握手:state 防 CSRF,授权码一次性,access_token 短期有效</text>
+
+  <text x="115" y="55" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">浏览器 B</text>
+  <text x="345" y="55" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">客户端应用 C</text>
+  <text x="575" y="55" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">授权服务器 AS</text>
+  <text x="805" y="55" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">资源服务器 RS</text>
+
+  <line x1="115" y1="70" x2="115" y2="510" stroke="#bc8cff" stroke-dasharray="3,2"/>
+  <line x1="345" y1="70" x2="345" y2="510" stroke="#58a6ff" stroke-dasharray="3,2"/>
+  <line x1="575" y1="70" x2="575" y2="510" stroke="#3fb950" stroke-dasharray="3,2"/>
+  <line x1="805" y1="70" x2="805" y2="510" stroke="#d29922" stroke-dasharray="3,2"/>
+
+  <path d="M115,90 L345,90" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="230" y="84" text-anchor="middle" fill="#e9d5ff" font-size="9">1 访问受保护资源</text>
+
+  <path d="M345,115 L115,115" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="230" y="109" text-anchor="middle" fill="#dbeafe" font-size="9">2 302 重定向到授权端点</text>
+
+  <path d="M115,140 L575,140" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="345" y="134" text-anchor="middle" fill="#e9d5ff" font-size="9">3 GET /authorize ★ client_id + redirect_uri + scope + state</text>
+
+  <path d="M575,165 L115,165" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="345" y="159" text-anchor="middle" fill="#bbf7d0" font-size="9">4 显示登录 + 授权同意页面</text>
+
+  <path d="M115,190 L575,190" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="345" y="184" text-anchor="middle" fill="#e9d5ff" font-size="9">5 用户输入凭据并同意授权</text>
+
+  <path d="M575,215 L115,215" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="345" y="209" text-anchor="middle" fill="#bbf7d0" font-size="9">6 ★ 重定向到 redirect_uri,携带 code + state</text>
+
+  <path d="M115,240 L345,240" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="230" y="234" text-anchor="middle" fill="#e9d5ff" font-size="9">7 携带授权码请求回调 URL</text>
+
+  <rect x="320" y="252" width="50" height="22" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="345" y="266" text-anchor="middle" fill="#dbeafe" font-size="9" font-weight="bold">★校验 state</text>
+
+  <path d="M345,290 L575,290" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="460" y="284" text-anchor="middle" fill="#dbeafe" font-size="9">8 POST /token ★ code + client_id + client_secret + redirect_uri</text>
+
+  <rect x="550" y="302" width="50" height="22" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="575" y="316" text-anchor="middle" fill="#bbf7d0" font-size="9" font-weight="bold">★签发 token</text>
+
+  <path d="M575,340 L345,340" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="460" y="334" text-anchor="middle" fill="#bbf7d0" font-size="9">9 access_token + refresh_token + expires_in</text>
+
+  <path d="M345,370 L805,370" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="575" y="364" text-anchor="middle" fill="#dbeafe" font-size="9">10 GET /api/data Authorization: Bearer access_token</text>
+
+  <rect x="780" y="382" width="50" height="22" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="805" y="396" text-anchor="middle" fill="#fed7aa" font-size="9" font-weight="bold">本地验签</text>
+
+  <path d="M805,420 L345,420" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="575" y="414" text-anchor="middle" fill="#fed7aa" font-size="9">11 返回受保护资源数据</text>
+
+  <path d="M345,445 L115,445" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="230" y="439" text-anchor="middle" fill="#dbeafe" font-size="9">12 渲染页面</text>
+
+  <text x="20" y="490" fill="#fed7aa" font-size="10">★ state 参数防 CSRF:客户端生成随机值,授权服务器原封不动返回,客户端校验一致性</text>
+  <text x="20" y="506" fill="#fed7aa" font-size="10">★ 授权码 code 只能用一次且生命周期极短(通常 30 秒-2 分钟),换 token 后立即失效</text>
+</svg>
+</div>
+<p><code>state</code> 参数是防 CSRF 的关键。客户端生成随机值,授权服务器原封不动地在步骤 6 中返回。客户端验证 <code>state</code> 是否一致——如不一致,说明请求被篡改,必须拒绝。</p>
+<h3>23.4.2 PKCE 扩展:公开客户端</h3>
+<p>对于原生应用(移动端、SPA)等无法安全存储 <code>client_secret</code> 的公开客户端,PKCE(Proof Key for Code Exchange,RFC 7636)提供了额外的安全保障。</p>
+<div class="diagram">
+<div class="diagram-title">图 23-6 · PKCE 扩展流程(无 client_secret 的公开客户端如何防止授权码被劫持)</div>
+<svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="22" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">客户端持有 verifier,授权服务器只见 challenge,中间人拿到 code 也换不到 token</text>
+
+  <text x="180" y="55" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">公开客户端 App</text>
+  <text x="700" y="55" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">授权服务器 AS</text>
+
+  <line x1="180" y1="70" x2="180" y2="350" stroke="#bc8cff" stroke-dasharray="3,2"/>
+  <line x1="700" y1="70" x2="700" y2="350" stroke="#3fb950" stroke-dasharray="3,2"/>
+
+  <rect x="40" y="85" width="280" height="50" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="180" y="105" text-anchor="middle" fill="#e9d5ff" font-size="10" font-weight="bold">★ 步骤 1:本地生成 code_verifier</text>
+  <text x="180" y="120" text-anchor="middle" fill="#e9d5ff" font-size="9">随机 43~128 字符,只在客户端持有</text>
+
+  <rect x="40" y="145" width="280" height="50" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="180" y="165" text-anchor="middle" fill="#e9d5ff" font-size="10" font-weight="bold">★ 步骤 2:计算 code_challenge</text>
+  <text x="180" y="180" text-anchor="middle" fill="#e9d5ff" font-size="9">BASE64URL(SHA256(code_verifier))</text>
+
+  <path d="M180,210 L700,210" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="440" y="204" text-anchor="middle" fill="#e9d5ff" font-size="10">3 GET /authorize 携带 code_challenge + S256 方法</text>
+
+  <path d="M700,235 L180,235" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="440" y="229" text-anchor="middle" fill="#bbf7d0" font-size="10">4 返回授权码 code(challenge 服务端缓存)</text>
+
+  <path d="M180,260 L700,260" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="440" y="254" text-anchor="middle" fill="#e9d5ff" font-size="10">5 POST /token 携带 code + ★ code_verifier</text>
+
+  <rect x="560" y="272" width="280" height="36" rx="4" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="700" y="287" text-anchor="middle" fill="#bbf7d0" font-size="10" font-weight="bold">★ 6 验证 SHA256(verifier) ?= challenge</text>
+  <text x="700" y="301" text-anchor="middle" fill="#bbf7d0" font-size="9">不通过则拒绝换 token</text>
+
+  <path d="M700,320 L180,320" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="440" y="314" text-anchor="middle" fill="#bbf7d0" font-size="10">7 返回 access_token</text>
+
+  <text x="20" y="358" fill="#fed7aa" font-size="10">★ 安全原理:即便攻击者截获 code,无 verifier 也换不到 token;SHA256 不可逆推</text>
+</svg>
+</div>
+<p>PKCE 安全原理:即使攻击者截获了授权码 <code>code</code>,由于不知道 <code>code_verifier</code>,也无法换取 token。<code>code_challenge</code> 是 SHA256 哈希值,无法逆向推导出 <code>code_verifier</code>。</p>
+<h3>23.4.3 Token 存储策略对比</h3>
+<table>
+<thead>
+<tr>
+<th>存储方式</th>
+<th>安全性</th>
+<th>XSS 风险</th>
+<th>CSRF 风险</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HttpOnly Cookie</td>
+<td>极高</td>
+<td>低(JS 无法读取)</td>
+<td>需 CSRF 防护</td>
+<td>传统 Web 应用</td>
+</tr>
+<tr>
+<td>内存变量</td>
+<td>高</td>
+<td>低(页面刷新丢失)</td>
+<td>无</td>
+<td>SPA 短生命周期</td>
+</tr>
+<tr>
+<td>SessionStorage</td>
+<td>中</td>
+<td>中(同标签页可访问)</td>
+<td>无</td>
+<td>SPA 单标签页</td>
+</tr>
+<tr>
+<td>LocalStorage</td>
+<td>低</td>
+<td>高(任何 JS 可读)</td>
+<td>无</td>
+<td>不推荐用于敏感 Token</td>
+</tr>
+</tbody>
+</table>
+<h3>23.4.4 Spring Authorization Server 自建授权服务器</h3>
+<p>Spring 官方的 Spring Authorization Server 项目(从 Spring Security 5.x 独立出来)实现了完整的 OAuth2 授权码流程,包括客户端注册、授权端点、令牌端点与 JWKS 端点。它不再依赖第三方授权服务器(如 Keycloak),适合需要完全掌控认证逻辑的企业内部系统。Token 签发使用 RSA 非对称密钥,资源服务器通过 JWKS 端点获取公钥进行本地验签。</p>
+<pre><code class="language-java">@Bean
+public RegisteredClientRepository registeredClientRepository() {
+    RegisteredClient client = RegisteredClient.withId(UUID.randomUUID().toString())
+        .clientId(&quot;my-spa-client&quot;)
+        .clientAuthenticationMethod(ClientAuthenticationMethod.NONE)
+        .authorizationGrantType(AuthorizationGrantType.AUTHORIZATION_CODE)
+        .redirectUri(&quot;http://localhost:3000/callback&quot;)
+        .scope(OidcScopes.OPENID)
+        .scope(&quot;read&quot;)
+        .clientSettings(ClientSettings.builder()
+            .requireProofKey(true)
+            .build())
+        .build();
+    return new InMemoryRegisteredClientRepository(client);
+}
+</code></pre>
+<h3>23.4.5 Keycloak 与 OIDC 集成</h3>
+<p>Spring Boot 3.x 与 Spring Security 6 中,不再推荐使用老的 Keycloak Spring Security 适配器。更稳妥的方式是把 Keycloak 当作标准 OIDC Provider:登录应用使用 <code>oauth2Login()</code>,资源服务器使用 <code>oauth2ResourceServer().jwt()</code>,通过 issuer 与 JWKS 验证 Bearer Token,然后把 JWT claims 转成 Spring Security authorities。</p>
+<pre><code class="language-java">@Bean
+public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    http
+        .oauth2ResourceServer(oauth2 -&gt; oauth2
+            .jwt(jwt -&gt; jwt
+                .jwkSetUri(&quot;https://keycloak.example.com/realms/myrealm/protocol/openid-connect/certs&quot;)
+                .jwtAuthenticationConverter(keycloakJwtConverter())
+            )
+        )
+        .authorizeHttpRequests(auth -&gt; auth
+            .requestMatchers(&quot;/admin/**&quot;).hasRole(&quot;ADMIN&quot;)
+            .anyRequest().authenticated()
+        );
+    return http.build();
+}
+</code></pre>
+<h2 id="23.5-jwt-深度解析">23.5 JWT 深度解析</h2>
+<p>JWT(JSON Web Token,RFC 7519)由三部分组成,以点号分隔:<code>Header.Payload.Signature</code>。每一部分都是 Base64URL 编码的 JSON。JWT 默认只是签名,不是加密——任何拿到 token 的人都能解码 header 与 payload,因此不应把密码、身份证号、内部密钥等敏感数据放进 claims。</p>
+<h3>23.5.1 JWT 三段式结构</h3>
+<div class="diagram">
+<div class="diagram-title">图 23-7 · JWT 三段式结构(Header . Payload . Signature)</div>
+<svg viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="22" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">三段式 = 描述 + 数据 + 防伪;每段独立 Base64URL 编码</text>
+
+  <rect x="80" y="50" width="760" height="60" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="460" y="78" text-anchor="middle" fill="#dbeafe" font-size="13" font-weight="bold">★ JWT = Header . Payload . Signature</text>
+  <text x="460" y="98" text-anchor="middle" fill="#dbeafe" font-size="10">eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.MEUCIQD...</text>
+
+  <path d="M280,110 L240,160" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M460,110 L460,160" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M640,110 L680,160" stroke="#f87171" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="40" y="170" width="240" height="160" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="160" y="192" text-anchor="middle" fill="#bbf7d0" font-size="12" font-weight="bold">Header(头)</text>
+  <line x1="60" y1="200" x2="260" y2="200" stroke="#3fb950" opacity="0.5"/>
+  <text x="60" y="220" fill="#bbf7d0" font-size="10">"alg": "RS256"</text>
+  <text x="60" y="238" fill="#bbf7d0" font-size="10">"kid": "key-01"</text>
+  <text x="60" y="256" fill="#bbf7d0" font-size="10">"typ": "JWT"</text>
+  <text x="60" y="284" fill="#3fb950" font-size="9">★ 描述签名算法</text>
+  <text x="60" y="300" fill="#3fb950" font-size="9">  与密钥 ID</text>
+  <text x="60" y="320" fill="#fed7aa" font-size="9">注意:绝不能信任 alg=none</text>
+
+  <rect x="300" y="170" width="320" height="160" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="460" y="192" text-anchor="middle" fill="#fed7aa" font-size="12" font-weight="bold">Payload(载荷)</text>
+  <line x1="320" y1="200" x2="600" y2="200" stroke="#d29922" opacity="0.5"/>
+  <text x="320" y="220" fill="#fed7aa" font-size="10">"sub": "user-1001"  ← 主体</text>
+  <text x="320" y="236" fill="#fed7aa" font-size="10">"iss": "https://auth.example.com"</text>
+  <text x="320" y="252" fill="#fed7aa" font-size="10">"aud": "api-gateway"</text>
+  <text x="320" y="268" fill="#fed7aa" font-size="10">"exp": 1704067200  ← 过期</text>
+  <text x="320" y="284" fill="#fed7aa" font-size="10">"nbf": 1704066600  ← 生效起</text>
+  <text x="320" y="300" fill="#fed7aa" font-size="10">"iat": 1704066600  ← 签发时</text>
+  <text x="320" y="320" fill="#f87171" font-size="9">★ 不要放敏感数据!只是签名,任何人能解码</text>
+
+  <rect x="640" y="170" width="240" height="160" rx="8" fill="url(#g-red)" stroke="#f87171"/>
+  <text x="760" y="192" text-anchor="middle" fill="#fecaca" font-size="12" font-weight="bold">Signature(签名)</text>
+  <line x1="660" y1="200" x2="860" y2="200" stroke="#f87171" opacity="0.5"/>
+  <text x="660" y="222" fill="#fecaca" font-size="10">RS256(</text>
+  <text x="660" y="238" fill="#fecaca" font-size="10">  base64url(header)</text>
+  <text x="660" y="252" fill="#fecaca" font-size="10">  + "."</text>
+  <text x="660" y="266" fill="#fecaca" font-size="10">  + base64url(payload),</text>
+  <text x="660" y="280" fill="#fecaca" font-size="10">  PRIVATE_KEY)</text>
+  <text x="660" y="306" fill="#fecaca" font-size="9">★ 覆盖前两段防篡改</text>
+  <text x="660" y="322" fill="#fecaca" font-size="9">  不加密、可防伪</text>
+</svg>
+</div>
+<p><code>Payload</code> 中的标准 claim 名称遵循 RFC 7519:<code>iss</code>(签发者)、<code>sub</code>(主体)、<code>aud</code>(受众)、<code>exp</code>(过期时间)、<code>nbf</code>(生效时间)、<code>iat</code>(签发时间)、<code>jti</code>(JWT ID,防重放)。自定义 claim 应避免与标准 claim 冲突。</p>
+<h3>23.5.2 Token 生命周期</h3>
+<div class="diagram">
+<div class="diagram-title">图 23-8 · Access Token 与 Refresh Token 双 Token 生命周期</div>
+<svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="22" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">短期 Access Token(15min~1h) + 长期 Refresh Token(数天~数月)</text>
+
+  <rect x="40" y="60" width="160" height="50" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="120" y="80" text-anchor="middle" fill="#e9d5ff" font-size="11" font-weight="bold">登录成功</text>
+  <text x="120" y="98" text-anchor="middle" fill="#e9d5ff" font-size="10">签发双 Token</text>
+
+  <rect x="260" y="60" width="160" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="340" y="80" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">★ Token 有效期内</text>
+  <text x="340" y="98" text-anchor="middle" fill="#dbeafe" font-size="10">每次请求携带</text>
+
+  <polygon points="540,60 660,85 540,110 480,85" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="570" y="83" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">是否过期?</text>
+
+  <rect x="700" y="60" width="180" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="790" y="80" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">验证签名 + 提取 Claims</text>
+  <text x="790" y="98" text-anchor="middle" fill="#bbf7d0" font-size="10">授权 → 业务处理</text>
+
+  <polygon points="540,160 660,185 540,210 480,185" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="570" y="183" text-anchor="middle" fill="#fed7aa" font-size="11" font-weight="bold">有 Refresh Token?</text>
+
+  <rect x="260" y="160" width="160" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="340" y="180" text-anchor="middle" fill="#fed7aa" font-size="11" font-weight="bold">★ 静默续期</text>
+  <text x="340" y="198" text-anchor="middle" fill="#fed7aa" font-size="10">换新 Access Token</text>
+
+  <rect x="700" y="160" width="180" height="50" rx="6" fill="url(#g-red)" stroke="#f87171"/>
+  <text x="790" y="180" text-anchor="middle" fill="#fecaca" font-size="11" font-weight="bold">重新登录</text>
+  <text x="790" y="198" text-anchor="middle" fill="#fecaca" font-size="10">用户体验中断</text>
+
+  <polygon points="540,250 660,275 540,300 480,275" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="570" y="273" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">需要撤销?</text>
+
+  <rect x="700" y="250" width="180" height="50" rx="6" fill="url(#g-red)" stroke="#f87171"/>
+  <text x="790" y="270" text-anchor="middle" fill="#fecaca" font-size="11" font-weight="bold">★ 加入黑名单</text>
+  <text x="790" y="288" text-anchor="middle" fill="#fecaca" font-size="10">Redis / 数据库 jti</text>
+
+  <rect x="260" y="250" width="160" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="340" y="270" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">继续使用</text>
+  <text x="340" y="288" text-anchor="middle" fill="#bbf7d0" font-size="10">直到自然过期</text>
+
+  <path d="M200,85 L260,85" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M420,85 L480,85" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M660,85 L700,85" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="676" y="78" fill="#bbf7d0" font-size="9">未过期</text>
+  <path d="M540,110 L540,160" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="555" y="135" fill="#fecaca" font-size="9">已过期</text>
+  <path d="M480,185 L420,185" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="445" y="178" fill="#bbf7d0" font-size="9">有</text>
+  <path d="M660,185 L700,185" stroke="#f87171" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="676" y="178" fill="#fecaca" font-size="9">无</text>
+  <path d="M340,160 L340,110" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M790,110 L790,140 L600,140 L540,250" stroke="#3fb950" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M480,275 L420,275" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="445" y="268" fill="#bbf7d0" font-size="9">否</text>
+  <path d="M660,275 L700,275" stroke="#f87171" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="676" y="268" fill="#fecaca" font-size="9">是</text>
+
+  <text x="20" y="340" fill="#fed7aa" font-size="10">★ 设计目的:Access Token 短期降低泄露风险;Refresh Token 长期且可撤销,不暴露在每次请求中</text>
+  <text x="20" y="358" fill="#fed7aa" font-size="10">★ 撤销 = 把 jti 写入黑名单(Redis 24h TTL);定期清理已自然过期的条目</text>
+</svg>
+</div>
+<p>Access Token 通常短期有效(15 分钟至 1 小时),Refresh Token 长期有效(数天至数月)。这种分离设计的目的是:即使 Access Token 泄露,影响窗口也很短;Refresh Token 可以撤销且不暴露在每次业务请求中。</p>
+<h3>23.5.3 HS256 与 RS256 对比</h3>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th>HS256 HMAC-SHA256</th>
+<th>RS256 RSA-SHA256</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>算法类型</td>
+<td>对称签名</td>
+<td>非对称签名</td>
+</tr>
+<tr>
+<td>密钥</td>
+<td>共享密钥 secret</td>
+<td>私钥签名 公钥验证</td>
+</tr>
+<tr>
+<td>性能</td>
+<td>签名与验证都较快</td>
+<td>签名更慢,验证可在资源服务器本地完成</td>
+</tr>
+<tr>
+<td>密钥分发</td>
+<td>需安全传输共享密钥</td>
+<td>公钥可公开分发(JWKS)</td>
+</tr>
+<tr>
+<td>微服务适用性</td>
+<td>中(所有服务需持有密钥)</td>
+<td>高(资源服务器只需公钥)</td>
+</tr>
+<tr>
+<td>安全风险</td>
+<td>密钥泄露即可伪造签名</td>
+<td>私钥泄露才危险,公钥泄露无影响</td>
+</tr>
+</tbody>
+</table>
+<h3>23.5.4 JWKS 端点发现流程</h3>
+<div class="diagram">
+<div class="diagram-title">图 23-9 · JWKS 端点发现与公钥缓存流程</div>
+<svg viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="22" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">资源服务器一次拉取公钥本地缓存,后续验签零网络开销</text>
+
+  <text x="180" y="55" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">资源服务器 RS</text>
+  <text x="700" y="55" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">授权服务器 AS</text>
+
+  <line x1="180" y1="70" x2="180" y2="330" stroke="#d29922" stroke-dasharray="3,2"/>
+  <line x1="700" y1="70" x2="700" y2="330" stroke="#3fb950" stroke-dasharray="3,2"/>
+
+  <path d="M180,100 L700,100" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="440" y="93" text-anchor="middle" fill="#fed7aa" font-size="10">1 GET /.well-known/openid-configuration</text>
+
+  <path d="M700,130 L180,130" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="440" y="123" text-anchor="middle" fill="#bbf7d0" font-size="10">2 返回 metadata,包含 jwks_uri</text>
+
+  <path d="M180,160 L700,160" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="440" y="153" text-anchor="middle" fill="#fed7aa" font-size="10">3 GET jwks_uri 拉取公钥列表</text>
+
+  <path d="M700,190 L180,190" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="440" y="183" text-anchor="middle" fill="#bbf7d0" font-size="10">4 keys[]: kty=RSA, kid=key-01, n, e=AQAB</text>
+
+  <rect x="40" y="210" width="280" height="64" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="180" y="232" text-anchor="middle" fill="#fed7aa" font-size="11" font-weight="bold">★ 缓存公钥</text>
+  <text x="180" y="248" text-anchor="middle" fill="#fed7aa" font-size="10">本地内存 + TTL(默认 5 分钟)</text>
+  <text x="180" y="264" text-anchor="middle" fill="#fed7aa" font-size="10">支持密钥轮换</text>
+
+  <rect x="40" y="290" width="280" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="180" y="310" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">★ 后续验签:JWT.Header.kid</text>
+  <text x="180" y="326" text-anchor="middle" fill="#dbeafe" font-size="10">→ 选择对应公钥本地验证</text>
+
+  <rect x="540" y="210" width="320" height="130" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="700" y="232" text-anchor="middle" fill="#e9d5ff" font-size="11" font-weight="bold">密钥轮换 Key Rotation</text>
+  <line x1="560" y1="240" x2="840" y2="240" stroke="#bc8cff" opacity="0.5"/>
+  <text x="560" y="258" fill="#e9d5ff" font-size="10">新密钥 kid=key-02 上线 →</text>
+  <text x="560" y="274" fill="#e9d5ff" font-size="10">JWKS 同时返回 key-01 + key-02</text>
+  <text x="560" y="290" fill="#e9d5ff" font-size="10">旧 token 用 key-01 验签</text>
+  <text x="560" y="306" fill="#e9d5ff" font-size="10">新 token 用 key-02 验签</text>
+  <text x="560" y="324" fill="#fed7aa" font-size="10">★ 平滑切换,旧 token 自然过期</text>
+</svg>
+</div>
+<p><code>kid</code>(Key ID)字段允许授权服务器同时维护多个签名密钥。这在密钥轮换(Key Rotation)场景下至关重要:旧 Token 用旧 <code>kid</code> 验证,新 Token 用新 <code>kid</code> 验证,平滑过渡而无需所有 Token 立即失效。</p>
+<h3>23.5.5 Spring Cloud Gateway 边缘验签</h3>
+<p>在微服务架构中,Spring Cloud Gateway 作为边缘网关可以在入口处验证 JWT,而非每个微服务独立验证。Gateway 启动时从授权服务器的 JWKS 端点一次性拉取公钥并缓存(定期刷新),后续所有请求的 JWT 验签都在本地完成,无网络开销。验签通过后,将用户信息作为请求头转发给下游微服务。由于 Gateway 是响应式架构,安全配置使用的是 WebFlux 的 <code>ServerHttpSecurity</code>。</p>
+<pre><code class="language-java">@Bean
+public SecurityWebFilterChain springSecurityFilterChain(ServerHttpSecurity http) {
+    return http
+        .csrf(ServerHttpSecurity.CsrfSpec::disable)
+        .authorizeExchange(exchanges -&gt; exchanges
+            .pathMatchers(&quot;/auth/**&quot;, &quot;/public/**&quot;).permitAll()
+            .anyExchange().authenticated()
+        )
+        .oauth2ResourceServer(oauth2 -&gt; oauth2
+            .jwt(jwt -&gt; jwt
+                .jwkSetUri(&quot;https://auth.example.com/.well-known/jwks.json&quot;)
+            )
+        )
+        .build();
+}
+</code></pre>
+<h3>23.5.6 无状态与有状态对比输出</h3>
+<p>JWT 资源服务器链通常是无状态的:认证信息来自每次请求的 <code>Authorization</code> 头,响应里不会创建 <code>JSESSIONID</code>。</p>
+<pre><code class="language-text">GET /api/orders/O1001 HTTP/1.1
+Authorization: Bearer eyJraWQiOiJrZXktMDEiLCJhbGciOiJSUzI1NiJ9...
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+X-Authenticated-Customer: C1001
+
+{&quot;orderId&quot;:&quot;O1001&quot;, &quot;customerId&quot;:&quot;C1001&quot;, &quot;status&quot;:&quot;PAID&quot;}
+</code></pre>
+<p>无 Token 或 Token 过期时,资源服务器返回 Bearer 错误,不依赖 Session 恢复身份:</p>
+<pre><code class="language-text">GET /api/orders/O1001 HTTP/1.1
+Authorization: Bearer expired.jwt.value
+
+HTTP/1.1 401 Unauthorized
+WWW-Authenticate: Bearer error=&quot;invalid_token&quot;, error_description=&quot;Jwt expired at 2026-05-02T07:20:00Z&quot;
+</code></pre>
+<p>传统表单登录则是有状态的:登录成功后身份保存在服务端 Session 中,后续请求靠 Cookie 找回 <code>SecurityContext</code>。</p>
+<pre><code class="language-text">GET /account/me HTTP/1.1
+Cookie: JSESSIONID=7C1A3E8F0F1C0E5E9A1D4C8B8B7F1A20
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{&quot;username&quot;:&quot;admin&quot;, &quot;authorities&quot;:[&quot;ROLE_ADMIN&quot;], &quot;contextSource&quot;:&quot;HttpSessionSecurityContextRepository&quot;}
+</code></pre>
+<h2 id="23.6-csrf-防护">23.6 CSRF 防护</h2>
+<p>CSRF(Cross-Site Request Forgery,跨站请求伪造)攻击利用浏览器自动携带 Cookie 的特性,诱导已登录用户在不知情的情况下发送恶意请求。Spring Security 默认开启 CSRF 防护。</p>
+<h3>23.6.1 Synchronizer Token 模式</h3>
+<div class="diagram">
+<div class="diagram-title">图 23-10 · Synchronizer Token 防护流程</div>
+<svg viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="22" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">服务端在 Session 中保存随机 Token,客户端必须回传匹配值</text>
+
+  <text x="180" y="55" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">浏览器 B</text>
+  <text x="700" y="55" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">服务器 S</text>
+
+  <line x1="180" y1="70" x2="180" y2="330" stroke="#bc8cff" stroke-dasharray="3,2"/>
+  <line x1="700" y1="70" x2="700" y2="330" stroke="#3fb950" stroke-dasharray="3,2"/>
+
+  <path d="M180,90 L700,90" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="440" y="84" text-anchor="middle" fill="#e9d5ff" font-size="10">1 GET /form 加载页面</text>
+
+  <rect x="540" y="100" width="320" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="700" y="118" text-anchor="middle" fill="#bbf7d0" font-size="10" font-weight="bold">★ 生成随机 CSRF Token = abc123</text>
+  <text x="700" y="132" text-anchor="middle" fill="#bbf7d0" font-size="9">存入 HttpSession[CSRF_TOKEN]</text>
+
+  <path d="M700,160 L180,160" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="440" y="154" text-anchor="middle" fill="#bbf7d0" font-size="10">2 返回页面 + Token 嵌入 hidden 字段</text>
+
+  <rect x="20" y="170" width="320" height="36" rx="4" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="180" y="192" text-anchor="middle" fill="#e9d5ff" font-size="10">&lt;input type="hidden" name="_csrf" value="abc123"&gt;</text>
+
+  <path d="M180,225 L700,225" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="440" y="219" text-anchor="middle" fill="#e9d5ff" font-size="10">3 POST /transfer _csrf=abc123 + 业务参数</text>
+
+  <rect x="540" y="235" width="320" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="700" y="252" text-anchor="middle" fill="#bbf7d0" font-size="10" font-weight="bold">★ 对比 Form Token ?= Session Token</text>
+  <text x="700" y="266" text-anchor="middle" fill="#bbf7d0" font-size="9">不一致即拒绝</text>
+
+  <path d="M700,295 L180,295" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="440" y="289" text-anchor="middle" fill="#bbf7d0" font-size="10">4 Token 匹配 → 处理请求</text>
+
+  <text x="20" y="340" fill="#fed7aa" font-size="10">★ 安全原理:攻击站点无法读取目标站点的 Session,也无法预测随机 Token 值</text>
+</svg>
+</div>
+<h3>23.6.2 Double Submit Cookie 模式</h3>
+<div class="diagram">
+<div class="diagram-title">图 23-11 · Double Submit Cookie 防护流程(无服务端 Session)</div>
+<svg viewBox="0 0 920 340" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="22" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">同一 Token 同时放在 Cookie 和 Header,跨站请求只能携带 Cookie</text>
+
+  <text x="180" y="55" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">浏览器 B</text>
+  <text x="700" y="55" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">服务器 S</text>
+
+  <line x1="180" y1="70" x2="180" y2="320" stroke="#bc8cff" stroke-dasharray="3,2"/>
+  <line x1="700" y1="70" x2="700" y2="320" stroke="#3fb950" stroke-dasharray="3,2"/>
+
+  <path d="M180,90 L700,90" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="440" y="84" text-anchor="middle" fill="#e9d5ff" font-size="10">1 GET /page</text>
+
+  <path d="M700,115 L180,115" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="440" y="109" text-anchor="middle" fill="#bbf7d0" font-size="10">2 Set-Cookie: XSRF-TOKEN=abc123 ★ 非 HttpOnly</text>
+
+  <rect x="20" y="125" width="320" height="36" rx="4" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="180" y="148" text-anchor="middle" fill="#e9d5ff" font-size="10" font-weight="bold">★ JS 读取 Cookie 值 → axios.defaults</text>
+
+  <path d="M180,180 L700,180" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="440" y="174" text-anchor="middle" fill="#e9d5ff" font-size="10">3 POST /api/action</text>
+  <text x="440" y="188" text-anchor="middle" fill="#fed7aa" font-size="9">Cookie: XSRF-TOKEN=abc123 + Header: X-XSRF-TOKEN: abc123</text>
+
+  <rect x="540" y="200" width="320" height="46" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="700" y="220" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">★ 对比 Cookie Token ?= Header Token</text>
+  <text x="700" y="236" text-anchor="middle" fill="#bbf7d0" font-size="10">两值一致即合法</text>
+
+  <path d="M700,265 L180,265" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="440" y="259" text-anchor="middle" fill="#bbf7d0" font-size="10">4 请求合法 → 处理</text>
+
+  <text x="20" y="298" fill="#fed7aa" font-size="10">★ 安全原理:跨站请求自动带 Cookie,但同源策略阻止恶意脚本读取并设置 Header</text>
+  <text x="20" y="316" fill="#fed7aa" font-size="10">★ 适用 SPA,无需服务端 Session,但 Cookie 必须 HttpOnly=false 才能被 JS 读取</text>
+</svg>
+</div>
+<p>Double Submit 模式的安全原理:跨站请求虽然会自动携带 Cookie,但攻击者无法通过 JavaScript 读取目标站点的 Cookie(同源策略),因此无法在请求头中设置正确的 Token 值。</p>
+<h3>23.6.3 何时可禁用 CSRF 防护</h3>
+<div class="diagram">
+<div class="diagram-title">图 23-12 · CSRF 防护启用决策树</div>
+<svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="22" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">是否需要 CSRF 防护取决于"浏览器是否会自动携带凭据"</text>
+
+  <polygon points="460,50 620,90 460,130 300,90" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="460" y="86" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">应用使用 Cookie 维持会话?</text>
+
+  <rect x="40" y="160" width="200" height="50" rx="6" fill="url(#g-red)" stroke="#f87171" stroke-width="2"/>
+  <text x="140" y="180" text-anchor="middle" fill="#fecaca" font-size="11" font-weight="bold">★ 必须启用 CSRF</text>
+  <text x="140" y="198" text-anchor="middle" fill="#fecaca" font-size="10">浏览器自动带 Cookie</text>
+
+  <polygon points="640,160 800,200 640,240 520,200" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="640" y="196" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">使用 Bearer Token?</text>
+  <text x="640" y="212" text-anchor="middle" fill="#58a6ff" font-size="10">JWT / OAuth2</text>
+
+  <rect x="700" y="290" width="200" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="800" y="310" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">★ 可禁用 CSRF</text>
+  <text x="800" y="328" text-anchor="middle" fill="#bbf7d0" font-size="10">浏览器不自动带 Authorization</text>
+
+  <polygon points="380,260 540,300 380,340 240,300" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="380" y="296" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">纯 API 服务?</text>
+  <text x="380" y="312" text-anchor="middle" fill="#58a6ff" font-size="10">无浏览器客户端</text>
+
+  <rect x="40" y="290" width="180" height="50" rx="6" fill="url(#g-red)" stroke="#f87171"/>
+  <text x="130" y="310" text-anchor="middle" fill="#fecaca" font-size="11" font-weight="bold">需要 CSRF 防护</text>
+  <text x="130" y="328" text-anchor="middle" fill="#fecaca" font-size="10">兜底安全</text>
+
+  <path d="M380,90 L240,170" stroke="#f87171" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="280" y="135" fill="#fecaca" font-size="10">是</text>
+  <path d="M540,90 L640,160" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="600" y="135" fill="#dbeafe" font-size="10">否</text>
+  <path d="M730,235 L800,290" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="780" y="270" fill="#bbf7d0" font-size="10">是</text>
+  <path d="M580,235 L450,275" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="540" y="270" fill="#dbeafe" font-size="10">否</text>
+  <path d="M540,310 L700,310" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="620" y="304" fill="#bbf7d0" font-size="10">是</text>
+  <path d="M240,300 L220,310" stroke="#f87171" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="240" y="290" fill="#fecaca" font-size="10">否</text>
+
+  <text x="20" y="370" fill="#fed7aa" font-size="10">★ 默认开启;只有在确认完全使用 Bearer Token 且无浏览器客户端时才禁用</text>
+</svg>
+</div>
+<h3>23.6.4 SPA 与 Spring Security 配合</h3>
+<p>当 React 或 Vue 单页应用与 Spring Boot API 后端分离部署时,CSRF 防护通常使用 <code>CookieCsrfTokenRepository.withHttpOnlyFalse()</code>。原因是:前端 JavaScript 需要读取 Cookie 中的 CSRF Token 值,然后在每个非 GET 请求的 <code>X-XSRF-TOKEN</code> 请求头中携带。如 Cookie 设置了 <code>HttpOnly</code>,JavaScript 无法按这个约定回传请求头,请求会被 <code>CsrfFilter</code> 拒绝。Axios 默认支持自动读取 <code>XSRF-TOKEN</code> Cookie 并设置请求头。</p>
+<pre><code class="language-java">@Bean
+public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    http.csrf(csrf -&gt; csrf
+        .csrfTokenRepository(CookieCsrfTokenRepository.withHttpOnlyFalse())
+        .csrfTokenRequestHandler(new CsrfTokenRequestAttributeHandler())
+    );
+    return http.build();
+}
+</code></pre>
+<h3>23.6.5 失败与成功输出对比</h3>
+<p>缺少 CSRF Token 时,用户即使已经登录,写请求也会被 <code>CsrfFilter</code> 拒绝:</p>
+<pre><code class="language-text">POST /api/profile HTTP/1.1
+Cookie: JSESSIONID=7C1A3E8F0F1C0E5E9A1D4C8B8B7F1A20; XSRF-TOKEN=abc123
+Content-Type: application/json
+
+{&quot;displayName&quot;:&quot;Customer C1001&quot;}
+
+HTTP/1.1 403 Forbidden
+Content-Type: application/json
+
+{&quot;status&quot;:403, &quot;error&quot;:&quot;Forbidden&quot;, &quot;message&quot;:&quot;Invalid CSRF token found&quot;}
+</code></pre>
+<p>前端把 Cookie 中的 <code>XSRF-TOKEN</code> 同步放到 <code>X-XSRF-TOKEN</code> 请求头后,同一个请求才会通过:</p>
+<pre><code class="language-text">POST /api/profile HTTP/1.1
+Cookie: JSESSIONID=7C1A3E8F0F1C0E5E9A1D4C8B8B7F1A20; XSRF-TOKEN=abc123
+X-XSRF-TOKEN: abc123
+Content-Type: application/json
+
+{&quot;displayName&quot;:&quot;Customer C1001&quot;}
+
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{&quot;username&quot;:&quot;alice&quot;, &quot;displayName&quot;:&quot;Customer C1001&quot;, &quot;updated&quot;:true}
+</code></pre>
+<h2 id="23.7-securitycontext-传播">23.7 SecurityContext 传播</h2>
+<p><code>SecurityContextHolder</code> 默认使用 <code>MODE_THREADLOCAL</code> 策略,将认证信息存储在当前线程的 <code>ThreadLocal</code> 中。这在同步 Servlet 模型中运行良好,但在异步与响应式场景下面临挑战。</p>
+<h3>23.7.1 ThreadLocal 存储模型</h3>
+<div class="diagram">
+<div class="diagram-title">图 23-13 · SecurityContext 的 ThreadLocal 存储与异步线程的"丢失"</div>
+<svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="22" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">同线程访问简单,但跨线程会"丢失"——异步必须显式传播</text>
+
+  <rect x="20" y="50" width="200" height="44" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="120" y="70" text-anchor="middle" fill="#e9d5ff" font-size="11" font-weight="bold">Servlet 请求线程</text>
+  <text x="120" y="86" text-anchor="middle" fill="#bc8cff" font-size="10">http-nio-8080-exec-1</text>
+
+  <rect x="260" y="50" width="220" height="44" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="370" y="70" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">SecurityContextHolderFilter</text>
+  <text x="370" y="86" text-anchor="middle" fill="#58a6ff" font-size="10">从 Repository 加载</text>
+
+  <rect x="520" y="50" width="200" height="44" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="620" y="70" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">★ ThreadLocal Map</text>
+  <text x="620" y="86" text-anchor="middle" fill="#bbf7d0" font-size="10">SecurityContext 存储</text>
+
+  <rect x="760" y="50" width="140" height="44" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="830" y="70" text-anchor="middle" fill="#fed7aa" font-size="11" font-weight="bold">Controller</text>
+  <text x="830" y="86" text-anchor="middle" fill="#fed7aa" font-size="10">getContext() 同步取</text>
+
+  <rect x="260" y="130" width="460" height="44" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="490" y="150" text-anchor="middle" fill="#e9d5ff" font-size="11" font-weight="bold">请求结束:Filter 清理 ThreadLocal</text>
+  <text x="490" y="166" text-anchor="middle" fill="#e9d5ff" font-size="10">避免线程池复用时残留上次请求的 Context</text>
+
+  <rect x="20" y="220" width="200" height="44" rx="6" fill="url(#g-red)" stroke="#f87171"/>
+  <text x="120" y="240" text-anchor="middle" fill="#fecaca" font-size="11" font-weight="bold">CompletableFuture / 新线程</text>
+  <text x="120" y="256" text-anchor="middle" fill="#fecaca" font-size="10">async-pool-thread-3</text>
+
+  <rect x="260" y="220" width="220" height="44" rx="6" fill="url(#g-red)" stroke="#f87171" stroke-width="2"/>
+  <text x="370" y="240" text-anchor="middle" fill="#fecaca" font-size="11" font-weight="bold">★ 拿不到 Context!</text>
+  <text x="370" y="256" text-anchor="middle" fill="#fecaca" font-size="10">getAuthentication() = null</text>
+
+  <rect x="520" y="220" width="380" height="44" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="710" y="240" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">★ 修复方案:DelegatingSecurityContextExecutor</text>
+  <text x="710" y="256" text-anchor="middle" fill="#bbf7d0" font-size="10">提交任务时自动捕获并传播 Context</text>
+
+  <path d="M220,72 L260,72" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M480,72 L520,72" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M720,72 L760,72" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M620,94 L490,130" stroke="#3fb950" stroke-width="1" stroke-dasharray="4,2" marker-end="url(#arr)" fill="none"/>
+  <path d="M220,242 L260,242" stroke="#f87171" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M480,242 L520,242" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <text x="20" y="310" fill="#fed7aa" font-size="10">★ ThreadLocal 用 Thread.currentThread() 作为 Map 的 key,新线程查不到对应条目</text>
+  <text x="20" y="328" fill="#fed7aa" font-size="10">★ MODE_INHERITABLETHREADLOCAL 只在 new Thread() 时拷贝一次,线程池复用时不可靠</text>
+  <text x="20" y="346" fill="#fed7aa" font-size="10">★ 推荐:用 DelegatingSecurityContextAsyncTaskExecutor 包装 ThreadPoolTaskExecutor</text>
+  <text x="20" y="364" fill="#fed7aa" font-size="10">★ WebFlux 不用 ThreadLocal,而是 Reactor Context;接口也不同(ReactiveSecurityContextHolder)</text>
+</svg>
+</div>
+<p><code>SecurityContextHolderFilter</code> 在请求开始时从 <code>SecurityContextRepository</code>(如 <code>HttpSessionSecurityContextRepository</code>)加载 <code>SecurityContext</code> 到 <code>ThreadLocal</code>,在请求结束时清理 <code>ThreadLocal</code>。这保证了同一线程在请求生命周期内可以通过静态方法 <code>SecurityContextHolder.getContext()</code> 获取当前用户。</p>
+<h3>23.7.2 异步场景的传播策略</h3>
+<div class="diagram">
+<div class="diagram-title">图 23-14 · SecurityContext 的四种异步传播方案对比</div>
+<svg viewBox="0 0 920 440" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="22" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">从最简单到最规范:四档可选方案,生产首推方案 2/3</text>
+
+  <rect x="380" y="40" width="160" height="44" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="460" y="60" text-anchor="middle" fill="#e9d5ff" font-size="11" font-weight="bold">异步 / 响应式场景</text>
+  <text x="460" y="76" text-anchor="middle" fill="#bc8cff" font-size="10">需要在新线程拿到当前用户</text>
+
+  <rect x="20" y="120" width="220" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="130" y="140" text-anchor="middle" fill="#fed7aa" font-size="11" font-weight="bold">方案 1</text>
+  <text x="130" y="158" text-anchor="middle" fill="#fed7aa" font-size="10">MODE_INHERITABLETHREADLOCAL</text>
+
+  <rect x="260" y="120" width="220" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="370" y="140" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">★ 方案 2</text>
+  <text x="370" y="158" text-anchor="middle" fill="#bbf7d0" font-size="10">DelegatingSecurityContextExecutor</text>
+
+  <rect x="500" y="120" width="220" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="610" y="140" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">★ 方案 3</text>
+  <text x="610" y="158" text-anchor="middle" fill="#bbf7d0" font-size="10">@Async + AsyncConfigurer</text>
+
+  <rect x="740" y="120" width="160" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="820" y="140" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">方案 4</text>
+  <text x="820" y="158" text-anchor="middle" fill="#dbeafe" font-size="10">Reactor Context (WebFlux)</text>
+
+  <rect x="20" y="210" width="220" height="80" rx="6" fill="url(#g-red)" stroke="#f87171"/>
+  <text x="130" y="230" text-anchor="middle" fill="#fecaca" font-size="10" font-weight="bold">缺点</text>
+  <text x="130" y="248" text-anchor="middle" fill="#fecaca" font-size="10">线程池复用时不可靠</text>
+  <text x="130" y="264" text-anchor="middle" fill="#fecaca" font-size="10">只在 new Thread 时</text>
+  <text x="130" y="280" text-anchor="middle" fill="#fecaca" font-size="10">继承一次</text>
+
+  <rect x="260" y="210" width="220" height="80" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="370" y="230" text-anchor="middle" fill="#bbf7d0" font-size="10" font-weight="bold">优势</text>
+  <text x="370" y="248" text-anchor="middle" fill="#bbf7d0" font-size="10">每次提交任务都传播</text>
+  <text x="370" y="264" text-anchor="middle" fill="#bbf7d0" font-size="10">显式装饰器透明包装</text>
+  <text x="370" y="280" text-anchor="middle" fill="#bbf7d0" font-size="10">线程池友好</text>
+
+  <rect x="500" y="210" width="220" height="80" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="610" y="230" text-anchor="middle" fill="#bbf7d0" font-size="10" font-weight="bold">优势</text>
+  <text x="610" y="248" text-anchor="middle" fill="#bbf7d0" font-size="10">Spring 原生支持</text>
+  <text x="610" y="264" text-anchor="middle" fill="#bbf7d0" font-size="10">配置 AsyncConfigurer 即可</text>
+  <text x="610" y="280" text-anchor="middle" fill="#bbf7d0" font-size="10">业务代码零侵入</text>
+
+  <rect x="740" y="210" width="160" height="80" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="820" y="230" text-anchor="middle" fill="#dbeafe" font-size="10" font-weight="bold">特性</text>
+  <text x="820" y="248" text-anchor="middle" fill="#dbeafe" font-size="10">WebFlux 官方方案</text>
+  <text x="820" y="264" text-anchor="middle" fill="#dbeafe" font-size="10">Reactor Context</text>
+  <text x="820" y="280" text-anchor="middle" fill="#dbeafe" font-size="10">沿信号链传播</text>
+
+  <path d="M460,84 L130,120" stroke="#d29922" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M460,84 L370,120" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M460,84 L610,120" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M460,84 L820,120" stroke="#58a6ff" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M130,170 L130,210" stroke="#f87171" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M370,170 L370,210" stroke="#3fb950" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M610,170 L610,210" stroke="#3fb950" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M820,170 L820,210" stroke="#58a6ff" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+
+  <text x="20" y="340" fill="#fed7aa" font-size="10">★ 生产推荐顺序:Servlet 业务用方案 2 或 3,WebFlux 业务用方案 4</text>
+  <text x="20" y="358" fill="#fed7aa" font-size="10">★ 方案 1 只适合手动 new Thread() 的极简场景,严禁配合线程池使用</text>
+  <text x="20" y="376" fill="#fed7aa" font-size="10">★ 方案 2/3 本质都是装饰器:在提交任务时把当前 Context 闭包,执行时恢复</text>
+  <text x="20" y="394" fill="#fed7aa" font-size="10">★ 千万不要在 EventLoop 线程里拿 SecurityContext.getContext()——会拿到错乱的请求上下文</text>
+  <text x="20" y="412" fill="#fed7aa" font-size="10">★ 用 Spring Boot 3.2+ 的 spring.threads.virtual.enabled=true 后,Virtual Thread 也走 ThreadLocal,行为一致</text>
+</svg>
+</div>
+<p>使用 <code>CompletableFuture.supplyAsync()</code> 或直接 <code>new Thread()</code> 创建的线程不会自动继承 <code>SecurityContext</code>。必须使用 <code>DelegatingSecurityContextRunnable</code> 包装 <code>Runnable</code>,或使用被 <code>DelegatingSecurityContextExecutorService</code> 包装过的线程池。</p>
+<h3>23.7.3 WebFlux 与 ReactiveSecurityContextHolder</h3>
+<p>在响应式 Spring Security 中,<code>SecurityContext</code> 不存储在 <code>ThreadLocal</code> 中,而是通过 Reactor 的 <code>Context</code>(类似协程的上下文)传播。这是因为 WebFlux 的请求可能在多个线程间切换(EventLoop 线程、<code>boundedElastic</code> 线程等),<code>ThreadLocal</code> 无法跨线程传递。</p>
+<p>获取当前用户的方式也完全不同:MVC 用 <code>SecurityContextHolder.getContext()</code>(同步),WebFlux 用 <code>ReactiveSecurityContextHolder.getContext()</code>(返回 <code>Mono</code>):</p>
+<pre><code class="language-java">@GetMapping(&quot;/me&quot;)
+public UserInfo currentUser() {
+    Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+    return new UserInfo(auth.getName(), auth.getAuthorities());
+}
+
+@GetMapping(&quot;/me-reactive&quot;)
+public Mono&lt;UserInfo&gt; currentUserReactive() {
+    return ReactiveSecurityContextHolder.getContext()
+        .map(SecurityContext::getAuthentication)
+        .map(auth -&gt; new UserInfo(auth.getName(), auth.getAuthorities()));
+}
+</code></pre>
+<h3>23.7.4 异步线程的修复方案</h3>
+<pre><code class="language-java">@Async
+public CompletableFuture&lt;Report&gt; generateReport() {
+    Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+    return CompletableFuture.completedFuture(new Report(auth.getName()));
+}
+
+@Bean
+public TaskExecutor taskExecutor() {
+    ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+    executor.setCorePoolSize(10);
+    executor.setMaxPoolSize(20);
+    executor.setThreadNamePrefix(&quot;async-secure-&quot;);
+    executor.initialize();
+    return new DelegatingSecurityContextAsyncTaskExecutor(executor);
+}
+</code></pre>
+<p>包装后的线程池在每次提交任务时,自动捕获提交线程的 <code>SecurityContext</code> 并在执行任务的线程中恢复,任务结束后清理。这种"装饰器模式"对业务代码完全透明。</p>
+<h2 id="23.8-方法级安全">23.8 方法级安全</h2>
+<p>URL 授权适合保护入口,方法级安全适合保护业务能力。实际项目里二者通常同时存在:Controller 先挡住明显不该访问的路径,Service 再用业务参数做细粒度检查。</p>
+<h3>23.8.1 注解驱动的方法级安全</h3>
+<pre><code class="language-java">@Configuration
+@EnableMethodSecurity
+class MethodSecurityConfig {
+}
+
+@Service
+class InvoiceService {
+    @PreAuthorize(&quot;hasRole('ADMIN') or #owner == authentication.name&quot;)
+    public InvoiceDto findInvoice(String owner, String invoiceId) {
+        return repository.findByOwnerAndId(owner, invoiceId);
+    }
+
+    @PreAuthorize(&quot;hasAuthority('payment:approve')&quot;)
+    public void approve(String invoiceId) {
+        repository.markApproved(invoiceId);
+    }
+
+    @PostAuthorize(&quot;returnObject.owner == authentication.name&quot;)
+    public InvoiceDto getMyInvoice(String invoiceId) {
+        return repository.findById(invoiceId);
+    }
+
+    @PreFilter(&quot;filterObject.amount &lt; 10000&quot;)
+    public void batchApprove(List&lt;InvoiceDto&gt; invoices) {
+        invoices.forEach(this::approveOne);
+    }
+}
+</code></pre>
+<h3>23.8.2 SpEL 表达式与方法参数</h3>
+<table>
+<thead>
+<tr>
+<th>注解</th>
+<th>执行时机</th>
+<th>表达式可用变量</th>
+<th>典型用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>@PreAuthorize</code></td>
+<td>方法执行前</td>
+<td><code>authentication</code>,方法参数(<code>#paramName</code>)</td>
+<td>基于参数的访问控制</td>
+</tr>
+<tr>
+<td><code>@PostAuthorize</code></td>
+<td>方法执行后</td>
+<td><code>returnObject</code>,<code>authentication</code></td>
+<td>基于返回值的过滤</td>
+</tr>
+<tr>
+<td><code>@PreFilter</code></td>
+<td>方法执行前</td>
+<td><code>filterObject</code>(集合元素)</td>
+<td>过滤入参集合</td>
+</tr>
+<tr>
+<td><code>@PostFilter</code></td>
+<td>方法执行后</td>
+<td><code>filterObject</code>(返回集合元素)</td>
+<td>过滤返回集合</td>
+</tr>
+<tr>
+<td><code>@Secured</code></td>
+<td>方法执行前</td>
+<td>仅角色字符串</td>
+<td>简单角色检查(已弃用)</td>
+</tr>
+</tbody>
+</table>
+<h3>23.8.3 方法级安全的运行输出</h3>
+<p>当 <code>alice</code> 访问自己的发票时,SpEL 表达式 <code>#owner == authentication.name</code> 为真,方法正常返回:</p>
+<pre><code class="language-text">INFO o.s.s.a.m.AuthorizationManagerBeforeMethodInterceptor : Authorized invocation InvoiceService.findInvoice
+INFO c.example.InvoiceController : returned invoice INV-1001 to alice amount=1280.00
+</code></pre>
+<p>同一个用户审批支付时,因为缺少 <code>payment:approve</code> 权限,拦截发生在方法体执行之前:</p>
+<pre><code class="language-text">DEBUG o.s.s.a.m.AuthorizationManagerBeforeMethodInterceptor : Authorizing method invocation ReflectiveMethodInvocation: void InvoiceService.approve String
+DEBUG o.s.s.a.m.AuthorizationManagerBeforeMethodInterceptor : Failed to authorize ReflectiveMethodInvocation
+ERROR c.example.ApiExceptionHandler : AccessDeniedException: Access Denied
+</code></pre>
+<p>对外的 HTTP 响应仍然是 403,避免把内部方法名与 SpEL 细节暴露给客户端:</p>
+<pre><code class="language-text">POST /api/invoices/INV-1001/approve HTTP/1.1
+Cookie: JSESSIONID=9A9E0D6D8C4B4F0A8F1E3C2D1A0B5C77
+
+HTTP/1.1 403 Forbidden
+Content-Type: application/json
+
+{&quot;status&quot;:403, &quot;error&quot;:&quot;Forbidden&quot;, &quot;message&quot;:&quot;Access is denied&quot;}
+</code></pre>
+<h2 id="23.9-陷阱与限制">23.9 陷阱与限制</h2>
+<h3>23.9.1 陷阱 1:JWT 的 alg none 攻击</h3>
+<p>JWT 标准允许 <code>alg: "none"</code>(无签名)。如验证库没有显式拒绝 <code>none</code> 算法,攻击者可以伪造任意 JWT 绕过认证。</p>
+<p>修复:验证 JWT 时必须显式指定允许的算法列表。<code>JwtDecoders.fromIssuerLocation(issuerUri)</code> 默认安全;但自定义 <code>NimbusJwtDecoder</code> 时需确认 <code>.jwsAlgorithm(SignatureAlgorithm.RS256)</code> 已设置。绝不允许客户端控制验证算法。</p>
+<pre><code class="language-java">NimbusJwtDecoder decoder = NimbusJwtDecoder.withJwkSetUri(jwksUri)
+    .jwsAlgorithm(SignatureAlgorithm.RS256)
+    .build();
+decoder.setJwtValidator(JwtValidators.createDefaultWithIssuer(issuer));
+</code></pre>
+<h3>23.9.2 陷阱 2:SecurityContext 在异步线程中丢失</h3>
+<p><code>SecurityContextHolder</code> 默认使用 <code>ThreadLocal</code> 策略。当使用 <code>@Async</code>、<code>CompletableFuture</code> 或手动创建线程时,新线程没有 <code>SecurityContext</code>,<code>Authentication</code> 为 null,权限检查失败。</p>
+<p>修复方案 A 适合手动创建的短生命周期子线程,线程池中不推荐:</p>
+<pre><code class="language-java">SecurityContextHolder.setStrategyName(
+    SecurityContextHolder.MODE_INHERITABLETHREADLOCAL);
+</code></pre>
+<p>修复方案 B 是生产推荐,使用 Spring 提供的装饰器:</p>
+<pre><code class="language-java">@Bean
+public TaskExecutor taskExecutor() {
+    ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+    executor.setCorePoolSize(10);
+    return new DelegatingSecurityContextAsyncTaskExecutor(executor);
+}
+</code></pre>
+<h3>23.9.3 陷阱 3:CSRF 保护与前后端分离冲突</h3>
+<p>Spring Security 默认开启 CSRF 保护。SPA 前端通过 AJAX 发送 POST 或 PUT 或 DELETE 请求时,如未正确传递 CSRF Token,会返回 403 Forbidden。许多开发者直接 <code>csrf().disable()</code> 关闭 CSRF——这是错误的做法,等于把所有写操作暴露给跨站攻击。</p>
+<p>修复:使用 <code>CookieCsrfTokenRepository.withHttpOnlyFalse()</code>,将 CSRF Token 放在 Cookie 中(<code>XSRF-TOKEN</code>),前端框架(如 Axios、Angular HttpClient)会自动读取并放入请求头 <code>X-XSRF-TOKEN</code>。</p>
+<h3>23.9.4 陷阱 4:多个 SecurityFilterChain 的匹配顺序</h3>
+<p>如有多条 <code>SecurityFilterChain</code>,必须确保具体路径的链排在前面,<code>/**</code> 通配的链排在最后,因为 <code>FilterChainProxy</code> 只执行第一个匹配的链。</p>
+<p>错误做法:</p>
+<pre><code class="language-java">@Order(1)
+http.securityMatcher(&quot;/**&quot;)
+    .authorizeHttpRequests(auth -&gt; auth.anyRequest().authenticated())
+
+@Order(2)
+http.securityMatcher(&quot;/api/**&quot;)
+    .oauth2ResourceServer(oauth2 -&gt; oauth2.jwt(Customizer.withDefaults()))
+</code></pre>
+<p>正确做法:</p>
+<pre><code class="language-java">@Order(1)
+http.securityMatcher(&quot;/api/**&quot;)
+    .oauth2ResourceServer(oauth2 -&gt; oauth2.jwt(Customizer.withDefaults()))
+
+@Order(2)
+http.securityMatcher(&quot;/**&quot;)
+    .authorizeHttpRequests(auth -&gt; auth.anyRequest().authenticated())
+</code></pre>
+<h3>23.9.5 陷阱 5:JWT 时钟偏移导致 Token 验证失败</h3>
+<p>签发服务器与验证服务器之间时钟不同步(在容器与云环境中很常见),会导致刚签发的 Token 因 <code>nbf</code>(Not Before)检查失败而被拒绝。</p>
+<p>修复:配置时钟偏移容忍 <code>jwtDecoder.setClockSkew(Duration.ofSeconds(60))</code>。同时确保所有服务器使用 NTP 同步时钟。</p>
+<pre><code class="language-java">NimbusJwtDecoder decoder = NimbusJwtDecoder.withJwkSetUri(jwksUri).build();
+OAuth2TokenValidator&lt;Jwt&gt; withClockSkew = new DelegatingOAuth2TokenValidator&lt;&gt;(
+    new JwtTimestampValidator(Duration.ofSeconds(60)),
+    new JwtIssuerValidator(issuer));
+decoder.setJwtValidator(withClockSkew);
+</code></pre>
+<h3>23.9.6 陷阱 6:HttpOnly Cookie 与 SPA 读取需求</h3>
+<p><code>CookieCsrfTokenRepository</code> 默认 <code>httpOnly=true</code>,JavaScript 无法读取。SPA 场景必须使用 <code>withHttpOnlyFalse()</code> 工厂方法,但要注意:这意味着 XSS 漏洞可以读取 CSRF Token——前端的 XSS 防护(CSP、Sanitizer)同样重要。</p>
+<h3>23.9.7 陷阱 7:HttpSession 序列化与集群</h3>
+<p><code>HttpSessionSecurityContextRepository</code> 默认把 <code>SecurityContext</code> 存储在 <code>HttpSession</code> 中。如启用了 Spring Session(Redis 或 JDBC 后端),<code>SecurityContext</code>、<code>Authentication</code> 与 <code>Principal</code> 必须实现 <code>Serializable</code>。自定义 <code>Authentication</code> 实现忘记实现 <code>Serializable</code> 会导致集群环境下登录态无法跨节点复用。</p>
+<h2 id="23.10-源码入口与扩展边界">23.10 源码入口与扩展边界</h2>
+<p>Spring Security 的源码入口在 Servlet 层:容器先调用 <code>DelegatingFilterProxy</code>,它再委托 Spring Bean <code>FilterChainProxy</code>。<code>FilterChainProxy</code> 只做两件事:按请求匹配第一条 <code>SecurityFilterChain</code>,再按顺序执行链内安全过滤器。</p>
+<h3>23.10.1 关键源码入口</h3>
+<table>
+<thead>
+<tr>
+<th>关注点</th>
+<th>源码入口</th>
+<th>运行时职责</th>
+<th>排查信号</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Servlet 桥接</td>
+<td><code>DelegatingFilterProxy.doFilter</code></td>
+<td>委托给 Spring Bean <code>FilterChainProxy</code></td>
+<td>启动日志中过滤器注册</td>
+</tr>
+<tr>
+<td>链路匹配</td>
+<td><code>FilterChainProxy.doFilterInternal</code></td>
+<td>选择匹配的 <code>SecurityFilterChain</code></td>
+<td>DEBUG 日志 Securing 与 Invoking</td>
+</tr>
+<tr>
+<td>认证管理</td>
+<td><code>ProviderManager.authenticate</code></td>
+<td>遍历 <code>AuthenticationProvider</code></td>
+<td>DEBUG 日志 Authenticating with Provider</td>
+</tr>
+<tr>
+<td>用户密码认证</td>
+<td><code>DaoAuthenticationProvider</code></td>
+<td>调用 <code>UserDetailsService</code> 加 密码比对</td>
+<td>BadCredentialsException</td>
+</tr>
+<tr>
+<td>JWT 解码</td>
+<td><code>NimbusJwtDecoder</code></td>
+<td>验证签名、过期、issuer、audience</td>
+<td>JwtException 系列</td>
+</tr>
+<tr>
+<td>OAuth2 客户端</td>
+<td><code>OAuth2AuthorizationCodeAuthenticationProvider</code></td>
+<td>处理授权码换 Token</td>
+<td>TRACE 日志 Token Endpoint</td>
+</tr>
+<tr>
+<td>URL 授权</td>
+<td><code>AuthorizationFilter</code></td>
+<td>调用 <code>AuthorizationManager</code></td>
+<td>Authorizing 与 Failed to authorize</td>
+</tr>
+<tr>
+<td>方法级授权</td>
+<td><code>AuthorizationManagerBeforeMethodInterceptor</code></td>
+<td>AOP 拦截 <code>@PreAuthorize</code></td>
+<td>AccessDeniedException</td>
+</tr>
+<tr>
+<td>异常翻译</td>
+<td><code>ExceptionTranslationFilter</code></td>
+<td><code>AuthenticationException</code> 与 <code>AccessDeniedException</code> 分流</td>
+<td>401 加 EntryPoint 或 403 加 Handler</td>
+</tr>
+<tr>
+<td>Context 存储</td>
+<td><code>SecurityContextHolderFilter</code></td>
+<td>加载 加 清理 ThreadLocal</td>
+<td>DEBUG 日志 Set SecurityContext</td>
+</tr>
+</tbody>
+</table>
+<h3>23.10.2 源码到运行时全链路</h3>
+<div class="diagram">
+<div class="diagram-title">图 23-15 · Spring Security 源码到运行时调用全链路</div>
+<svg viewBox="0 0 920 540" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="22" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">从配置加载 → 请求处理 → 授权决策 → 三类出口</text>
+
+  <rect x="20" y="50" width="200" height="44" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="120" y="70" text-anchor="middle" fill="#e9d5ff" font-size="11" font-weight="bold">application.yml</text>
+  <text x="120" y="86" text-anchor="middle" fill="#bc8cff" font-size="9">spring.security.* 配置</text>
+
+  <rect x="260" y="50" width="220" height="44" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="370" y="70" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">SecurityAutoConfiguration</text>
+  <text x="370" y="86" text-anchor="middle" fill="#58a6ff" font-size="9">+ OAuth2ResourceServerAutoConfig</text>
+
+  <rect x="520" y="50" width="180" height="44" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="610" y="70" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">SecurityFilterChain Bean</text>
+  <text x="610" y="86" text-anchor="middle" fill="#3fb950" font-size="9">用户配置</text>
+
+  <rect x="740" y="50" width="160" height="44" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="820" y="70" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">★ FilterChainProxy</text>
+  <text x="820" y="86" text-anchor="middle" fill="#bbf7d0" font-size="9">注册到 Servlet</text>
+
+  <rect x="20" y="130" width="180" height="44" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="110" y="150" text-anchor="middle" fill="#e9d5ff" font-size="11" font-weight="bold">HTTP 请求</text>
+
+  <rect x="220" y="130" width="180" height="44" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="310" y="150" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">DelegatingFilterProxy</text>
+  <text x="310" y="166" text-anchor="middle" fill="#58a6ff" font-size="9">桥接</text>
+
+  <polygon points="500,130 660,150 500,170 440,150" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="540" y="156" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">RequestMatcher 匹配</text>
+
+  <rect x="20" y="195" width="200" height="40" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="120" y="220" text-anchor="middle" fill="#fed7aa" font-size="10" font-weight="bold">SecurityContextHolderFilter</text>
+
+  <rect x="240" y="195" width="160" height="40" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="320" y="220" text-anchor="middle" fill="#fed7aa" font-size="10" font-weight="bold">CsrfFilter</text>
+
+  <rect x="420" y="195" width="220" height="40" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="530" y="220" text-anchor="middle" fill="#fed7aa" font-size="10" font-weight="bold">★ 认证过滤器</text>
+
+  <rect x="660" y="195" width="220" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="770" y="220" text-anchor="middle" fill="#dbeafe" font-size="10" font-weight="bold">AuthenticationManager</text>
+
+  <rect x="20" y="260" width="200" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="120" y="284" text-anchor="middle" fill="#dbeafe" font-size="10" font-weight="bold">AuthenticationProvider</text>
+
+  <rect x="240" y="260" width="200" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="340" y="284" text-anchor="middle" fill="#bbf7d0" font-size="10" font-weight="bold">SecurityContext → ThreadLocal</text>
+
+  <rect x="460" y="260" width="200" height="40" rx="6" fill="url(#g-red)" stroke="#f87171"/>
+  <text x="560" y="284" text-anchor="middle" fill="#fecaca" font-size="10" font-weight="bold">ExceptionTranslationFilter</text>
+
+  <rect x="680" y="260" width="220" height="40" rx="6" fill="url(#g-red)" stroke="#f87171" stroke-width="2"/>
+  <text x="790" y="284" text-anchor="middle" fill="#fecaca" font-size="10" font-weight="bold">★ AuthorizationFilter</text>
+
+  <polygon points="460,330 620,360 460,390 380,360" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="500" y="365" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">授权结果</text>
+
+  <rect x="20" y="430" width="220" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="130" y="450" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">★ 通过</text>
+  <text x="130" y="468" text-anchor="middle" fill="#bbf7d0" font-size="10">DispatcherServlet 业务</text>
+
+  <rect x="280" y="430" width="280" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="420" y="450" text-anchor="middle" fill="#fed7aa" font-size="11" font-weight="bold">★ 未认证</text>
+  <text x="420" y="468" text-anchor="middle" fill="#fed7aa" font-size="10">EntryPoint → 401 / 302 登录页</text>
+
+  <rect x="600" y="430" width="280" height="50" rx="6" fill="url(#g-red)" stroke="#f87171" stroke-width="2"/>
+  <text x="740" y="450" text-anchor="middle" fill="#fecaca" font-size="11" font-weight="bold">★ 未授权</text>
+  <text x="740" y="468" text-anchor="middle" fill="#fecaca" font-size="10">AccessDeniedHandler → 403</text>
+
+  <path d="M220,72 L260,72" stroke="#58a6ff" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M480,72 L520,72" stroke="#58a6ff" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M700,72 L740,72" stroke="#3fb950" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M200,152 L220,152" stroke="#bc8cff" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M400,152 L440,152" stroke="#58a6ff" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M540,170 L120,195" stroke="#58a6ff" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M220,215 L240,215" stroke="#d29922" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M400,215 L420,215" stroke="#d29922" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M640,215 L660,215" stroke="#d29922" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M770,235 L120,260" stroke="#58a6ff" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M220,280 L240,280" stroke="#58a6ff" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M440,280 L460,280" stroke="#3fb950" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M660,280 L680,280" stroke="#f87171" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M790,300 L500,330" stroke="#f87171" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M380,360 L130,430" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="240" y="395" fill="#bbf7d0" font-size="9">通过</text>
+  <path d="M460,390 L420,430" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="430" y="415" fill="#fed7aa" font-size="9">未认证</text>
+  <path d="M620,360 L740,430" stroke="#f87171" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="690" y="395" fill="#fecaca" font-size="9">未授权</text>
+
+  <text x="20" y="510" fill="#fed7aa" font-size="10">★ 三类出口本质都是把"安全决策"翻译成 HTTP 响应,业务层(Controller)只接收已通过的请求</text>
+  <text x="20" y="528" fill="#fed7aa" font-size="10">★ 调试入口:开 logging.level.org.springframework.security=DEBUG,完整链路全部可见</text>
+</svg>
+</div>
+<h3>23.10.3 设计取舍与被拒绝方案</h3>
+<table>
+<thead>
+<tr>
+<th>设计选择</th>
+<th>为什么这样做</th>
+<th>被拒绝方案</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DelegatingFilterProxy</code> 桥接</td>
+<td>让安全 Bean 享受 Spring 生命周期</td>
+<td>直接注册多个 Servlet Filter</td>
+<td>多一层代理转发</td>
+</tr>
+<tr>
+<td><code>FilterChainProxy</code> 管多条链</td>
+<td>不同路径可使用完全不同安全策略</td>
+<td>单链 if else 配置</td>
+<td>顺序配置容易出错</td>
+</tr>
+<tr>
+<td>认证与授权分离</td>
+<td>多种认证协议组合;授权逻辑统一</td>
+<td>在过滤器中做角色检查</td>
+<td>过滤器数量多</td>
+</tr>
+<tr>
+<td><code>SecurityContextHolder</code> 用 ThreadLocal</td>
+<td>Servlet 同线程访问简单</td>
+<td>全局 Map 加 RequestId</td>
+<td>异步线程必须显式传播</td>
+</tr>
+<tr>
+<td>安全在 MVC 前执行</td>
+<td>攻击流量不进入业务层</td>
+<td>Controller 自校验登录</td>
+<td>路径配置必须精确</td>
+</tr>
+<tr>
+<td><code>AuthorizationManager</code> 替代旧 API</td>
+<td>统一授权抽象,替代 <code>AccessDecisionManager</code></td>
+<td>投票器机制</td>
+<td>旧代码迁移成本</td>
+</tr>
+<tr>
+<td>OAuth2 与 OIDC 内置</td>
+<td>避免依赖第三方适配器</td>
+<td>第三方库各自实现</td>
+<td>配置复杂度增加</td>
+</tr>
+<tr>
+<td>默认开启 CSRF 与 CSP 与 HSTS</td>
+<td>安全默认值</td>
+<td>默认关闭让用户主动开启</td>
+<td>SPA 场景需要额外配置</td>
+</tr>
+</tbody>
+</table>
+<h3>23.10.4 扩展边界</h3>
+<table>
+<thead>
+<tr>
+<th>扩展点</th>
+<th>可做的事</th>
+<th>不建议做的事</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SecurityFilterChain</code> Bean</td>
+<td>多链组合,按路径定制策略</td>
+<td>把所有逻辑塞进一个链</td>
+</tr>
+<tr>
+<td><code>AuthenticationProvider</code></td>
+<td>自定义认证(短信、生物识别)</td>
+<td>直接修改 <code>ProviderManager</code></td>
+</tr>
+<tr>
+<td><code>UserDetailsService</code></td>
+<td>自定义用户加载(数据库、LDAP、API)</td>
+<td>在 Filter 中查库</td>
+</tr>
+<tr>
+<td><code>PasswordEncoder</code></td>
+<td>升级算法(BCrypt → Argon2)</td>
+<td>自实现密码哈希</td>
+</tr>
+<tr>
+<td><code>JwtAuthenticationConverter</code></td>
+<td>自定义 JWT claims → Authorities 映射</td>
+<td>修改 <code>NimbusJwtDecoder</code> 内部行为</td>
+</tr>
+<tr>
+<td><code>AuthorizationManager</code></td>
+<td>自定义授权决策</td>
+<td>在 Controller 里硬编码角色检查</td>
+</tr>
+<tr>
+<td><code>AccessDeniedHandler</code> 与 <code>EntryPoint</code></td>
+<td>定制 401 与 403 响应格式</td>
+<td>在过滤器链外处理</td>
+</tr>
+<tr>
+<td><code>SecurityContextRepository</code></td>
+<td>自定义 Context 存储(Redis、JWT 无状态)</td>
+<td>直接操作 <code>HttpSession</code> 属性</td>
+</tr>
+<tr>
+<td><code>CsrfTokenRepository</code></td>
+<td>Cookie 与 Header 与 自定义存储</td>
+<td>全局禁用 CSRF</td>
+</tr>
+<tr>
+<td><code>MethodSecurityExpressionHandler</code></td>
+<td>注册自定义 SpEL 函数</td>
+<td>在每个 SpEL 表达式里写复杂业务逻辑</td>
+</tr>
+</tbody>
+</table>
+<h3>23.10.5 验证护栏</h3>
+<table>
+<thead>
+<tr>
+<th>验证目标</th>
+<th>推荐检查</th>
+<th>通过标准</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>过滤器链装配</td>
+<td>启动日志 <code>DefaultSecurityFilterChain</code></td>
+<td>期望的过滤器全部出现</td>
+</tr>
+<tr>
+<td>多链顺序</td>
+<td>启动日志 <code>Will secure any request with</code></td>
+<td>具体路径链在前,<code>/**</code> 在后</td>
+</tr>
+<tr>
+<td>认证成功</td>
+<td>DEBUG 日志加 Cookie 或 Token 响应</td>
+<td><code>SecurityContext</code> 已建立</td>
+</tr>
+<tr>
+<td>授权失败</td>
+<td>模拟无权限请求</td>
+<td>返回 401 或 403,无业务副作用</td>
+</tr>
+<tr>
+<td>JWT 验签</td>
+<td>篡改 Token 与 过期 Token 测试</td>
+<td>401 加 <code>WWW-Authenticate</code> 详细原因</td>
+</tr>
+<tr>
+<td>CSRF 防护</td>
+<td>缺 Token 与 错 Token 测试</td>
+<td>403 加 <code>Invalid CSRF token</code></td>
+</tr>
+<tr>
+<td>异步上下文传播</td>
+<td><code>@Async</code> 方法内打印当前用户</td>
+<td>用户名与请求线程一致</td>
+</tr>
+<tr>
+<td>Method Security</td>
+<td>越权调用 <code>@PreAuthorize</code> 方法</td>
+<td><code>AccessDeniedException</code></td>
+</tr>
+<tr>
+<td>集群 Session</td>
+<td>多节点登录互访</td>
+<td>任一节点登录,所有节点识别</td>
+</tr>
+<tr>
+<td>安全响应头</td>
+<td>检查响应 Header</td>
+<td><code>X-Content-Type-Options</code>、<code>HSTS</code>、<code>CSP</code> 存在</td>
+</tr>
+</tbody>
+</table>
+<div class="chapter-summary">
+<h2>23.11 本章小结</h2>
+
+<p>Servlet 桥接:<code>DelegatingFilterProxy</code> 把 Spring 管理的 <code>FilterChainProxy</code> 接入 Servlet 容器,使安全过滤器能享受依赖注入与生命周期管理。</p>
+<p>过滤器链:Spring Boot 3.x 默认配置约 14 个过滤器,从 <code>DisableEncodeUrlFilter</code> 到 <code>AuthorizationFilter</code>,覆盖 Session 加载、CSRF、认证、异常翻译与最终授权。多 <code>SecurityFilterChain</code> 配置时,具体路径链必须排在通配链之前。</p>
+<p>认证体系:<code>AuthenticationManager</code> → <code>ProviderManager</code> → <code>AuthenticationProvider</code> 三层架构;<code>UserDetailsService</code> 与 <code>PasswordEncoder</code> 是用户名密码认证的核心;<code>DelegatingPasswordEncoder</code> 支持算法平滑升级。</p>
+<p>OAuth2 流程:授权码模式四方(浏览器、客户端、授权服务器、资源服务器)交互;<code>state</code> 防 CSRF;PKCE 为公开客户端提供额外保障;Spring Authorization Server 支持自建授权服务。</p>
+<p>JWT 验签:Header.Payload.Signature 三段式;HS256 对称 与 RS256 非对称对比;JWKS 端点配合 <code>kid</code> 实现密钥轮换;Spring Cloud Gateway 边缘验签减少下游服务负担。</p>
+<p>CSRF 防护:Synchronizer Token 与 Double Submit Cookie 两种模式;SPA 必须使用 <code>CookieCsrfTokenRepository.withHttpOnlyFalse()</code>;Bearer Token 与纯 API 服务可禁用 CSRF。</p>
+<p>SecurityContext 传播:<code>ThreadLocal</code> 默认策略;异步场景使用 <code>DelegatingSecurityContextAsyncTaskExecutor</code>;WebFlux 用 <code>ReactiveSecurityContextHolder</code> 与 Reactor Context。</p>
+<p>方法级安全:<code>@PreAuthorize</code> 与 <code>@PostAuthorize</code> 与 <code>@PreFilter</code> 与 <code>@PostFilter</code> 配合 SpEL 表达式;基于参数与返回值的细粒度授权。</p>
+<p>七大陷阱:JWT alg none 攻击;异步线程 SecurityContext 丢失;CSRF 与 SPA 冲突;多链匹配顺序;时钟偏移导致 nbf 失败;HttpOnly 与 SPA 读取冲突;Session 序列化与集群。</p>
+<p>下一章 第 24 章 · Email 邮件服务 将探讨 Spring Boot 中的邮件发送与模板渲染——<code>JavaMailSender</code>、MIME 附件、异步发送与重试策略。</p>
+</div>
+
+
+<div class="chapter-nav">
+  <a href="ch22-jms.html">&larr; ch22-jms · 第 22 章 · JMS 消息服务</a>
+  <a href="ch24-email.html">ch24-email · 第 24 章 · 邮件服务 &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 Spring Boot &middot; 第 23 章 · Spring Security 过滤器链</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+</body>
+</html>

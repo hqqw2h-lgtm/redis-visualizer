@@ -1,0 +1,1597 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 3 章 · DSLContext 与 Configuration — 图解 jOOQ</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 jOOQ</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="ch02-codegen.html">上一章 ch02-codegen</a>
+  <a href="ch04-typesystem.html">下一章 ch04-typesystem</a>
+</nav>
+
+<aside class="toc">
+<a href="#3.0-章首速览">3.0 章首速览</a>
+<a href="#3.1-dslcontext-的角色定位">3.1 DSLContext 的角色定位</a>
+<a href="#3.2-configuration-七组件">3.2 Configuration 七组件</a>
+<a href="#3.3-connectionprovider-协议">3.3 ConnectionProvider 协议</a>
+<a href="#3.4-sql-渲染管线">3.4 SQL 渲染管线</a>
+<a href="#3.5-settings-调参面板">3.5 Settings 调参面板</a>
+<a href="#3.6-多数据源与多租户">3.6 多数据源与多租户</a>
+<a href="#3.7-陷阱与限制">3.7 陷阱与限制</a>
+<a href="#3.8-sql-snapshot-守护">3.8 SQL Snapshot 守护</a>
+<a href="#3.9-源码深潜">3.9 源码深潜</a>
+<a href="#3.10-本章要点">3.10 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 3 章 · DSLContext 与 Configuration</h1>
+<p class="subtitle">v7 图解版 · 自动从 v6 markdown 生成 · Mermaid 图原样保留</p>
+<div class="chapter-intro"><p><code>DSLContext</code> 是 jOOQ 运行期的唯一入口。所有查询构造、SQL 渲染、参数绑定、JDBC 执行、Record 映射都从它开始。但 <code>DSLContext</code> 本身不持有连接、不维护事务,它只是 <code>Configuration</code> 之上的薄门面,把所有运行期决策委托给 <code>Configuration</code> 中的可插拔组件。</p>
+<p><code>Configuration</code> 是 jOOQ 的运行期依赖注入容器,持有七类组件:<code>ConnectionProvider</code>、<code>TransactionProvider</code>、<code>ExecuteListenerProvider</code>、<code>RecordMapperProvider</code>、<code>ConverterProvider</code>、<code>Settings</code>、<code>SQLDialect</code>。该七元组完整描述一次 SQL 执行的所有可定制行为。本章逐一拆解 <code>DSLContext</code> 的实例化路径、<code>Configuration</code> 的 derive 模型、SQL 渲染管线、Settings 调参面板、以及多数据源 / 多租户场景下的扩展模式。</p>
+</div>
+<h2 id="3.0-章首速览">3.0 章首速览</h2>
+<h3>图 3-0:DSLContext 全景</h3>
+<div class="diagram">
+  <div class="diagram-title">图 3-0 · DSLContext 与 Configuration 全景 — 7 大主题 + 子要点</div>
+  <svg viewBox="0 0 920 420" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="320" y="14" width="280" height="56" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="38" text-anchor="middle" fill="#bc8cff" font-size="14" font-weight="bold">DSLContext 与 Configuration</text>
+    <text x="460" y="58" text-anchor="middle" fill="#c9d1d9" font-size="11">运行期入口 + 七组件 SPI 容器</text>
+
+    <path d="M 340 70 L 70  130" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 380 70 L 200 130" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 420 70 L 340 130" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 70 L 460 130" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 500 70 L 580 130" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 540 70 L 720 130" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 580 70 L 850 130" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="10"  y="135" width="120" height="44" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="2"/>
+    <text x="70"  y="155" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">§3.1</text>
+    <text x="70"  y="172" text-anchor="middle" fill="#c9d1d9" font-size="10">角色定位</text>
+
+    <rect x="140" y="135" width="120" height="44" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="2"/>
+    <text x="200" y="155" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">§3.2</text>
+    <text x="200" y="172" text-anchor="middle" fill="#c9d1d9" font-size="10">七组件 SPI</text>
+
+    <rect x="280" y="135" width="120" height="44" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="340" y="155" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">§3.3</text>
+    <text x="340" y="172" text-anchor="middle" fill="#c9d1d9" font-size="10">ConnectionProvider</text>
+
+    <rect x="400" y="135" width="120" height="44" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="155" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">§3.4</text>
+    <text x="460" y="172" text-anchor="middle" fill="#c9d1d9" font-size="10">SQL 渲染管线</text>
+
+    <rect x="520" y="135" width="120" height="44" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="580" y="155" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">§3.5</text>
+    <text x="580" y="172" text-anchor="middle" fill="#c9d1d9" font-size="10">Settings 调参</text>
+
+    <rect x="660" y="135" width="120" height="44" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="2"/>
+    <text x="720" y="155" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">§3.6</text>
+    <text x="720" y="172" text-anchor="middle" fill="#c9d1d9" font-size="10">多数据源 / 多租户</text>
+
+    <rect x="790" y="135" width="120" height="44" rx="8" fill="url(#g-red)"    stroke="#f85149" stroke-width="2"/>
+    <text x="850" y="155" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">§3.7-3.10</text>
+    <text x="850" y="172" text-anchor="middle" fill="#c9d1d9" font-size="10">陷阱 + 源码</text>
+
+    <path d="M 70  179 L 70  220" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 200 179 L 200 220" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 340 179 L 340 220" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 179 L 460 220" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 580 179 L 580 220" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 720 179 L 720 220" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 850 179 L 850 220" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="10"  y="225" width="120" height="46" rx="6" fill="#161b22" stroke="#58a6ff"/>
+    <text x="70"  y="245" text-anchor="middle" fill="#c9d1d9" font-size="10">DSL.using</text>
+    <text x="70"  y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">三种入口</text>
+
+    <rect x="140" y="225" width="120" height="46" rx="6" fill="#161b22" stroke="#3fb950"/>
+    <text x="200" y="245" text-anchor="middle" fill="#c9d1d9" font-size="10">7 类 SPI</text>
+    <text x="200" y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">+ Settings</text>
+
+    <rect x="280" y="225" width="120" height="46" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="340" y="245" text-anchor="middle" fill="#c9d1d9" font-size="10">acquire / release</text>
+    <text x="340" y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">协议</text>
+
+    <rect x="400" y="225" width="120" height="46" rx="6" fill="#161b22" stroke="#bc8cff"/>
+    <text x="460" y="245" text-anchor="middle" fill="#c9d1d9" font-size="10">AST → SQL</text>
+    <text x="460" y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">+ bind</text>
+
+    <rect x="520" y="225" width="120" height="46" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="580" y="245" text-anchor="middle" fill="#c9d1d9" font-size="10">renderSchema</text>
+    <text x="580" y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">nameCase</text>
+
+    <rect x="660" y="225" width="120" height="46" rx="6" fill="#161b22" stroke="#3fb950"/>
+    <text x="720" y="245" text-anchor="middle" fill="#c9d1d9" font-size="10">Configuration</text>
+    <text x="720" y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">.derive()</text>
+
+    <rect x="790" y="225" width="120" height="46" rx="6" fill="#161b22" stroke="#f85149"/>
+    <text x="850" y="245" text-anchor="middle" fill="#c9d1d9" font-size="10">线程安全</text>
+    <text x="850" y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">Cursor 泄漏</text>
+
+    <rect x="60" y="300" width="800" height="100" rx="8" fill="#0d1117" stroke="#30363d"/>
+    <text x="460" y="325" text-anchor="middle" fill="#8b949e" font-size="11">阅读路径:§3.1 角色 → §3.2 七组件 → §3.3 连接协议 → §3.4 渲染管线 → §3.5 Settings → §3.6 多源场景</text>
+    <text x="460" y="345" text-anchor="middle" fill="#8b949e" font-size="11">DSLContext 是无状态薄门面 · Configuration 是真正的运行期依赖容器 · derive() 是不可变扩展机制</text>
+    <text x="460" y="365" text-anchor="middle" fill="#8b949e" font-size="11">所有运行期可插拔行为都集中在 7 个 SPI:Connection / Transaction / Execute / RecordMapper / Converter / Settings / SQLDialect</text>
+    <text x="460" y="385" text-anchor="middle" fill="#8b949e" font-size="11">本章不涉及具体 SQL 语法,专注于运行期机制与扩展点</text>
+  </svg>
+</div>
+<p>本章按"角色 → 组件 → 连接 → 渲染 → 配置 → 多场景"六层组织。前六节解构运行期机制,最后两节回到陷阱与源码深潜。所有示例使用 PostgreSQL 方言。</p>
+<h2 id="3.1-dslcontext-的角色定位">3.1 DSLContext 的角色定位</h2>
+<h3>3.1.1 类层次</h3>
+<div class="diagram">
+  <div class="diagram-title">图 3-1-1 · DSLContext 类层次 — 接口 / 实现 / 工厂 / 配置 四元关系</div>
+  <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr"    markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+      <marker id="arr-tri" markerWidth="14" markerHeight="14" refX="13" refY="7" orient="auto"><path d="M0,0 L13,7 L0,14 z" fill="none" stroke="#bc8cff" stroke-width="1.5"/></marker>
+    </defs>
+
+    <rect x="20"  y="40" width="280" height="200" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="160" y="64" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">«interface» DSLContext</text>
+    <line x1="30" y1="74" x2="290" y2="74" stroke="#58a6ff" stroke-dasharray="3 3"/>
+    <text x="40" y="94"  fill="#c9d1d9" font-size="11">+ configuration() : Configuration</text>
+    <text x="40" y="112" fill="#c9d1d9" font-size="11">+ select(Field...) : SelectSelectStep</text>
+    <text x="40" y="130" fill="#c9d1d9" font-size="11">+ insertInto(Table) : InsertSetStep</text>
+    <text x="40" y="148" fill="#c9d1d9" font-size="11">+ update(Table) : UpdateSetFirstStep</text>
+    <text x="40" y="166" fill="#c9d1d9" font-size="11">+ delete(Table) : DeleteWhereStep</text>
+    <text x="40" y="184" fill="#c9d1d9" font-size="11">+ fetch(ResultQuery) : Result</text>
+    <text x="40" y="202" fill="#c9d1d9" font-size="11">+ execute(Query) : int</text>
+    <text x="40" y="220" fill="#c9d1d9" font-size="11">+ transactionResult(TxCallable) : T</text>
+
+    <rect x="20"  y="280" width="280" height="120" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="160" y="304" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">DefaultDSLContext</text>
+    <line x1="30" y1="314" x2="290" y2="314" stroke="#3fb950" stroke-dasharray="3 3"/>
+    <text x="40" y="334" fill="#c9d1d9" font-size="11">- configuration : Configuration</text>
+    <line x1="30" y1="346" x2="290" y2="346" stroke="#3fb950" stroke-dasharray="3 3"/>
+    <text x="40" y="366" fill="#c9d1d9" font-size="11">+ DefaultDSLContext(Configuration)</text>
+    <text x="40" y="384" fill="#c9d1d9" font-size="11">+ DefaultDSLContext(CP, Dialect)</text>
+
+    <rect x="380" y="40" width="280" height="200" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="520" y="64" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">«interface» Configuration</text>
+    <line x1="390" y1="74" x2="650" y2="74" stroke="#bc8cff" stroke-dasharray="3 3"/>
+    <text x="400" y="94"  fill="#c9d1d9" font-size="11">+ connectionProvider() : ConnectionProvider</text>
+    <text x="400" y="112" fill="#c9d1d9" font-size="11">+ transactionProvider() : TransactionProvider</text>
+    <text x="400" y="130" fill="#c9d1d9" font-size="11">+ settings() : Settings</text>
+    <text x="400" y="148" fill="#c9d1d9" font-size="11">+ dialect() : SQLDialect</text>
+    <text x="400" y="166" fill="#c9d1d9" font-size="11">+ derive() : Configuration</text>
+    <text x="400" y="200" fill="#8b949e" font-size="10" font-style="italic">不可变 · 通过 derive 派生新实例</text>
+    <text x="400" y="218" fill="#8b949e" font-size="10" font-style="italic">DefaultConfiguration 是默认实现</text>
+
+    <rect x="380" y="280" width="280" height="120" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="520" y="304" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">«utility» DSL</text>
+    <line x1="390" y1="314" x2="650" y2="314" stroke="#d29922" stroke-dasharray="3 3"/>
+    <text x="400" y="336" fill="#c9d1d9" font-size="11">+ using(DataSource, Dialect)$ : DSLContext</text>
+    <text x="400" y="356" fill="#c9d1d9" font-size="11">+ using(Configuration)$ : DSLContext</text>
+    <text x="400" y="376" fill="#c9d1d9" font-size="11">+ using(Connection, Dialect)$ : DSLContext</text>
+    <text x="400" y="394" fill="#8b949e" font-size="10" font-style="italic">静态工厂入口 · 装配 + 实例化</text>
+
+    <path d="M 160 280 L 160 240" stroke="#bc8cff" stroke-width="2" fill="none" marker-end="url(#arr-tri)"/>
+    <text x="180" y="263" fill="#8b949e" font-size="10" font-style="italic">implements</text>
+
+    <path d="M 300 340 L 380 340" stroke="#58a6ff" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+    <text x="340" y="332" text-anchor="middle" fill="#8b949e" font-size="10">holds</text>
+
+    <path d="M 520 280 L 520 240" stroke="#58a6ff" stroke-width="2" stroke-dasharray="4 3" fill="none" marker-end="url(#arr)"/>
+    <text x="540" y="263" fill="#8b949e" font-size="10" font-style="italic">creates</text>
+
+    <path d="M 380 340 L 380 200 L 300 200" stroke="#58a6ff" stroke-width="2" stroke-dasharray="4 3" fill="none" marker-end="url(#arr)"/>
+    <text x="320" y="195" text-anchor="end" fill="#8b949e" font-size="10" font-style="italic">creates DefaultDSLContext</text>
+
+    <rect x="720" y="100" width="180" height="220" rx="8" fill="#0d1117" stroke="#30363d"/>
+    <text x="810" y="124" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">关系图例</text>
+    <line x1="735" y1="138" x2="885" y2="138" stroke="#30363d"/>
+
+    <line x1="740" y1="160" x2="780" y2="160" stroke="#58a6ff" stroke-width="2"/>
+    <path d="M 770,155 L 780,160 L 770,165 z" fill="#58a6ff"/>
+    <text x="790" y="164" fill="#c9d1d9" font-size="10">holds (字段持有)</text>
+
+    <line x1="740" y1="190" x2="780" y2="190" stroke="#bc8cff" stroke-width="2"/>
+    <path d="M 770,182 L 783,190 L 770,198 z" fill="none" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="790" y="194" fill="#c9d1d9" font-size="10">implements</text>
+
+    <line x1="740" y1="220" x2="780" y2="220" stroke="#58a6ff" stroke-width="2" stroke-dasharray="4 3"/>
+    <path d="M 770,215 L 780,220 L 770,225 z" fill="#58a6ff"/>
+    <text x="790" y="224" fill="#c9d1d9" font-size="10">creates (工厂依赖)</text>
+
+    <text x="810" y="265" text-anchor="middle" fill="#8b949e" font-size="10">DSL 是工厂</text>
+    <text x="810" y="282" text-anchor="middle" fill="#8b949e" font-size="10">Configuration 是配置</text>
+    <text x="810" y="299" text-anchor="middle" fill="#8b949e" font-size="10">DefaultDSLContext 是实现</text>
+    <text x="810" y="316" text-anchor="middle" fill="#8b949e" font-size="10">DSLContext 是契约</text>
+
+    <text x="460" y="440" text-anchor="middle" fill="#8b949e" font-size="11">业务代码只引用 DSLContext 与 DSL · 内部 DefaultDSLContext / DefaultConfiguration 不暴露</text>
+  </svg>
+</div>
+<p><code>DSLContext</code> 是接口,<code>DefaultDSLContext</code> 是默认实现。<code>DSL.using(...)</code> 是创建工厂,内部组装 <code>DefaultConfiguration</code> 并实例化 <code>DefaultDSLContext</code>。所有 DSL 方法委托给内部 <code>Configuration</code>。</p>
+<h3>3.1.2 三种实例化方式</h3>
+<table>
+<thead>
+<tr>
+<th>方式</th>
+<th>入参</th>
+<th>适用场景</th>
+<th>线程安全</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DSL.using(DataSource, SQLDialect)</code></td>
+<td>数据源 + 方言</td>
+<td>生产应用</td>
+<td>是</td>
+</tr>
+<tr>
+<td><code>DSL.using(Configuration)</code></td>
+<td>完整配置</td>
+<td>高级定制</td>
+<td>是</td>
+</tr>
+<tr>
+<td><code>DSL.using(Connection, SQLDialect)</code></td>
+<td>单连接</td>
+<td>测试 / 脚本</td>
+<td>否</td>
+</tr>
+</tbody>
+</table>
+<pre><code class="language-java">DSLContext ctx1 = DSL.using(dataSource, SQLDialect.POSTGRES);
+
+Configuration config = new DefaultConfiguration()
+    .set(dataSource)
+    .set(SQLDialect.MYSQL)
+    .set(new Settings().withRenderSchema(false));
+DSLContext ctx2 = DSL.using(config);
+
+try (Connection conn = DriverManager.getConnection(url)) {
+    DSLContext ctx3 = DSL.using(conn, SQLDialect.H2);
+}
+</code></pre>
+<h3>3.1.3 最小验证</h3>
+<pre><code class="language-java">DSLContext ctx = DSL.using(dataSource, SQLDialect.POSTGRES);
+
+System.out.println(ctx.getClass().getSimpleName());
+System.out.println(ctx.configuration().dialect());
+System.out.println(ctx.fetchValue(&quot;select current_schema()&quot;));
+</code></pre>
+<pre><code class="language-text">DefaultDSLContext
+POSTGRES
+public
+</code></pre>
+<p><code>ctx</code> 不是连接,而是包着 <code>Configuration</code> 的运行期入口。<code>fetchValue</code> 触发一次完整的 acquire-render-bind-execute-release 周期。</p>
+<h3>3.1.4 ASCII:门面与配置的关系</h3>
+<pre><code class="language-text">应用代码
+   │
+   ▼
+DSLContext  (接口,薄门面)
+   │
+   │ 持有
+   ▼
+Configuration (依赖容器)
+   │
+   ├── ConnectionProvider     连接获取 / 释放
+   ├── TransactionProvider    commit / rollback
+   ├── ExecuteListenerProvider 监听器链
+   ├── RecordMapperProvider   Record → POJO
+   ├── ConverterProvider      DB ↔ Java 类型
+   ├── Settings               渲染开关
+   └── SQLDialect             方言
+</code></pre>
+<h2 id="3.2-configuration-七组件">3.2 Configuration 七组件</h2>
+<h3>3.2.1 组件总览</h3>
+<div class="diagram">
+  <div class="diagram-title">图 3-2-1 · Configuration 七组件总览 — 5 个 SPI + Settings + SQLDialect</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="320" y="14" width="280" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="38" text-anchor="middle" fill="#bc8cff" font-size="14" font-weight="bold">Configuration</text>
+    <text x="460" y="58" text-anchor="middle" fill="#c9d1d9" font-size="11">运行期依赖容器 · 不可变 · 通过 derive 派生</text>
+
+    <path d="M 340 74 L 70  130" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 380 74 L 210 130" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 420 74 L 350 130" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 74 L 460 130" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 500 74 L 570 130" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 540 74 L 710 130" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 580 74 L 850 130" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="10"  y="135" width="120" height="100" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="70"  y="158" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">① SPI</text>
+    <text x="70"  y="178" text-anchor="middle" fill="#c9d1d9" font-size="11">Connection</text>
+    <text x="70"  y="193" text-anchor="middle" fill="#c9d1d9" font-size="11">Provider</text>
+    <text x="70"  y="215" text-anchor="middle" fill="#8b949e" font-size="10">acquire</text>
+    <text x="70"  y="228" text-anchor="middle" fill="#8b949e" font-size="10">release</text>
+
+    <rect x="150" y="135" width="120" height="100" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="210" y="158" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">② SPI</text>
+    <text x="210" y="178" text-anchor="middle" fill="#c9d1d9" font-size="11">Transaction</text>
+    <text x="210" y="193" text-anchor="middle" fill="#c9d1d9" font-size="11">Provider</text>
+    <text x="210" y="215" text-anchor="middle" fill="#8b949e" font-size="10">commit</text>
+    <text x="210" y="228" text-anchor="middle" fill="#8b949e" font-size="10">rollback</text>
+
+    <rect x="290" y="135" width="120" height="100" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="350" y="158" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">③ SPI</text>
+    <text x="350" y="178" text-anchor="middle" fill="#c9d1d9" font-size="11">Execute</text>
+    <text x="350" y="193" text-anchor="middle" fill="#c9d1d9" font-size="11">Listener</text>
+    <text x="350" y="215" text-anchor="middle" fill="#8b949e" font-size="10">日志 / 审计</text>
+    <text x="350" y="228" text-anchor="middle" fill="#8b949e" font-size="10">性能监控</text>
+
+    <rect x="400" y="135" width="120" height="100" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="460" y="158" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">④ SPI</text>
+    <text x="460" y="178" text-anchor="middle" fill="#c9d1d9" font-size="11">RecordMapper</text>
+    <text x="460" y="193" text-anchor="middle" fill="#c9d1d9" font-size="11">Provider</text>
+    <text x="460" y="215" text-anchor="middle" fill="#8b949e" font-size="10">Record →</text>
+    <text x="460" y="228" text-anchor="middle" fill="#8b949e" font-size="10">POJO</text>
+
+    <rect x="510" y="135" width="120" height="100" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="570" y="158" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">⑤ SPI</text>
+    <text x="570" y="178" text-anchor="middle" fill="#c9d1d9" font-size="11">Converter</text>
+    <text x="570" y="193" text-anchor="middle" fill="#c9d1d9" font-size="11">Provider</text>
+    <text x="570" y="215" text-anchor="middle" fill="#8b949e" font-size="10">DB ↔ Java</text>
+    <text x="570" y="228" text-anchor="middle" fill="#8b949e" font-size="10">类型转换</text>
+
+    <rect x="650" y="135" width="120" height="100" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="710" y="158" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">⑥ 配置</text>
+    <text x="710" y="178" text-anchor="middle" fill="#c9d1d9" font-size="11">Settings</text>
+    <text x="710" y="193" text-anchor="middle" fill="#c9d1d9" font-size="11">(JAXB)</text>
+    <text x="710" y="215" text-anchor="middle" fill="#8b949e" font-size="10">渲染开关</text>
+    <text x="710" y="228" text-anchor="middle" fill="#8b949e" font-size="10">命名策略</text>
+
+    <rect x="790" y="135" width="120" height="100" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="850" y="158" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">⑦ 枚举</text>
+    <text x="850" y="178" text-anchor="middle" fill="#c9d1d9" font-size="11">SQLDialect</text>
+    <text x="850" y="215" text-anchor="middle" fill="#8b949e" font-size="10">POSTGRES</text>
+    <text x="850" y="228" text-anchor="middle" fill="#8b949e" font-size="10">MYSQL / H2</text>
+
+    <rect x="60"  y="265" width="800" height="100" rx="8" fill="#0d1117" stroke="#30363d"/>
+    <text x="80"  y="288" fill="#c9d1d9" font-size="11" font-weight="bold">分组语义</text>
+    <text x="80"  y="308" fill="#58a6ff" font-size="11">连接层(①②)</text>
+    <text x="220" y="308" fill="#c9d1d9" font-size="11">— 决定 JDBC 资源生命周期 · Spring 项目通常被覆盖</text>
+    <text x="80"  y="328" fill="#3fb950" font-size="11">映射层(③④⑤)</text>
+    <text x="220" y="328" fill="#c9d1d9" font-size="11">— 决定 Record / POJO / 自定义类型的处理 · 业务可插拔</text>
+    <text x="80"  y="348" fill="#d29922" font-size="11">渲染层(⑥⑦)</text>
+    <text x="220" y="348" fill="#c9d1d9" font-size="11">— 决定生成的 SQL 文本 · 与运行时无关 · 仅在 SQL 字符串构造时使用</text>
+  </svg>
+</div>
+<h3>3.2.2 组件对照</h3>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>类型</th>
+<th>默认实现</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ConnectionProvider</code></td>
+<td>SPI</td>
+<td><code>DataSourceConnectionProvider</code></td>
+<td>从 DataSource 获取并释放 Connection</td>
+</tr>
+<tr>
+<td><code>TransactionProvider</code></td>
+<td>SPI</td>
+<td><code>DefaultTransactionProvider</code></td>
+<td>管理 commit / rollback,支持嵌套</td>
+</tr>
+<tr>
+<td><code>ExecuteListenerProvider</code></td>
+<td>SPI</td>
+<td>无(用户提供)</td>
+<td>执行前后回调:日志、性能、审计</td>
+</tr>
+<tr>
+<td><code>RecordMapperProvider</code></td>
+<td>SPI</td>
+<td><code>DefaultRecordMapperProvider</code></td>
+<td>Record 到 POJO 映射</td>
+</tr>
+<tr>
+<td><code>ConverterProvider</code></td>
+<td>SPI</td>
+<td><code>DefaultConverterProvider</code></td>
+<td>数据库类型与 Java 类型双向转换</td>
+</tr>
+<tr>
+<td><code>Settings</code></td>
+<td>配置 JAXB</td>
+<td><code>new Settings()</code></td>
+<td>渲染格式 / 关键字大小写 / 乐观锁</td>
+</tr>
+<tr>
+<td><code>SQLDialect</code></td>
+<td>枚举</td>
+<td><code>DEFAULT</code></td>
+<td>目标数据库方言</td>
+</tr>
+</tbody>
+</table>
+<h3>3.2.3 derive 模型</h3>
+<pre><code class="language-java">Configuration base = new DefaultConfiguration()
+    .set(dataSource)
+    .set(SQLDialect.POSTGRES)
+    .set(new Settings().withRenderSchema(true));
+
+Configuration noSchema = base.derive(new Settings()
+    .withRenderSchema(false)
+    .withRenderKeywordCase(RenderKeywordCase.UPPER));
+
+String baseSql = base.dsl()
+    .select(ORDERS.ID, ORDERS.STATUS)
+    .from(ORDERS)
+    .getSQL();
+
+String localSql = noSchema.dsl()
+    .select(ORDERS.ID, ORDERS.STATUS)
+    .from(ORDERS)
+    .getSQL();
+
+System.out.println(base.connectionProvider() == noSchema.connectionProvider());
+System.out.println(localSql);
+</code></pre>
+<pre><code class="language-sql">-- baseSql
+select &quot;public&quot;.&quot;orders&quot;.&quot;id&quot;, &quot;public&quot;.&quot;orders&quot;.&quot;status&quot;
+from &quot;public&quot;.&quot;orders&quot;
+
+-- localSql
+SELECT &quot;orders&quot;.&quot;id&quot;, &quot;orders&quot;.&quot;status&quot;
+FROM &quot;orders&quot;
+</code></pre>
+<pre><code class="language-text">true
+SELECT &quot;orders&quot;.&quot;id&quot;, &quot;orders&quot;.&quot;status&quot; FROM &quot;orders&quot;
+</code></pre>
+<h3>3.2.4 derive 的不可变语义</h3>
+<p><code>Configuration.derive(...)</code> 返回新实例,共享原配置中其他组件引用,仅替换显式提供的部分。该机制使多租户、多数据源、监控注入场景能在不污染全局 <code>DSLContext</code> 的前提下定制单次操作。</p>
+<table>
+<thead>
+<tr>
+<th>派生方式</th>
+<th>替换组件</th>
+<th>共享组件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>derive(Settings)</code></td>
+<td>Settings</td>
+<td>其他六类</td>
+</tr>
+<tr>
+<td><code>derive(SQLDialect)</code></td>
+<td>Dialect</td>
+<td>其他六类</td>
+</tr>
+<tr>
+<td><code>derive(ConnectionProvider)</code></td>
+<td>连接提供者</td>
+<td>其他六类</td>
+</tr>
+<tr>
+<td><code>derive(ExecuteListenerProvider)</code></td>
+<td>监听器</td>
+<td>其他六类</td>
+</tr>
+</tbody>
+</table>
+<h2 id="3.3-connectionprovider-协议">3.3 ConnectionProvider 协议</h2>
+<h3>3.3.1 acquire 与 release 时序</h3>
+<div class="diagram">
+  <div class="diagram-title">图 3-3-1 · acquire / release 时序 — 一次完整的 SQL 执行生命周期</div>
+  <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="30"  y="20" width="120" height="36" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="90"  y="44" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">应用代码</text>
+    <rect x="210" y="20" width="120" height="36" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="270" y="44" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">DSLContext</text>
+    <rect x="390" y="20" width="140" height="36" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="460" y="44" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">ConnectionProvider</text>
+    <rect x="590" y="20" width="140" height="36" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="660" y="44" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">DataSource / Pool</text>
+    <rect x="790" y="20" width="110" height="36" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="845" y="44" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">数据库</text>
+
+    <line x1="90"  y1="56" x2="90"  y2="450" stroke="#30363d" stroke-dasharray="3 3"/>
+    <line x1="270" y1="56" x2="270" y2="450" stroke="#30363d" stroke-dasharray="3 3"/>
+    <line x1="460" y1="56" x2="460" y2="450" stroke="#30363d" stroke-dasharray="3 3"/>
+    <line x1="660" y1="56" x2="660" y2="450" stroke="#30363d" stroke-dasharray="3 3"/>
+    <line x1="845" y1="56" x2="845" y2="450" stroke="#30363d" stroke-dasharray="3 3"/>
+
+    <path d="M 90 80 L 270 80" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="180" y="74" text-anchor="middle" fill="#c9d1d9" font-size="11">① ctx.select(...).fetch()</text>
+
+    <path d="M 270 110 L 460 110" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="365" y="104" text-anchor="middle" fill="#c9d1d9" font-size="11">② acquire()</text>
+
+    <path d="M 460 140 L 660 140" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="560" y="134" text-anchor="middle" fill="#c9d1d9" font-size="11">③ getConnection()</text>
+
+    <path d="M 660 170 L 460 170" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" fill="none" marker-end="url(#arr)"/>
+    <text x="560" y="164" text-anchor="middle" fill="#c9d1d9" font-size="11">④ Connection</text>
+
+    <path d="M 460 200 L 270 200" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" fill="none" marker-end="url(#arr)"/>
+    <text x="365" y="194" text-anchor="middle" fill="#c9d1d9" font-size="11">⑤ Connection</text>
+
+    <path d="M 270 230 L 845 230" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="555" y="224" text-anchor="middle" fill="#c9d1d9" font-size="11">⑥ PreparedStatement.execute()</text>
+
+    <path d="M 845 260 L 270 260" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" fill="none" marker-end="url(#arr)"/>
+    <text x="555" y="254" text-anchor="middle" fill="#c9d1d9" font-size="11">⑦ ResultSet</text>
+
+    <path d="M 270 290 L 460 290" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="365" y="284" text-anchor="middle" fill="#c9d1d9" font-size="11">⑧ release(Connection)</text>
+
+    <path d="M 460 320 L 660 320" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="560" y="314" text-anchor="middle" fill="#c9d1d9" font-size="11">⑨ connection.close()</text>
+
+    <rect x="590" y="340" width="140" height="36" rx="6" fill="rgba(92,65,23,.30)" stroke="#d29922" stroke-dasharray="3 3"/>
+    <text x="660" y="362" text-anchor="middle" fill="#d29922" font-size="11">归还到池 (非物理关闭)</text>
+
+    <path d="M 270 410 L 90 410" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" fill="none" marker-end="url(#arr)"/>
+    <text x="180" y="404" text-anchor="middle" fill="#c9d1d9" font-size="11">⑩ Result&lt;Record&gt;</text>
+  </svg>
+</div>
+<p>每次 SQL 执行触发一次完整的 acquire-execute-release。<code>release</code> 调用 <code>Connection.close()</code>,该方法在连接池下被解释为"归还到池",而非真正关闭物理连接。</p>
+<h3>3.3.2 两种内置 ConnectionProvider</h3>
+<table>
+<thead>
+<tr>
+<th>Provider</th>
+<th>连接来源</th>
+<th>生命周期</th>
+<th>适合场景</th>
+<th>并发风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DataSourceConnectionProvider</code></td>
+<td>DataSource / 池</td>
+<td>每次 acquire / release</td>
+<td>生产、Spring</td>
+<td>低</td>
+</tr>
+<tr>
+<td><code>DefaultConnectionProvider</code></td>
+<td>单 Connection</td>
+<td>调用方关闭</td>
+<td>测试、脚本</td>
+<td>高</td>
+</tr>
+</tbody>
+</table>
+<h3>3.3.3 Spring 事务感知集成</h3>
+<pre><code class="language-java">DSLContext ctx = DSL.using(
+    new DefaultConfiguration()
+        .set(dataSource)
+        .set(SQLDialect.POSTGRES)
+        .set(new SpringTransactionProvider())
+        .set(new DataSourceConnectionProvider(
+            new TransactionAwareDataSourceProxy(dataSource))));
+</code></pre>
+<p>Spring Boot 自动配置中,<code>DataSourceConnectionProvider</code> 包装的是 <code>TransactionAwareDataSourceProxy</code>,使 <code>DataSourceUtils.getConnection()</code> 能取到当前线程绑定的连接。事务未结束时 <code>release</code> 不真正关闭连接,而是交由 Spring 事务管理器统一管理。</p>
+<h3>3.3.4 jOOQ transaction API 与派生配置</h3>
+<pre><code class="language-java">ctx.transaction(configuration -&gt; {
+    DSLContext tx = DSL.using(configuration);
+
+    int inserted = tx.insertInto(CUSTOMERS)
+        .columns(CUSTOMERS.ID, CUSTOMERS.NAME, CUSTOMERS.STATUS)
+        .values(10L, &quot;Ada&quot;, &quot;ACTIVE&quot;)
+        .execute();
+
+    int updated = tx.update(ORDERS)
+        .set(ORDERS.CUSTOMER_ID, 10L)
+        .where(ORDERS.ID.in(1L, 2L))
+        .execute();
+
+    System.out.println(&quot;inserted=&quot; + inserted + &quot; updated=&quot; + updated);
+});
+</code></pre>
+<pre><code class="language-log">[DEBUG] o.j.t.LoggerListener -- Begin transaction
+[DEBUG] o.j.t.LoggerListener -- Executing query : insert into &quot;customers&quot; ...
+[DEBUG] o.j.t.LoggerListener -- Executing query : update &quot;orders&quot; ...
+[DEBUG] o.j.t.LoggerListener -- Commit transaction
+inserted=1 updated=2
+</code></pre>
+<p><code>transaction(...)</code> 不是把外层 <code>DSLContext</code> 变为事务对象。jOOQ 给闭包传入派生 <code>Configuration</code>,绑定当前事务连接;闭包内必须用该派生配置创建新 <code>DSLContext</code>,否则 SQL 执行不在事务上下文。</p>
+<h2 id="3.4-sql-渲染管线">3.4 SQL 渲染管线</h2>
+<h3>3.4.1 渲染流程</h3>
+<div class="diagram">
+  <div class="diagram-title">图 3-4-1 · SQL 渲染管线 — AST 两次遍历产出 SQL 文本 + bind values</div>
+  <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="350" y="14" width="220" height="56" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="38" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">DSL API 调用</text>
+    <text x="460" y="58" text-anchor="middle" fill="#c9d1d9" font-size="11">ctx.select.from.where</text>
+
+    <path d="M 460 70 L 460 100" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="350" y="105" width="220" height="56" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="460" y="129" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">QueryPart AST</text>
+    <text x="460" y="149" text-anchor="middle" fill="#c9d1d9" font-size="11">SelectQueryImpl 树</text>
+
+    <path d="M 410 161 L 230 200" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="300" y="180" text-anchor="middle" fill="#8b949e" font-size="10">accept(RenderContext)</text>
+
+    <path d="M 510 161 L 690 200" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="620" y="180" text-anchor="middle" fill="#8b949e" font-size="10">accept(BindContext)</text>
+
+    <rect x="80"  y="205" width="280" height="56" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="220" y="229" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">RenderContext · 遍历 1</text>
+    <text x="220" y="249" text-anchor="middle" fill="#c9d1d9" font-size="11">遍历 AST → 输出 SQL 文本</text>
+
+    <rect x="560" y="205" width="280" height="56" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="700" y="229" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">BindContext · 遍历 2</text>
+    <text x="700" y="249" text-anchor="middle" fill="#c9d1d9" font-size="11">遍历 AST → 收集 ?-bind 值</text>
+
+    <path d="M 220 261 L 220 350" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 700 261 L 700 350" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="80"  y="355" width="280" height="56" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="220" y="379" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">SQL 字符串</text>
+    <text x="220" y="399" text-anchor="middle" fill="#c9d1d9" font-size="11">含 ? 占位符</text>
+
+    <rect x="560" y="355" width="280" height="56" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="700" y="379" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">bind values</text>
+    <text x="700" y="399" text-anchor="middle" fill="#c9d1d9" font-size="11">List&lt;Object&gt; · 按 ? 顺序</text>
+
+    <rect x="380" y="200" width="160" height="160" rx="8" fill="rgba(60,30,90,.10)" stroke="#bc8cff" stroke-dasharray="4 3"/>
+    <text x="460" y="223" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">渲染三步(逐节点)</text>
+    <rect x="395" y="234" width="130" height="32" rx="6" fill="#161b22" stroke="#bc8cff"/>
+    <text x="460" y="254" text-anchor="middle" fill="#c9d1d9" font-size="11">① 方言适配</text>
+    <rect x="395" y="272" width="130" height="32" rx="6" fill="#161b22" stroke="#bc8cff"/>
+    <text x="460" y="292" text-anchor="middle" fill="#c9d1d9" font-size="11">② Settings 应用</text>
+    <rect x="395" y="310" width="130" height="32" rx="6" fill="#161b22" stroke="#bc8cff"/>
+    <text x="460" y="330" text-anchor="middle" fill="#c9d1d9" font-size="11">③ 绑定策略</text>
+
+    <text x="460" y="440" text-anchor="middle" fill="#8b949e" font-size="11">SQL 文本与参数分离 · 默认安全 · ParamType.INLINED 仅用于调试,生产严禁</text>
+  </svg>
+</div>
+<h3>3.4.2 访问者模式核心</h3>
+<p>每个 <code>QueryPart</code>(Field、Table、Condition、Param)实现 <code>accept(Context)</code>,将自身片段追加到 <code>RenderContext</code> 的内部 <code>StringBuilder</code>。该模式使 SQL 文本输出与参数收集在两次遍历中独立完成。</p>
+<h3>3.4.3 Indexed 与 Inline 对比</h3>
+<pre><code class="language-java">SelectConditionStep&lt;Record1&lt;String&gt;&gt; q = ctx
+    .select(ORDERS.STATUS)
+    .from(ORDERS)
+    .where(ORDERS.ID.eq(1L));
+
+System.out.println(&quot;indexed: &quot; + q.getSQL());
+System.out.println(&quot;binds  : &quot; + q.getBindValues());
+System.out.println(&quot;inlined: &quot; + q.getSQL(ParamType.INLINED));
+</code></pre>
+<pre><code class="language-text">indexed: select &quot;orders&quot;.&quot;status&quot; from &quot;orders&quot; where &quot;orders&quot;.&quot;id&quot; = ?
+binds  : [1]
+inlined: select &quot;orders&quot;.&quot;status&quot; from &quot;orders&quot; where &quot;orders&quot;.&quot;id&quot; = 1
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>ParamType</th>
+<th>输出形式</th>
+<th>用途</th>
+<th>注入风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>INDEXED</code>(默认)</td>
+<td><code>?</code></td>
+<td>生产执行</td>
+<td>安全</td>
+</tr>
+<tr>
+<td><code>INLINED</code></td>
+<td>字面量</td>
+<td>调试 / 复制</td>
+<td>不安全</td>
+</tr>
+<tr>
+<td><code>NAMED</code></td>
+<td><code>:p1</code></td>
+<td>命名参数驱动</td>
+<td>安全</td>
+</tr>
+<tr>
+<td><code>NAMED_OR_INLINED</code></td>
+<td>命名或内联</td>
+<td>兼容驱动</td>
+<td>视场景</td>
+</tr>
+</tbody>
+</table>
+<h3>3.4.4 render 与 execute 边界</h3>
+<pre><code class="language-java">Query rename = ctx.update(ORDERS)
+    .set(ORDERS.STATUS, &quot;CANCELLED&quot;)
+    .where(ORDERS.ID.eq(1L));
+
+System.out.println(&quot;rendered: &quot; + rename.getSQL());
+System.out.println(&quot;binds   : &quot; + rename.getBindValues());
+
+int rows = rename.execute();
+System.out.println(&quot;affected: &quot; + rows);
+</code></pre>
+<pre><code class="language-log">[DEBUG] o.j.t.LoggerListener -- Executing query : update &quot;orders&quot; set &quot;status&quot; = ? where &quot;orders&quot;.&quot;id&quot; = ?
+[DEBUG] o.j.t.LoggerListener -- -&gt; with bind values : [CANCELLED, 1]
+rendered: update &quot;orders&quot; set &quot;status&quot; = ? where &quot;orders&quot;.&quot;id&quot; = ?
+binds   : [CANCELLED, 1]
+affected: 1
+</code></pre>
+<p><code>getSQL()</code> 仅渲染,不接触 JDBC。<code>execute()</code> 才触发 acquire 连接、绑定参数、调用 <code>PreparedStatement.executeUpdate</code>、release 连接的完整周期。该分离使单元测试可以在不连接数据库的前提下断言 SQL 形状。</p>
+<h2 id="3.5-settings-调参面板">3.5 Settings 调参面板</h2>
+<h3>3.5.1 常用 Settings 字段</h3>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>默认</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>renderSchema</code></td>
+<td><code>true</code></td>
+<td>表名是否带 schema 前缀</td>
+</tr>
+<tr>
+<td><code>renderNameCase</code></td>
+<td><code>AS_IS</code></td>
+<td>标识符大小写</td>
+</tr>
+<tr>
+<td><code>renderKeywordCase</code></td>
+<td><code>AS_IS</code></td>
+<td>关键字大小写</td>
+</tr>
+<tr>
+<td><code>renderFormatted</code></td>
+<td><code>false</code></td>
+<td>SQL 美化缩进</td>
+</tr>
+<tr>
+<td><code>executeLogging</code></td>
+<td><code>true</code></td>
+<td>SLF4J 输出执行 SQL</td>
+</tr>
+<tr>
+<td><code>executeWithOptimisticLocking</code></td>
+<td><code>false</code></td>
+<td>UpdatableRecord 自动加 version 条件</td>
+</tr>
+<tr>
+<td><code>fetchSize</code></td>
+<td><code>0</code></td>
+<td>JDBC fetchSize 提示</td>
+</tr>
+<tr>
+<td><code>returnAllOnUpdatableRecord</code></td>
+<td><code>false</code></td>
+<td>store() 后回填字段</td>
+</tr>
+<tr>
+<td><code>renderQuotedNames</code></td>
+<td><code>EXPLICIT_DEFAULT_QUOTED</code></td>
+<td>引号策略</td>
+</tr>
+<tr>
+<td><code>mapJPAAnnotations</code></td>
+<td><code>true</code></td>
+<td>解析 JPA 注解</td>
+</tr>
+</tbody>
+</table>
+<h3>3.5.2 同 AST 不同 Settings 对比</h3>
+<pre><code class="language-java">SelectJoinStep&lt;Record2&lt;Long, String&gt;&gt; query = ctx
+    .select(ORDERS.ID, ORDERS.STATUS)
+    .from(ORDERS);
+
+DSLContext compact = ctx.configuration()
+    .derive(new Settings()
+        .withRenderSchema(false)
+        .withRenderKeywordCase(RenderKeywordCase.LOWER))
+    .dsl();
+
+DSLContext formatted = ctx.configuration()
+    .derive(new Settings()
+        .withRenderSchema(false)
+        .withRenderKeywordCase(RenderKeywordCase.UPPER)
+        .withRenderFormatted(true))
+    .dsl();
+
+System.out.println(compact.render(query));
+System.out.println(&quot;---&quot;);
+System.out.println(formatted.render(query));
+</code></pre>
+<pre><code class="language-sql">-- compact.render(query)
+select &quot;orders&quot;.&quot;id&quot;, &quot;orders&quot;.&quot;status&quot; from &quot;orders&quot;
+
+---
+
+-- formatted.render(query)
+SELECT
+  &quot;orders&quot;.&quot;id&quot;,
+  &quot;orders&quot;.&quot;status&quot;
+FROM &quot;orders&quot;
+</code></pre>
+<h3>3.5.3 渲染影响矩阵</h3>
+<table>
+<thead>
+<tr>
+<th>同 DSL</th>
+<th>Settings</th>
+<th>输出</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>select.from(ORDERS)</code></td>
+<td><code>renderSchema=true, keyword=UPPER</code></td>
+<td><code>SELECT "public"."orders"."id" FROM "public"."orders"</code></td>
+</tr>
+<tr>
+<td>同上</td>
+<td><code>renderSchema=false, keyword=LOWER</code></td>
+<td><code>select "orders"."id" from "orders"</code></td>
+</tr>
+<tr>
+<td>同上</td>
+<td><code>renderSchema=false, name=UPPER</code></td>
+<td><code>select ORDERS.ID from ORDERS</code></td>
+</tr>
+</tbody>
+</table>
+<h3>3.5.4 Settings 生效阶段对照</h3>
+<table>
+<thead>
+<tr>
+<th>Settings</th>
+<th>渲染阶段</th>
+<th>执行阶段</th>
+<th>Record 操作</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>renderSchema</code></td>
+<td>是</td>
+<td>否</td>
+<td>否</td>
+</tr>
+<tr>
+<td><code>renderKeywordCase</code></td>
+<td>是</td>
+<td>否</td>
+<td>否</td>
+</tr>
+<tr>
+<td><code>executeLogging</code></td>
+<td>否</td>
+<td>是</td>
+<td>是</td>
+</tr>
+<tr>
+<td><code>executeWithOptimisticLocking</code></td>
+<td>否</td>
+<td>否</td>
+<td>仅 UpdatableRecord</td>
+</tr>
+<tr>
+<td><code>fetchSize</code></td>
+<td>否</td>
+<td>是</td>
+<td>否</td>
+</tr>
+<tr>
+<td><code>returnAllOnUpdatableRecord</code></td>
+<td>否</td>
+<td>否</td>
+<td>仅 UpdatableRecord</td>
+</tr>
+</tbody>
+</table>
+<h2 id="3.6-多数据源与多租户">3.6 多数据源与多租户</h2>
+<h3>3.6.1 多数据源拓扑</h3>
+<div class="diagram">
+  <div class="diagram-title">图 3-6-1 · 多数据源拓扑 — 每个数据源独立 DSLContext + 独立连接池</div>
+  <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="350" y="14" width="220" height="56" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="38" text-anchor="middle" fill="#bc8cff" font-size="14" font-weight="bold">应用 Service</text>
+    <text x="460" y="58" text-anchor="middle" fill="#c9d1d9" font-size="11">业务编排层</text>
+
+    <path d="M 380 70 L 150 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 70 L 460 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 540 70 L 770 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="40"  y="135" width="220" height="66" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="150" y="158" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">订单 DSLContext</text>
+    <text x="150" y="178" text-anchor="middle" fill="#c9d1d9" font-size="11">SQLDialect.POSTGRES</text>
+    <text x="150" y="194" text-anchor="middle" fill="#8b949e" font-size="10">独立 Configuration</text>
+
+    <rect x="350" y="135" width="220" height="66" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="460" y="158" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">用户 DSLContext</text>
+    <text x="460" y="178" text-anchor="middle" fill="#c9d1d9" font-size="11">SQLDialect.MYSQL</text>
+    <text x="460" y="194" text-anchor="middle" fill="#8b949e" font-size="10">独立 Configuration</text>
+
+    <rect x="660" y="135" width="220" height="66" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="770" y="158" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">分析 DSLContext</text>
+    <text x="770" y="178" text-anchor="middle" fill="#c9d1d9" font-size="11">第三方方言</text>
+    <text x="770" y="194" text-anchor="middle" fill="#8b949e" font-size="10">SQLDialect.DEFAULT</text>
+
+    <path d="M 150 201 L 150 240" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 201 L 460 240" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 770 201 L 770 240" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="60"  y="245" width="180" height="56" rx="8" fill="#161b22" stroke="#58a6ff"/>
+    <text x="150" y="268" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">HikariCP A</text>
+    <text x="150" y="287" text-anchor="middle" fill="#c9d1d9" font-size="11">orders-pool · 20 conn</text>
+
+    <rect x="370" y="245" width="180" height="56" rx="8" fill="#161b22" stroke="#3fb950"/>
+    <text x="460" y="268" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">HikariCP B</text>
+    <text x="460" y="287" text-anchor="middle" fill="#c9d1d9" font-size="11">users-pool · 10 conn</text>
+
+    <rect x="680" y="245" width="180" height="56" rx="8" fill="#161b22" stroke="#d29922"/>
+    <text x="770" y="268" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">HikariCP C</text>
+    <text x="770" y="287" text-anchor="middle" fill="#c9d1d9" font-size="11">analytics-pool · 5 conn</text>
+
+    <path d="M 150 301 L 150 340" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 301 L 460 340" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 770 301 L 770 340" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <ellipse cx="150" cy="370" rx="100" ry="30" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="150" y="367" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">订单库 PG</text>
+    <text x="150" y="385" text-anchor="middle" fill="#c9d1d9" font-size="10">orders.db.internal</text>
+
+    <ellipse cx="460" cy="370" rx="100" ry="30" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="460" y="367" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">用户库 MySQL</text>
+    <text x="460" y="385" text-anchor="middle" fill="#c9d1d9" font-size="10">users.db.internal</text>
+
+    <ellipse cx="770" cy="370" rx="100" ry="30" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="770" y="367" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">分析库</text>
+    <text x="770" y="385" text-anchor="middle" fill="#c9d1d9" font-size="10">ClickHouse</text>
+
+    <text x="460" y="430" text-anchor="middle" fill="#8b949e" font-size="11">关键原则:DSLContext 是轻量门面 — 创建开销可忽略,绝不应共享单一"万能 Context"</text>
+    <text x="460" y="448" text-anchor="middle" fill="#8b949e" font-size="11">每个数据源对应独立 Configuration(Dialect + Pool + Settings),避免方言污染与 Pool 互相阻塞</text>
+  </svg>
+</div>
+<p><code>DSLContext</code> 是轻量对象,创建开销可忽略。多数据源场景应为每个库实例化独立 <code>DSLContext</code>,而非共享单一"万能 Context"。</p>
+<h3>3.6.2 ThreadLocal 多租户</h3>
+<div class="diagram">
+  <div class="diagram-title">图 3-6-2 · ThreadLocal 多租户时序 — TenantFilter 在请求入口注入 + finally 清理</div>
+  <svg viewBox="0 0 920 500" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="30"  y="20" width="120" height="36" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="90"  y="44" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">HTTP 请求</text>
+    <rect x="200" y="20" width="140" height="36" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="270" y="44" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">TenantFilter</text>
+    <rect x="390" y="20" width="140" height="36" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="460" y="44" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">ThreadLocal</text>
+    <rect x="580" y="20" width="140" height="36" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="650" y="44" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">OrderService</text>
+    <rect x="770" y="20" width="120" height="36" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="830" y="44" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">租户库</text>
+
+    <line x1="90"  y1="56" x2="90"  y2="490" stroke="#30363d" stroke-dasharray="3 3"/>
+    <line x1="270" y1="56" x2="270" y2="490" stroke="#30363d" stroke-dasharray="3 3"/>
+    <line x1="460" y1="56" x2="460" y2="490" stroke="#30363d" stroke-dasharray="3 3"/>
+    <line x1="650" y1="56" x2="650" y2="490" stroke="#30363d" stroke-dasharray="3 3"/>
+    <line x1="830" y1="56" x2="830" y2="490" stroke="#30363d" stroke-dasharray="3 3"/>
+
+    <path d="M 90 80 L 270 80" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="180" y="74" text-anchor="middle" fill="#c9d1d9" font-size="11">① X-Tenant-Id: acme</text>
+
+    <path d="M 270 110 Q 220 110 220 130 Q 220 150 270 150" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="180" y="134" text-anchor="middle" fill="#c9d1d9" font-size="11">② 查找 acme DataSource</text>
+
+    <path d="M 270 180 L 460 180" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="365" y="174" text-anchor="middle" fill="#c9d1d9" font-size="11">③ set(DSL.using(acmeDS, POSTGRES))</text>
+
+    <path d="M 270 220 L 650 220" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="460" y="214" text-anchor="middle" fill="#c9d1d9" font-size="11">④ service.findOrders()</text>
+
+    <path d="M 650 260 L 460 260" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" fill="none" marker-end="url(#arr)"/>
+    <text x="555" y="254" text-anchor="middle" fill="#c9d1d9" font-size="11">⑤ get() → DSLContext</text>
+
+    <path d="M 650 300 L 830 300" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="740" y="294" text-anchor="middle" fill="#c9d1d9" font-size="11">⑥ SELECT FROM orders</text>
+
+    <path d="M 830 330 L 650 330" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" fill="none" marker-end="url(#arr)"/>
+    <text x="740" y="324" text-anchor="middle" fill="#c9d1d9" font-size="11">⑦ Result</text>
+
+    <path d="M 650 370 L 270 370" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" fill="none" marker-end="url(#arr)"/>
+    <text x="460" y="364" text-anchor="middle" fill="#c9d1d9" font-size="11">⑧ orders</text>
+
+    <rect x="230" y="400" width="240" height="40" rx="6" fill="rgba(92,31,31,.30)" stroke="#f85149" stroke-dasharray="3 3"/>
+    <text x="350" y="425" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">finally 块 · 必须执行</text>
+
+    <path d="M 270 460 L 460 460" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="365" y="454" text-anchor="middle" fill="#c9d1d9" font-size="11">⑨ remove() · 防 ThreadLocal 泄漏</text>
+  </svg>
+</div>
+<pre><code class="language-java">public class TenantContext {
+    private static final ThreadLocal&lt;DSLContext&gt; CTX = new ThreadLocal&lt;&gt;();
+    public static void set(DSLContext ctx) { CTX.set(ctx); }
+    public static DSLContext dsl()         { return CTX.get(); }
+    public static void clear()             { CTX.remove(); }
+}
+
+@Override
+public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
+        throws IOException, ServletException {
+    String tenantId = ((HttpServletRequest) req).getHeader(&quot;X-Tenant-Id&quot;);
+    DataSource ds = tenantDataSources.get(tenantId);
+    TenantContext.set(DSL.using(ds, SQLDialect.POSTGRES));
+    try {
+        chain.doFilter(req, res);
+    } finally {
+        TenantContext.clear();
+    }
+}
+</code></pre>
+<h3>3.6.3 业务代码透明感知</h3>
+<pre><code class="language-java">public List&lt;OrderDto&gt; findOrders() {
+    return TenantContext.dsl()
+        .selectFrom(ORDERS)
+        .fetchInto(OrderDto.class);
+}
+</code></pre>
+<p>业务代码不感知租户。<code>Filter</code> 在请求入口注入,<code>finally</code> 清理避免 ThreadLocal 内存泄漏。该模式与 Spring Security 的 <code>SecurityContextHolder</code> 同构。</p>
+<h3>3.6.4 Virtual Threads 与 ScopedValue</h3>
+<p>JDK 21+ 虚拟线程数量可达数十万,ThreadLocal 模式仍可用但要警惕 <code>remove()</code> 必须执行。JDK 21 预览的 <code>ScopedValue</code> 自动跟随结构化并发的作用域,无需手动清理:</p>
+<pre><code class="language-java">public static final ScopedValue&lt;DSLContext&gt; TENANT = ScopedValue.newInstance();
+
+ScopedValue.where(TENANT, DSL.using(acmeDS, SQLDialect.POSTGRES))
+           .run(() -&gt; service.findOrders());
+</code></pre>
+<h2 id="3.7-陷阱与限制">3.7 陷阱与限制</h2>
+<h3>图 3-7:DSLContext 陷阱分类</h3>
+<div class="diagram">
+  <div class="diagram-title">图 3-7 · DSLContext 陷阱分类 — 4 大类 8 个高频问题</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="350" y="14" width="220" height="48" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="460" y="38" text-anchor="middle" fill="#f85149" font-size="14" font-weight="bold">DSLContext 陷阱</text>
+    <text x="460" y="55" text-anchor="middle" fill="#c9d1d9" font-size="11">8 个高频问题 · 4 个类别</text>
+
+    <path d="M 380 62 L 130 110" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 430 62 L 360 110" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 490 62 L 580 110" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 540 62 L 800 110" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="40"  y="115" width="200" height="40" rx="8" fill="url(#g-red)"    stroke="#f85149" stroke-width="2"/>
+    <text x="140" y="139" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">类别 1 · 生命周期</text>
+    <rect x="260" y="115" width="200" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="360" y="139" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">类别 2 · 并发</text>
+    <rect x="480" y="115" width="200" height="40" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="2"/>
+    <text x="580" y="139" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">类别 3 · 配置</text>
+    <rect x="700" y="115" width="200" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="800" y="139" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">类别 4 · 资源泄漏</text>
+
+    <path d="M 100 155 L 80 175"  stroke="#8b949e" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 180 155 L 200 175" stroke="#8b949e" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 320 155 L 300 175" stroke="#8b949e" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 400 155 L 420 175" stroke="#8b949e" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 540 155 L 520 175" stroke="#8b949e" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 620 155 L 640 175" stroke="#8b949e" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 760 155 L 740 175" stroke="#8b949e" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 840 155 L 860 175" stroke="#8b949e" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="20"  y="180" width="120" height="60" rx="6" fill="#161b22" stroke="#f85149"/>
+    <text x="80"  y="200" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">1</text>
+    <text x="80"  y="218" text-anchor="middle" fill="#c9d1d9" font-size="10">单 Connection</text>
+    <text x="80"  y="232" text-anchor="middle" fill="#c9d1d9" font-size="10">跨线程</text>
+
+    <rect x="140" y="180" width="120" height="60" rx="6" fill="#161b22" stroke="#f85149"/>
+    <text x="200" y="200" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">2</text>
+    <text x="200" y="218" text-anchor="middle" fill="#c9d1d9" font-size="10">transaction 内</text>
+    <text x="200" y="232" text-anchor="middle" fill="#c9d1d9" font-size="10">用旧 ctx</text>
+
+    <rect x="240" y="180" width="120" height="60" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="300" y="200" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">3</text>
+    <text x="300" y="218" text-anchor="middle" fill="#c9d1d9" font-size="10">共享可变</text>
+    <text x="300" y="232" text-anchor="middle" fill="#c9d1d9" font-size="10">Settings</text>
+
+    <rect x="360" y="180" width="120" height="60" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="420" y="200" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">4</text>
+    <text x="420" y="218" text-anchor="middle" fill="#c9d1d9" font-size="10">ThreadLocal</text>
+    <text x="420" y="232" text-anchor="middle" fill="#c9d1d9" font-size="10">未 clear</text>
+
+    <rect x="460" y="180" width="120" height="60" rx="6" fill="#161b22" stroke="#58a6ff"/>
+    <text x="520" y="200" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">5</text>
+    <text x="520" y="218" text-anchor="middle" fill="#c9d1d9" font-size="10">Settings 生效</text>
+    <text x="520" y="232" text-anchor="middle" fill="#c9d1d9" font-size="10">阶段误解</text>
+
+    <rect x="580" y="180" width="120" height="60" rx="6" fill="#161b22" stroke="#58a6ff"/>
+    <text x="640" y="200" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">6</text>
+    <text x="640" y="218" text-anchor="middle" fill="#c9d1d9" font-size="10">derive 后污染</text>
+    <text x="640" y="232" text-anchor="middle" fill="#c9d1d9" font-size="10">共享状态</text>
+
+    <rect x="680" y="180" width="120" height="60" rx="6" fill="#161b22" stroke="#bc8cff"/>
+    <text x="740" y="200" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">7</text>
+    <text x="740" y="218" text-anchor="middle" fill="#c9d1d9" font-size="10">Cursor</text>
+    <text x="740" y="232" text-anchor="middle" fill="#c9d1d9" font-size="10">不关闭</text>
+
+    <rect x="800" y="180" width="120" height="60" rx="6" fill="#161b22" stroke="#bc8cff"/>
+    <text x="860" y="200" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">8</text>
+    <text x="860" y="218" text-anchor="middle" fill="#c9d1d9" font-size="10">ResultSet</text>
+    <text x="860" y="232" text-anchor="middle" fill="#c9d1d9" font-size="10">流式未关闭</text>
+
+    <rect x="40" y="265" width="840" height="100" rx="8" fill="#0d1117" stroke="#30363d"/>
+    <text x="60" y="285" fill="#8b949e" font-size="11">严重度:</text>
+    <text x="60" y="305" fill="#f85149" font-size="11" font-weight="bold">高:1 / 2</text>
+    <text x="160" y="305" fill="#c9d1d9" font-size="11">— 数据损坏 / 事务静默丢失</text>
+    <text x="60" y="325" fill="#d29922" font-size="11" font-weight="bold">中:3 / 4</text>
+    <text x="160" y="325" fill="#c9d1d9" font-size="11">— 偶发并发竞态,生产难复现</text>
+    <text x="60" y="345" fill="#58a6ff" font-size="11" font-weight="bold">低:5 / 6 / 7 / 8</text>
+    <text x="195" y="345" fill="#c9d1d9" font-size="11">— 资源占用上涨 · 表现为内存 / 连接缓慢泄漏</text>
+  </svg>
+</div>
+<h3>表 3-7:陷阱明细</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">#</th>
+<th>陷阱</th>
+<th>症状</th>
+<th>根因</th>
+<th>修复</th>
+<th>监控指标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">1</td>
+<td>单 Connection 跨线程</td>
+<td>偶发 SQL 异常</td>
+<td>多线程共享同一连接</td>
+<td>改用 <code>DataSourceConnectionProvider</code></td>
+<td>异常日志</td>
+</tr>
+<tr>
+<td style="text-align: right;">2</td>
+<td>闭包用旧 ctx</td>
+<td>写不在事务</td>
+<td>未用派生 Configuration</td>
+<td><code>DSL.using(configuration)</code></td>
+<td>数据回滚测试</td>
+</tr>
+<tr>
+<td style="text-align: right;">3</td>
+<td>共享可变 Settings</td>
+<td>配置漂移</td>
+<td>修改已绑定 Settings</td>
+<td>使用 <code>derive</code></td>
+<td>单元测试</td>
+</tr>
+<tr>
+<td style="text-align: right;">4</td>
+<td>ThreadLocal 未 clear</td>
+<td>内存泄漏</td>
+<td><code>finally</code> 缺 <code>remove</code></td>
+<td><code>try / finally</code> 强制清理</td>
+<td>heap dump</td>
+</tr>
+<tr>
+<td style="text-align: right;">5</td>
+<td>Settings 不生效</td>
+<td>期望未达成</td>
+<td>错配阶段(渲染 vs 执行)</td>
+<td>查阶段对照表</td>
+<td>snapshot 测试</td>
+</tr>
+<tr>
+<td style="text-align: right;">6</td>
+<td>derive 后污染</td>
+<td>全局行为变化</td>
+<td>修改 derive 来源</td>
+<td>用 <code>new Settings(orig)</code> 拷贝</td>
+<td>code review</td>
+</tr>
+<tr>
+<td style="text-align: right;">7</td>
+<td>Cursor 未关闭</td>
+<td>连接耗尽</td>
+<td><code>fetchLazy</code> 后未 close</td>
+<td><code>try-with-resources</code></td>
+<td>连接池告警</td>
+</tr>
+<tr>
+<td style="text-align: right;">8</td>
+<td>break 跳出</td>
+<td>同上</td>
+<td>for 循环 break</td>
+<td>同上</td>
+<td>同上</td>
+</tr>
+</tbody>
+</table>
+<h3>Cursor 泄漏反例与正例</h3>
+<pre><code class="language-java">// 反模式:Cursor 未关闭
+Cursor&lt;Record&gt; cursor = ctx.selectFrom(ORDERS).fetchLazy();
+for (Record r : cursor) {
+    if (someCondition) break;
+}
+
+// 正模式:try-with-resources
+try (Cursor&lt;Record&gt; cursor = ctx.selectFrom(ORDERS).fetchLazy()) {
+    for (Record r : cursor) {
+        if (someCondition) break;
+    }
+}
+</code></pre>
+<h3>Settings 可变性反例</h3>
+<pre><code class="language-text">反模式:
+  Settings shared = new Settings().withRenderSchema(true);
+  DSLContext a = DSL.using(ds, POSTGRES, shared);
+  DSLContext b = DSL.using(ds, POSTGRES, shared);
+  shared.setRenderSchema(false);   // a 与 b 都被影响
+
+正模式:
+  Settings base = new Settings().withRenderSchema(true);
+  DSLContext a = DSL.using(ds, POSTGRES, base);
+  Configuration noSchemaCfg = a.configuration()
+      .derive(new Settings(base).withRenderSchema(false));
+  DSLContext b = DSL.using(noSchemaCfg);   // 互不污染
+</code></pre>
+<h2 id="3.8-sql-snapshot-守护">3.8 SQL Snapshot 守护</h2>
+<h3>3.8.1 基础 snapshot 测试</h3>
+<pre><code class="language-java">@Test
+void coreOrdersQuery_snapshot() {
+    var query = ctx.select(ORDERS.ID, ORDERS.STATUS)
+        .from(ORDERS)
+        .where(ORDERS.ID.eq(1L));
+
+    assertThat(query.getSQL())
+        .isEqualToNormalizingWhitespace(&quot;&quot;&quot;
+            select &quot;orders&quot;.&quot;id&quot;, &quot;orders&quot;.&quot;status&quot;
+            from &quot;orders&quot;
+            where &quot;orders&quot;.&quot;id&quot; = ?
+            &quot;&quot;&quot;);
+    assertThat(query.getBindValues()).containsExactly(1L);
+}
+</code></pre>
+<h3>3.8.2 多方言 snapshot</h3>
+<pre><code class="language-java">@ParameterizedTest
+@EnumSource(value = SQLDialect.class,
+    names = {&quot;POSTGRES&quot;, &quot;MYSQL&quot;, &quot;H2&quot;, &quot;ORACLE&quot;})
+void status_filter_renders_per_dialect(SQLDialect dialect) {
+    DSLContext per = DSL.using(dialect);
+    String sql = per.select(ORDERS.ID)
+                    .from(ORDERS)
+                    .where(ORDERS.STATUS.eq(&quot;PAID&quot;))
+                    .getSQL();
+    assertThat(sql)
+        .isEqualToNormalizingWhitespace(
+            readSnapshot(&quot;sql/orders-&quot; + dialect.getNameLC() + &quot;.sql&quot;));
+}
+</code></pre>
+<h3>3.8.3 Listener 事件顺序断言</h3>
+<pre><code class="language-java">final class TraceListener extends DefaultExecuteListener {
+    final List&lt;String&gt; events = new ArrayList&lt;&gt;();
+
+    @Override public void renderStart(ExecuteContext ctx) { events.add(&quot;renderStart&quot;); }
+    @Override public void bindEnd(ExecuteContext ctx)     { events.add(&quot;bindEnd&quot;); }
+    @Override public void executeEnd(ExecuteContext ctx)  { events.add(&quot;executeEnd&quot;); }
+}
+
+@Test
+void execute_lifecycle_observes_events() {
+    var trace = new TraceListener();
+    var local = base.configuration()
+        .derive(new DefaultExecuteListenerProvider(trace))
+        .dsl();
+
+    local.select(ORDERS.ID).from(ORDERS).where(ORDERS.ID.eq(1L)).fetch();
+
+    assertThat(trace.events)
+        .containsSubsequence(&quot;renderStart&quot;, &quot;bindEnd&quot;, &quot;executeEnd&quot;);
+}
+</code></pre>
+<h3>3.8.4 守护四类回归</h3>
+<table>
+<thead>
+<tr>
+<th>守护</th>
+<th>工具</th>
+<th>频率</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SQL 形状</td>
+<td>snapshot 文件</td>
+<td>每次 PR</td>
+</tr>
+<tr>
+<td>bind 顺序</td>
+<td><code>containsExactly</code></td>
+<td>每次 PR</td>
+</tr>
+<tr>
+<td>Listener 顺序</td>
+<td>事件列表</td>
+<td>升级 jOOQ 时</td>
+</tr>
+<tr>
+<td>多方言一致性</td>
+<td><code>@ParameterizedTest</code></td>
+<td>每次 PR</td>
+</tr>
+</tbody>
+</table>
+<h2 id="3.9-源码深潜">3.9 源码深潜</h2>
+<h3>图 3-9:DSLContext 内部架构</h3>
+<div class="diagram">
+  <div class="diagram-title">图 3-9 · DSLContext 内部架构 — 从工厂入口到 RecordFactory 的 12 个节点</div>
+  <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20"  y="40" width="170" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="105" y="62" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">① DSL.using(...)</text>
+    <text x="105" y="80" text-anchor="middle" fill="#c9d1d9" font-size="10">静态工厂入口</text>
+
+    <rect x="220" y="40" width="180" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="310" y="62" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">② DefaultConfiguration</text>
+    <text x="310" y="80" text-anchor="middle" fill="#c9d1d9" font-size="10">装配 7 组件</text>
+
+    <rect x="430" y="40" width="180" height="50" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="520" y="62" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">③ DefaultDSLContext</text>
+    <text x="520" y="80" text-anchor="middle" fill="#c9d1d9" font-size="10">薄门面 + select(...)</text>
+
+    <rect x="640" y="40" width="180" height="50" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="730" y="62" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">④ QueryPart AST</text>
+    <text x="730" y="80" text-anchor="middle" fill="#c9d1d9" font-size="10">SelectQueryImpl 树</text>
+
+    <path d="M 190 65 L 220 65" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 400 65 L 430 65" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 610 65 L 640 65" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <path d="M 690 90 L 240 150" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 770 90 L 540 150" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="120" y="155" width="220" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="230" y="177" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">⑤ RenderContext</text>
+    <text x="230" y="195" text-anchor="middle" fill="#c9d1d9" font-size="10">遍历 → SQL 文本</text>
+
+    <rect x="420" y="155" width="220" height="50" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="530" y="177" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">⑥ BindContext</text>
+    <text x="530" y="195" text-anchor="middle" fill="#c9d1d9" font-size="10">遍历 → bind values</text>
+
+    <path d="M 230 205 L 380 240" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 530 205 L 460 240" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="300" y="245" width="320" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="267" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">⑦ ExecuteContext</text>
+    <text x="460" y="285" text-anchor="middle" fill="#c9d1d9" font-size="10">渲染产物 + 监听器 + 连接</text>
+
+    <path d="M 360 295 L 200 340" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 560 295 L 720 340" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="80"  y="345" width="220" height="50" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="190" y="367" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">⑧ ExecuteListener 链</text>
+    <text x="190" y="385" text-anchor="middle" fill="#c9d1d9" font-size="10">日志 / 审计 / 监控</text>
+
+    <rect x="600" y="345" width="220" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="710" y="367" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">⑨ ConnectionProvider</text>
+    <text x="710" y="385" text-anchor="middle" fill="#c9d1d9" font-size="10">acquire JDBC Connection</text>
+
+    <path d="M 710 395 L 710 415" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="20"  y="415" width="180" height="40" rx="6" fill="#161b22" stroke="#3fb950"/>
+    <text x="110" y="440" text-anchor="middle" fill="#c9d1d9" font-size="11">⑫ RecordFactory</text>
+    <rect x="220" y="415" width="180" height="40" rx="6" fill="#161b22" stroke="#3fb950"/>
+    <text x="310" y="440" text-anchor="middle" fill="#c9d1d9" font-size="11">⑪ ResultSet</text>
+    <rect x="420" y="415" width="180" height="40" rx="6" fill="#161b22" stroke="#3fb950"/>
+    <text x="510" y="440" text-anchor="middle" fill="#c9d1d9" font-size="11">⑩ PreparedStatement</text>
+
+    <path d="M 600 435 L 605 435 L 605 425 L 600 425" stroke="#3fb950" stroke-width="1.5" fill="none"/>
+    <path d="M 400 435 L 405 435 L 405 425 L 400 425" stroke="#3fb950" stroke-width="1.5" fill="none"/>
+    <path d="M 600 435 L 420 435" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" fill="none" marker-end="url(#arr)"/>
+    <path d="M 400 435 L 220 435" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" fill="none" marker-end="url(#arr)"/>
+    <path d="M 200 435 L 200 435 L 200 435" stroke="#3fb950" stroke-width="1.5" fill="none"/>
+  </svg>
+</div>
+<h3>表 3-9:核心源码入口</h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>org.jooq.DSLContext</code></td>
+<td>接口定义</td>
+</tr>
+<tr>
+<td><code>org.jooq.impl.DefaultDSLContext</code></td>
+<td>默认实现</td>
+</tr>
+<tr>
+<td><code>org.jooq.Configuration</code></td>
+<td>配置接口</td>
+</tr>
+<tr>
+<td><code>org.jooq.impl.DefaultConfiguration</code></td>
+<td>配置实现</td>
+</tr>
+<tr>
+<td><code>org.jooq.ConnectionProvider</code></td>
+<td>连接提供 SPI</td>
+</tr>
+<tr>
+<td><code>org.jooq.ExecuteListener</code></td>
+<td>执行监听 SPI</td>
+</tr>
+<tr>
+<td><code>org.jooq.impl.DefaultRenderContext</code></td>
+<td>渲染上下文</td>
+</tr>
+<tr>
+<td><code>org.jooq.impl.DefaultBindContext</code></td>
+<td>绑定上下文</td>
+</tr>
+</tbody>
+</table>
+<h3>设计取舍</h3>
+<p><strong>取舍 1:门面与配置分离</strong></p>
+<p><code>DSLContext</code> 仅作为 API 入口,所有可变状态压到 <code>Configuration</code>。该分离使 <code>DSLContext</code> 可以是单例线程安全对象,而 <code>Configuration</code> 通过 <code>derive</code> 实现局部覆盖。代价是排查问题时需同时检查门面引用与配置组件。</p>
+<p><strong>取舍 2:Provider SPI 全可替换</strong></p>
+<p>连接获取、事务管理、监听器、记录映射、类型转换均为 SPI。该设计使 jOOQ 与 Spring、HikariCP、自定义连接池透明集成,代价是初学者面对 7 类接口学习曲线陡峭。</p>
+<p><strong>取舍 3:渲染在运行期发生</strong></p>
+<p>同一 AST 可由不同 <code>DSLContext</code> 渲染为不同方言 SQL。该机制使 SQL 重写、方言迁移、跨库测试成为可能,代价是 SQL snapshot 测试必须固定 <code>SQLDialect</code> 与 <code>Settings</code>。</p>
+<div class="chapter-summary">
+<h2>3.10 本章要点</h2>
+
+<table>
+<thead>
+<tr>
+<th>要点</th>
+<th>验证依据</th>
+<th>易错点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DSLContext</code> 是接口 + 默认实现</td>
+<td><code>DefaultDSLContext</code></td>
+<td>当作连接缓存</td>
+</tr>
+<tr>
+<td><code>Configuration</code> 含 7 类可插拔组件</td>
+<td><code>connectionProvider</code> 等</td>
+<td>漏接监听器</td>
+</tr>
+<tr>
+<td><code>derive</code> 不污染共享状态</td>
+<td><code>Configuration.derive</code></td>
+<td>修改原 Settings</td>
+</tr>
+<tr>
+<td><code>ConnectionProvider</code> 协议为 acquire/release</td>
+<td>时序图</td>
+<td>单连接跨线程</td>
+</tr>
+<tr>
+<td>渲染与执行分离</td>
+<td><code>getSQL</code> vs <code>execute</code></td>
+<td>把 inline SQL 用于生产</td>
+</tr>
+<tr>
+<td>Settings 影响阶段不同</td>
+<td>阶段对照表</td>
+<td>期望乐观锁影响 DSL update</td>
+</tr>
+<tr>
+<td>多租户用独立 DSLContext</td>
+<td>ThreadLocal / ScopedValue</td>
+<td>共享可变 Settings</td>
+</tr>
+<tr>
+<td>Cursor 必须 close</td>
+<td><code>try-with-resources</code></td>
+<td>for 循环 break</td>
+</tr>
+</tbody>
+</table>
+<p>最小回归命令:</p>
+<pre><code class="language-text">mvn -q test -Dtest=DSLContextTest,ConfigurationTest
+</code></pre>
+<pre><code class="language-log">[INFO] Tests run: 8, Failures: 0
+[INFO] BUILD SUCCESS
+</code></pre>
+<hr>
+<p>下一章讨论 jOOQ 类型系统的物理基础:<code>Field&lt;T&gt;</code>、<code>DataType&lt;T&gt;</code>、<code>Param&lt;T&gt;</code> 如何在编译期捕获 SQL 类型错误,以及 <code>Converter</code> 与 <code>Binding</code> 如何把数据库类型映射到自定义 Java 类型。</p>
+</div>
+
+
+<div class="chapter-nav">
+  <a href="ch02-codegen.html">&larr; ch02-codegen · 第 2 章 · 代码生成引擎</a>
+  <a href="ch04-typesystem.html">ch04-typesystem · 第 4 章 · 类型系统:Field&lt;T&gt; 与 DataType &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 jOOQ &middot; 第 3 章 · DSLContext 与 Configuration</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+</body>
+</html>

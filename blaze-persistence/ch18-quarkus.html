@@ -1,0 +1,855 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-book="blaze">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 18 章 · Quarkus 与 GraalVM 原生编译 — 图解 Blaze-Persistence</title>
+<link rel="stylesheet" href="books.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Blaze-Persistence</span>
+  <span class="sep">|</span>
+  <a href="index.html">目录</a>
+  <a href="ch17-graphql.html">← 第 17 章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s18-1">18.1 Quarkus 扩展架构</a>
+  <a href="#s18-2">18.2 构建时优化 vs 运行时初始化</a>
+  <a href="#s18-3">18.3 GraalVM 原生镜像</a>
+  <a href="#s18-4">18.4 静态 Entity View 实现</a>
+  <a href="#s18-5">18.5 原生镜像测试</a>
+  <a href="#s18-6">18.6 CDI 与 Bean 配置</a>
+  <a href="#s18-7">18.7 陷阱与限制</a>
+  <a href="#summary">本章小结</a>
+</aside>
+
+<article class="article">
+
+<h1>第 18 章 · Quarkus 与 GraalVM 原生编译</h1>
+<p class="subtitle">Quarkus 扩展 · 构建时优化 · 原生镜像 · 反射配置 · 静态代理</p>
+
+<div class="chapter-intro">
+  <p class="lead">当微服务启动时间从秒级压缩到毫秒级，当内存占用从数百 MB 降至数十 MB——Quarkus + GraalVM 原生编译正是实现这一飞跃的关键技术。但 Blaze-Persistence 大量依赖反射和动态代理，如何让它在"零反射"的原生镜像中正常工作？</p>
+  <ul class="will-learn">
+    <li>理解 <code>blaze-persistence-integration-quarkus</code> 扩展的架构与构建时处理流程</li>
+    <li>对比 Spring Boot 运行时初始化与 Quarkus 构建时优化的性能差异</li>
+    <li>掌握 GraalVM 原生镜像编译中反射配置与静态代理生成的完整方案</li>
+    <li>使用注解处理器生成静态 Entity View 实现，消除运行时字节码生成</li>
+    <li>编写并运行原生模式下的集成测试</li>
+    <li>配置 CDI Bean 注入 <code>CriteriaBuilderFactory</code> 和 <code>EntityViewManager</code></li>
+    <li>规避原生编译中的常见陷阱与已知限制</li>
+  </ul>
+  <p class="prereq">前置知识：<a href="ch02-setup.html">第 2 章 · 环境搭建</a> 的 Maven 配置基础，以及 <a href="ch04-entityview.html">第 4 章 · Entity View</a> 的核心概念。若已阅读 <a href="ch12-spring.html">第 12 章 · Spring Data 集成</a>，本章将自然对比两种框架的集成差异。</p>
+</div>
+
+
+<!-- ================================================================== -->
+<h2 id="s18-1">18.1 Quarkus 扩展架构</h2>
+<!-- ================================================================== -->
+
+<p>Blaze-Persistence 提供官方 Quarkus 扩展 <code>blaze-persistence-integration-quarkus</code>，它将 Entity View 的发现、校验和代理生成全部移入构建阶段，从而在运行时实现近零初始化开销。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 18-1 Quarkus 扩展构建时处理流程</div>
+<div class="mermaid">
+flowchart TD
+    subgraph BUILD ["构建阶段 (Build Time)"]
+        SCAN["扫描 classpath<br/>发现 @EntityView 类"] --> VALIDATE["校验 Entity View<br/>映射合法性"]
+        VALIDATE --> PROXY["生成代理类<br/>或触发静态实现"]
+        PROXY --> REGISTER["注册 BuildItem<br/>记录所有 View 元数据"]
+        REGISTER --> BEANS["生成 CDI Bean 配置<br/>CriteriaBuilderFactory<br/>EntityViewManager"]
+    end
+
+    subgraph RUNTIME ["运行阶段 (Runtime)"]
+        BEANS --> INJECT["@Inject 直接可用"]
+        INJECT --> QUERY["执行查询<br/>零初始化延迟"]
+    end
+
+    style SCAN fill:#1e3a5f,stroke:#58a6ff
+    style VALIDATE fill:#2d1f4e,stroke:#bc8cff
+    style PROXY fill:#2d1f4e,stroke:#bc8cff
+    style REGISTER fill:#1a3a2a,stroke:#3fb950
+    style BEANS fill:#1a3a2a,stroke:#3fb950
+    style INJECT fill:#3a2a1a,stroke:#d29922
+    style QUERY fill:#3a2a1a,stroke:#d29922
+</div>
+</div>
+
+<p>扩展的核心是一组 <code>@BuildStep</code> 处理器。每个处理器在 Maven/Gradle 编译时执行，将运行时本应完成的初始化工作提前完成，结果以 <code>BuildItem</code> 形式传递给下一个步骤。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 18-2 BuildStep 处理器链</div>
+<div class="mermaid">
+flowchart LR
+    BS1["EntityViewScanStep<br/>扫描注解"] --> BS2["EntityViewValidationStep<br/>校验映射"]
+    BS2 --> BS3["EntityViewProxyStep<br/>生成代理"]
+    BS3 --> BS4["CriteriaBuilderStep<br/>配置 CBF"]
+    BS4 --> BS5["BeanProducerStep<br/>注册 CDI Bean"]
+
+    BS1 -.->|"BuildItem"| BS2
+    BS2 -.->|"BuildItem"| BS3
+    BS3 -.->|"BuildItem"| BS4
+    BS4 -.->|"BuildItem"| BS5
+
+    style BS1 fill:#1e3a5f,stroke:#58a6ff
+    style BS2 fill:#1e3a5f,stroke:#58a6ff
+    style BS3 fill:#2d1f4e,stroke:#bc8cff
+    style BS4 fill:#2d1f4e,stroke:#bc8cff
+    style BS5 fill:#1a3a2a,stroke:#3fb950
+</div>
+</div>
+
+<h3>Maven 依赖配置</h3>
+
+<pre><code>&lt;!-- pom.xml — Quarkus + Blaze-Persistence 最小配置 --&gt;
+&lt;dependencyManagement&gt;
+  &lt;dependencies&gt;
+    &lt;dependency&gt;
+      &lt;groupId&gt;com.blazebit&lt;/groupId&gt;
+      &lt;artifactId&gt;blaze-persistence-bom&lt;/artifactId&gt;
+      &lt;version&gt;${blaze-persistence.version}&lt;/version&gt;
+      &lt;type&gt;pom&lt;/type&gt;
+      &lt;scope&gt;import&lt;/scope&gt;
+    &lt;/dependency&gt;
+  &lt;/dependencies&gt;
+&lt;/dependencyManagement&gt;
+
+&lt;dependencies&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;com.blazebit&lt;/groupId&gt;
+    &lt;artifactId&gt;blaze-persistence-integration-quarkus&lt;/artifactId&gt;
+  &lt;/dependency&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;com.blazebit&lt;/groupId&gt;
+    &lt;artifactId&gt;blaze-persistence-integration-hibernate-6.2&lt;/artifactId&gt;
+    &lt;scope&gt;runtime&lt;/scope&gt;
+  &lt;/dependency&gt;
+&lt;/dependencies&gt;</code></pre>
+
+<h3>application.properties</h3>
+
+<pre><code># Quarkus Blaze-Persistence 配置
+quarkus.blaze-persistence.default-batch-size=50
+quarkus.blaze-persistence.packages-to-scan=com.example.view
+
+# 数据源
+quarkus.datasource.db-kind=postgresql
+quarkus.datasource.jdbc.url=jdbc:postgresql://localhost:5432/mydb
+quarkus.hibernate-orm.database.generation=update</code></pre>
+
+
+<!-- ================================================================== -->
+<h2 id="s18-2">18.2 构建时优化 vs 运行时初始化</h2>
+<!-- ================================================================== -->
+
+<p>传统的 Spring Boot 集成（<a href="ch12-spring.html">第 12 章</a>）在应用启动时才执行 Entity View 的扫描、校验和代理生成。Quarkus 将这些步骤全部前置到编译阶段，带来数量级的启动加速。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 18-3 Spring Boot vs Quarkus 启动流程对比</div>
+<div style="display:flex;flex-wrap:wrap;gap:16px;justify-content:center;padding:16px 0;">
+  <div style="border:1px solid #f85149;border-radius:8px;padding:14px 18px;min-width:240px;max-width:320px;background:rgba(67,20,7,.10);flex:1;">
+    <div style="font-weight:bold;color:#f85149;margin-bottom:10px;font-size:14px;">Spring Boot — 运行时初始化</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.7;">
+      <div>❶ JVM 启动</div>
+      <div>❷ 加载 Spring Context</div>
+      <div>❸ 扫描 @EntityView 注解</div>
+      <div>❹ 校验映射合法性</div>
+      <div style="color:#f85149;">❺ 生成动态代理 (字节码生成)</div>
+      <div>❻ 创建 EntityViewManager</div>
+      <div style="color:#3fb950;">❼ 应用就绪 ✅</div>
+    </div>
+  </div>
+  <div style="border:1px solid #58a6ff;border-radius:8px;padding:14px 18px;min-width:240px;max-width:320px;background:rgba(30,58,95,.10);flex:1;">
+    <div style="font-weight:bold;color:#58a6ff;margin-bottom:10px;font-size:14px;">Quarkus — 构建时优化</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.7;">
+      <div>❶ JVM / 原生镜像启动</div>
+      <div>❷ 加载预编译 Bean</div>
+      <div>❸ EntityViewManager 直接可用</div>
+      <div style="color:#3fb950;">❹ 应用就绪 ✅</div>
+    </div>
+  </div>
+</div>
+</div>
+
+<h3>启动性能对比</h3>
+
+<div class="diagram">
+<div class="diagram-title">Fig 18-4 三种模式启动时间对比 (典型值)</div>
+<div class="mermaid">
+gantt
+    title 启动时间对比（毫秒）
+    dateFormat X
+    axisFormat %s ms
+
+    section Spring Boot (JVM)
+    扫描 + 校验 + 代理生成    :0, 1800
+    Spring Context 初始化     :1800, 3200
+    应用就绪                  :3200, 3500
+
+    section Quarkus (JVM)
+    预编译 Bean 加载           :0, 200
+    Hibernate 初始化           :200, 600
+    应用就绪                   :600, 700
+
+    section Quarkus (Native)
+    原生镜像启动               :0, 15
+    应用就绪                   :15, 30
+</div>
+</div>
+
+<div class="key-insight">
+  <strong>💡 核心差异：</strong>Spring Boot 每次启动重复执行 classpath 扫描和字节码生成；Quarkus 只在 <code>mvn package</code> 时执行一次，运行时直接加载结果。原生镜像模式进一步省去 JVM 预热，启动可压至 30ms 以内。
+</div>
+
+<h3>构建时优化的代价</h3>
+
+<table>
+<thead>
+<tr><th>维度</th><th>Spring Boot</th><th>Quarkus (JVM)</th><th>Quarkus (Native)</th></tr>
+</thead>
+<tbody>
+<tr><td>编译时间</td><td>快 (秒级)</td><td>稍慢 (增加 BuildStep)</td><td>显著增加 (分钟级)</td></tr>
+<tr><td>启动时间</td><td style="color:var(--red)">~3.5s</td><td style="color:var(--orange)">~0.7s</td><td style="color:var(--green)">~0.03s</td></tr>
+<tr><td>内存占用</td><td style="color:var(--red)">~250MB</td><td style="color:var(--orange)">~120MB</td><td style="color:var(--green)">~30MB</td></tr>
+<tr><td>热部署</td><td>DevTools 热替换</td><td>Dev Mode 热替换</td><td>需重新编译</td></tr>
+<tr><td>调试体验</td><td>标准 JVM 调试</td><td>标准 JVM 调试</td><td>受限</td></tr>
+</tbody>
+</table>
+
+
+<!-- ================================================================== -->
+<h2 id="s18-3">18.3 GraalVM 原生镜像</h2>
+<!-- ================================================================== -->
+
+<p>GraalVM <code>native-image</code> 通过静态分析将 Java 字节码编译为平台原生可执行文件。这一过程面临三大挑战：反射、动态代理和 <code>ServiceLoader</code>——而 Blaze-Persistence 恰好依赖这三者。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 18-5 GraalVM 原生镜像编译管线 (Blaze-Persistence 视角)</div>
+<div class="mermaid">
+flowchart TD
+    SRC["Java 源码 +<br/>@EntityView 接口"] --> COMPILE["javac 编译"]
+    COMPILE --> APT["APT 注解处理器<br/>生成静态实现"]
+    APT --> BYTECODE["字节码<br/>(应用 + 静态实现)"]
+    BYTECODE --> NATIVE["native-image 编译器"]
+
+    subgraph NATIVE_PROCESS ["native-image 静态分析"]
+        direction TB
+        POINTS["分析入口点<br/>可达性分析"] --> REFLECT["反射配置<br/>reflect-config.json"]
+        REFLECT --> PROXY_CFG["代理配置<br/>proxy-config.json"]
+        PROXY_CFG --> RESOURCE["资源配置<br/>resource-config.json"]
+        RESOURCE --> LINK["AOT 编译 &amp; 链接"]
+    end
+
+    NATIVE --> POINTS
+    LINK --> BINARY["原生可执行文件<br/>myapp-runner"]
+
+    style SRC fill:#1e3a5f,stroke:#58a6ff
+    style APT fill:#2d1f4e,stroke:#bc8cff
+    style BYTECODE fill:#1e3a5f,stroke:#58a6ff
+    style NATIVE fill:#3a2a1a,stroke:#d29922
+    style POINTS fill:#3a2a1a,stroke:#d29922
+    style REFLECT fill:#3a1a1a,stroke:#f85149
+    style PROXY_CFG fill:#3a1a1a,stroke:#f85149
+    style RESOURCE fill:#3a2a1a,stroke:#d29922
+    style LINK fill:#1a3a2a,stroke:#3fb950
+    style BINARY fill:#1a3a1a,stroke:#3fb950
+</div>
+</div>
+
+<h3>三大挑战及应对</h3>
+
+<div class="diagram">
+<div class="diagram-title">Fig 18-6 GraalVM 原生编译三大挑战</div>
+<div class="mermaid">
+flowchart LR
+    subgraph C1 ["挑战 1: 反射"]
+        R1["Entity View 接口<br/>通过反射获取方法"] --> S1["✅ reflect-config.json<br/>注册所有 View 类"]
+    end
+
+    subgraph C2 ["挑战 2: 动态代理"]
+        R2["运行时生成<br/>View 代理实现类"] --> S2["✅ 静态实现生成<br/>编译期生成源码"]
+    end
+
+    subgraph C3 ["挑战 3: ServiceLoader"]
+        R3["SPI 动态加载<br/>EntityViewProvider"] --> S3["✅ Quarkus 构建时<br/>预解析 SPI"]
+    end
+
+    style R1 fill:#3a1a1a,stroke:#f85149
+    style R2 fill:#3a1a1a,stroke:#f85149
+    style R3 fill:#3a1a1a,stroke:#f85149
+    style S1 fill:#1a3a1a,stroke:#3fb950
+    style S2 fill:#1a3a1a,stroke:#3fb950
+    style S3 fill:#1a3a1a,stroke:#3fb950
+</div>
+</div>
+
+<h3>反射配置</h3>
+
+<p>Quarkus 扩展在构建时自动生成 <code>reflect-config.json</code>，将所有 Entity View 接口及其方法注册为可反射访问。手动配置示例：</p>
+
+<pre><code>// reflect-config.json (由 Quarkus 扩展自动生成)
+[
+  {
+    "name": "com.example.view.CatView",
+    "allDeclaredMethods": true,
+    "allDeclaredConstructors": true
+  },
+  {
+    "name": "com.example.view.CatCreateView",
+    "allDeclaredMethods": true,
+    "allDeclaredConstructors": true
+  }
+]</code></pre>
+
+<div class="warning">
+  <strong>⚠️ 自定义 View：</strong>如果 Entity View 使用了自定义的 <code>@PostCreate</code>、<code>@PostLoad</code> 回调方法，这些方法也必须注册到反射配置中，否则原生镜像运行时会抛出 <code>IllegalAccessError</code>。
+</div>
+
+
+<!-- ================================================================== -->
+<h2 id="s18-4">18.4 静态 Entity View 实现</h2>
+<!-- ================================================================== -->
+
+<p>在 JVM 模式下，Blaze-Persistence 通过运行时字节码生成为每个 <code>@EntityView</code> 接口创建实现类。GraalVM 原生镜像不支持运行时字节码生成——解决方案是使用 <strong>注解处理器 (APT)</strong> 在编译期直接生成 Java 源码。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 18-7 静态实现生成流程</div>
+<div class="mermaid">
+flowchart LR
+    A["@EntityView(Cat.class)<br/>interface CatView"] --> B["APT 注解处理器<br/>blaze-persistence-<br/>entity-view-processor"]
+    B --> C["生成<br/>CatView_Impl.java"]
+    C --> D["javac 编译<br/>CatView_Impl.class"]
+    D --> E["native-image<br/>直接编译"]
+    E --> F["原生可执行文件<br/>包含 CatView 实现 ✅"]
+
+    style A fill:#1e3a5f,stroke:#58a6ff
+    style B fill:#2d1f4e,stroke:#bc8cff
+    style C fill:#2d1f4e,stroke:#bc8cff
+    style D fill:#1a3a2a,stroke:#3fb950
+    style E fill:#3a2a1a,stroke:#d29922
+    style F fill:#1a3a1a,stroke:#3fb950
+</div>
+</div>
+
+<h3>动态代理 vs 静态实现</h3>
+
+<div class="diagram">
+<div class="diagram-title">Fig 18-8 两种代理模式对比</div>
+<div class="mermaid">
+flowchart TD
+    subgraph DYNAMIC ["动态代理 (JVM 模式)"]
+        direction TB
+        DI["@EntityView<br/>interface CatView"] --> DR["运行时<br/>ByteBuddy / Javassist"]
+        DR --> DC["内存中生成<br/>CatView$Proxy.class"]
+        DC --> DU["使用代理实例"]
+    end
+
+    subgraph STATIC ["静态实现 (原生模式)"]
+        direction TB
+        SI["@EntityView<br/>interface CatView"] --> SC["编译期 APT<br/>生成 CatView_Impl.java"]
+        SC --> SJ["javac 编译<br/>CatView_Impl.class"]
+        SJ --> SU["使用实现类实例"]
+    end
+
+    DU --> NOTE1["❌ 原生镜像不支持<br/>运行时字节码"]
+    SU --> NOTE2["✅ 原生镜像完全兼容"]
+
+    style DR fill:#3a1a1a,stroke:#f85149
+    style DC fill:#3a1a1a,stroke:#f85149
+    style SC fill:#1a3a1a,stroke:#3fb950
+    style SJ fill:#1a3a1a,stroke:#3fb950
+    style NOTE1 fill:#3a1a1a,stroke:#f85149
+    style NOTE2 fill:#1a3a1a,stroke:#3fb950
+</div>
+</div>
+
+<h3>构建配置</h3>
+
+<pre><code>&lt;!-- pom.xml — 启用静态实现注解处理器 --&gt;
+&lt;dependencies&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;com.blazebit&lt;/groupId&gt;
+    &lt;artifactId&gt;blaze-persistence-entity-view-processor&lt;/artifactId&gt;
+    &lt;scope&gt;provided&lt;/scope&gt;
+  &lt;/dependency&gt;
+&lt;/dependencies&gt;
+
+&lt;build&gt;
+  &lt;plugins&gt;
+    &lt;plugin&gt;
+      &lt;groupId&gt;org.apache.maven.plugins&lt;/groupId&gt;
+      &lt;artifactId&gt;maven-compiler-plugin&lt;/artifactId&gt;
+      &lt;configuration&gt;
+        &lt;annotationProcessorPaths&gt;
+          &lt;path&gt;
+            &lt;groupId&gt;com.blazebit&lt;/groupId&gt;
+            &lt;artifactId&gt;blaze-persistence-entity-view-processor&lt;/artifactId&gt;
+            &lt;version&gt;${blaze-persistence.version}&lt;/version&gt;
+          &lt;/path&gt;
+        &lt;/annotationProcessorPaths&gt;
+      &lt;/configuration&gt;
+    &lt;/plugin&gt;
+  &lt;/plugins&gt;
+&lt;/build&gt;</code></pre>
+
+<h3>生成的实现类示例</h3>
+
+<pre><code>// 由 APT 自动生成 — CatView_Impl.java
+@Generated("com.blazebit.persistence.view.processor")
+public class CatView_Impl implements CatView {
+
+    private final Long id;
+    private final String name;
+    private final Integer age;
+
+    public CatView_Impl(Long id, String name, Integer age) {
+        this.id = id;
+        this.name = name;
+        this.age = age;
+    }
+
+    @Override
+    public Long getId() { return id; }
+
+    @Override
+    public String getName() { return name; }
+
+    @Override
+    public Integer getAge() { return age; }
+}</code></pre>
+
+<div class="key-insight">
+  <strong>💡 零反射运行时：</strong>静态实现类是普通的 Java 类，所有 getter 方法都是直接方法调用——不经过反射、不经过代理。这不仅满足 GraalVM 的要求，同时也带来微小的运行时性能提升。
+</div>
+
+
+<!-- ================================================================== -->
+<h2 id="s18-5">18.5 原生镜像测试</h2>
+<!-- ================================================================== -->
+
+<p>Quarkus 提供两级测试注解：<code>@QuarkusTest</code> 在 JVM 模式下运行，<code>@QuarkusIntegrationTest</code> 对已构建的原生镜像执行黑盒测试。两者的执行管线差异显著。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 18-9 JVM 测试 vs 原生测试执行管线</div>
+<div class="mermaid">
+flowchart TD
+    subgraph JVM_TEST ["@QuarkusTest (JVM 模式)"]
+        JT1["Maven test 阶段"] --> JT2["启动 Quarkus<br/>JVM 进程"]
+        JT2 --> JT3["注入 CDI Bean"]
+        JT3 --> JT4["执行测试方法"]
+        JT4 --> JT5["验证结果"]
+    end
+
+    subgraph NATIVE_TEST ["@QuarkusIntegrationTest (原生模式)"]
+        NT1["Maven verify 阶段"] --> NT2["启动原生<br/>可执行文件"]
+        NT2 --> NT3["通过 HTTP / REST<br/>外部调用"]
+        NT3 --> NT4["执行测试方法"]
+        NT4 --> NT5["验证结果"]
+    end
+
+    JT5 --> NOTE_JVM["可直接 @Inject<br/>访问内部 Bean"]
+    NT5 --> NOTE_NATIVE["黑盒测试<br/>仅通过外部接口验证"]
+
+    style JT1 fill:#1e3a5f,stroke:#58a6ff
+    style JT2 fill:#1e3a5f,stroke:#58a6ff
+    style JT3 fill:#2d1f4e,stroke:#bc8cff
+    style JT4 fill:#2d1f4e,stroke:#bc8cff
+    style JT5 fill:#1a3a1a,stroke:#3fb950
+    style NT1 fill:#3a2a1a,stroke:#d29922
+    style NT2 fill:#3a2a1a,stroke:#d29922
+    style NT3 fill:#3a2a1a,stroke:#d29922
+    style NT4 fill:#3a2a1a,stroke:#d29922
+    style NT5 fill:#1a3a1a,stroke:#3fb950
+</div>
+</div>
+
+<h3>集成测试示例</h3>
+
+<pre><code>// CatResourceIT.java — 原生镜像集成测试
+@QuarkusIntegrationTest
+public class CatResourceIT {
+
+    @Test
+    void listCats_shouldReturnEntityViews() {
+        given()
+            .when().get("/api/cats")
+            .then()
+            .statusCode(200)
+            .body("$.size()", greaterThan(0))
+            .body("[0].name", notNullValue());
+    }
+
+    @Test
+    void getCatById_shouldReturnDetailView() {
+        given()
+            .when().get("/api/cats/1")
+            .then()
+            .statusCode(200)
+            .body("id", equalTo(1))
+            .body("name", notNullValue())
+            .body("age", greaterThanOrEqualTo(0));
+    }
+}</code></pre>
+
+<h3>运行原生测试</h3>
+
+<pre><code># 构建原生镜像并执行集成测试
+./mvnw verify -Pnative
+
+# 仅运行集成测试 (镜像已构建)
+./mvnw failsafe:integration-test -Pnative</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">Fig 18-10 原生测试 CI 管线</div>
+<div class="mermaid">
+flowchart LR
+    PUSH["Git Push"] --> CI["CI 触发"]
+    CI --> JVM_BUILD["mvn test<br/>JVM 单元测试"]
+    JVM_BUILD --> NATIVE_BUILD["mvn package -Pnative<br/>原生镜像编译"]
+    NATIVE_BUILD --> IT["mvn verify -Pnative<br/>集成测试"]
+    IT --> PASS{"通过?"}
+    PASS -->|"✅ 是"| DEPLOY["部署到 K8s"]
+    PASS -->|"❌ 否"| FAIL["通知开发者"]
+
+    style PUSH fill:#1e3a5f,stroke:#58a6ff
+    style NATIVE_BUILD fill:#3a2a1a,stroke:#d29922
+    style IT fill:#2d1f4e,stroke:#bc8cff
+    style DEPLOY fill:#1a3a1a,stroke:#3fb950
+    style FAIL fill:#3a1a1a,stroke:#f85149
+</div>
+</div>
+
+<h3>常见失败与调试</h3>
+
+<table>
+<thead>
+<tr><th>错误信息</th><th>原因</th><th>修复方法</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ClassNotFoundException</code></td><td>Entity View 类未注册到反射配置</td><td>确认 Quarkus 扩展版本与 BP 版本一致</td></tr>
+<tr><td><code>NoSuchMethodException</code></td><td>自定义方法未注册</td><td>添加到 <code>reflect-config.json</code></td></tr>
+<tr><td><code>UnsupportedFeatureError: Proxy</code></td><td>尝试运行时生成动态代理</td><td>启用静态实现 APT (18.4)</td></tr>
+<tr><td><code>MissingResourceException</code></td><td>SPI 文件未包含在镜像中</td><td>添加到 <code>resource-config.json</code></td></tr>
+<tr><td><code>OutOfMemoryError</code> (编译期)</td><td>原生编译内存不足</td><td><code>-J-Xmx8g</code> 增大编译内存</td></tr>
+</tbody>
+</table>
+
+
+<!-- ================================================================== -->
+<h2 id="s18-6">18.6 CDI 与 Bean 配置</h2>
+<!-- ================================================================== -->
+
+<p>在 Quarkus 中，<code>CriteriaBuilderFactory</code> 和 <code>EntityViewManager</code> 由扩展自动注册为 <code>@ApplicationScoped</code> CDI Bean——无需手动创建 <code>@Produces</code> 方法。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 18-11 Quarkus CDI Bean 依赖关系</div>
+<div class="mermaid">
+flowchart TD
+    subgraph QUARKUS_CDI ["Quarkus CDI 容器"]
+        EM["EntityManager<br/>@PersistenceContext"]
+        CBF["CriteriaBuilderFactory<br/>@ApplicationScoped"]
+        EVM["EntityViewManager<br/>@ApplicationScoped"]
+        SVC["CatService<br/>@ApplicationScoped"]
+        CTRL["CatResource<br/>@Path(cats)"]
+    end
+
+    EM --> CBF
+    CBF --> EVM
+    CBF --> SVC
+    EVM --> SVC
+    SVC --> CTRL
+
+    subgraph AUTO ["Quarkus 扩展自动注册"]
+        A_CBF["产生 CBF Bean"]
+        A_EVM["产生 EVM Bean"]
+    end
+
+    A_CBF -.->|"@Produces"| CBF
+    A_EVM -.->|"@Produces"| EVM
+
+    style EM fill:#1e3a5f,stroke:#58a6ff
+    style CBF fill:#2d1f4e,stroke:#bc8cff
+    style EVM fill:#2d1f4e,stroke:#bc8cff
+    style SVC fill:#1a3a2a,stroke:#3fb950
+    style CTRL fill:#3a2a1a,stroke:#d29922
+    style A_CBF fill:#1a2a3a,stroke:#39d2c0
+    style A_EVM fill:#1a2a3a,stroke:#39d2c0
+</div>
+</div>
+
+<h3>服务层注入示例</h3>
+
+<pre><code>@ApplicationScoped
+public class CatService {
+
+    @Inject
+    CriteriaBuilderFactory cbf;
+
+    @Inject
+    EntityViewManager evm;
+
+    @Inject
+    EntityManager em;
+
+    public List&lt;CatListView&gt; findAll() {
+        CriteriaBuilder&lt;Cat&gt; cb = cbf.create(em, Cat.class);
+        return evm.applySetting(
+            EntityViewSetting.create(CatListView.class), cb
+        ).getResultList();
+    }
+
+    @Transactional
+    public void create(CatCreateView cat) {
+        evm.save(em, cat);
+    }
+}</code></pre>
+
+<h3>多持久化单元</h3>
+
+<div class="diagram">
+<div class="diagram-title">Fig 18-12 多持久化单元 Bean 路由</div>
+<div class="mermaid">
+flowchart LR
+    subgraph PU1 ["持久化单元: default"]
+        EM1["EntityManager<br/>(default)"]
+        CBF1["CriteriaBuilderFactory<br/>(default)"]
+        EVM1["EntityViewManager<br/>(default)"]
+    end
+
+    subgraph PU2 ["持久化单元: analytics"]
+        EM2["EntityManager<br/>@analytics"]
+        CBF2["CriteriaBuilderFactory<br/>@analytics"]
+        EVM2["EntityViewManager<br/>@analytics"]
+    end
+
+    SVC1["CatService<br/>@Inject (default)"] --> CBF1
+    SVC1 --> EVM1
+    SVC2["ReportService<br/>@Inject @analytics"] --> CBF2
+    SVC2 --> EVM2
+
+    style EM1 fill:#1e3a5f,stroke:#58a6ff
+    style CBF1 fill:#2d1f4e,stroke:#bc8cff
+    style EVM1 fill:#2d1f4e,stroke:#bc8cff
+    style EM2 fill:#3a2a1a,stroke:#d29922
+    style CBF2 fill:#3a2a1a,stroke:#d29922
+    style EVM2 fill:#3a2a1a,stroke:#d29922
+    style SVC1 fill:#1a3a1a,stroke:#3fb950
+    style SVC2 fill:#1a3a1a,stroke:#3fb950
+</div>
+</div>
+
+<pre><code># application.properties — 多持久化单元
+quarkus.hibernate-orm.database.generation=update
+quarkus.datasource.db-kind=postgresql
+quarkus.datasource.jdbc.url=jdbc:postgresql://localhost:5432/main
+
+quarkus.hibernate-orm."analytics".database.generation=none
+quarkus.datasource."analytics".db-kind=postgresql
+quarkus.datasource."analytics".jdbc.url=jdbc:postgresql://localhost:5432/analytics</code></pre>
+
+<pre><code>@ApplicationScoped
+public class ReportService {
+
+    @Inject
+    @PersistenceUnit("analytics")
+    EntityManager em;
+
+    @Inject
+    @Named("analytics")
+    CriteriaBuilderFactory cbf;
+
+    @Inject
+    @Named("analytics")
+    EntityViewManager evm;
+
+    public List&lt;ReportView&gt; generateReport() {
+        return evm.applySetting(
+            EntityViewSetting.create(ReportView.class),
+            cbf.create(em, Report.class)
+        ).getResultList();
+    }
+}</code></pre>
+
+<div class="key-insight">
+  <strong>💡 对比 Spring：</strong>在 Spring Boot（<a href="ch12-spring.html">第 12 章</a>）中需要手动编写 <code>@Configuration</code> 类创建 Bean。Quarkus 扩展完全自动化此过程——引入依赖即可注入，真正的"零配置"体验。
+</div>
+
+
+<!-- ================================================================== -->
+<h2 id="s18-7">18.7 陷阱与限制</h2>
+<!-- ================================================================== -->
+
+<p>原生编译为 Blaze-Persistence 带来了极致的启动性能，但也引入了若干限制和注意事项。以下是生产环境中最常遇到的问题。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 18-13 原生编译限制分类</div>
+<div style="display:flex;flex-wrap:wrap;gap:16px;justify-content:center;padding:16px 0;">
+  <div style="border:1px solid #f85149;border-radius:8px;padding:14px 18px;min-width:160px;max-width:220px;background:rgba(67,20,7,.10);">
+    <div style="font-weight:bold;color:#f85149;margin-bottom:6px;">功能限制</div>
+    <div style="color:#8b949e;font-size:13px;">• 部分 @Mapping 表达式不支持<br>• 动态 View 创建不可用</div>
+  </div>
+  <div style="border:1px solid #d29922;border-radius:8px;padding:14px 18px;min-width:160px;max-width:220px;background:rgba(13,27,42,.10);">
+    <div style="font-weight:bold;color:#d29922;margin-bottom:6px;">构建限制</div>
+    <div style="color:#8b949e;font-size:13px;">• 编译时间显著增加<br>• 编译内存需 8GB+</div>
+  </div>
+  <div style="border:1px solid #bc8cff;border-radius:8px;padding:14px 18px;min-width:160px;max-width:220px;background:rgba(46,16,101,.10);">
+    <div style="font-weight:bold;color:#bc8cff;margin-bottom:6px;">运行时限制</div>
+    <div style="color:#8b949e;font-size:13px;">• 无法运行时新增 Entity View<br>• 调试困难，堆栈不完整</div>
+  </div>
+  <div style="border:1px solid #58a6ff;border-radius:8px;padding:14px 18px;min-width:160px;max-width:220px;background:rgba(30,58,95,.10);">
+    <div style="font-weight:bold;color:#58a6ff;margin-bottom:6px;">兼容性限制</div>
+    <div style="color:#8b949e;font-size:13px;">• 仅支持 Hibernate<br>• Hibernate 版本需 6.2+</div>
+  </div>
+</div>
+</div>
+
+<h3>功能限制详解</h3>
+
+<table>
+<thead>
+<tr><th>功能</th><th>JVM 模式</th><th>原生模式</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td>基本 Entity View</td><td style="color:var(--green)">✅</td><td style="color:var(--green)">✅</td><td>通过静态实现完全支持</td></tr>
+<tr><td>@UpdatableEntityView</td><td style="color:var(--green)">✅</td><td style="color:var(--green)">✅</td><td>需要 APT 生成可变实现</td></tr>
+<tr><td>@CreatableEntityView</td><td style="color:var(--green)">✅</td><td style="color:var(--green)">✅</td><td>需要 APT 生成构建器</td></tr>
+<tr><td>MULTISET Fetch</td><td style="color:var(--green)">✅</td><td style="color:var(--green)">✅</td><td>完全支持</td></tr>
+<tr><td>CTE 查询</td><td style="color:var(--green)">✅</td><td style="color:var(--orange)">⚠️</td><td>需确保 CTE 实体注册到反射配置</td></tr>
+<tr><td>动态 EntityViewSetting</td><td style="color:var(--green)">✅</td><td style="color:var(--orange)">⚠️</td><td>运行时动态添加排序/过滤受限</td></tr>
+<tr><td>自定义 TypeConverter</td><td style="color:var(--green)">✅</td><td style="color:var(--orange)">⚠️</td><td>需手动注册到反射配置</td></tr>
+<tr><td>运行时注册新 View</td><td style="color:var(--green)">✅</td><td style="color:var(--red)">❌</td><td>原生镜像封闭世界假设</td></tr>
+<tr><td>EclipseLink 支持</td><td style="color:var(--orange)">⚠️</td><td style="color:var(--red)">❌</td><td>仅 Hibernate 支持原生编译</td></tr>
+</tbody>
+</table>
+
+<h3>静态实现生成的已知限制</h3>
+
+<div class="diagram">
+<div class="diagram-title">Fig 18-14 APT 处理决策树</div>
+<div class="mermaid">
+flowchart TD
+    START["Entity View 接口"] --> Q1{"包含复杂<br/>@Mapping 表达式?"}
+
+    Q1 -->|"否"| APT_OK["APT 可生成<br/>静态实现 ✅"]
+    Q1 -->|"是"| Q2{"表达式类型?"}
+
+    Q2 -->|"简单属性路径<br/>name, owner.name"| APT_OK
+    Q2 -->|"JPQL 子查询<br/>SUBQUERY()"| APT_PARTIAL["APT 生成骨架<br/>子查询运行时解析"]
+    Q2 -->|"CASE WHEN<br/>复杂表达式"| APT_PARTIAL
+
+    APT_OK --> NATIVE_OK["原生编译 ✅"]
+    APT_PARTIAL --> REFLECT_NEED["需额外反射配置<br/>+ 运行时解析"]
+    REFLECT_NEED --> NATIVE_MAYBE["原生编译<br/>可能需手动配置"]
+
+    style START fill:#1e3a5f,stroke:#58a6ff
+    style APT_OK fill:#1a3a1a,stroke:#3fb950
+    style APT_PARTIAL fill:#3a2a1a,stroke:#d29922
+    style NATIVE_OK fill:#1a3a1a,stroke:#3fb950
+    style REFLECT_NEED fill:#3a2a1a,stroke:#d29922
+    style NATIVE_MAYBE fill:#3a2a1a,stroke:#d29922
+</div>
+</div>
+
+<h3>构建时间优化建议</h3>
+
+<pre><code># 增大 native-image 编译内存
+quarkus.native.native-image-xmx=8g
+
+# 启用并行编译
+quarkus.native.additional-build-args=\
+  -H:+BuildOutputJSONFile,\
+  --parallelism=4
+
+# 开发期间使用 JVM 模式快速迭代
+./mvnw quarkus:dev</code></pre>
+
+<div class="warning">
+  <strong>⚠️ 调试提示：</strong>如果原生镜像启动后 Entity View 查询返回空结果或抛出异常，首先在 JVM 模式 (<code>@QuarkusTest</code>) 验证功能正确性，再使用 <code>-H:+ReportExceptionStackTraces</code> 获取完整原生模式堆栈。
+</div>
+
+<h3>生产就绪检查清单</h3>
+
+<div class="diagram">
+<div class="diagram-title">Fig 18-15 原生编译上线检查清单</div>
+<div class="mermaid">
+flowchart LR
+    subgraph MUST ["必须"]
+        C1["APT 处理器<br/>已配置"]
+        C2["JVM 模式测试<br/>全部通过"]
+        C3["原生集成测试<br/>全部通过"]
+        C4["reflect-config<br/>已验证"]
+    end
+
+    subgraph SHOULD ["推荐"]
+        C5["编译内存<br/>≥ 8GB"]
+        C6["CI/CD 原生<br/>构建管线"]
+        C7["容器基础镜像<br/>distroless"]
+    end
+
+    subgraph OPTIONAL ["可选"]
+        C8["PGO 优化<br/>Profile-Guided"]
+        C9["G1 GC 替代<br/>Serial GC"]
+    end
+
+    MUST --> SHOULD --> OPTIONAL
+
+    style C1 fill:#3a1a1a,stroke:#f85149
+    style C2 fill:#3a1a1a,stroke:#f85149
+    style C3 fill:#3a1a1a,stroke:#f85149
+    style C4 fill:#3a1a1a,stroke:#f85149
+    style C5 fill:#3a2a1a,stroke:#d29922
+    style C6 fill:#3a2a1a,stroke:#d29922
+    style C7 fill:#3a2a1a,stroke:#d29922
+    style C8 fill:#1e3a5f,stroke:#58a6ff
+    style C9 fill:#1e3a5f,stroke:#58a6ff
+</div>
+</div>
+
+
+<!-- ================================================================== -->
+<!-- CHAPTER SUMMARY -->
+<!-- ================================================================== -->
+
+<div class="chapter-summary" id="summary">
+  <h2>📝 本章小结</h2>
+  <ul>
+    <li><strong>Quarkus 扩展</strong>通过 <code>@BuildStep</code> 处理器将 Entity View 的扫描、校验和代理生成全部移至构建阶段，实现运行时零初始化开销。</li>
+    <li><strong>构建时优化</strong>让 Quarkus JVM 模式启动时间降至 ~0.7s（对比 Spring Boot ~3.5s），原生模式更可压至 ~30ms。</li>
+    <li><strong>GraalVM 原生镜像</strong>面临反射、动态代理、ServiceLoader 三大挑战，Quarkus 扩展通过自动生成反射配置和预解析 SPI 逐一解决。</li>
+    <li><strong>静态 Entity View 实现</strong>是原生编译的核心方案——APT 注解处理器在编译期生成完整的 Java 源码，彻底消除运行时字节码生成需求。</li>
+    <li><strong>原生测试</strong>分两层：<code>@QuarkusTest</code> 进行 JVM 模式白盒测试，<code>@QuarkusIntegrationTest</code> 对原生可执行文件执行黑盒验证。</li>
+    <li><strong>CDI 集成</strong>完全自动化——<code>CriteriaBuilderFactory</code> 和 <code>EntityViewManager</code> 由扩展自动注册为 CDI Bean，支持多持久化单元场景。</li>
+    <li><strong>已知限制</strong>包括：仅支持 Hibernate、运行时无法新增 Entity View、部分复杂 @Mapping 表达式需额外配置。</li>
+  </ul>
+  <p class="next-hint">下一章 <a href="ch19-codepath.html">第 19 章 · 代码到 SQL 全路径追踪</a> 将以一条真实查询为例，逐帧追踪从 CriteriaBuilder API 到最终原生 SQL 的每一步内部变换——本书最重要的深度剖析章节。</p>
+</div>
+
+<div class="chapter-nav">
+  <a href="ch17-graphql.html">← 第 17 章 · GraphQL 集成</a>
+  <a href="ch19-codepath.html">第 19 章 · 代码到 SQL 全路径追踪 →</a>
+</div>
+
+<p class="footer">&copy; 2026 图解 Blaze-Persistence &middot; 第 18 章</p>
+
+</article>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+mermaid.initialize({
+  theme: 'dark',
+  themeVariables: {
+    primaryColor: '#58a6ff', primaryTextColor: '#e6edf3', primaryBorderColor: '#30363d',
+    lineColor: '#8b949e', secondaryColor: '#161b22', tertiaryColor: '#0d1117',
+    background: '#161b22', mainBkg: '#161b22', nodeBorder: '#30363d',
+    clusterBkg: 'rgba(22,27,34,.5)', clusterBorder: '#30363d', titleColor: '#e6edf3',
+    edgeLabelBackground: '#161b22',
+  },
+  flowchart: { curve: 'basis', padding: 15 },
+  sequence: { actorMargin: 50, messageMargin: 30 },
+});
+</script>
+</body>
+</html>

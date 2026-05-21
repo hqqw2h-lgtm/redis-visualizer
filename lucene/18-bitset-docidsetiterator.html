@@ -1,0 +1,2478 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lucene 图解 - 第18章 BitSet 与 DocIdSetIterator</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="g-blue" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="rgba(56,139,253,0.28)"/>
+      <stop offset="100%" stop-color="rgba(56,139,253,0.10)"/>
+    </linearGradient>
+    <linearGradient id="g-green" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="rgba(63,185,80,0.28)"/>
+      <stop offset="100%" stop-color="rgba(63,185,80,0.10)"/>
+    </linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="rgba(212,153,34,0.30)"/>
+      <stop offset="100%" stop-color="rgba(212,153,34,0.10)"/>
+    </linearGradient>
+    <linearGradient id="g-red" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="rgba(248,81,73,0.28)"/>
+      <stop offset="100%" stop-color="rgba(248,81,73,0.10)"/>
+    </linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="rgba(189,140,255,0.28)"/>
+      <stop offset="100%" stop-color="rgba(189,140,255,0.10)"/>
+    </linearGradient>
+    <marker id="arr"   viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#58a6ff"/></marker>
+    <marker id="arr-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#3fb950"/></marker>
+    <marker id="arr-o" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d29922"/></marker>
+    <marker id="arr-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#f85149"/></marker>
+    <marker id="arr-p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#bc8cff"/></marker>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Lucene</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="17-doc-store-fields.html">上一章</a>
+  <a href="19-write-lock.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s18-1">18.1 DocIdSetIterator 接口</a>
+  <a href="#s18-2">18.2 FixedBitSet 字级位图</a>
+  <a href="#s18-3">18.3 SparseFixedBitSet 双层稀疏</a>
+  <a href="#s18-4">18.4 RoaringDocIdSet 三容器</a>
+  <a href="#s18-5">18.5 字级位运算与 SIMD</a>
+  <a href="#s18-6">18.6 BitSetIterator 适配</a>
+  <a href="#s18-7">18.7 advance 算法剖析</a>
+  <a href="#s18-8">18.8 cost 与执行计划</a>
+  <a href="#s18-9">18.9 ConjunctionDISI 求交</a>
+  <a href="#s18-10">18.10 DisjunctionDISI 求并</a>
+  <a href="#s18-11">18.11 TwoPhaseIterator</a>
+  <a href="#s18-12">18.12 DocIdSetBuilder 自适应</a>
+  <a href="#s18-13">18.13 LiveDocs 与 .liv 文件</a>
+  <a href="#s18-14">18.14 LiveDocs 在查询中</a>
+  <a href="#s18-15">18.15 性能基准</a>
+  <a href="#s18-16">18.16 生产陷阱</a>
+  <a href="#s18-17">18.17 源码入口</a>
+  <a href="#s18-summary">18.18 本章小结</a>
+</aside>
+
+<div class="article">
+
+<h1>第 18 章 · BitSet 与 DocIdSetIterator</h1>
+<p class="subtitle">DocIdSetIterator · FixedBitSet · SparseFixedBitSet · RoaringDocIdSet · advance · leapfrog · TwoPhaseIterator · DocIdSetBuilder · LiveDocs · .liv</p>
+
+<div class="chapter-intro">
+  <p class="lead">第 11 章把 PostingsEnum 当作"docID 流"的物理形态讲清楚了——term 倒排里的 docID 集合可以用 PFOR + 多级 skip 高效遍历。但 Lucene 内部还有一类截然不同的 docID 集合:<strong>LiveDocs(段内删除标记)、Filter 缓存的 BitSet、FacetCollector 的命中标记、TwoPhaseIterator 的中间结果</strong>——它们的特点是"已经物化为内存集合,需要支持 O(1) 随机访问 + 顺序迭代 + 集合运算"。本章拆解这些场景下的物理结构:<code>FixedBitSet</code> 用 <code>long[]</code> 阵列实现稠密位图,<code>SparseFixedBitSet</code> 用双层 bucket 处理 &lt; 5% 密度,<code>RoaringDocIdSet</code> 三种 container 自适应切换。所有这些容器都通过 <code>BitSetIterator</code> 包装成 <code>DocIdSetIterator</code>,与 PostingsEnum 一起被 ConjunctionDISI / DisjunctionDISI / TwoPhaseIterator 等求交求并算法消费。</p>
+  <p>具体一点:<code>DocIdSetIterator</code>(简称 DISI)是 Lucene 查询执行的"通用语言"。它只定义四个核心方法 <code>nextDoc / advance / docID / cost</code>,但所有 docID 流——无论来自倒排索引(PostingsEnum)、BitSet 包装(BitSetIterator)、求交结果(ConjunctionDISI)、求并结果(DisjunctionDISIPriorityQueue)、BKD 候选(PointInSetIterator)——都实现这套接口。这种统一让"求交求并"算法只需要按 DISI 协议工作,不关心底层来源。本章用大量的字节级布局图、leapfrog 时序图、状态机流程图,把"为什么 1000 万 docID 求交在毫秒内完成"这条路径拆开:<strong>从 long word 上的字级 AND 运算(O(N/64)),到 SparseFixedBitSet 的 12× 内存节省,到 conjunction 用 cost() 选驱动迭代器的启发式,到 LiveDocs 在每个候选 doc 上的 1-bit 过滤</strong>。读完之后你能从源码层面回答"为什么 Lucene 用 long[] 而不是 List&lt;Integer&gt;,以及为什么求交比逐 doc 检查快几个数量级"。</p>
+  <ul class="will-learn">
+    <li>DocIdSetIterator 接口的四个核心方法 <code>nextDoc / advance / docID / cost</code>,以及"严格升序、不可回退"的契约——为什么 advance(target ≤ docID) 是死循环</li>
+    <li>FixedBitSet 的 <code>long[]</code> 物理形态:<code>set/get/clear</code> 都是 <code>bits[i &gt;&gt;&gt; 6] op (1L &lt;&lt; (i &amp; 63))</code>,与 CPU 指令 popcnt / tzcnt / lzcnt 配合,1 千万 doc 仅占 1.25 MiB</li>
+    <li>SparseFixedBitSet 的双层 bucket 结构:每 4096 doc 一块,只为命中 block 分配 <code>long[]</code> 数组,1 千万 doc / 1000 命中场景内存从 1.25 MiB 降到 ~100 KiB,12× 节省</li>
+    <li>RoaringDocIdSet 的三种 container 自适应:ArrayContainer(≤ 4096 ord 用 short[])/ BitmapContainer(&gt; 4096 ord 用 FixedBitSet)/ RunContainer(长 run 主导用 (start,len) 对)</li>
+    <li>字级位运算的 SIMD 加速:1000 万 docID 求交在 AVX-512 上约 200 µs,而 List&lt;Integer&gt; 实现要数小时——这是 BitSet 选择不可妥协的原因</li>
+    <li>ConjunctionDISI 的 leapfrog 算法:cost() 最小的 DISI 当首发,其它 DISI 用 advance 跟随,总迭代次数 = O(min(cost))</li>
+    <li>DisjunctionDISIPriorityQueue 的最小堆:按当前 docID 排序,每次 nextDoc 触发 sift-down 重排,O(log K) 维护</li>
+    <li>TwoPhaseIterator 的 cheap + expensive 拆分:approximation 快速候选 + matches 精确确认,PhraseQuery / GeoDistance 都靠它</li>
+    <li>DocIdSetBuilder 的稀疏到稠密自适应切换:阈值 maxDoc/128 决定 int[] / SparseFixedBitSet / FixedBitSet,业务代码无需关心</li>
+    <li>LiveDocs 物理形态:.liv 文件含 generation 编号 + FixedBitSet,merge 时清理已删除 doc 的 postings 引用</li>
+  </ul>
+  <p class="prereq">前置知识:第 11 章 PostingsEnum 的 advance / nextDoc 接口语义(本章把它们泛化到所有 DISI 实现);第 4 章 BooleanQuery MUST/SHOULD/FILTER 的求交求并执行流(本章拆开底层 ConjunctionDISI / DisjunctionDISIPriorityQueue);第 1 章 segment 的概念(LiveDocs 是 segment 内 doc 标记)。本章不涉及 BKD-tree(第 12 章)、FST(第 10 章),与它们完全独立。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s18-1">18.1 DocIdSetIterator 接口:查询执行的通用语言</h2>
+<!-- ============================================================ -->
+
+<p>Lucene 查询执行的核心抽象只有一个—— <code>DocIdSetIterator</code>。它定义了"按 docID 升序遍历 + 跳跃定位"的最小必要接口,所有 docID 流都实现这套接口。理解这个接口的契约和复杂度模型,是理解后续 BitSet 实现、求交求并算法、TwoPhaseIterator 的前提。本节先用一张类层级图把所有 DISI 实现串起来,再把接口契约逐字段拆开。</p>
+
+<h3>DISI 类层级</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-1-1 · DocIdSetIterator 接口及其主要实现</div>
+  <svg viewBox="0 0 1240 720" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 顶部 DocIdSetIterator 抽象 -->
+    <rect x="380" y="20" width="480" height="200" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="620" y="44" text-anchor="middle" fill="#cfe9ff" font-size="14" font-weight="700">«abstract» DocIdSetIterator</text>
+    <text x="620" y="62" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">查询执行的通用语言 ★</text>
+    <line x1="395" y1="74" x2="845" y2="74" stroke="#58a6ff" stroke-width="1"/>
+    <text x="400" y="98"  fill="#a5d6ff" font-size="12">+ nextDoc()         : int</text>
+    <text x="400" y="118" fill="#a5d6ff" font-size="12">+ advance(target)   : int</text>
+    <text x="400" y="138" fill="#a5d6ff" font-size="12">+ docID()           : int</text>
+    <text x="400" y="158" fill="#a5d6ff" font-size="12">+ cost()            : long</text>
+    <text x="400" y="178" fill="#a5d6ff" font-size="12">+ slowAdvance(target): int</text>
+    <text x="400" y="200" fill="#39d2c0" font-size="12" font-weight="700">+ NO_MORE_DOCS = Integer.MAX_VALUE</text>
+
+    <!-- 6 个直接实现 -->
+    <rect x="20"  y="320" width="190" height="100" rx="12" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.6"/>
+    <text x="115" y="346" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">BitSetIterator ★</text>
+    <text x="115" y="368" text-anchor="middle" fill="#a5d6ff" font-size="11">— BitSet bits</text>
+    <text x="115" y="386" text-anchor="middle" fill="#a5d6ff" font-size="11">— long cost</text>
+    <text x="115" y="408" text-anchor="middle" fill="#39d2c0" font-size="10" font-weight="700">内存 — LiveDocs / Filter</text>
+
+    <rect x="230" y="320" width="190" height="100" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.6"/>
+    <text x="325" y="346" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">«abstract» PostingsEnum</text>
+    <text x="325" y="368" text-anchor="middle" fill="#a5d6ff" font-size="11">+ freq()      : int</text>
+    <text x="325" y="386" text-anchor="middle" fill="#a5d6ff" font-size="11">+ nextPosition(): int</text>
+    <text x="325" y="408" text-anchor="middle" fill="#39d2c0" font-size="10" font-weight="700">磁盘 — .doc / .pos 倒排</text>
+
+    <rect x="440" y="320" width="190" height="100" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.6"/>
+    <text x="535" y="346" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">ConjunctionDISI</text>
+    <text x="535" y="368" text-anchor="middle" fill="#a5d6ff" font-size="11">— DISI lead</text>
+    <text x="535" y="386" text-anchor="middle" fill="#a5d6ff" font-size="11">— DISI[] others</text>
+    <text x="535" y="408" text-anchor="middle" fill="#39d2c0" font-size="10" font-weight="700">求交 · leapfrog</text>
+
+    <rect x="650" y="320" width="240" height="100" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.6"/>
+    <text x="770" y="346" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">DisjunctionDISIPriorityQueue</text>
+    <text x="770" y="368" text-anchor="middle" fill="#a5d6ff" font-size="11">— DISI[] heap</text>
+    <text x="770" y="386" text-anchor="middle" fill="#a5d6ff" font-size="11">— int size</text>
+    <text x="770" y="408" text-anchor="middle" fill="#39d2c0" font-size="10" font-weight="700">求并 · 最小堆</text>
+
+    <rect x="910" y="320" width="160" height="100" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.4"/>
+    <text x="990" y="346" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">PointInSetIterator</text>
+    <text x="990" y="368" text-anchor="middle" fill="#a5d6ff" font-size="11">BKD-tree 候选 doc</text>
+    <text x="990" y="408" text-anchor="middle" fill="#39d2c0" font-size="10" font-weight="700">第 12 章</text>
+
+    <rect x="1090" y="320" width="140" height="100" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.4"/>
+    <text x="1160" y="346" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">ConstantScoreScorer</text>
+    <text x="1160" y="368" text-anchor="middle" fill="#a5d6ff" font-size="11">filter 包装</text>
+    <text x="1160" y="408" text-anchor="middle" fill="#39d2c0" font-size="10" font-weight="700">恒定 score</text>
+
+    <!-- 6 条继承箭头 -->
+    <g fill="none">
+      <line x1="500" y1="220" x2="115"  y2="318" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+      <line x1="540" y1="220" x2="325"  y2="318" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <line x1="580" y1="220" x2="535"  y2="318" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <line x1="640" y1="220" x2="770"  y2="318" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <line x1="700" y1="220" x2="990"  y2="318" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <line x1="760" y1="220" x2="1160" y2="318" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    </g>
+
+    <!-- TwoPhaseIterator 单独 -->
+    <rect x="380" y="510" width="480" height="100" rx="12" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.6"/>
+    <text x="620" y="536" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">TwoPhaseIterator</text>
+    <text x="620" y="558" text-anchor="middle" fill="#a5d6ff" font-size="12">+ approximation() : DISI    — cheap 候选</text>
+    <text x="620" y="578" text-anchor="middle" fill="#a5d6ff" font-size="12">+ matches()       : boolean — expensive 精确确认</text>
+    <text x="620" y="598" text-anchor="middle" fill="#a5d6ff" font-size="12">+ matchCost()     : float</text>
+
+    <!-- TwoPhase 依赖 DISI -->
+    <line x1="620" y1="510" x2="620" y2="222" stroke="#d29922" stroke-width="1.4" stroke-dasharray="6 3" marker-end="url(#arr-o)"/>
+    <text x="640" y="350" fill="#ffd591" font-size="11" font-weight="700">..&gt; approximation()</text>
+
+    <text x="620" y="660" text-anchor="middle" fill="#39d2c0" font-size="13" font-weight="700">★ BitSetIterator (内存) 与 PostingsEnum (磁盘) 平级 — ConjunctionDISI 不区分来源</text>
+    <text x="620" y="688" text-anchor="middle" fill="#a5d6ff" font-size="12">这是 "内存集合" 与 "磁盘倒排" 在同一执行引擎中统一的根基</text>
+  </svg>
+</div>
+
+<p>这棵继承树的关键洞察:<strong>BitSetIterator 与 PostingsEnum 平级</strong>——前者来自内存 BitSet(LiveDocs / Filter cache),后者来自磁盘倒排(.doc 文件)。两者实现同一个 DISI 接口,所以 ConjunctionDISI 在做求交时根本不区分子 DISI 的物理来源,既能把 BitSetIterator 与 PostingsEnum 求交,也能把两个 BitSetIterator 求交,这是 Lucene 把"内存集合"和"磁盘倒排"统一到一个执行引擎的根基。</p>
+
+<h3>DocIdSetIterator 接口契约</h3>
+
+<pre><code class="language-java">public abstract class DocIdSetIterator {
+    public static final int NO_MORE_DOCS = Integer.MAX_VALUE;
+
+    public abstract int docID();
+
+    public abstract int nextDoc() throws IOException;
+
+    public abstract int advance(int target) throws IOException;
+
+    public abstract long cost();
+
+    protected final int slowAdvance(int target) throws IOException {
+        assert docID() &lt; target;
+        int doc;
+        do {
+            doc = nextDoc();
+        } while (doc &lt; target);
+        return doc;
+    }
+
+    public static DocIdSetIterator empty() { /* ... */ }
+
+    public static DocIdSetIterator all(int maxDoc) { /* ... */ }
+
+    public static DocIdSetIterator range(int minDoc, int maxDoc) { /* ... */ }
+}</code></pre>
+
+<h3>DISI 状态机</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-1-2 · DISI 三态状态机</div>
+  <svg viewBox="0 0 1240 480" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- start (黑圆) -->
+    <circle cx="100" cy="240" r="14" fill="#0d1117" stroke="#58a6ff" stroke-width="2"/>
+    <circle cx="100" cy="240" r="6"  fill="#58a6ff"/>
+
+    <!-- Initial -->
+    <rect x="200" y="180" width="240" height="120" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="320" y="208" text-anchor="middle" fill="#cfe9ff" font-size="14" font-weight="700">Initial</text>
+    <text x="320" y="232" text-anchor="middle" fill="#a5d6ff" font-size="11">docID() == -1</text>
+    <text x="320" y="252" text-anchor="middle" fill="#a5d6ff" font-size="11">未定位 — 不可读取数据</text>
+    <text x="320" y="278" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">入态: new DISI</text>
+
+    <!-- Positioned -->
+    <rect x="540" y="180" width="240" height="120" rx="14" fill="url(#g-green)" stroke="#3fb950" stroke-width="2.2"/>
+    <text x="660" y="208" text-anchor="middle" fill="#9be7b3" font-size="14" font-weight="700">Positioned ★</text>
+    <text x="660" y="232" text-anchor="middle" fill="#a5d6ff" font-size="11">docID() = current docID</text>
+    <text x="660" y="252" text-anchor="middle" fill="#a5d6ff" font-size="11">合法: docID() / cost()</text>
+    <text x="660" y="278" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">主工作态</text>
+
+    <!-- Exhausted -->
+    <rect x="880" y="180" width="240" height="120" rx="14" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="1000" y="208" text-anchor="middle" fill="#ffadad" font-size="14" font-weight="700">Exhausted</text>
+    <text x="1000" y="232" text-anchor="middle" fill="#a5d6ff" font-size="11">docID() == NO_MORE_DOCS</text>
+    <text x="1000" y="252" text-anchor="middle" fill="#a5d6ff" font-size="11">= Integer.MAX_VALUE</text>
+    <text x="1000" y="278" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">终态 — 流耗尽</text>
+
+    <!-- end (双圆) -->
+    <circle cx="1190" cy="240" r="14" fill="none" stroke="#f85149" stroke-width="2"/>
+    <circle cx="1190" cy="240" r="8"  fill="#f85149"/>
+
+    <!-- 转移 1: start → Initial -->
+    <line x1="115" y1="240" x2="198" y2="240" stroke="#58a6ff" stroke-width="1.8" marker-end="url(#arr)"/>
+    <text x="156" y="232" text-anchor="middle" fill="#cfe9ff" font-size="11">new DISI</text>
+
+    <!-- 转移 2: Initial → Positioned -->
+    <line x1="440" y1="240" x2="538" y2="240" stroke="#3fb950" stroke-width="1.8" marker-end="url(#arr-g)"/>
+    <text x="489" y="232" text-anchor="middle" fill="#9be7b3" font-size="11" font-weight="700">nextDoc()</text>
+    <text x="489" y="256" text-anchor="middle" fill="#9be7b3" font-size="11">advance(target)</text>
+
+    <!-- 转移 3: Positioned 自循环 -->
+    <path d="M 600 180 Q 600 100 660 100 Q 720 100 720 180" stroke="#3fb950" stroke-width="1.6" fill="none" marker-end="url(#arr-g)"/>
+    <text x="660" y="86" text-anchor="middle" fill="#9be7b3" font-size="11" font-weight="700">nextDoc() · advance(target &gt; docID())</text>
+
+    <!-- 转移 4: Positioned → Exhausted -->
+    <line x1="780" y1="240" x2="878" y2="240" stroke="#f85149" stroke-width="1.8" marker-end="url(#arr-r)"/>
+    <text x="829" y="232" text-anchor="middle" fill="#ffadad" font-size="11" font-weight="700">nextDoc()</text>
+    <text x="829" y="256" text-anchor="middle" fill="#ffadad" font-size="11">→ NO_MORE_DOCS</text>
+
+    <!-- 转移 5: Initial → Exhausted (上方弧) -->
+    <path d="M 320 180 Q 320 50 1000 50 Q 1000 50 1000 180" stroke="#f85149" stroke-width="1.4" stroke-dasharray="6 3" fill="none" marker-end="url(#arr-r)"/>
+    <text x="660" y="42" text-anchor="middle" fill="#ffadad" font-size="11" font-weight="700">empty() — 直接耗尽</text>
+
+    <!-- 转移 6: Exhausted → end -->
+    <line x1="1120" y1="240" x2="1175" y2="240" stroke="#f85149" stroke-width="1.6" marker-end="url(#arr-r)"/>
+
+    <!-- 注释区 — 非法操作 -->
+    <rect x="200" y="340" width="920" height="120" rx="12" fill="rgba(248,81,73,0.05)" stroke="#f85149" stroke-width="1.4" stroke-dasharray="6 3"/>
+    <text x="220" y="366" fill="#f85149" font-size="13" font-weight="700">★ 契约 (违反 = 死循环 / 错误结果)</text>
+    <text x="220" y="392" fill="#ffadad" font-size="12">  非法 ① · advance(target ≤ docID())  —  必须严格大于当前位置</text>
+    <text x="220" y="416" fill="#ffadad" font-size="12">  非法 ② · 重复调用同一 advance(target) — 第二次调用结果未定义</text>
+    <text x="220" y="440" fill="#ffadad" font-size="12">  非法 ③ · 在 Initial 态 (docID == -1) 调用 docID() 之外的查询 API</text>
+  </svg>
+</div>
+
+<h3>DISI 实现汇总</h3>
+
+<table>
+  <thead>
+    <tr><th>实现</th><th>来源</th><th>nextDoc 复杂度</th><th>advance 复杂度</th><th>cost 含义</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>BitSetIterator</code></td><td>FixedBitSet / SparseFixedBitSet</td><td>O(1) 字级</td><td>O(1) 字级跳跃</td><td>cardinality(set bit 数)</td></tr>
+    <tr><td><code>RoaringDocIdSet.iterator</code></td><td>Roaring 三容器</td><td>O(1) 容器内</td><td>O(log buckets)</td><td>cardinality</td></tr>
+    <tr><td><code>BlockPostingsEnum</code></td><td>term 倒排(.doc)</td><td>O(1) block 内</td><td>O(log freq) 多级 skip</td><td>docFreq</td></tr>
+    <tr><td><code>ConjunctionDISI</code></td><td>MUST / FILTER 求交</td><td>leapfrog</td><td>leapfrog</td><td>min(子 cost)</td></tr>
+    <tr><td><code>DisjunctionDISIPriorityQueue</code></td><td>SHOULD 求并</td><td>O(log K) 堆</td><td>O(log K)</td><td>sum(子 cost)</td></tr>
+    <tr><td><code>PointInSetIterator</code></td><td>BKD 树(.dim)</td><td>O(1) 候选</td><td>批量返回</td><td>estimatePointCount</td></tr>
+    <tr><td><code>ConstantScoreScorer</code></td><td>包装 DISI 但不评分</td><td>同 inner</td><td>同 inner</td><td>同 inner</td></tr>
+    <tr><td><code>DocIdSetIterator.empty()</code></td><td>空集</td><td>O(1) 立即返回</td><td>O(1) 立即返回</td><td>0</td></tr>
+    <tr><td><code>DocIdSetIterator.all(N)</code></td><td>全集 [0, N)</td><td>O(1)</td><td>O(1)</td><td>N</td></tr>
+  </tbody>
+</table>
+
+<div class="key-insight">
+  <strong>NO_MORE_DOCS = Integer.MAX_VALUE 是协议常量,不是占位</strong>。所有 DISI 实现耗尽时都返回 <code>2147483647</code>。这个值被 ConjunctionDISI / DisjunctionDISI 当作"哨兵":只要任一子 DISI 返回 NO_MORE_DOCS,求交就提前终止;求并堆里收到 NO_MORE_DOCS 的子 DISI 直接被弹出。把"耗尽"编码成一个比 maxDoc 大得多的整数,让上层算法用同一个整数比较循环处理"正常推进"和"流尾"两种情况,无需额外标志位。这种"用 sentinel 替代 Optional"是 Lucene 在热路径上避免分支预测失败的标准技巧。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s18-2">18.2 FixedBitSet:long[] 阵列上的字级位图</h2>
+<!-- ============================================================ -->
+
+<p>FixedBitSet 是密集 docID 集合的默认实现。它把"集合"映射到 <code>long[] bits</code> 数组,每个 long 64 个 bit,用 <code>i &gt;&gt;&gt; 6</code> 算 word 索引、用 <code>i &amp; 63</code> 算 bit 偏移。这种朴素到极致的布局是它在生产里跑得飞快的根本原因——CPU 指令 <code>POPCNT / TZCNT / LZCNT</code> 直接对 long 操作,JIT 把 hot loop 编成 SIMD,L1 cache 命中率几乎 100%。本节用字节布局图把 FixedBitSet 的物理形态讲清楚。</p>
+
+<h3>long[] 阵列布局</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-2-1 · FixedBitSet 物理布局(numBits=200)</div>
+  <div style="background:#0d1117;border:1.5px solid #58a6ff;border-radius:10px;padding:18px;font-family:'Cascadia Code','SFMono-Regular',Consolas,monospace;font-size:12.5px;color:#a5d6ff;">
+    <div style="color:#58a6ff;font-weight:600;font-size:13px;margin-bottom:10px;">FixedBitSet { numBits = 200, bits = long[4] }</div>
+
+    <div style="background:#161b22;border-left:3px solid #3fb950;padding:10px 12px;margin-bottom:8px;border-radius:4px;">
+      <div style="color:#3fb950;font-weight:600;margin-bottom:4px;">▼ bits[0] · docID 0..63 · word 0</div>
+      <div style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+        bit  位置:  63 62 ... 12 ... 5 ... 1 0<br>
+        bit  内容:  0  0  ...  1  ... 1 ... 1 1<br>
+        long 值:  0x000000000000_1023 (假设 docID 0,1,5,12 命中)<br>
+        <span style="color:#3fb950;">▸ set(0)  → bits[0] |= 1L &lt;&lt; (0 &amp; 63)</span><br>
+        <span style="color:#3fb950;">▸ set(12) → bits[0] |= 1L &lt;&lt; (12 &amp; 63)</span>
+      </div>
+    </div>
+
+    <div style="background:#161b22;border-left:3px solid #d29922;padding:10px 12px;margin-bottom:8px;border-radius:4px;">
+      <div style="color:#d29922;font-weight:600;margin-bottom:4px;">▼ bits[1] · docID 64..127 · word 1 = 0(全部空)</div>
+      <div style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+        long 值: 0x0000000000000000<br>
+        <span style="color:#6e7681;">// nextSetBit(64) 跳过整个 word 1</span>
+      </div>
+    </div>
+
+    <div style="background:#161b22;border-left:3px solid #d2a8ff;padding:10px 12px;margin-bottom:8px;border-radius:4px;">
+      <div style="color:#d2a8ff;font-weight:600;margin-bottom:4px;">▼ bits[2] · docID 128..191 · word 2</div>
+      <div style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+        bit 位置:  191 ... 130 ... 128<br>
+        bit 内容:  0   ...  1  ... 0<br>
+        long 值: 0x0000000000000004 (docID 130 命中)<br>
+        <span style="color:#3fb950;">▸ word index = 130 &gt;&gt;&gt; 6 = 2</span><br>
+        <span style="color:#3fb950;">▸ bit index  = 130 &amp; 63 = 2</span>
+      </div>
+    </div>
+
+    <div style="background:#161b22;border-left:3px solid #f0883e;padding:10px 12px;border-radius:4px;">
+      <div style="color:#f0883e;font-weight:600;margin-bottom:4px;">▼ bits[3] · docID 192..199 · word 3 (尾部 8 bits)</div>
+      <div style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+        long 值: 0x0000000000000000<br>
+        <span style="color:#6e7681;">// 余下 200..255 不存在,bit 200 以后写入会触发 ArrayIndexOutOfBoundsException</span>
+      </div>
+    </div>
+
+    <div style="margin-top:14px;padding:10px;background:rgba(63,185,80,0.08);border-left:3px solid #3fb950;border-radius:4px;">
+      <strong style="color:#3fb950;">关键不变量:</strong><br>
+      <span style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+      ① bits.length = ceil(numBits / 64) = 4 long;<br>
+      ② 每 long 64 bit,小端在 bit 0(LSB);<br>
+      ③ bit i 在 word index = i &gt;&gt;&gt; 6,bit offset = i &amp; 63;<br>
+      ④ 1.25 MiB / 1 千万 doc(8 byte × 156250 long ≈ 1.25 MiB)。
+      </span>
+    </div>
+  </div>
+</div>
+
+<h3>核心 API 实现</h3>
+
+<pre><code class="language-java">public final class FixedBitSet extends BitSet {
+    private final long[] bits;
+    private final int numBits;
+    private final int numWords;
+
+    public FixedBitSet(int numBits) {
+        this.numBits = numBits;
+        this.numWords = bits2words(numBits);
+        this.bits = new long[numWords];
+    }
+
+    public boolean get(int index) {
+        assert index &gt;= 0 &amp;&amp; index &lt; numBits;
+        int wordNum = index &gt;&gt; 6;
+        long bitmask = 1L &lt;&lt; (index &amp; 0x3F);
+        return (bits[wordNum] &amp; bitmask) != 0;
+    }
+
+    public void set(int index) {
+        assert index &gt;= 0 &amp;&amp; index &lt; numBits;
+        int wordNum = index &gt;&gt; 6;
+        long bitmask = 1L &lt;&lt; (index &amp; 0x3F);
+        bits[wordNum] |= bitmask;
+    }
+
+    public void clear(int index) {
+        assert index &gt;= 0 &amp;&amp; index &lt; numBits;
+        int wordNum = index &gt;&gt; 6;
+        long bitmask = 1L &lt;&lt; (index &amp; 0x3F);
+        bits[wordNum] &amp;= ~bitmask;
+    }
+
+    public int nextSetBit(int index) {
+        int i = index &gt;&gt; 6;
+        long word = bits[i] &gt;&gt; (index &amp; 0x3F);
+        if (word != 0) {
+            return index + Long.numberOfTrailingZeros(word);
+        }
+        while (++i &lt; numWords) {
+            word = bits[i];
+            if (word != 0) {
+                return (i &lt;&lt; 6) + Long.numberOfTrailingZeros(word);
+            }
+        }
+        return DocIdSetIterator.NO_MORE_DOCS;
+    }
+
+    public int cardinality() {
+        return (int) BitUtil.pop_array(bits, 0, numWords);
+    }
+}</code></pre>
+
+<h3>FixedBitSet 的常见用途</h3>
+
+<table>
+  <thead>
+    <tr><th>用途</th><th>调用方</th><th>典型大小</th><th>关键操作</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>LiveDocs(段内)</td><td>SegmentReader</td><td>maxDoc / 8 bytes</td><td>get(docID) 过滤已删除</td></tr>
+    <tr><td>Filter 缓存</td><td>LRUQueryCache</td><td>maxDoc / 8 bytes</td><td>iterator() 喂给 ConjunctionDISI</td></tr>
+    <tr><td>FacetCollector 候选</td><td>FacetsCollector</td><td>maxDoc / 8 bytes</td><td>set(docID) 累积命中</td></tr>
+    <tr><td>TwoPhaseIterator 中间集合</td><td>PhraseQuery / GeoDistance</td><td>命中数 / 8 bytes</td><td>批量 set + iterator()</td></tr>
+    <tr><td>DocIdSetBuilder 终态</td><td>RangeQuery 等</td><td>命中数 / 8 bytes</td><td>build() 返回</td></tr>
+  </tbody>
+</table>
+
+<div class="real-world">
+  <strong>FixedBitSet 是 Lucene 内部 docID 集合的"默认之锚"</strong>。在 1 千万 doc 的订单库上,任何 50% 以上密度的 filter 缓存(<code>status:PAID</code> 通常 80% 命中、<code>tenantId:T100</code> 单租户 50-90% 命中)都会被 LRUQueryCache 物化成 FixedBitSet。1 千万 bit = 1.25 MiB,LRUQueryCache 默认上限 32 MB 即可缓存 25 个不同 filter——这正好覆盖电商搜索的常见过滤组合。从 P99 看,缓存命中后求交几乎免费(亚毫秒),所以<em>"FILTER + 高密度 + LRUQueryCache"是 Lucene 性能调优的第一性原理</em>。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s18-3">18.3 SparseFixedBitSet:稀疏场景的 12× 节省</h2>
+<!-- ============================================================ -->
+
+<p>FixedBitSet 在密度 ≥ 5% 时是最优选择,但在 1 千万 doc 中只有几千命中的稀疏场景下,1.25 MiB 内存里 99.9% 都是 0,纯属浪费。<strong>SparseFixedBitSet 用双层 bucket 结构解决这个问题:每 4096 doc 一个 block,只为含 set bit 的 block 分配 long 数组</strong>。本节拆解它的物理布局以及"稀疏 vs 稠密"的密度决策。</p>
+
+<h3>双层结构</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-3-1 · SparseFixedBitSet 双层 bucket</div>
+  <svg viewBox="0 0 1240 480" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 顶层 indices -->
+    <rect x="20"  y="180" width="240" height="120" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="140" y="208" text-anchor="middle" fill="#cfe9ff" font-size="14" font-weight="700">顶层 indices[]</text>
+    <text x="140" y="232" text-anchor="middle" fill="#a5d6ff" font-size="12">long[ceil(blockCount/64)]</text>
+    <text x="140" y="252" text-anchor="middle" fill="#a5d6ff" font-size="11">每 bit = 1 个 4096-doc block</text>
+    <text x="140" y="276" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">已分配 block 编号位图</text>
+
+    <!-- 中间层: 已分配 vs 未分配 -->
+    <rect x="380" y="40" width="280" height="80" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.6"/>
+    <text x="520" y="64" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">block 0 · doc 0..4095</text>
+    <text x="520" y="84" text-anchor="middle" fill="#a5d6ff" font-size="11">indices bit 0 = 1 — 已分配</text>
+    <text x="520" y="104" text-anchor="middle" fill="#39d2c0" font-size="10">含 1 个 set bit</text>
+
+    <rect x="380" y="140" width="280" height="80" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.6"/>
+    <text x="520" y="164" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">block 5 · doc 20480..24575</text>
+    <text x="520" y="184" text-anchor="middle" fill="#a5d6ff" font-size="11">indices bit 5 = 1 — 已分配</text>
+    <text x="520" y="204" text-anchor="middle" fill="#39d2c0" font-size="10">含 4 个 set bit</text>
+
+    <rect x="380" y="240" width="280" height="80" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.6"/>
+    <text x="520" y="264" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">block 17 · doc 69632..73727</text>
+    <text x="520" y="284" text-anchor="middle" fill="#a5d6ff" font-size="11">indices bit 17 = 1 — 已分配</text>
+    <text x="520" y="304" text-anchor="middle" fill="#39d2c0" font-size="10">含 2 个 set bit</text>
+
+    <rect x="380" y="340" width="280" height="80" rx="12" fill="rgba(248,81,73,0.10)" stroke="#f85149" stroke-width="1.4" stroke-dasharray="6 3"/>
+    <text x="520" y="364" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">block 1..4 · 6..16 · 18..</text>
+    <text x="520" y="384" text-anchor="middle" fill="#a5d6ff" font-size="11">indices bit = 0 — 未分配</text>
+    <text x="520" y="404" text-anchor="middle" fill="#39d2c0" font-size="10">不进入 bits[][] 数组</text>
+
+    <!-- 顶层 → block 4 条线 -->
+    <line x1="260" y1="220" x2="378" y2="80"  stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+    <line x1="260" y1="240" x2="378" y2="180" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+    <line x1="260" y1="260" x2="378" y2="280" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+    <line x1="260" y1="280" x2="378" y2="380" stroke="#f85149" stroke-width="1.4" stroke-dasharray="6 3" marker-end="url(#arr-r)"/>
+
+    <!-- 第 3 层: long[64] 实际数据 -->
+    <rect x="780" y="40" width="240" height="80" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="900" y="64" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">bits[0] = long[64]</text>
+    <text x="900" y="84" text-anchor="middle" fill="#a5d6ff" font-size="11">4096 bit · 512 B</text>
+    <text x="900" y="104" text-anchor="middle" fill="#39d2c0" font-size="10">实际占内存的 long 数组</text>
+
+    <rect x="780" y="140" width="240" height="80" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="900" y="164" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">bits[5] = long[64]</text>
+    <text x="900" y="184" text-anchor="middle" fill="#a5d6ff" font-size="11">4096 bit · 512 B</text>
+    <text x="900" y="204" text-anchor="middle" fill="#39d2c0" font-size="10">仅命中 block 才分配</text>
+
+    <rect x="780" y="240" width="240" height="80" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="900" y="264" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">bits[17] = long[64]</text>
+    <text x="900" y="284" text-anchor="middle" fill="#a5d6ff" font-size="11">4096 bit · 512 B</text>
+    <text x="900" y="304" text-anchor="middle" fill="#39d2c0" font-size="10">total ~ 250 × 512 B = 125 KB</text>
+
+    <rect x="780" y="340" width="240" height="80" rx="12" fill="rgba(248,81,73,0.10)" stroke="#f85149" stroke-width="1.4" stroke-dasharray="6 3"/>
+    <text x="900" y="370" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">null</text>
+    <text x="900" y="392" text-anchor="middle" fill="#a5d6ff" font-size="11">不占内存</text>
+
+    <line x1="660" y1="80"  x2="778" y2="80"  stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <line x1="660" y1="180" x2="778" y2="180" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <line x1="660" y1="280" x2="778" y2="280" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <line x1="660" y1="380" x2="778" y2="380" stroke="#f85149" stroke-width="1.3" stroke-dasharray="5 3" marker-end="url(#arr-r)"/>
+
+    <!-- 右侧 收益 -->
+    <rect x="1060" y="180" width="160" height="120" rx="14" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.8"/>
+    <text x="1140" y="208" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">12× 节省 ★</text>
+    <text x="1140" y="232" text-anchor="middle" fill="#a5d6ff" font-size="11">FixedBitSet</text>
+    <text x="1140" y="248" text-anchor="middle" fill="#a5d6ff" font-size="11">→ 1.25 MiB</text>
+    <text x="1140" y="270" text-anchor="middle" fill="#a5d6ff" font-size="11">SparseFixedBitSet</text>
+    <text x="1140" y="288" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">→ ~ 100 KiB</text>
+
+    <text x="620" y="460" text-anchor="middle" fill="#39d2c0" font-size="13" font-weight="700">★ 1 千万 doc / 1000 命中场景 — 99.9% 的 block 都不分配 long 数组</text>
+  </svg>
+</div>
+
+<h3>物理布局</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-3-2 · SparseFixedBitSet 字段(1 千万 doc / 1000 命中)</div>
+  <div style="background:#0d1117;border:1.5px solid #d29922;border-radius:10px;padding:18px;font-family:'Cascadia Code','SFMono-Regular',Consolas,monospace;font-size:12.5px;color:#a5d6ff;">
+    <div style="color:#d29922;font-weight:600;font-size:13px;margin-bottom:10px;">SparseFixedBitSet { 1000 命中 / 10M doc · 仅 ~250 个 block 分配 }</div>
+
+    <div style="background:#161b22;border-left:3px solid #58a6ff;padding:10px 12px;margin-bottom:8px;border-radius:4px;">
+      <div style="color:#58a6ff;font-weight:600;margin-bottom:4px;">▼ 顶层数组 · long[ceil(blockCount / 64)]</div>
+      <div style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+        总 block 数 = ceil(10M / 4096) = 2442 个<br>
+        长度 = ceil(2442 / 64) = 39 long = 312 bytes<br>
+        每 bit 表示对应 block 是否已分配
+      </div>
+    </div>
+
+    <div style="background:#161b22;border-left:3px solid #3fb950;padding:10px 12px;margin-bottom:8px;border-radius:4px;">
+      <div style="color:#3fb950;font-weight:600;margin-bottom:4px;">▼ bits[][] · long[2442][] (大部分为 null)</div>
+      <div style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+        仅 ~250 个 block 真正分配 long[64] (512 bytes)<br>
+        总占用 = 250 × 512 = 128 KiB<br>
+        <span style="color:#3fb950;">▸ vs FixedBitSet(1.25 MiB) → 10× 节省</span>
+      </div>
+    </div>
+
+    <div style="background:#161b22;border-left:3px solid #d2a8ff;padding:10px 12px;margin-bottom:8px;border-radius:4px;">
+      <div style="color:#d2a8ff;font-weight:600;margin-bottom:4px;">▼ exponents[] · short[2442]</div>
+      <div style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+        每 block 实际命中数(用于 cardinality 快速累加)<br>
+        长度 ≈ 4884 bytes
+      </div>
+    </div>
+
+    <div style="margin-top:12px;padding:10px;background:rgba(210,153,34,0.08);border-left:3px solid #d29922;border-radius:4px;">
+      <strong style="color:#d29922;">总开销估算 · 1000 命中 / 10M doc:</strong><br>
+      <span style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+      ① bits[][] 数据: 128 KiB(主要)<br>
+      ② 顶层 indices: 312 bytes<br>
+      ③ exponents: 4.8 KiB<br>
+      ④ 总计 ≈ 133 KiB · 比 FixedBitSet 1.25 MiB 节省 90%
+      </span>
+    </div>
+  </div>
+</div>
+
+<h3>稀疏 vs 稠密决策卡片</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-3-3 · 密度阈值决策(maxDoc=10M)</div>
+  <div style="background:#0d1117;border:1.5px solid #f0883e;border-radius:10px;padding:18px;font-family:'Cascadia Code','SFMono-Regular',Consolas,monospace;font-size:12.5px;color:#a5d6ff;">
+    <div style="color:#f0883e;font-weight:600;font-size:13px;margin-bottom:12px;">命中密度 → 推荐实现</div>
+
+    <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:10px;">
+      <div style="background:#161b22;border:1px solid #30363d;padding:10px;border-radius:6px;">
+        <div style="color:#3fb950;font-weight:600;margin-bottom:4px;">density &gt; 50%(稠密)</div>
+        <div style="color:#8b949e;font-size:11px;">FixedBitSet 1.25 MiB · 字级 AND/OR 极快 · LiveDocs 默认</div>
+      </div>
+      <div style="background:#161b22;border:1px solid #30363d;padding:10px;border-radius:6px;">
+        <div style="color:#3fb950;font-weight:600;margin-bottom:4px;">5% ≤ density ≤ 50%</div>
+        <div style="color:#8b949e;font-size:11px;">FixedBitSet 仍最优 · 密度足够稠密,Sparse 节省有限</div>
+      </div>
+      <div style="background:#161b22;border:1px solid #30363d;padding:10px;border-radius:6px;">
+        <div style="color:#d29922;font-weight:600;margin-bottom:4px;">0.5% ≤ density &lt; 5%</div>
+        <div style="color:#8b949e;font-size:11px;">SparseFixedBitSet 最优 · 内存节省 5-12× · 稍慢于 Fixed</div>
+      </div>
+      <div style="background:#161b22;border:1px solid #30363d;padding:10px;border-radius:6px;">
+        <div style="color:#f85149;font-weight:600;margin-bottom:4px;">density &lt; 0.5%(极稀疏)</div>
+        <div style="color:#8b949e;font-size:11px;">RoaringDocIdSet 或 int[] 排序 · 单 docID 仅 2-4 字节</div>
+      </div>
+    </div>
+
+    <div style="margin-top:12px;padding:10px;background:rgba(240,136,62,0.08);border-left:3px solid #f0883e;border-radius:4px;">
+      <strong style="color:#f0883e;">DocIdSetBuilder 自动选择:</strong><br>
+      <span style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+      Lucene 不要求开发者预判密度。<code>DocIdSetBuilder</code> 累积时维护已添加 docID 数,达到 maxDoc/128 自动从 int[] 切到 FixedBitSet,详见 §18.12。
+      </span>
+    </div>
+  </div>
+</div>
+
+<h3>FixedBitSet vs SparseFixedBitSet 全面对比</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4>FixedBitSet(密集首选)</h4>
+    <ul style="margin:0;padding-left:18px;font-size:13px;">
+      <li>固定 long[ceil(numBits/64)],预分配</li>
+      <li>1 千万 doc:1.25 MiB(总是 1.25 MiB)</li>
+      <li>get/set/clear:O(1) 一条指令</li>
+      <li>nextSetBit:O(1) 字级跳过 0 word</li>
+      <li>AND/OR/ANDNOT:O(N/64) SIMD 友好</li>
+      <li>稀疏场景浪费严重</li>
+    </ul>
+    <p style="margin-top:8px;font-size:12px;color:#f85149;">density &lt; 5% 时内存 90% 浪费,选 Sparse。</p>
+  </div>
+  <div class="compare-good">
+    <h4>SparseFixedBitSet(稀疏首选)</h4>
+    <ul style="margin:0;padding-left:18px;font-size:13px;">
+      <li>双层 bucket,按需分配 4096-bit block</li>
+      <li>1 千万 doc / 1000 命中:~133 KiB(10×)</li>
+      <li>get/set/clear:O(1) 但常数稍大</li>
+      <li>nextSetBit:跳过未分配 block</li>
+      <li>AND/OR:遍历 block,慢于 Fixed</li>
+      <li>密集场景反而慢且费内存</li>
+    </ul>
+    <p style="margin-top:8px;font-size:12px;color:#3fb950;">0.5% ≤ density &lt; 5% 区间最优。</p>
+  </div>
+</div>
+
+<div class="warning">
+  <strong>SparseFixedBitSet 的 AND 比 FixedBitSet 慢 3-5×</strong>。原因:Sparse 必须先比对两个集合的 indices(已分配 block 列表),只在双方都分配的 block 上做字级 AND;而 FixedBitSet 直接两个 long[] 逐 long 做 <code>&amp;</code>。生产里如果两个稀疏集合频繁求交,反而应该考虑都升级为 FixedBitSet——内存多花 1 MB,但求交速度提升数倍。这种"内存换时间"的权衡,LRUQueryCache 内部默认按 maxDoc/100 阈值自动选择。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s18-4">18.4 RoaringDocIdSet:三容器自适应</h2>
+<!-- ============================================================ -->
+
+<p>当 docID 集合的密度跨度极大——某些 64K 段全空、另一些段几乎全满、还有些段是连续 run——单一编码方案都不是最优。<strong>Roaring Bitmap 的解法:把 docID 空间按高 16 bit 切分成 65536 个 bucket(每 bucket 对应 64K docID 范围),每个 bucket 独立选择三种 container 中最优的</strong>。这种"分块自适应"是 Lucene 处理极稀疏 + 不均匀分布的杀手锏。</p>
+
+<h3>三容器自适应</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-4-1 · Roaring 三种 container</div>
+  <svg viewBox="0 0 1240 660" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 顶部 docID 分桶 -->
+    <rect x="380" y="20" width="480" height="62" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.8"/>
+    <text x="620" y="44" text-anchor="middle" fill="#cfe9ff" font-size="14" font-weight="700">docID 高 16 bit 分桶</text>
+    <text x="620" y="64" text-anchor="middle" fill="#a5d6ff" font-size="12">bucket 0..65535 · 每桶覆盖 64K docID 范围</text>
+
+    <!-- 三个 bucket 示例 -->
+    <rect x="60"  y="130" width="280" height="62" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="200" y="154" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">bucket 0</text>
+    <text x="200" y="174" text-anchor="middle" fill="#a5d6ff" font-size="11">docID [0..65535]</text>
+
+    <rect x="480" y="130" width="280" height="62" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="620" y="154" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">bucket 1</text>
+    <text x="620" y="174" text-anchor="middle" fill="#a5d6ff" font-size="11">docID [65536..131071]</text>
+
+    <rect x="900" y="130" width="280" height="62" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="1040" y="154" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">bucket N</text>
+    <text x="1040" y="174" text-anchor="middle" fill="#a5d6ff" font-size="11">…</text>
+
+    <line x1="500" y1="82" x2="200"  y2="128" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <line x1="620" y1="82" x2="620"  y2="128" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <line x1="740" y1="82" x2="1040" y2="128" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+
+    <!-- 决策菱形 -->
+    <polygon points="620,240 800,290 620,340 440,290" fill="rgba(248,81,73,0.10)" stroke="#f85149" stroke-width="1.6"/>
+    <text x="620" y="285" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">bucket 内</text>
+    <text x="620" y="305" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">ord 数 ?</text>
+    <line x1="620" y1="192" x2="620" y2="238" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+
+    <!-- 三容器分支 -->
+    <rect x="20"  y="400" width="360" height="120" rx="14" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.8"/>
+    <text x="200" y="426" text-anchor="middle" fill="#9be7b3" font-size="14" font-weight="700">ArrayContainer</text>
+    <text x="200" y="448" text-anchor="middle" fill="#a5d6ff" font-size="12">short[] 升序排列 ord 值</text>
+    <text x="200" y="468" text-anchor="middle" fill="#a5d6ff" font-size="12">2 B / ord  · 二分查找</text>
+    <text x="200" y="490" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">≤ 4096 ord — 稀疏</text>
+    <text x="200" y="510" text-anchor="middle" fill="#a5d6ff" font-size="10">最大 8 KB / bucket</text>
+
+    <rect x="430" y="400" width="380" height="120" rx="14" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.8"/>
+    <text x="620" y="426" text-anchor="middle" fill="#ffd591" font-size="14" font-weight="700">BitmapContainer</text>
+    <text x="620" y="448" text-anchor="middle" fill="#a5d6ff" font-size="12">FixedBitSet · 64K bit = 1024 long</text>
+    <text x="620" y="468" text-anchor="middle" fill="#a5d6ff" font-size="12">8 KiB / bucket · 字级位运算</text>
+    <text x="620" y="490" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">&gt; 4096 ord — 中密度 / 高密度</text>
+    <text x="620" y="510" text-anchor="middle" fill="#a5d6ff" font-size="10">popcnt / SIMD AND 求交</text>
+
+    <rect x="860" y="400" width="360" height="120" rx="14" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.8"/>
+    <text x="1040" y="426" text-anchor="middle" fill="#e6d3ff" font-size="14" font-weight="700">RunContainer</text>
+    <text x="1040" y="448" text-anchor="middle" fill="#a5d6ff" font-size="12">(start, length) 对 · short[]</text>
+    <text x="1040" y="468" text-anchor="middle" fill="#a5d6ff" font-size="12">4 B / run · 极致 connected</text>
+    <text x="1040" y="490" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">长 run 主导 — 连续 docID</text>
+    <text x="1040" y="510" text-anchor="middle" fill="#a5d6ff" font-size="10">如 LiveDocs 整段 set</text>
+
+    <line x1="500" y1="320" x2="220" y2="398" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+    <text x="370" y="362" text-anchor="middle" fill="#9be7b3" font-size="11" font-weight="700">≤ 4096</text>
+
+    <line x1="620" y1="340" x2="620" y2="398" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+    <text x="640" y="375" fill="#ffd591" font-size="11" font-weight="700">&gt; 4096</text>
+
+    <line x1="740" y1="320" x2="1020" y2="398" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <text x="900" y="362" text-anchor="middle" fill="#e6d3ff" font-size="11" font-weight="700">长 run</text>
+
+    <!-- 升级 / 降级 双向虚线 -->
+    <path d="M 380 460 Q 405 460 430 460" stroke="#3fb950" stroke-width="1.4" stroke-dasharray="6 3" fill="none" marker-end="url(#arr-g)"/>
+    <text x="405" y="448" text-anchor="middle" fill="#9be7b3" font-size="10" font-weight="700">ord 增 ↑ 升级</text>
+
+    <path d="M 810 460 Q 835 460 860 460" stroke="#bc8cff" stroke-width="1.4" stroke-dasharray="6 3" fill="none" marker-end="url(#arr-p)"/>
+    <text x="835" y="448" text-anchor="middle" fill="#e6d3ff" font-size="10" font-weight="700">长 run ↑ 降级</text>
+
+    <text x="620" y="580" text-anchor="middle" fill="#39d2c0" font-size="13" font-weight="700">★ 自适应 — 每个 bucket 独立选 container · 同一份 RoaringDocIdSet 可同时含 3 种</text>
+    <text x="620" y="608" text-anchor="middle" fill="#a5d6ff" font-size="12">极稀疏 + 不均匀分布场景的最优编码 — Lucene 默认在 docFreq 中等的 Filter Cache 用它</text>
+    <text x="620" y="636" text-anchor="middle" fill="#d29922" font-size="11" font-weight="700">运行时根据写入触发自动 ArrayContainer ↔ BitmapContainer ↔ RunContainer 切换</text>
+  </svg>
+</div>
+
+<h3>三容器特征对比</h3>
+
+<table>
+  <thead>
+    <tr><th>容器</th><th>触发条件</th><th>编码</th><th>单 ord 内存</th><th>典型场景</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>ArrayContainer</code></td><td>bucket 内 ord ≤ 4096</td><td>short[] 排序</td><td>2 byte / ord</td><td>稀疏 bucket(极稀疏 ID 集合)</td></tr>
+    <tr><td><code>BitmapContainer</code></td><td>4096 &lt; ord ≤ 61440</td><td>FixedBitSet 64K bit</td><td>0.125 byte / ord</td><td>中密度 bucket</td></tr>
+    <tr><td><code>RunContainer</code></td><td>连续 run 主导</td><td>(start,length) 对</td><td>4 byte / run</td><td>顺序导入 / 范围查询结果</td></tr>
+  </tbody>
+</table>
+
+<h3>RoaringDocIdSet 字节布局示例</h3>
+
+<pre><code class="language-text">RoaringDocIdSet 字节级示意:
+
+  bucket 0 (docID 0..65535):
+    container_type = ARRAY (1 byte)
+    cardinality    = 1000  (2 byte)
+    short[1000]    = [3, 7, 12, ..., 65500]  (2000 byte)
+    总占用 ≈ 2 KiB
+
+  bucket 1 (docID 65536..131071):
+    container_type = BITMAP (1 byte)
+    cardinality    = 5000  (2 byte)
+    long[1024]     = FixedBitSet 64K bit  (8 KiB)
+    总占用 ≈ 8 KiB
+
+  bucket 2 (docID 131072..196607):
+    container_type = RUN (1 byte)
+    runCount       = 2     (2 byte)
+    runs           = [(100, 100), (300, 100)]  (16 byte)
+    总占用 ≈ 19 byte ← 极致紧凑
+
+  顶层目录:
+    bucketKeys[]   = [0, 1, 2]  (sorted short[])
+    containerOffsets[] = [0, 2048, 10240]
+</code></pre>
+
+<h3>Roaring vs FixedBitSet 对比</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4>FixedBitSet</h4>
+    <ul style="margin:0;padding-left:18px;font-size:13px;">
+      <li>固定 1.25 MiB(1 千万 doc)</li>
+      <li>无视分布,均匀分配</li>
+      <li>50% 命中: 1.25 MiB(完美)</li>
+      <li>0.01% 命中: 1.25 MiB(99.99% 浪费)</li>
+      <li>AND/OR: 字级,极快</li>
+      <li>不擅长极稀疏分布</li>
+    </ul>
+    <p style="margin-top:8px;font-size:12px;color:#f85149;">高密度场景王者,极稀疏退化严重。</p>
+  </div>
+  <div class="compare-good">
+    <h4>RoaringDocIdSet</h4>
+    <ul style="margin:0;padding-left:18px;font-size:13px;">
+      <li>分桶 + 三 container 自适应</li>
+      <li>0.01% 命中: ~12 KiB(100× 节省)</li>
+      <li>50% 均匀: ~6 MiB(略大于 Fixed)</li>
+      <li>长 run: RunContainer 极致紧凑</li>
+      <li>AND/OR: 容器类型不同需特殊处理</li>
+      <li>反序列化稍慢(多层结构)</li>
+    </ul>
+    <p style="margin-top:8px;font-size:12px;color:#3fb950;">不均匀分布最优,LiveDocs 历史版本曾用。</p>
+  </div>
+</div>
+
+<div class="key-insight">
+  <strong>Roaring 在 Lucene 中的实际位置变迁</strong>。Lucene 4.x-5.x 时期,LiveDocs 文件 .liv 默认用 RoaringDocIdSet 持久化(节省删除率低时的磁盘空间)。Lucene 6.0 起切回 FixedBitSet—— SSD 普及让 1-2 MiB 的 .liv 文件 IO 不再是瓶颈,而 Roaring 反序列化的 CPU 成本反而成为查询热路径开销。今天 RoaringDocIdSet 主要存在于 <code>org.apache.lucene.util.RoaringDocIdSet</code>,作为 LRUQueryCache 在<em>命中率极低</em>(&lt; 0.5%)时的备选——这也是为什么大部分生产集群你看到的 cache 都是 FixedBitSet 而不是 Roaring。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s18-5">18.5 字级位运算:1000 万 docID 求交亚毫秒级</h2>
+<!-- ============================================================ -->
+
+<p>BooleanQuery 的 MUST / FILTER / MUST_NOT 子句在执行时会把多个 DocIdSet 求交、求并、求差。如果按"逐 docID 检查"的实现,1000 万 docID 求交需要 1000 万次 BitSet.get(),每次 O(1) 但常数巨大。<strong>Lucene 的实际实现是按 64-bit 字 (long word) 整批运算</strong>,把工作压缩到 ~150 万次 long 操作 (1000 万 / 64),配合 JIT 自动向量化为 SIMD,在 AVX-512 上做到亚毫秒。本节展示 FixedBitSet 的 AND/OR/ANDNOT 字级实现以及对应的 SIMD 加速。</p>
+
+<h3>三种集合运算的字级实现</h3>
+
+<pre><code class="language-java">public final class FixedBitSet extends BitSet {
+
+    public void and(FixedBitSet other) {
+        long[] thisBits  = this.bits;
+        long[] otherBits = other.bits;
+        int n = Math.min(thisBits.length, otherBits.length);
+        for (int i = 0; i &lt; n; i++) {
+            thisBits[i] &amp;= otherBits[i];
+        }
+        for (int i = n; i &lt; thisBits.length; i++) {
+            thisBits[i] = 0L;
+        }
+    }
+
+    public void or(FixedBitSet other) {
+        long[] thisBits  = this.bits;
+        long[] otherBits = other.bits;
+        int n = Math.min(thisBits.length, otherBits.length);
+        for (int i = 0; i &lt; n; i++) {
+            thisBits[i] |= otherBits[i];
+        }
+    }
+
+    public void andNot(FixedBitSet other) {
+        long[] thisBits  = this.bits;
+        long[] otherBits = other.bits;
+        int n = Math.min(thisBits.length, otherBits.length);
+        for (int i = 0; i &lt; n; i++) {
+            thisBits[i] &amp;= ~otherBits[i];
+        }
+    }
+
+    public int intersectionCount(FixedBitSet other) {
+        return (int) BitUtil.pop_intersect(
+            this.bits, other.bits, 0,
+            Math.min(this.bits.length, other.bits.length));
+    }
+}</code></pre>
+
+<h3>BooleanClause 与字级运算的映射</h3>
+
+<table>
+  <thead>
+    <tr><th>BooleanClause</th><th>字级运算</th><th>典型例子</th><th>典型代价</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>MUST / FILTER</code></td><td>AND <code>&amp;</code></td><td>tenant=T1 AND status=PAID</td><td>O(N/64)</td></tr>
+    <tr><td><code>SHOULD</code></td><td>OR <code>|</code></td><td>note 命中 OR title 命中</td><td>O(N/64)</td></tr>
+    <tr><td><code>MUST_NOT</code></td><td>ANDNOT <code>&amp; ~</code></td><td>NOT canceled</td><td>O(N/64)</td></tr>
+    <tr><td>cardinality()</td><td>POPCNT 累加</td><td>计命中 doc 数</td><td>O(N/64)</td></tr>
+    <tr><td>intersectionCount()</td><td>POPCNT(a &amp; b)</td><td>共现统计</td><td>O(N/64)</td></tr>
+  </tbody>
+</table>
+
+<h3>SIMD 自动向量化的加速比</h3>
+
+<div class="metric-row">
+  <div class="metric">
+    <div class="value">1.5 ms</div>
+    <div class="label">标量 AND</div>
+  </div>
+  <div class="metric">
+    <div class="value">400 µs</div>
+    <div class="label">AVX2 256-bit</div>
+  </div>
+  <div class="metric">
+    <div class="value">200 µs</div>
+    <div class="label">AVX-512</div>
+  </div>
+  <div class="metric">
+    <div class="value">7×</div>
+    <div class="label">SIMD vs 标量</div>
+  </div>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">表 18-5-1 · 1000 万 docID 集合运算延迟</div>
+  <table>
+    <thead>
+      <tr><th>CPU 指令集</th><th>一次处理 long 数</th><th>1000 万 docID AND 时长</th><th>1000 万 docID OR 时长</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>标量(无 SIMD)</td><td>1</td><td>~1.5 ms</td><td>~1.5 ms</td></tr>
+      <tr><td>SSE2 (128-bit)</td><td>2</td><td>~800 µs</td><td>~800 µs</td></tr>
+      <tr><td>AVX2 (256-bit)</td><td>4</td><td>~400 µs</td><td>~400 µs</td></tr>
+      <tr><td>AVX-512 (512-bit)</td><td>8</td><td>~200 µs</td><td>~200 µs</td></tr>
+      <tr><td>POPCNT 累加(cardinality)</td><td>1 word/cycle</td><td>~50 µs</td><td>—</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>反例:用 List&lt;Integer&gt; 表示 docID 集合</h3>
+
+<pre><code class="language-java">List&lt;Integer&gt; setA = ...;
+List&lt;Integer&gt; setB = ...;
+List&lt;Integer&gt; intersect = setA.stream()
+    .filter(setB::contains)
+    .collect(Collectors.toList());</code></pre>
+
+<pre><code class="language-java">FixedBitSet setA = new FixedBitSet(maxDoc);
+FixedBitSet setB = new FixedBitSet(maxDoc);
+setA.and(setB);</code></pre>
+
+<div class="key-insight">
+  <strong>docID 集合的内存模型选择直接决定了集合运算的复杂度等级</strong>。<code>List&lt;Integer&gt;</code> 在 1000 万 docID 上占 80 MB heap、求交 O(N×M) 要数小时;而 FixedBitSet 占 1.25 MiB heap、求交亚毫秒。这就是 Lucene 内部所有 docID 集合都用 BitSet 的根本原因—— <strong>集合运算在 long word 上是 O(N/64) 而不是 O(N)</strong>,加上 JIT 把 long 循环自动向量化到 SIMD,用户态字节码就能达到接近 memcpy 的吞吐。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s18-6">18.6 BitSetIterator:把 BitSet 包装成 DISI</h2>
+<!-- ============================================================ -->
+
+<p>BitSet 自身只支持 <code>get(i) / set(i) / nextSetBit(i)</code> 这种"按 docID 直接访问"的语义,不直接实现 DocIdSetIterator。<strong><code>BitSetIterator</code> 把 BitSet 包装成 DISI</strong>,让 ConjunctionDISI / DisjunctionDISI 可以无差别地消费 BitSet。本节拆解 BitSetIterator 的实现,以及它的 nextDoc / advance 性能特征。</p>
+
+<h3>BitSetIterator 实现</h3>
+
+<pre><code class="language-java">public class BitSetIterator extends DocIdSetIterator {
+    private final BitSet bits;
+    private final int length;
+    private final long cost;
+    private int doc = -1;
+
+    public BitSetIterator(BitSet bits, long cost) {
+        this.bits = bits;
+        this.length = bits.length();
+        this.cost = cost;
+    }
+
+    @Override
+    public int docID() { return doc; }
+
+    @Override
+    public int nextDoc() throws IOException {
+        return advance(doc + 1);
+    }
+
+    @Override
+    public int advance(int target) throws IOException {
+        if (target &gt;= length) {
+            return doc = NO_MORE_DOCS;
+        }
+        return doc = bits.nextSetBit(target);
+    }
+
+    @Override
+    public long cost() { return cost; }
+
+    public BitSet getBitSet() { return bits; }
+}</code></pre>
+
+<h3>nextSetBit 字级实现</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-6-1 · BitSetIterator.advance 字级跳跃</div>
+  <svg viewBox="0 0 1240 720" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- Start -->
+    <rect x="500" y="20" width="240" height="50" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="620" y="50" text-anchor="middle" fill="#cfe9ff" font-size="14" font-weight="700">advance(target)</text>
+
+    <!-- Bound 菱形 -->
+    <polygon points="620,110 800,160 620,210 440,160" fill="rgba(248,81,73,0.10)" stroke="#f85149" stroke-width="1.5"/>
+    <text x="620" y="158" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">target ≥ length ?</text>
+    <text x="620" y="178" text-anchor="middle" fill="#a5d6ff" font-size="10">边界检查</text>
+    <line x1="620" y1="70" x2="620" y2="108" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+
+    <!-- Done (右侧 — 终态) -->
+    <rect x="900" y="135" width="280" height="50" rx="12" fill="url(#g-red)" stroke="#f85149" stroke-width="1.6"/>
+    <text x="1040" y="165" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">return NO_MORE_DOCS</text>
+    <line x1="800" y1="160" x2="898" y2="160" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    <text x="850" y="152" text-anchor="middle" fill="#ffadad" font-size="11" font-weight="700">是</text>
+
+    <!-- Word 操作 -->
+    <rect x="380" y="240" width="480" height="80" rx="14" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.6"/>
+    <text x="620" y="266" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">wordIdx = target &gt;&gt;&gt; 6</text>
+    <text x="620" y="288" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">w = bits[wordIdx] &gt;&gt;&gt; (target &amp; 63)</text>
+    <text x="620" y="310" text-anchor="middle" fill="#a5d6ff" font-size="11">直接定位到目标 word + 高位 mask</text>
+    <line x1="620" y1="210" x2="620" y2="238" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <text x="640" y="228" fill="#a5d6ff" font-size="11">否</text>
+
+    <!-- Found 菱形 -->
+    <polygon points="620,350 780,400 620,450 460,400" fill="rgba(63,185,80,0.10)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="620" y="395" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">w != 0 ?</text>
+    <text x="620" y="415" text-anchor="middle" fill="#a5d6ff" font-size="10">同 word 内有 set bit ?</text>
+    <line x1="620" y1="320" x2="620" y2="348" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+
+    <!-- Out1 (右侧出口) -->
+    <rect x="900" y="375" width="320" height="50" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.8"/>
+    <text x="1060" y="406" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">return target + tzcnt(w)</text>
+    <line x1="780" y1="400" x2="898" y2="400" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+    <text x="838" y="392" text-anchor="middle" fill="#9be7b3" font-size="11" font-weight="700">是</text>
+
+    <!-- Loop -->
+    <rect x="380" y="490" width="480" height="80" rx="14" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.6"/>
+    <text x="620" y="516" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">wordIdx++  ·  w = bits[wordIdx]</text>
+    <text x="620" y="538" text-anchor="middle" fill="#a5d6ff" font-size="11">跳到下一 word</text>
+    <text x="620" y="558" text-anchor="middle" fill="#a5d6ff" font-size="11">— loop · 字级跳跃跨过全 0 word</text>
+    <line x1="620" y1="450" x2="620" y2="488" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+    <text x="640" y="475" fill="#ffd591" font-size="11">否</text>
+
+    <!-- WL 菱形 (内嵌 in loop) -->
+    <polygon points="280,530 380,570 280,610 180,570" fill="rgba(63,185,80,0.10)" stroke="#3fb950" stroke-width="1.4"/>
+    <text x="280" y="575" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">w != 0 ?</text>
+    <line x1="378" y1="528" x2="298" y2="555" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+
+    <!-- Out2 -->
+    <rect x="20" y="540" width="160" height="60" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.6"/>
+    <text x="100" y="566" text-anchor="middle" fill="#9be7b3" font-size="11" font-weight="700">return</text>
+    <text x="100" y="586" text-anchor="middle" fill="#9be7b3" font-size="11" font-weight="700">(wordIdx&lt;&lt;6) + tzcnt(w)</text>
+    <line x1="178" y1="570" x2="180" y2="570" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+    <text x="200" y="562" text-anchor="middle" fill="#9be7b3" font-size="10">是</text>
+
+    <!-- Cont 菱形 -->
+    <polygon points="980,530 1080,570 980,610 880,570" fill="rgba(212,153,34,0.10)" stroke="#d29922" stroke-width="1.4"/>
+    <text x="980" y="568" text-anchor="middle" fill="#ffd591" font-size="12" font-weight="700">wordIdx</text>
+    <text x="980" y="586" text-anchor="middle" fill="#ffd591" font-size="12" font-weight="700">&lt; numWords ?</text>
+    <line x1="860" y1="528" x2="960" y2="555" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+    <text x="280" y="640" fill="#ffd591" font-size="11">否 ↓</text>
+
+    <!-- 是 — 回 Loop (上方弧线) -->
+    <path d="M 1080 570 Q 1140 570 1140 530 Q 1140 470 860 510" stroke="#d29922" stroke-width="1.4" stroke-dasharray="6 3" fill="none" marker-end="url(#arr-o)"/>
+    <text x="1140" y="500" text-anchor="middle" fill="#ffd591" font-size="11" font-weight="700">是 — loop</text>
+
+    <!-- 否 — 到 Done (右侧) -->
+    <path d="M 980 610 Q 980 660 1040 660 Q 1100 660 1040 200" stroke="#f85149" stroke-width="1.3" stroke-dasharray="5 3" fill="none" marker-end="url(#arr-r)"/>
+    <text x="1100" y="630" text-anchor="middle" fill="#ffadad" font-size="11" font-weight="700">否 — 全 0 → Done</text>
+
+    <!-- 注释 -->
+    <text x="620" y="690" text-anchor="middle" fill="#39d2c0" font-size="13" font-weight="700">★ 关键 — bits[wordIdx] &gt;&gt;&gt; 63 直接拿到 trailing-zero, AVX 单条 tzcnt 指令</text>
+  </svg>
+</div>
+
+<h3>advance vs nextDoc 性能特征</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4>nextDoc():顺序遍历</h4>
+    <ul style="margin:0;padding-left:18px;font-size:13px;">
+      <li>本质 advance(doc + 1)</li>
+      <li>稠密命中:几乎每 word 一个 set bit</li>
+      <li>每 nextDoc ~2-4 ns(L1 cache)</li>
+      <li>稀疏:可能跨多个空 word</li>
+      <li>典型场景:全 segment 扫描</li>
+      <li>SIMD 加速有限(单值循环)</li>
+    </ul>
+    <p style="margin-top:8px;font-size:12px;color:#f85149;">10M 全空遍历:~80 µs(纯 word 跳过)</p>
+  </div>
+  <div class="compare-good">
+    <h4>advance(target):字级跳跃</h4>
+    <ul style="margin:0;padding-left:18px;font-size:13px;">
+      <li>跳到指定 word 后 mask + tzcnt</li>
+      <li>跨距 &lt; 64:同 word 内,~3 ns</li>
+      <li>跨距 64-1000:跳几个 word,~10 ns</li>
+      <li>跨距 1M:跳 ~15K word,~150 µs</li>
+      <li>典型场景:leapfrog 求交</li>
+      <li>大跨度时仍胜过 PostingsEnum 解码</li>
+    </ul>
+    <p style="margin-top:8px;font-size:12px;color:#3fb950;">字级跳跃比 PostingsEnum 多级 skip 在中等跨距上快 2×</p>
+  </div>
+</div>
+
+<h3>BitSetIterator 的 cost() 含义</h3>
+
+<table>
+  <thead>
+    <tr><th>用途</th><th>cost 取值</th><th>用途</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>FixedBitSet (LiveDocs)</td><td>maxDoc - delDocCount</td><td>段内活 doc 数</td></tr>
+    <tr><td>FixedBitSet (Filter cache)</td><td>cardinality()</td><td>命中数</td></tr>
+    <tr><td>SparseFixedBitSet</td><td>approximateCardinality()</td><td>命中数估计</td></tr>
+    <tr><td>预估为空集</td><td>0</td><td>立即终止 conjunction</td></tr>
+    <tr><td>未知</td><td>maxDoc</td><td>保守上界,不会被 leapfrog 选首发</td></tr>
+  </tbody>
+</table>
+
+<div class="real-world">
+  <strong>BitSetIterator 在 LRUQueryCache 命中后的关键作用</strong>。一个 1 千万订单的 ES 集群,<code>status:PAID</code> filter 被频繁查询。第一次查询时,Lucene 从倒排取 docID 流物化为 FixedBitSet 缓存到 LRUQueryCache;后续每次查询直接 <code>cache.get(query, leaf)</code> 拿到 FixedBitSet,用 <code>new BitSetIterator(bits, bits.cardinality())</code> 包装成 DISI 喂给 ConjunctionDISI——这条路径连 .doc 文件都不打开,P99 从 25ms 直接降到 2ms。<em>"FILTER + 高密度 + 缓存"三件套的真正提速点是 BitSetIterator 替代 PostingsEnum,绕过磁盘 + 解码两层成本。</em>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s18-7">18.7 advance 算法剖析:从默认到字级优化</h2>
+<!-- ============================================================ -->
+
+<p>advance(target) 是 DISI 接口最重要的方法——所有跳跃式访问都通过它。不同 DISI 实现的 advance 性能天差地别:默认 <code>slowAdvance</code> 是 O(N),BitSetIterator 是 O(N/64),BlockPostingsEnum 是 O(log freq)。本节展开 advance 在 BitSet 上的字级优化路径,以及与 PostingsEnum 的对比。</p>
+
+<h3>三级 advance 实现</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-7-1 · 三种 DISI 的 advance 复杂度</div>
+  <svg viewBox="0 0 1240 480" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 三个泳道 -->
+    <text x="200" y="30"  text-anchor="middle" fill="#f85149" font-size="14" font-weight="700">慢路径 (基线)</text>
+    <text x="620" y="30"  text-anchor="middle" fill="#3fb950" font-size="14" font-weight="700">字级跳跃 (BitSet)</text>
+    <text x="1040" y="30" text-anchor="middle" fill="#bc8cff" font-size="14" font-weight="700">金字塔跳跃 (Postings)</text>
+
+    <!-- 慢路径 (slowAdvance) -->
+    <rect x="20"  y="60"  width="360" height="80" rx="14" fill="rgba(248,81,73,0.12)" stroke="#f85149" stroke-width="1.6"/>
+    <text x="200" y="86"  text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">DISI.slowAdvance(target)</text>
+    <text x="200" y="106" text-anchor="middle" fill="#a5d6ff" font-size="11">所有 DISI 的默认实现 (兜底)</text>
+    <text x="200" y="126" text-anchor="middle" fill="#a5d6ff" font-size="10">在 base class 上提供</text>
+
+    <rect x="20"  y="170" width="360" height="100" rx="14" fill="rgba(248,81,73,0.05)" stroke="#f85149" stroke-width="1.4" stroke-dasharray="6 3"/>
+    <text x="200" y="196" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">while (docID() &lt; target)</text>
+    <text x="200" y="216" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">    nextDoc();</text>
+    <text x="200" y="240" text-anchor="middle" fill="#a5d6ff" font-size="10">单步前进 — 没有任何跳过</text>
+    <text x="200" y="258" text-anchor="middle" fill="#a5d6ff" font-size="10">如 LongRangeIterator / 自定义 DISI</text>
+
+    <rect x="20"  y="300" width="360" height="80" rx="14" fill="url(#g-red)" stroke="#f85149" stroke-width="1.8"/>
+    <text x="200" y="328" text-anchor="middle" fill="#ffadad" font-size="14" font-weight="700">O(target − docID)</text>
+    <text x="200" y="350" text-anchor="middle" fill="#a5d6ff" font-size="11">线性扫 — 1 M 跨距 ≈ 5 ms</text>
+    <text x="200" y="370" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">★ 仅在小跨距使用</text>
+
+    <line x1="200" y1="140" x2="200" y2="168" stroke="#f85149" stroke-width="1.4" marker-end="url(#arr-r)"/>
+    <line x1="200" y1="270" x2="200" y2="298" stroke="#f85149" stroke-width="1.4" marker-end="url(#arr-r)"/>
+
+    <!-- 中间: BitSetIterator -->
+    <rect x="440" y="60"  width="360" height="80" rx="14" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="620" y="86"  text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">BitSetIterator.advance(target) ★</text>
+    <text x="620" y="106" text-anchor="middle" fill="#a5d6ff" font-size="11">FixedBitSet / SparseFixedBitSet</text>
+    <text x="620" y="126" text-anchor="middle" fill="#a5d6ff" font-size="10">LiveDocs / Filter Cache 命中态</text>
+
+    <rect x="440" y="170" width="360" height="100" rx="14" fill="rgba(63,185,80,0.05)" stroke="#3fb950" stroke-width="1.4" stroke-dasharray="6 3"/>
+    <text x="620" y="196" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">跳到 word [target &gt;&gt;&gt; 6]</text>
+    <text x="620" y="216" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">word & mask · tzcnt</text>
+    <text x="620" y="240" text-anchor="middle" fill="#a5d6ff" font-size="10">word 内 1 条 CPU 指令 trailing zeros</text>
+    <text x="620" y="258" text-anchor="middle" fill="#a5d6ff" font-size="10">word 间循环跳过全 0 word</text>
+
+    <rect x="440" y="300" width="360" height="80" rx="14" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="620" y="328" text-anchor="middle" fill="#9be7b3" font-size="14" font-weight="700">O((target − docID) / 64)</text>
+    <text x="620" y="350" text-anchor="middle" fill="#a5d6ff" font-size="11">字级跳跃 — 1 M 跨距 ≈ 150 µs</text>
+    <text x="620" y="370" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">★ 中等跨度王者</text>
+
+    <line x1="620" y1="140" x2="620" y2="168" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+    <line x1="620" y1="270" x2="620" y2="298" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+
+    <!-- 右: BlockPostingsEnum -->
+    <rect x="860" y="60"  width="360" height="80" rx="14" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="1040" y="86"  text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">BlockPostingsEnum.advance(target)</text>
+    <text x="1040" y="106" text-anchor="middle" fill="#a5d6ff" font-size="11">.doc / .pos 倒排 — 磁盘 mmap</text>
+    <text x="1040" y="126" text-anchor="middle" fill="#a5d6ff" font-size="10">第 11 章</text>
+
+    <rect x="860" y="170" width="360" height="100" rx="14" fill="rgba(189,140,255,0.05)" stroke="#bc8cff" stroke-width="1.4" stroke-dasharray="6 3"/>
+    <text x="1040" y="196" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">三级 skip 二分</text>
+    <text x="1040" y="216" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">L2 → L1 → L0 → block</text>
+    <text x="1040" y="240" text-anchor="middle" fill="#a5d6ff" font-size="10">每级 8 个 entry · 跳过批量 docID</text>
+    <text x="1040" y="258" text-anchor="middle" fill="#a5d6ff" font-size="10">block 内 PFOR 解压 128 docID</text>
+
+    <rect x="860" y="300" width="360" height="80" rx="14" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="1040" y="328" text-anchor="middle" fill="#e6d3ff" font-size="14" font-weight="700">O(log freq)</text>
+    <text x="1040" y="350" text-anchor="middle" fill="#a5d6ff" font-size="11">金字塔跳跃 — 1 M 跨距 ≈ 50 µs</text>
+    <text x="1040" y="370" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">★ 大跨度 + 高 freq 最优</text>
+
+    <line x1="1040" y1="140" x2="1040" y2="168" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+    <line x1="1040" y1="270" x2="1040" y2="298" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+
+    <!-- 底部 比较 -->
+    <text x="620" y="430" text-anchor="middle" fill="#39d2c0" font-size="13" font-weight="700">★ 大跨距 1 M docID — slowAdvance 5 ms · BitSetIterator 150 µs · PostingsEnum 50 µs</text>
+    <text x="620" y="458" text-anchor="middle" fill="#a5d6ff" font-size="12">中等跨距 (10K-100K): BitSetIterator ≈ PostingsEnum, 但 BitSetIterator 没有解码开销</text>
+  </svg>
+</div>
+
+<h3>BitSetIterator.advance 字级实现</h3>
+
+<pre><code class="language-java">public int advance(int target) throws IOException {
+    if (target &gt;= length) {
+        return doc = NO_MORE_DOCS;
+    }
+    return doc = bits.nextSetBit(target);
+}
+
+public int nextSetBit(int index) {
+    int wordIdx = index &gt;&gt;&gt; 6;
+    long word = bits[wordIdx] &amp; (-1L &lt;&lt; (index &amp; 63));
+
+    while (word == 0L) {
+        if (++wordIdx == numWords) {
+            return DocIdSetIterator.NO_MORE_DOCS;
+        }
+        word = bits[wordIdx];
+    }
+
+    return (wordIdx &lt;&lt; 6) + Long.numberOfTrailingZeros(word);
+}</code></pre>
+
+<h3>advance 跨距与延迟实测</h3>
+
+<table>
+  <thead>
+    <tr><th>跨距(target - 当前 docID)</th><th>BitSetIterator 延迟</th><th>BlockPostingsEnum 延迟</th><th>胜出方</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>0-64(同 word 内)</td><td>2-4 ns</td><td>4-8 ns</td><td>BitSetIterator</td></tr>
+    <tr><td>64-1024(跨几 word)</td><td>5-15 ns</td><td>20-50 ns</td><td>BitSetIterator</td></tr>
+    <tr><td>1K-128K(中跨)</td><td>50-300 ns</td><td>80-200 ns</td><td>相当</td></tr>
+    <tr><td>128K-1M(大跨)</td><td>1-8 µs</td><td>200-500 ns</td><td>BlockPostingsEnum</td></tr>
+    <tr><td>&gt; 1M(全段)</td><td>~150 µs(全 word 扫)</td><td>500-1500 ns(三级 skip)</td><td>BlockPostingsEnum</td></tr>
+  </tbody>
+</table>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-7-2 · BitSet advance 字级跳跃示意</div>
+  <div style="background:#0d1117;border:1.5px solid #d2a8ff;border-radius:10px;padding:18px;font-family:'Cascadia Code','SFMono-Regular',Consolas,monospace;font-size:12.5px;color:#a5d6ff;">
+    <div style="color:#d2a8ff;font-weight:600;font-size:13px;margin-bottom:10px;">advance(target=200) · 当前 docID = 12</div>
+
+    <div style="background:#161b22;border-left:3px solid #58a6ff;padding:10px 12px;margin-bottom:8px;border-radius:4px;">
+      <div style="color:#58a6ff;font-weight:600;margin-bottom:4px;">Step 1 · 计算 word 索引</div>
+      <div style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+        wordIdx = 200 &gt;&gt;&gt; 6 = 3<br>
+        bitOffset = 200 &amp; 63 = 8<br>
+        <span style="color:#3fb950;">▸ 直接跳到 bits[3],无需扫 bits[1]、bits[2]</span>
+      </div>
+    </div>
+
+    <div style="background:#161b22;border-left:3px solid #d29922;padding:10px 12px;margin-bottom:8px;border-radius:4px;">
+      <div style="color:#d29922;font-weight:600;margin-bottom:4px;">Step 2 · mask 掉 bit 200 之前的位</div>
+      <div style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+        word = bits[3] &amp; (-1L &lt;&lt; (200 &amp; 63))<br>
+                   = bits[3] &amp; 0xFFFFFFFFFFFFFF00<br>
+        <span style="color:#3fb950;">▸ 清掉 bit 192..199,保留 bit 200..255</span>
+      </div>
+    </div>
+
+    <div style="background:#161b22;border-left:3px solid #3fb950;padding:10px 12px;margin-bottom:8px;border-radius:4px;">
+      <div style="color:#3fb950;font-weight:600;margin-bottom:4px;">Step 3 · 找最低 set bit</div>
+      <div style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+        if word != 0:<br>
+        &nbsp;&nbsp;return (3 &lt;&lt; 6) + Long.numberOfTrailingZeros(word)<br>
+        else 跳到下一非零 word
+      </div>
+    </div>
+
+    <div style="background:#161b22;border-left:3px solid #f0883e;padding:10px 12px;border-radius:4px;">
+      <div style="color:#f0883e;font-weight:600;margin-bottom:4px;">Step 4 · 跨 word 的循环跳过</div>
+      <div style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+        while word == 0: wordIdx++; word = bits[wordIdx]<br>
+        每空 word 一条 cmp + jne,JIT 自动展开 4-8×<br>
+        <span style="color:#3fb950;">▸ 1M 空 word 跨度 ~150 µs</span>
+      </div>
+    </div>
+
+    <div style="margin-top:12px;padding:10px;background:rgba(210,168,255,0.08);border-left:3px solid #d2a8ff;border-radius:4px;">
+      <strong style="color:#d2a8ff;">CPU 指令利用:</strong><br>
+      <span style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+      ① wordIdx 计算:1 条 SHR;<br>
+      ② mask 计算:1 条 SAR + 1 条 AND;<br>
+      ③ 找最低 bit:1 条 TZCNT(Intel BMI1)或 BSF;<br>
+      ④ 全部命中 L1 cache,SIMD 不必参与。
+      </span>
+    </div>
+  </div>
+</div>
+
+<div class="warning">
+  <strong>不要手动 advance 跨整段</strong>。某些自定义 Query 实现会先把候选 docID 收集到 int[],然后逐个 <code>iterator.advance(int[i])</code>——这种用法在 BitSetIterator 上还能接受(字级跳跃),但在 PostingsEnum 上会触发 N 次 refillDocs,性能崩盘。正确做法:把候选 int[] 排序后转成 BitSet,再用 <code>BitSetIterator</code> 包装喂给 ConjunctionDISI,让 Lucene 内部决定 leapfrog 的次序。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s18-8">18.8 cost() 与执行计划:为什么短表当首发</h2>
+<!-- ============================================================ -->
+
+<p><code>DocIdSetIterator.cost()</code> 返回该流的"剩余迭代代价估计",通常等于"还有多少 docID 会被产出"。这个数字不影响正确性,但 BooleanQuery / ConjunctionDISI 用它做执行计划:<strong>cost 最小的 DISI 当 leapfrog 的首发,其它 DISI 用 advance 跟随</strong>。这种"短表驱动长表"的启发式是 Lucene 求交在不平衡子句下仍稳定快的根基。</p>
+
+<h3>cost 在不同 DISI 上的含义</h3>
+
+<table>
+  <thead>
+    <tr><th>DISI</th><th>cost 估计来源</th><th>典型值</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>BlockPostingsEnum</code></td><td>termsEnum.docFreq()</td><td>该 term 在段内 docFreq</td></tr>
+    <tr><td><code>BitSetIterator</code></td><td>构造时传入</td><td>cardinality / approximateCardinality</td></tr>
+    <tr><td><code>ConjunctionDISI</code></td><td>min(子 cost)</td><td>最稀子句的 cost</td></tr>
+    <tr><td><code>DisjunctionDISIPriorityQueue</code></td><td>sum(子 cost)</td><td>所有子句 cost 之和</td></tr>
+    <tr><td><code>PointInSetIterator</code></td><td>BKD estimatePointCount</td><td>BKD tree 候选点数</td></tr>
+    <tr><td><code>TwoPhaseIterator.approximation()</code></td><td>approximation cost</td><td>cheap phase 候选数</td></tr>
+  </tbody>
+</table>
+
+<h3>BooleanQuery 用 cost 排序子句</h3>
+
+<pre><code class="language-java">List&lt;Scorer&gt; scorers = ...;
+scorers.sort(Comparator.comparingLong(s -&gt; s.iterator().cost()));
+
+DocIdSetIterator lead = scorers.get(0).iterator();
+List&lt;DocIdSetIterator&gt; followers = scorers.stream()
+    .skip(1)
+    .map(Scorer::iterator)
+    .collect(Collectors.toList());
+
+while (lead.nextDoc() != NO_MORE_DOCS) {
+    int doc = lead.docID();
+    boolean matched = true;
+    for (DocIdSetIterator f : followers) {
+        if (f.advance(doc) != doc) {
+            matched = false;
+            break;
+        }
+    }
+    if (matched) collect(doc);
+}</code></pre>
+
+<h3>cost 估计错误的代价</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-8-1 · cost 错配的 P99 退化</div>
+  <svg viewBox="0 0 1240 460" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 输入 query -->
+    <rect x="20"  y="180" width="220" height="80" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="130" y="208" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">query</text>
+    <text x="130" y="230" text-anchor="middle" fill="#a5d6ff" font-size="12">a AND b AND c</text>
+    <text x="130" y="250" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">3 个 DISI 求交</text>
+
+    <!-- cost -->
+    <rect x="280" y="180" width="280" height="80" rx="14" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.6"/>
+    <text x="420" y="208" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">3 个 DISI 的 cost</text>
+    <text x="420" y="230" text-anchor="middle" fill="#a5d6ff" font-size="12">cost(a) = 5 M  ·  cost(c) = 1 M</text>
+    <text x="420" y="250" text-anchor="middle" fill="#39d2c0" font-size="12" font-weight="700">cost(b) = 50 K ★ 最小</text>
+    <line x1="240" y1="220" x2="278" y2="220" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+
+    <!-- 正确顺序 (上分支) -->
+    <rect x="600" y="40"  width="320" height="100" rx="14" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.8"/>
+    <text x="760" y="66"  text-anchor="middle" fill="#9be7b3" font-size="14" font-weight="700">正确顺序 ✓</text>
+    <text x="760" y="88"  text-anchor="middle" fill="#a5d6ff" font-size="12">b (50 K) lead</text>
+    <text x="760" y="108" text-anchor="middle" fill="#a5d6ff" font-size="12">→ advance a (5 M)</text>
+    <text x="760" y="128" text-anchor="middle" fill="#a5d6ff" font-size="12">→ advance c (1 M)</text>
+
+    <rect x="960" y="40"  width="260" height="100" rx="14" fill="rgba(63,185,80,0.20)" stroke="#3fb950" stroke-width="2"/>
+    <text x="1090" y="68"  text-anchor="middle" fill="#9be7b3" font-size="14" font-weight="700">P99 ≈ 1 ms ✓</text>
+    <text x="1090" y="92"  text-anchor="middle" fill="#a5d6ff" font-size="11">50 K × 2 advance</text>
+    <text x="1090" y="112" text-anchor="middle" fill="#a5d6ff" font-size="11">字级跳跃 ~ 20 ns ea.</text>
+    <text x="1090" y="130" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">在线生产路径</text>
+
+    <line x1="560" y1="200" x2="598" y2="100" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+    <line x1="920" y1="90"  x2="958" y2="90"  stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+
+    <!-- 错误顺序 (下分支) -->
+    <rect x="600" y="280" width="320" height="120" rx="14" fill="rgba(248,81,73,0.18)" stroke="#f85149" stroke-width="1.8"/>
+    <text x="760" y="306" text-anchor="middle" fill="#ffadad" font-size="14" font-weight="700">错误顺序 ✗</text>
+    <text x="760" y="326" text-anchor="middle" fill="#a5d6ff" font-size="11">自定义 Query · cost() = 0 全返 0</text>
+    <text x="760" y="346" text-anchor="middle" fill="#ffadad" font-size="12">a (5 M) lead — 大集合在前</text>
+    <text x="760" y="366" text-anchor="middle" fill="#ffadad" font-size="12">→ advance b (50 K)</text>
+    <text x="760" y="386" text-anchor="middle" fill="#ffadad" font-size="12">→ advance c (1 M)</text>
+
+    <rect x="960" y="280" width="260" height="120" rx="14" fill="rgba(248,81,73,0.30)" stroke="#f85149" stroke-width="2"/>
+    <text x="1090" y="306" text-anchor="middle" fill="#ffadad" font-size="14" font-weight="700">P99 ≈ 100 ms ✗</text>
+    <text x="1090" y="328" text-anchor="middle" fill="#a5d6ff" font-size="11">5 M × 2 advance</text>
+    <text x="1090" y="348" text-anchor="middle" fill="#a5d6ff" font-size="11">每条 advance + scorer 调用</text>
+    <text x="1090" y="368" text-anchor="middle" fill="#ffadad" font-size="12" font-weight="700">退化 100× ★</text>
+    <text x="1090" y="388" text-anchor="middle" fill="#a5d6ff" font-size="11">SLO 击穿 → 500 错误</text>
+
+    <line x1="560" y1="240" x2="598" y2="340" stroke="#f85149" stroke-width="1.6" marker-end="url(#arr-r)"/>
+    <line x1="920" y1="340" x2="958" y2="340" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+  </svg>
+</div>
+
+<div class="key-insight">
+  <strong>自定义 Query 不实现 cost() 是生产 P99 退化的隐藏炸弹</strong>。新手写自定义 Query 经常返回 <code>Long.MAX_VALUE</code> 或 0,导致 BooleanQuery 把它当成"最大"或"最小"放错位置。正确做法:<em>给一个粗略接近真实命中数的估计</em>,比如对范围查询用 <code>(end - start) × density</code>,对自定义 Filter 用 <code>maxDoc / 10</code> 之类的合理猜测。即使估计偏离 50%,只要量级正确,leapfrog 顺序仍接近最优;但如果估计偏离 1000×,P99 直接退化几个数量级。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s18-9">18.9 ConjunctionDISI:leapfrog 求交</h2>
+<!-- ============================================================ -->
+
+<p>BooleanQuery MUST / FILTER 子句的求交由 <code>ConjunctionDISI</code> 实现,它的核心算法是 <strong>leapfrog</strong>:cost 最小的子 DISI 当首发(<code>lead</code>),用 nextDoc 推进;其它子 DISI 用 advance 跟随。如果某个 follower 的 docID &gt; lead 当前 doc,提升 lead 到该 docID 重启循环。这是 Lucene 求交的最关键算法,本节用时序图把它画清楚。</p>
+
+<h3>ConjunctionDISI 实现骨架</h3>
+
+<pre><code class="language-java">public final class ConjunctionDISI extends DocIdSetIterator {
+    private final DocIdSetIterator lead;
+    private final DocIdSetIterator[] others;
+
+    public ConjunctionDISI(List&lt;? extends DocIdSetIterator&gt; iterators) {
+        iterators.sort(Comparator.comparingLong(DocIdSetIterator::cost));
+        this.lead = iterators.get(0);
+        this.others = iterators.subList(1, iterators.size())
+            .toArray(new DocIdSetIterator[0]);
+    }
+
+    @Override
+    public int nextDoc() throws IOException {
+        return doNext(lead.nextDoc());
+    }
+
+    @Override
+    public int advance(int target) throws IOException {
+        return doNext(lead.advance(target));
+    }
+
+    private int doNext(int doc) throws IOException {
+        advanceHead: for (;;) {
+            for (DocIdSetIterator other : others) {
+                int next = other.advance(doc);
+                if (next &gt; doc) {
+                    doc = lead.advance(next);
+                    continue advanceHead;
+                }
+            }
+            return doc;
+        }
+    }
+
+    @Override
+    public long cost() { return lead.cost(); }
+}</code></pre>
+
+<h3>conjunction 跳跃时序图</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-9-1 · ConjunctionDISI 跳跃交互(短表驱动长表)</div>
+  <svg viewBox="0 0 1240 600" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 三个泳道 -->
+    <rect x="80"   y="20" width="220" height="50" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="190"  y="50" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">ConjunctionDISI</text>
+
+    <rect x="500"  y="20" width="220" height="50" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="1.6"/>
+    <text x="610"  y="44" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">Lead — B (cost 3) ★</text>
+    <text x="610"  y="62" text-anchor="middle" fill="#a5d6ff" font-size="10">短表 · 驱动迭代</text>
+
+    <rect x="920"  y="20" width="220" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="1030" y="44" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">Other — A (cost 6)</text>
+    <text x="1030" y="62" text-anchor="middle" fill="#a5d6ff" font-size="10">长表 · 被驱动 advance</text>
+
+    <line x1="190"  y1="70" x2="190"  y2="580" stroke="#58a6ff" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="610"  y1="70" x2="610"  y2="580" stroke="#3fb950" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="1030" y1="70" x2="1030" y2="580" stroke="#bc8cff" stroke-width="1" stroke-dasharray="4 4"/>
+
+    <!-- ① CD → L nextDoc -->
+    <line x1="190" y1="100" x2="608" y2="100" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+    <text x="400" y="93" text-anchor="middle" fill="#9be7b3" font-size="11" font-weight="700">① nextDoc()</text>
+
+    <line x1="610" y1="130" x2="192" y2="130" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arr-g)"/>
+    <text x="400" y="123" text-anchor="middle" fill="#9be7b3" font-size="11">② doc = 7</text>
+
+    <line x1="190" y1="160" x2="1028" y2="160" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+    <text x="610" y="153" text-anchor="middle" fill="#e6d3ff" font-size="11" font-weight="700">③ advance(7)</text>
+
+    <line x1="1030" y1="190" x2="192" y2="190" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arr-p)"/>
+    <text x="610" y="183" text-anchor="middle" fill="#e6d3ff" font-size="11">④ doc = 7 (对齐!)</text>
+
+    <rect x="80" y="208" width="1080" height="26" rx="6" fill="rgba(63,185,80,0.10)" stroke="#3fb950" stroke-width="1"/>
+    <text x="620" y="226" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="700">Note · 对齐 → emit doc = 7  ✓</text>
+
+    <!-- ⑤ -->
+    <line x1="190" y1="265" x2="608" y2="265" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+    <text x="400" y="258" text-anchor="middle" fill="#9be7b3" font-size="11" font-weight="700">⑤ nextDoc()</text>
+
+    <line x1="610" y1="295" x2="192" y2="295" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arr-g)"/>
+    <text x="400" y="288" text-anchor="middle" fill="#9be7b3" font-size="11">⑥ doc = 42</text>
+
+    <line x1="190" y1="325" x2="1028" y2="325" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+    <text x="610" y="318" text-anchor="middle" fill="#e6d3ff" font-size="11" font-weight="700">⑦ advance(42)</text>
+
+    <line x1="1030" y1="355" x2="192" y2="355" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arr-p)"/>
+    <text x="610" y="348" text-anchor="middle" fill="#e6d3ff" font-size="11">⑧ doc = 42 (对齐!)</text>
+
+    <rect x="80" y="370" width="1080" height="26" rx="6" fill="rgba(63,185,80,0.10)" stroke="#3fb950" stroke-width="1"/>
+    <text x="620" y="388" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="700">Note · 对齐 → emit doc = 42  ✓</text>
+
+    <!-- ⑨ — 终态 -->
+    <line x1="190" y1="425" x2="608" y2="425" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+    <text x="400" y="418" text-anchor="middle" fill="#9be7b3" font-size="11" font-weight="700">⑨ nextDoc()</text>
+
+    <line x1="610" y1="455" x2="192" y2="455" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arr-g)"/>
+    <text x="400" y="448" text-anchor="middle" fill="#9be7b3" font-size="11">⑩ doc = 100</text>
+
+    <line x1="190" y1="485" x2="1028" y2="485" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+    <text x="610" y="478" text-anchor="middle" fill="#e6d3ff" font-size="11" font-weight="700">⑪ advance(100)</text>
+
+    <line x1="1030" y1="515" x2="192" y2="515" stroke="#f85149" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arr-r)"/>
+    <text x="610" y="508" text-anchor="middle" fill="#ffadad" font-size="11" font-weight="700">⑫ NO_MORE_DOCS  ✗</text>
+
+    <rect x="80" y="530" width="1080" height="26" rx="6" fill="rgba(248,81,73,0.10)" stroke="#f85149" stroke-width="1"/>
+    <text x="620" y="548" text-anchor="middle" fill="#f85149" font-size="11" font-weight="700">Note · 任一子流耗尽 → 提前终止 (return NO_MORE_DOCS)</text>
+
+    <text x="620" y="585" text-anchor="middle" fill="#39d2c0" font-size="12" font-weight="700">★ 短表 (cost 小) 当 lead, 长表用 advance 跟随 — 总迭代 = O(min(cost))</text>
+  </svg>
+</div>
+
+<h3>leapfrog 时序卡片</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-9-2 · ConjunctionDISI leapfrog 时序(A=[1,7,11,19,42,99], B=[7,42,100])</div>
+  <div style="background:#0d1117;border:1.5px solid #3fb950;border-radius:10px;padding:18px;font-family:'Cascadia Code','SFMono-Regular',Consolas,monospace;font-size:12.5px;color:#a5d6ff;">
+    <div style="color:#3fb950;font-weight:600;font-size:13px;margin-bottom:12px;">cost(B)=3 &lt; cost(A)=6 → B 是 lead</div>
+
+    <div style="background:#161b22;border:1px solid #30363d;padding:12px;border-radius:6px;line-height:1.85;">
+      <div style="color:#d29922;font-weight:600;">Step 1 · B.nextDoc() → 7</div>
+      <div style="margin-left:16px;color:#8b949e;">A.advance(7) → 7 <span style="color:#3fb950;">✓ A.docID == B.docID == 7 → 命中 doc=7</span></div>
+
+      <div style="color:#d29922;font-weight:600;margin-top:8px;">Step 2 · B.nextDoc() → 42</div>
+      <div style="margin-left:16px;color:#8b949e;">A.advance(42) → 42 <span style="color:#3fb950;">✓ 命中 doc=42</span></div>
+
+      <div style="color:#d29922;font-weight:600;margin-top:8px;">Step 3 · B.nextDoc() → 100</div>
+      <div style="margin-left:16px;color:#8b949e;">A.advance(100) → NO_MORE_DOCS <span style="color:#f85149;">✗ A 已耗尽</span></div>
+
+      <div style="color:#d29922;font-weight:600;margin-top:8px;">Step 4 · 提前终止</div>
+      <div style="margin-left:16px;color:#8b949e;">return NO_MORE_DOCS</div>
+    </div>
+
+    <div style="margin-top:12px;padding:10px 12px;background:rgba(63,185,80,0.08);border-left:3px solid #3fb950;border-radius:4px;">
+      <div style="color:#3fb950;font-weight:600;">命中: doc=7, doc=42(共 2 个)</div>
+      <div style="color:#8b949e;font-size:11.5px;margin-top:4px;">
+      关键性质:<br>
+      ① 短表(B)驱动长表(A);<br>
+      ② B 用 nextDoc 顺序推进,A 用 advance 大步跳跃;<br>
+      ③ 任一子表用尽即整体结束;<br>
+      ④ 总迭代次数 = O(min(cost)) = O(3) 而非 O(6+3)。
+      </div>
+    </div>
+  </div>
+</div>
+
+<h3>多子句 leapfrog 复杂度</h3>
+
+<table>
+  <thead>
+    <tr><th>子句数 K</th><th>典型 leapfrog 跳跃数 / 命中</th><th>主要瓶颈</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>2</td><td>~1.5 advance</td><td>lead.nextDoc 主导</td></tr>
+    <tr><td>3</td><td>~2-3 advance</td><td>follower advance</td></tr>
+    <tr><td>5</td><td>~3-5 advance</td><td>多 follower 串行</td></tr>
+    <tr><td>10</td><td>~6-10 advance</td><td>follower 顺序遍历成本上升</td></tr>
+    <tr><td>20</td><td>~12-18 advance</td><td>leapfrog 收敛慢</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s18-10">18.10 DisjunctionDISI:最小堆求并</h2>
+<!-- ============================================================ -->
+
+<p>BooleanQuery SHOULD 子句的求并由 <code>DisjunctionDISIPriorityQueue</code> 实现:把所有子 DISI 放入按当前 docID 升序的最小堆,每次取堆顶作为输出,然后调 <code>top.nextDoc()</code> 重排堆。这种"K 路归并"的标准模式,把"求并"的复杂度控制在 O(N × log K)。本节展开堆操作的关键步骤。</p>
+
+<h3>最小堆结构</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-10-1 · DisjunctionDISIPriorityQueue 最小堆</div>
+  <svg viewBox="0 0 1240 580" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 堆顶 disi[0] -->
+    <rect x="500" y="20" width="240" height="80" rx="14" fill="rgba(63,185,80,0.20)" stroke="#3fb950" stroke-width="2"/>
+    <text x="620" y="46" text-anchor="middle" fill="#9be7b3" font-size="14" font-weight="700">堆顶 disi[0] ★</text>
+    <text x="620" y="68" text-anchor="middle" fill="#a5d6ff" font-size="11">当前 docID 最小</text>
+    <text x="620" y="86" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">输出 = disi[0].docID()</text>
+
+    <!-- 第二层 -->
+    <rect x="280" y="160" width="200" height="60" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="380" y="184" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">disi[1]</text>
+    <text x="380" y="202" text-anchor="middle" fill="#a5d6ff" font-size="10">左孩子</text>
+
+    <rect x="760" y="160" width="200" height="60" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="860" y="184" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">disi[2]</text>
+    <text x="860" y="202" text-anchor="middle" fill="#a5d6ff" font-size="10">右孩子</text>
+
+    <line x1="540" y1="100" x2="380" y2="158" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+    <line x1="700" y1="100" x2="860" y2="158" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+
+    <!-- 第三层 -->
+    <rect x="60"  y="280" width="160" height="50" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.4"/>
+    <text x="140" y="310" text-anchor="middle" fill="#cfe9ff" font-size="12" font-weight="700">disi[3]</text>
+
+    <rect x="240" y="280" width="160" height="50" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.4"/>
+    <text x="320" y="310" text-anchor="middle" fill="#cfe9ff" font-size="12" font-weight="700">disi[4]</text>
+
+    <rect x="420" y="280" width="160" height="50" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.4"/>
+    <text x="500" y="310" text-anchor="middle" fill="#cfe9ff" font-size="12" font-weight="700">disi[5]</text>
+
+    <rect x="600" y="280" width="160" height="50" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.4"/>
+    <text x="680" y="310" text-anchor="middle" fill="#cfe9ff" font-size="12" font-weight="700">disi[6]</text>
+
+    <line x1="340" y1="220" x2="170" y2="278" stroke="#58a6ff" stroke-width="1.4" marker-end="url(#arr)"/>
+    <line x1="420" y1="220" x2="320" y2="278" stroke="#58a6ff" stroke-width="1.4" marker-end="url(#arr)"/>
+    <line x1="820" y1="220" x2="500" y2="278" stroke="#58a6ff" stroke-width="1.4" marker-end="url(#arr)"/>
+    <line x1="900" y1="220" x2="680" y2="278" stroke="#58a6ff" stroke-width="1.4" marker-end="url(#arr)"/>
+
+    <!-- 工作流 (右侧) -->
+    <rect x="900" y="280" width="320" height="200" rx="14" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.6"/>
+    <text x="1060" y="306" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">堆顶工作流</text>
+
+    <rect x="920" y="320" width="280" height="40" rx="8" fill="rgba(212,153,34,0.15)" stroke="#d29922" stroke-width="1.2"/>
+    <text x="1060" y="345" text-anchor="middle" fill="#ffd591" font-size="12" font-weight="700">① 输出 docID = disi[0].docID()</text>
+
+    <rect x="920" y="370" width="280" height="40" rx="8" fill="rgba(189,140,255,0.15)" stroke="#bc8cff" stroke-width="1.2"/>
+    <text x="1060" y="395" text-anchor="middle" fill="#e6d3ff" font-size="12" font-weight="700">② disi[0].nextDoc()</text>
+
+    <rect x="920" y="420" width="280" height="40" rx="8" fill="rgba(63,185,80,0.15)" stroke="#3fb950" stroke-width="1.2"/>
+    <text x="1060" y="446" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">③ sift-down O(log K)</text>
+
+    <line x1="900" y1="60"  x2="918" y2="320" stroke="#d29922" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arr-o)"/>
+
+    <!-- 反馈环 -->
+    <path d="M 1060 460 Q 1060 530 620 530 Q 380 530 380 220" stroke="#3fb950" stroke-width="1.4" stroke-dasharray="6 3" fill="none" marker-end="url(#arr-g)"/>
+    <text x="700" y="552" text-anchor="middle" fill="#9be7b3" font-size="11" font-weight="700">重排后回到堆顶 — 重复</text>
+  </svg>
+</div>
+
+<h3>实现骨架</h3>
+
+<pre><code class="language-java">public class DisjunctionDISIPriorityQueue {
+    private final DisiWrapper[] heap;
+    private int size;
+
+    public DisjunctionDISIPriorityQueue(int maxSize) {
+        this.heap = new DisiWrapper[maxSize];
+    }
+
+    public DisiWrapper top() { return heap[0]; }
+
+    public DisiWrapper updateTop() {
+        downHeap(0);
+        return heap[0];
+    }
+
+    private void downHeap(int i) {
+        DisiWrapper node = heap[i];
+        int j = leftChild(i);
+        while (j &lt; size) {
+            int rightSibling = j + 1;
+            if (rightSibling &lt; size
+                &amp;&amp; heap[rightSibling].doc &lt; heap[j].doc) {
+                j = rightSibling;
+            }
+            if (node.doc &lt;= heap[j].doc) break;
+            heap[i] = heap[j];
+            i = j;
+            j = leftChild(i);
+        }
+        heap[i] = node;
+    }
+
+    private static int leftChild(int i) { return 2 * i + 1; }
+}</code></pre>
+
+<h3>SHOULD 求并的迭代逻辑</h3>
+
+<pre><code class="language-java">public int nextDoc() throws IOException {
+    DisiWrapper top = pq.top();
+    int currentDoc = top.doc;
+
+    do {
+        top.doc = top.iterator.nextDoc();
+        top = pq.updateTop();
+    } while (top.doc == currentDoc);
+
+    return top.doc == NO_MORE_DOCS ? NO_MORE_DOCS : top.doc;
+}</code></pre>
+
+<h3>求并的复杂度对比</h3>
+
+<table>
+  <thead>
+    <tr><th>子句数 K</th><th>每 nextDoc 操作</th><th>总命中代价</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>2</td><td>1 次 sift(深度 1)</td><td>O(N)</td></tr>
+    <tr><td>5</td><td>~2-3 次比较</td><td>O(N × 2.3)</td></tr>
+    <tr><td>10</td><td>~3-4 次比较</td><td>O(N × 3.3)</td></tr>
+    <tr><td>50</td><td>~5-6 次比较</td><td>O(N × 5.6)</td></tr>
+    <tr><td>100</td><td>~6-7 次比较</td><td>O(N × 6.6)</td></tr>
+  </tbody>
+</table>
+
+<div class="warning">
+  <strong>SHOULD 子句数过多会让最小堆成为瓶颈</strong>。某 SaaS 客服产品用 100 个 SHOULD 子句做"任意 tag 匹配",每次 nextDoc 触发 ~7 次堆比较 + 7 次 advance,在 1 千万 doc 上 P99 高达 800ms。改造方案:把 100 个 tag 合并到一个 multi-valued 字段 <code>tags</code>,用单一 TermsQuery(MUST 单字段多 term)替代——内部仍用 DisjunctionDISI 求并,但 Lucene 对单字段多 term 走优化路径(<code>BlendedTermQuery</code> 或 <code>TermInSetQuery</code>),P99 降到 30ms。<em>SHOULD 子句不是免费的,K 越大堆深度越大。</em>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s18-11">18.11 TwoPhaseIterator:cheap 候选 + expensive 确认</h2>
+<!-- ============================================================ -->
+
+<p>有些查询的命中判断分两步:<strong>第一步快速过滤候选(approximation),第二步精确确认(matches)</strong>。例如 PhraseQuery 先用倒排取共现 doc,再读 .pos 文件确认 position 邻接;LatLonPoint distance 先用 BBox 过滤,再算精确距离。<code>TwoPhaseIterator</code> 把这两阶段建模成一个抽象,让 BooleanQuery 等上层算法在 leapfrog 时只调 cheap phase,在最终命中时调 expensive phase——这是 Lucene 把"贵的代价分摊到必要 doc"的核心机制。</p>
+
+<h3>TwoPhaseIterator 接口</h3>
+
+<pre><code class="language-java">public abstract class TwoPhaseIterator {
+    protected final DocIdSetIterator approximation;
+
+    protected TwoPhaseIterator(DocIdSetIterator approximation) {
+        this.approximation = approximation;
+    }
+
+    public DocIdSetIterator approximation() {
+        return approximation;
+    }
+
+    public abstract boolean matches() throws IOException;
+
+    public abstract float matchCost();
+
+    public static DocIdSetIterator asDocIdSetIterator(TwoPhaseIterator twoPhase) {
+        return new TwoPhaseIteratorAsDocIdSetIterator(twoPhase);
+    }
+}</code></pre>
+
+<h3>两阶段时序</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-11-1 · TwoPhase 在 BooleanQuery 中的时序</div>
+  <svg viewBox="0 0 1240 720" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 4 个泳道 -->
+    <rect x="40"   y="20" width="200" height="50" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="140"  y="50" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">ConjunctionDISI</text>
+
+    <rect x="380"  y="20" width="200" height="50" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="480"  y="50" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">TwoPhaseIterator</text>
+
+    <rect x="700"  y="20" width="200" height="50" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="1.5"/>
+    <text x="800"  y="44" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">approximation() ★</text>
+    <text x="800"  y="62" text-anchor="middle" fill="#a5d6ff" font-size="10">cheap 候选</text>
+
+    <rect x="1020" y="20" width="200" height="50" rx="8" fill="url(#g-red)"    stroke="#f85149" stroke-width="1.5"/>
+    <text x="1120" y="44" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">matches() ★</text>
+    <text x="1120" y="62" text-anchor="middle" fill="#a5d6ff" font-size="10">expensive 精确</text>
+
+    <line x1="140"  y1="70" x2="140"  y2="700" stroke="#58a6ff" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="480"  y1="70" x2="480"  y2="700" stroke="#d29922" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="800"  y1="70" x2="800"  y2="700" stroke="#3fb950" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="1120" y1="70" x2="1120" y2="700" stroke="#f85149" stroke-width="1" stroke-dasharray="4 4"/>
+
+    <!-- Note 阶段 1 -->
+    <rect x="40" y="100" width="540" height="30" rx="6" fill="rgba(212,153,34,0.12)" stroke="#d29922" stroke-width="1"/>
+    <text x="310" y="120" text-anchor="middle" fill="#d29922" font-size="11" font-weight="700">— 阶段 ① leapfrog 候选 (cheap) —</text>
+
+    <line x1="140" y1="150" x2="478" y2="150" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+    <text x="310" y="143" text-anchor="middle" fill="#ffd591" font-size="11" font-weight="700">① leapfrog 阶段</text>
+
+    <line x1="480" y1="180" x2="798" y2="180" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+    <text x="640" y="173" text-anchor="middle" fill="#9be7b3" font-size="11" font-weight="700">② nextDoc / advance</text>
+
+    <line x1="800" y1="210" x2="482" y2="210" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arr-g)"/>
+    <text x="640" y="203" text-anchor="middle" fill="#9be7b3" font-size="11">③ 候选 docID</text>
+
+    <line x1="480" y1="240" x2="142" y2="240" stroke="#d29922" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arr-o)"/>
+    <text x="310" y="233" text-anchor="middle" fill="#ffd591" font-size="11">④ doc (尚未 matches 验证)</text>
+
+    <!-- Conj self -->
+    <path d="M 140 280 Q 200 280 200 295 Q 200 310 142 310" stroke="#58a6ff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <text x="270" y="305" fill="#cfe9ff" font-size="11" font-weight="700">⑤ 与其它 DISI 对齐</text>
+
+    <!-- alt 大框: 对齐 -->
+    <rect x="40" y="340" width="1180" height="320" rx="10" fill="rgba(189,140,255,0.05)" stroke="#bc8cff" stroke-width="1.2" stroke-dasharray="6 3"/>
+    <text x="60" y="362" fill="#bc8cff" font-size="12" font-weight="700">alt · 所有子 DISI 都对齐到 doc</text>
+
+    <line x1="140" y1="390" x2="478" y2="390" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+    <text x="310" y="383" text-anchor="middle" fill="#ffd591" font-size="11" font-weight="700">⑥ collect 前调 matches()</text>
+
+    <line x1="480" y1="420" x2="1118" y2="420" stroke="#f85149" stroke-width="1.6" marker-end="url(#arr-r)"/>
+    <text x="800" y="413" text-anchor="middle" fill="#ffadad" font-size="11" font-weight="700">⑦ matches() — 阶段 ② expensive</text>
+
+    <line x1="1120" y1="450" x2="482" y2="450" stroke="#f85149" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arr-r)"/>
+    <text x="800" y="443" text-anchor="middle" fill="#ffadad" font-size="11">⑧ true / false</text>
+
+    <!-- 内嵌 alt -->
+    <rect x="60" y="475" width="1140" height="170" rx="10" fill="rgba(248,81,73,0.04)" stroke="#f85149" stroke-width="1" stroke-dasharray="5 3"/>
+    <text x="80" y="495" fill="#f85149" font-size="11" font-weight="700">alt · matches 返回值</text>
+
+    <text x="80" y="520" fill="#3fb950" font-size="12" font-weight="700">true — 真命中 ✓</text>
+    <line x1="480" y1="535" x2="142" y2="535" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arr-g)"/>
+    <text x="310" y="528" text-anchor="middle" fill="#9be7b3" font-size="11" font-weight="700">⑨ collect 真命中</text>
+
+    <line x1="80" y1="555" x2="1180" y2="555" stroke="#f85149" stroke-width="1" stroke-dasharray="3 3"/>
+    <text x="80" y="575" fill="#f85149" font-size="12" font-weight="700">false — 假候选 ✗</text>
+    <line x1="480" y1="595" x2="798" y2="595" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+    <text x="640" y="588" text-anchor="middle" fill="#9be7b3" font-size="11" font-weight="700">⑩ 继续 nextDoc — 重新候选</text>
+
+    <text x="620" y="690" text-anchor="middle" fill="#39d2c0" font-size="13" font-weight="700">★ 设计 — cheap approximation 大量产候选, expensive matches 仅在已对齐 doc 上做精确确认</text>
+  </svg>
+</div>
+
+<h3>TwoPhase 用例汇总</h3>
+
+<table>
+  <thead>
+    <tr><th>查询</th><th>approximation</th><th>matches 代价</th><th>典型 cheap:expensive 比</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>PhraseQuery</code></td><td>共现 doc(.doc)</td><td>读 .pos 检查 position 邻接</td><td>10-50:1</td></tr>
+    <tr><td><code>SpanQuery</code></td><td>候选 span doc</td><td>span 校验</td><td>5-20:1</td></tr>
+    <tr><td><code>LatLonPoint distance</code></td><td>BBox 范围</td><td>精确距离公式</td><td>3-10:1</td></tr>
+    <tr><td><code>PointInPolygonQuery</code></td><td>BBox 范围</td><td>多边形包含判定</td><td>5-15:1</td></tr>
+    <tr><td><code>MultiTermQuery</code> (rewrite 后)</td><td>子 term 求并</td><td>—</td><td>无 expensive</td></tr>
+  </tbody>
+</table>
+
+<h3>PhraseQuery 实例</h3>
+
+<pre><code class="language-java">public class PhraseScorer extends Scorer {
+
+    private final TwoPhaseIterator twoPhase;
+
+    PhraseScorer(Weight weight, ConjunctionDISI approximation,
+                 PhraseMatcher phraseMatcher, ScoreMode scoreMode) {
+        super(weight);
+        this.twoPhase = new TwoPhaseIterator(approximation) {
+            @Override
+            public boolean matches() throws IOException {
+                phraseMatcher.reset();
+                return phraseMatcher.nextMatch();
+            }
+
+            @Override
+            public float matchCost() {
+                return phraseMatcher.matchCost();
+            }
+        };
+    }
+
+    @Override
+    public DocIdSetIterator iterator() {
+        return TwoPhaseIterator.asDocIdSetIterator(twoPhase);
+    }
+
+    @Override
+    public TwoPhaseIterator twoPhaseIterator() { return twoPhase; }
+}</code></pre>
+
+<div class="key-insight">
+  <strong>matchCost() 让 BooleanQuery 决定 TwoPhase 的求交位置</strong>。BooleanQuery 求交多个子句时,会把 TwoPhase 的 expensive matches 推迟到所有 cheap approximation 都对齐之后再调用——这意味着 PhraseQuery 的 .pos 读取只在所有其它 MUST 子句都命中的 doc 上发生。如果这个机制不存在,每个 .pos 候选都要确认,在 1 千万 doc 上代价是数倍。<em>matchCost 越大,这个 deferred 优化越关键</em>;一个 GeoDistance 的 matchCost 是 PhraseQuery 的 5-10 倍,deferred 优化在 GeoDistance 上的提速可达 50-200×。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s18-12">18.12 DocIdSetBuilder:稀疏到稠密自适应</h2>
+<!-- ============================================================ -->
+
+<p>不是所有 docID 集合都适合 FixedBitSet。如果一个 query 命中 1000 万 doc 中的 500 个,FixedBitSet 占 1.25 MiB 但只用了 0.005%——巨大浪费。如果命中 80%(800 万),SparseFixedBitSet 反而比 FixedBitSet 更慢更费内存。<strong><code>DocIdSetBuilder</code> 是 Lucene 的自适应工具:先用稀疏数组累积 docID,达到密度阈值时切换到 FixedBitSet</strong>。本节展开它的切换逻辑与典型用法。</p>
+
+<h3>切换流程</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-12-1 · DocIdSetBuilder 自适应切换</div>
+  <svg viewBox="0 0 1240 600" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- Start -->
+    <rect x="20"  y="40" width="240" height="60" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="140" y="64" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">builder.add(docID)</text>
+    <text x="140" y="84" text-anchor="middle" fill="#a5d6ff" font-size="11">不断累积</text>
+
+    <!-- Check 菱形 -->
+    <polygon points="430,70 600,40 770,70 600,100" fill="rgba(248,81,73,0.10)" stroke="#f85149" stroke-width="1.5"/>
+    <text x="600" y="64" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">已添加 docID 数</text>
+    <text x="600" y="82" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">≥ maxDoc / 128 ?</text>
+    <line x1="260" y1="70" x2="428" y2="70" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+
+    <!-- 否 → Append -->
+    <rect x="430" y="160" width="220" height="60" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="540" y="184" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">追加到 int[] 缓冲</text>
+    <text x="540" y="204" text-anchor="middle" fill="#a5d6ff" font-size="11">push_back · 连续</text>
+    <line x1="500" y1="100" x2="500" y2="158" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+    <text x="475" y="135" fill="#9be7b3" font-size="11" font-weight="700">否</text>
+
+    <!-- 是 → Switch → SetBit -->
+    <rect x="780" y="160" width="220" height="60" rx="12" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.6"/>
+    <text x="890" y="184" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">切换为 FixedBitSet</text>
+    <text x="890" y="204" text-anchor="middle" fill="#a5d6ff" font-size="11">分配 long[]</text>
+    <line x1="700" y1="100" x2="800" y2="158" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+    <text x="730" y="135" fill="#ffd591" font-size="11" font-weight="700">是</text>
+
+    <rect x="780" y="250" width="220" height="50" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.4"/>
+    <text x="890" y="280" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">set 对应 bit</text>
+    <line x1="890" y1="220" x2="890" y2="248" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+
+    <!-- Cont 汇合 -->
+    <rect x="430" y="320" width="380" height="50" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="620" y="350" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">继续累积下一 docID — 直到 build()</text>
+    <line x1="540" y1="220" x2="540" y2="318" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+    <line x1="890" y1="300" x2="710" y2="318" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+
+    <!-- Build -->
+    <rect x="480" y="400" width="280" height="50" rx="12" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="620" y="430" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">builder.build()</text>
+    <line x1="620" y1="370" x2="620" y2="398" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+
+    <!-- Out 决策 -->
+    <polygon points="620,460 800,510 620,560 440,510" fill="rgba(248,81,73,0.10)" stroke="#f85149" stroke-width="1.4"/>
+    <text x="620" y="510" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">返回类型</text>
+    <text x="620" y="528" text-anchor="middle" fill="#a5d6ff" font-size="10">基于密度</text>
+    <line x1="620" y1="450" x2="620" y2="458" stroke="#58a6ff" stroke-width="1.4" marker-end="url(#arr)"/>
+
+    <!-- 三个出口 -->
+    <rect x="20"   y="490" width="240" height="60" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="140"  y="514" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">int[] 排序去重</text>
+    <text x="140"  y="534" text-anchor="middle" fill="#a5d6ff" font-size="11">密度 &lt; 0.005</text>
+
+    <rect x="900"  y="490" width="320" height="60" rx="12" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="1060" y="514" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">SparseFixedBitSet</text>
+    <text x="1060" y="534" text-anchor="middle" fill="#a5d6ff" font-size="11">0.005 ≤ d &lt; 0.05</text>
+
+    <rect x="850"  y="400" width="320" height="50" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="1010" y="430" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">FixedBitSet (密度 ≥ 0.05)</text>
+
+    <line x1="440" y1="510" x2="262" y2="520" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+    <line x1="800" y1="510" x2="898" y2="520" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+    <line x1="780" y1="475" x2="848" y2="430" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+  </svg>
+</div>
+
+<h3>三种密度的实现选择</h3>
+
+<table>
+  <thead>
+    <tr><th>密度(命中 / maxDoc)</th><th>实现</th><th>单 docID 内存</th><th>查询性能</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>&lt; 0.005(极稀疏)</td><td>int[] 排序 + 二分</td><td>4 字节</td><td>O(log N)</td></tr>
+    <tr><td>0.005 - 0.05(稀疏)</td><td>SparseFixedBitSet</td><td>~0.5 字节</td><td>O(1) bucket 查</td></tr>
+    <tr><td>≥ 0.05(稠密)</td><td>FixedBitSet</td><td>0.125 字节(1 bit)</td><td>O(1) 字级</td></tr>
+  </tbody>
+</table>
+
+<h3>典型用法</h3>
+
+<pre><code class="language-java">public DocIdSet collectMatchingDocs(int maxDoc, IndexSearcher searcher,
+                                     Query query) throws IOException {
+    DocIdSetBuilder builder = new DocIdSetBuilder(maxDoc);
+
+    Weight weight = searcher.createWeight(query, ScoreMode.COMPLETE_NO_SCORES, 1f);
+    for (LeafReaderContext ctx : searcher.getIndexReader().leaves()) {
+        Scorer scorer = weight.scorer(ctx);
+        if (scorer == null) continue;
+        DocIdSetIterator iter = scorer.iterator();
+        DocIdSetBuilder.BulkAdder adder = builder.grow(iter.cost());
+        for (int doc = iter.nextDoc(); doc != NO_MORE_DOCS; doc = iter.nextDoc()) {
+            adder.add(ctx.docBase + doc);
+        }
+    }
+
+    return builder.build();
+}</code></pre>
+
+<h3>文档号空间分布卡片</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-12-2 · 文档号空间分布与最优实现</div>
+  <div style="background:#0d1117;border:1.5px solid #58a6ff;border-radius:10px;padding:18px;font-family:'Cascadia Code','SFMono-Regular',Consolas,monospace;font-size:12.5px;color:#a5d6ff;">
+    <div style="color:#58a6ff;font-weight:600;font-size:13px;margin-bottom:10px;">maxDoc = 10M · 几种命中分布对应的最优实现</div>
+
+    <div style="background:#161b22;border-left:3px solid #f85149;padding:10px 12px;margin-bottom:8px;border-radius:4px;">
+      <div style="color:#f85149;font-weight:600;margin-bottom:4px;">▼ 极稀疏 100 命中(0.001%)</div>
+      <div style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+        分布: [42, 1234, 5678, 99999, 123456, ...] 离散<br>
+        实现: <span style="color:#3fb950;">int[100]</span>(400 byte)<br>
+        ▸ 比 FixedBitSet 1.25 MiB 节省 3000×
+      </div>
+    </div>
+
+    <div style="background:#161b22;border-left:3px solid #d29922;padding:10px 12px;margin-bottom:8px;border-radius:4px;">
+      <div style="color:#d29922;font-weight:600;margin-bottom:4px;">▼ 稀疏 1000 命中(0.01%)</div>
+      <div style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+        分布: 集中在几个 4096-bucket<br>
+        实现: <span style="color:#3fb950;">SparseFixedBitSet</span> ~133 KiB<br>
+        ▸ 桶级跳过,字级访问
+      </div>
+    </div>
+
+    <div style="background:#161b22;border-left:3px solid #58a6ff;padding:10px 12px;margin-bottom:8px;border-radius:4px;">
+      <div style="color:#58a6ff;font-weight:600;margin-bottom:4px;">▼ 中密度 50万命中(5%)</div>
+      <div style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+        分布: 大部分 4096-bucket 都有命中<br>
+        实现: <span style="color:#3fb950;">FixedBitSet</span> 1.25 MiB<br>
+        ▸ 字级 AND/OR SIMD 加速
+      </div>
+    </div>
+
+    <div style="background:#161b22;border-left:3px solid #3fb950;padding:10px 12px;border-radius:4px;">
+      <div style="color:#3fb950;font-weight:600;margin-bottom:4px;">▼ 稠密 800万命中(80%)</div>
+      <div style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+        分布: 几乎所有 doc 命中<br>
+        实现: <span style="color:#3fb950;">FixedBitSet</span> 1.25 MiB<br>
+        ▸ 反向思考: not-bitset 可能更紧凑
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s18-13">18.13 LiveDocs 与 .liv 文件</h2>
+<!-- ============================================================ -->
+
+<p>LiveDocs 是 segment 内"哪些 doc 还活着"的位图——所有 IndexWriter.deleteDocuments / updateDocuments 的最终落点。LiveDocs 是 FixedBitSet 在 Lucene 内最重要的应用,所有查询的 DISI 在 collect 之前都要过一遍 LiveDocs 过滤。本节展开 .liv 文件的字节布局、generation 命名、merge 时的清理。</p>
+
+<h3>LiveDocs 的概念</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-13-1 · LiveDocs 的位图语义</div>
+  <div style="background:#0d1117;border:1.5px solid #58a6ff;border-radius:10px;padding:18px;font-family:'Cascadia Code','SFMono-Regular',Consolas,monospace;font-size:12.5px;color:#a5d6ff;">
+    <div style="color:#58a6ff;font-weight:600;font-size:13px;margin-bottom:10px;">segment _0 · maxDoc = 100 · 删除了 doc 5, 12, 42</div>
+
+    <div style="background:#161b22;border-left:3px solid #3fb950;padding:10px 12px;margin-bottom:8px;border-radius:4px;">
+      <div style="color:#3fb950;font-weight:600;margin-bottom:4px;">▼ 初始 LiveDocs · 全 1</div>
+      <div style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+        bits = [1111_1111, 1111_1111, ..., 1111_1111]<br>
+        cardinality = 100, 全 alive
+      </div>
+    </div>
+
+    <div style="background:#161b22;border-left:3px solid #f85149;padding:10px 12px;margin-bottom:8px;border-radius:4px;">
+      <div style="color:#f85149;font-weight:600;margin-bottom:4px;">▼ 删除 doc 5, 12, 42 后</div>
+      <div style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+        bits[0]: 0xDF (bit 5 cleared = 1101 1111)<br>
+        bits[0]: 0xCF (bit 12 cleared)  <span style="color:#6e7681;">// 实际 bits[0] 含 bit 0..63</span><br>
+        bits[0] full: bit 5 = 0, bit 12 = 0, bit 42 = 0<br>
+        cardinality = 97, 97 alive
+      </div>
+    </div>
+
+    <div style="background:#161b22;border-left:3px solid #d29922;padding:10px 12px;border-radius:4px;">
+      <div style="color:#d29922;font-weight:600;margin-bottom:4px;">▼ 查询时的过滤</div>
+      <div style="color:#8b949e;font-size:11.5px;line-height:1.7;">
+        每个 DISI 输出的 docID 都先 liveDocs.get(doc):<br>
+        - true (alive)  → collect<br>
+        - false (deleted) → 丢弃 + 继续 nextDoc<br>
+        <span style="color:#3fb950;">▸ 这是查询路径上的 1 bit / doc 开销</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<h3>.liv 文件字节布局</h3>
+
+<pre><code class="language-text">.liv 文件结构(LiveDocs 持久化):
+
+  ┌──────────────────────────────────────────┐
+  │ CodecHeader (16 byte)                     │
+  │   magic 0x3FD76C17 + "Lucene90LiveDocs"   │
+  │   + version int + segment id 16 byte      │
+  ├──────────────────────────────────────────┤
+  │ generation: long (8 byte, 大端)            │
+  │   每次更新 LiveDocs 自增                    │
+  ├──────────────────────────────────────────┤
+  │ FixedBitSet (numBits / 64 个 long):        │
+  │   numBits (VInt, 1-5 byte)                  │
+  │   long[ceil(numBits/64)] (numBits/8 byte)   │
+  │   小端字节序(JVM 默认)                    │
+  ├──────────────────────────────────────────┤
+  │ CodecFooter (16 byte)                     │
+  │   magic 0xC02893E8 + algorithm + CRC32    │
+  └──────────────────────────────────────────┘
+
+  文件名规则:
+    _0_3.liv
+    └─ _0:   segment 名
+       └─ _3: LiveDocs generation
+
+  每次新增删除 → 写新 _0_4.liv,旧版本由 IndexWriter 异步删除
+  reader 打开时定位 generation 最大的 .liv 作为最新</code></pre>
+
+<h3>LiveDocs 写入路径</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-13-2 · IndexWriter.deleteDocuments 到 .liv 的流程</div>
+  <svg viewBox="0 0 1240 240" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 7 个连续步骤 -->
+    <rect x="20"   y="40" width="160" height="80" rx="12" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="100"  y="68" text-anchor="middle" fill="#cfe9ff" font-size="12" font-weight="700">IndexWriter</text>
+    <text x="100"  y="86" text-anchor="middle" fill="#a5d6ff" font-size="11">.deleteDocuments</text>
+    <text x="100"  y="106" text-anchor="middle" fill="#39d2c0" font-size="10">业务调用入口</text>
+
+    <rect x="200"  y="40" width="140" height="80" rx="12" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="270"  y="68" text-anchor="middle" fill="#ffd591" font-size="12" font-weight="700">BufferedUpdates</text>
+    <text x="270"  y="86" text-anchor="middle" fill="#a5d6ff" font-size="10">缓冲删除请求</text>
+    <text x="270"  y="106" text-anchor="middle" fill="#39d2c0" font-size="10">term / docID 队列</text>
+
+    <rect x="360"  y="40" width="140" height="80" rx="12" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="430"  y="68" text-anchor="middle" fill="#ffd591" font-size="12" font-weight="700">applyDeletes</text>
+    <text x="430"  y="86" text-anchor="middle" fill="#a5d6ff" font-size="10">flush / commit 时</text>
+
+    <rect x="520"  y="40" width="140" height="80" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="590"  y="68" text-anchor="middle" fill="#e6d3ff" font-size="12" font-weight="700">定位所属 segment</text>
+    <text x="590"  y="86" text-anchor="middle" fill="#a5d6ff" font-size="10">term → docFreq</text>
+
+    <rect x="680"  y="40" width="160" height="80" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.6"/>
+    <text x="760"  y="68" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">FixedBitSet</text>
+    <text x="760"  y="86" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">.clear(docID) ★</text>
+    <text x="760"  y="106" text-anchor="middle" fill="#39d2c0" font-size="10">in-memory 翻 bit</text>
+
+    <rect x="860"  y="40" width="160" height="80" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="940"  y="68" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">SegmentInfo</text>
+    <text x="940"  y="86" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">.delGen++</text>
+    <text x="940"  y="106" text-anchor="middle" fill="#39d2c0" font-size="10">新 generation</text>
+
+    <rect x="1040" y="40" width="180" height="80" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.6"/>
+    <text x="1130" y="68" text-anchor="middle" fill="#e6d3ff" font-size="12" font-weight="700">commit / flush</text>
+    <text x="1130" y="86" text-anchor="middle" fill="#e6d3ff" font-size="12" font-weight="700">写新 .liv</text>
+    <text x="1130" y="106" text-anchor="middle" fill="#39d2c0" font-size="10">_seg_gen.liv</text>
+
+    <!-- 6 条横向 arrow -->
+    <line x1="180" y1="80" x2="198" y2="80" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="340" y1="80" x2="358" y2="80" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+    <line x1="500" y1="80" x2="518" y2="80" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+    <line x1="660" y1="80" x2="678" y2="80" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <line x1="840" y1="80" x2="858" y2="80" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+    <line x1="1020" y1="80" x2="1038" y2="80" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+
+    <!-- 旧 .liv 异步删除 (下方) -->
+    <rect x="1000" y="160" width="220" height="60" rx="12" fill="rgba(248,81,73,0.10)" stroke="#f85149" stroke-width="1.4" stroke-dasharray="6 3"/>
+    <text x="1110" y="184" text-anchor="middle" fill="#ffadad" font-size="12" font-weight="700">旧 .liv 异步删除</text>
+    <text x="1110" y="204" text-anchor="middle" fill="#a5d6ff" font-size="11">IndexFileDeleter — 引用计数</text>
+    <line x1="1130" y1="120" x2="1110" y2="158" stroke="#f85149" stroke-width="1.4" marker-end="url(#arr-r)"/>
+  </svg>
+</div>
+
+<h3>LiveDocs 内存占用估算</h3>
+
+<div class="metric-row">
+  <div class="metric">
+    <div class="value">1.25 MiB</div>
+    <div class="label">10M doc LiveDocs</div>
+  </div>
+  <div class="metric">
+    <div class="value">12 MiB</div>
+    <div class="label">100M doc LiveDocs</div>
+  </div>
+  <div class="metric">
+    <div class="value">125 ns</div>
+    <div class="label">advance 跳过 1 删除</div>
+  </div>
+  <div class="metric">
+    <div class="value">~50 µs</div>
+    <div class="label">10M cardinality</div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s18-14">18.14 LiveDocs 在查询中:每候选 1 bit 过滤</h2>
+<!-- ============================================================ -->
+
+<p>查询时每个 DISI 推进的候选 doc 都要过一遍 LiveDocs。这个过滤通过 <code>ConstantScoreScorer</code> 或 <code>FilteredDocIdSetIterator</code> 的内层逻辑实现:Scorer.iterator().nextDoc() 拿到候选,Collector.collect() 之前先 <code>liveDocs.get(doc)</code>。如果是 false,跳过当前 doc 继续 nextDoc。本节展开这个机制以及它的性能影响。</p>
+
+<h3>查询时的 LiveDocs 过滤时序</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-14-1 · 查询执行时 LiveDocs 过滤</div>
+  <svg viewBox="0 0 1240 480" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 5 个泳道 -->
+    <rect x="40"   y="20" width="180" height="50" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="1.4"/>
+    <text x="130"  y="50" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">Query</text>
+
+    <rect x="280"  y="20" width="180" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.4"/>
+    <text x="370"  y="50" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">LeafReader</text>
+
+    <rect x="520"  y="20" width="180" height="50" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.4"/>
+    <text x="610"  y="50" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">DocIdSetIterator</text>
+
+    <rect x="760"  y="20" width="180" height="50" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="1.6"/>
+    <text x="850"  y="44" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">LiveDocs ★</text>
+    <text x="850"  y="62" text-anchor="middle" fill="#a5d6ff" font-size="10">FixedBitSet 过滤</text>
+
+    <rect x="1000" y="20" width="200" height="50" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="1.4"/>
+    <text x="1100" y="50" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">Collector</text>
+
+    <line x1="130"  y1="70" x2="130"  y2="460" stroke="#58a6ff" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="370"  y1="70" x2="370"  y2="460" stroke="#bc8cff" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="610"  y1="70" x2="610"  y2="460" stroke="#d29922" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="850"  y1="70" x2="850"  y2="460" stroke="#3fb950" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="1100" y1="70" x2="1100" y2="460" stroke="#58a6ff" stroke-width="1" stroke-dasharray="4 4"/>
+
+    <!-- ① Q → DISI nextDoc -->
+    <line x1="130" y1="110" x2="608" y2="110" stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+    <text x="370" y="103" text-anchor="middle" fill="#ffd591" font-size="11" font-weight="700">① nextDoc()</text>
+
+    <!-- ② DISI → Q candidate -->
+    <line x1="610" y1="140" x2="132" y2="140" stroke="#d29922" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arr-o)"/>
+    <text x="370" y="133" text-anchor="middle" fill="#ffd591" font-size="11">② candidate doc = 42</text>
+
+    <!-- ③ Q → Liv get(42) -->
+    <line x1="130" y1="180" x2="848" y2="180" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+    <text x="490" y="173" text-anchor="middle" fill="#9be7b3" font-size="11" font-weight="700">③ liveDocs.get(42) — bit 检查</text>
+
+    <!-- alt 框 -->
+    <rect x="40" y="210" width="1200" height="240" rx="10" fill="rgba(189,140,255,0.05)" stroke="#bc8cff" stroke-width="1.2" stroke-dasharray="6 3"/>
+    <text x="60" y="232" fill="#bc8cff" font-size="12" font-weight="700">alt · LiveDocs bit 是否 set?</text>
+
+    <text x="60" y="260" fill="#3fb950" font-size="12" font-weight="700">bit set (alive — doc 还活着) ✓</text>
+    <line x1="850" y1="280" x2="132" y2="280" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arr-g)"/>
+    <text x="490" y="273" text-anchor="middle" fill="#9be7b3" font-size="11" font-weight="700">④ true</text>
+
+    <line x1="130" y1="310" x2="1098" y2="310" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+    <text x="610" y="303" text-anchor="middle" fill="#cfe9ff" font-size="11" font-weight="700">⑤ collect(doc = 42) — 真命中</text>
+
+    <line x1="60" y1="335" x2="1240" y2="335" stroke="#f85149" stroke-width="1" stroke-dasharray="3 3"/>
+
+    <text x="60" y="360" fill="#f85149" font-size="12" font-weight="700">bit clear (deleted — doc 被删) ✗</text>
+    <line x1="850" y1="380" x2="132" y2="380" stroke="#f85149" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arr-r)"/>
+    <text x="490" y="373" text-anchor="middle" fill="#ffadad" font-size="11" font-weight="700">⑥ false</text>
+
+    <line x1="130" y1="410" x2="608" y2="410" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+    <text x="370" y="403" text-anchor="middle" fill="#ffd591" font-size="11" font-weight="700">⑦ nextDoc() — 跳过被删 doc</text>
+
+    <text x="610" y="440" text-anchor="middle" fill="#ffadad" font-size="11">回到 loop 头 — 继续找下一候选</text>
+  </svg>
+</div>
+
+<h3>ConstantScoreScorer 包装 LiveDocs</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-14-2 · ConstantScoreScorer 在过滤路径上的位置</div>
+  <svg viewBox="0 0 1240 360" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 入口 FILTER -->
+    <rect x="20"  y="140" width="200" height="80" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="120" y="168" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">FILTER 子句</text>
+    <text x="120" y="188" text-anchor="middle" fill="#a5d6ff" font-size="11">status:PAID</text>
+    <text x="120" y="208" text-anchor="middle" fill="#39d2c0" font-size="10">不参与 score</text>
+
+    <!-- Cache 决策 -->
+    <polygon points="380,180 540,140 700,180 540,220" fill="rgba(248,81,73,0.10)" stroke="#f85149" stroke-width="1.6"/>
+    <text x="540" y="178" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">LRUQueryCache</text>
+    <text x="540" y="198" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">命中 ?</text>
+    <line x1="220" y1="180" x2="378" y2="180" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+
+    <!-- 是 → BitSetIterator (上分支) -->
+    <rect x="380" y="40" width="320" height="64" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.6"/>
+    <text x="540" y="64" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">BitSetIterator(FixedBitSet) ★</text>
+    <text x="540" y="84" text-anchor="middle" fill="#a5d6ff" font-size="11">命中 — 不打开 .doc · 字级跳跃</text>
+    <line x1="540" y1="138" x2="540" y2="106" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+    <text x="560" y="125" fill="#9be7b3" font-size="11" font-weight="700">是</text>
+
+    <!-- 否 → PostingsEnum (下分支) -->
+    <rect x="380" y="260" width="320" height="64" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.6"/>
+    <text x="540" y="284" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">PostingsEnum (.doc)</text>
+    <text x="540" y="304" text-anchor="middle" fill="#a5d6ff" font-size="11">未命中 — 走磁盘倒排 · 第 11 章</text>
+    <line x1="540" y1="222" x2="540" y2="258" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <text x="560" y="245" fill="#e6d3ff" font-size="11" font-weight="700">否</text>
+
+    <!-- ConstantScoreScorer 中间汇合 -->
+    <rect x="780" y="140" width="240" height="80" rx="14" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.8"/>
+    <text x="900" y="166" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">ConstantScoreScorer</text>
+    <text x="900" y="186" text-anchor="middle" fill="#a5d6ff" font-size="11">包装 DISI</text>
+    <text x="900" y="208" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">score = boost (常量)</text>
+
+    <line x1="700" y1="72"  x2="800" y2="148" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+    <line x1="700" y1="292" x2="800" y2="216" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+
+    <!-- LiveDocs filter -->
+    <rect x="1080" y="140" width="140" height="80" rx="14" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.6"/>
+    <text x="1150" y="166" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">LiveDocs</text>
+    <text x="1150" y="184" text-anchor="middle" fill="#a5d6ff" font-size="11">filter</text>
+    <text x="1150" y="206" text-anchor="middle" fill="#39d2c0" font-size="10">每候选 1 bit</text>
+    <line x1="1020" y1="180" x2="1078" y2="180" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+
+    <!-- Collector -->
+    <rect x="500" y="280" width="240" height="48" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="620" y="310" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">Collector.collect()</text>
+
+    <path d="M 1150 220 Q 1150 280 880 304 Q 740 320 740 304" stroke="#58a6ff" stroke-width="1.4" stroke-dasharray="6 3" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<pre><code class="language-java">public final class ConstantScoreScorer extends Scorer {
+    private final float score;
+    private final ScoreMode scoreMode;
+    private final DocIdSetIterator approximation;
+    private final TwoPhaseIterator twoPhaseIterator;
+
+    public ConstantScoreScorer(float score, ScoreMode scoreMode,
+                                DocIdSetIterator iterator) {
+        this.score = score;
+        this.scoreMode = scoreMode;
+        this.approximation = iterator;
+        this.twoPhaseIterator = null;
+    }
+
+    @Override
+    public DocIdSetIterator iterator() { return approximation; }
+
+    @Override
+    public float score() { return score; }
+
+    @Override
+    public int docID() { return approximation.docID(); }
+
+    @Override
+    public float getMaxScore(int upTo) { return score; }
+}</code></pre>
+
+<h3>LiveDocs 性能影响</h3>
+
+<table>
+  <thead>
+    <tr><th>删除率</th><th>candidate 浪费比</th><th>P99 影响</th><th>典型对策</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>&lt; 5%(健康)</td><td>5% 候选作废</td><td>+ 几乎 0</td><td>无需特殊处理</td></tr>
+    <tr><td>5-20%(常态)</td><td>20% 候选作废</td><td>+ 5-10%</td><td>正常 segment merge 即可清理</td></tr>
+    <tr><td>20-50%(高)</td><td>50% 候选作废</td><td>+ 20-50%</td><td>显式 forceMergeDeletes</td></tr>
+    <tr><td>&gt; 50%(异常)</td><td>50%+ 候选作废 + 索引膨胀</td><td>+ 100% 以上</td><td>必须 forceMerge 紧凑</td></tr>
+  </tbody>
+</table>
+
+<div class="warning">
+  <strong>高删除率不 forceMerge 是磁盘膨胀的最大根因</strong>。一个生产订单库,每天删 10% 旧订单,90 天后磁盘里只有 ~40% 是 alive doc——但 .doc / .pos / .pay 文件依然按"含已删 doc"的大小存在,LiveDocs 不能释放底层 postings 空间。某客户索引从 5 GB 膨胀到 18 GB 才发现,执行 <code>writer.forceMergeDeletes()</code> 后回到 6.2 GB。<em>定期 forceMergeDeletes 是高写入索引的运维必修课;Lucene 9 起的 <code>TieredMergePolicy.deletesPctAllowed</code> 默认 33%,可以调到 20% 主动触发。</em>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s18-15">18.15 性能基准:advance / cardinality / AND 的纳秒级数据</h2>
+<!-- ============================================================ -->
+
+<p>本节给出 BitSet / DISI 路径上各操作的纳秒级基线。所有数据基于 NVMe SSD + JDK 21 + Lucene 9.10 + 单核 + L1/L2 cache 命中。生产里偏离基线 ≥ 5 倍,通常说明有热点(GC、cache miss、跨 NUMA)。</p>
+
+<h3>核心操作纳秒级表</h3>
+
+<table>
+  <thead>
+    <tr><th>操作</th><th>数据规模</th><th>期望延迟</th><th>主要瓶颈</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>FixedBitSet.get(i)</code></td><td>L1 cache 命中</td><td>0.5-1 ns</td><td>1 条 SHR + AND</td></tr>
+    <tr><td><code>FixedBitSet.set(i)</code></td><td>L1 cache 命中</td><td>0.5-1 ns</td><td>1 条 OR</td></tr>
+    <tr><td><code>FixedBitSet.cardinality()</code></td><td>1M long(8 MiB)</td><td>~50 µs</td><td>POPCNT 累加</td></tr>
+    <tr><td><code>FixedBitSet.and(other)</code></td><td>1M long</td><td>~200 µs(AVX-512)</td><td>SIMD AND</td></tr>
+    <tr><td><code>FixedBitSet.or(other)</code></td><td>1M long</td><td>~200 µs</td><td>SIMD OR</td></tr>
+    <tr><td><code>BitSetIterator.nextDoc()</code></td><td>稠密(每 word 多 set bit)</td><td>2-4 ns</td><td>循环展开</td></tr>
+    <tr><td><code>BitSetIterator.advance(short)</code></td><td>跨距 &lt; 64</td><td>2-4 ns</td><td>同 word 内</td></tr>
+    <tr><td><code>BitSetIterator.advance(mid)</code></td><td>跨距 1K</td><td>10-30 ns</td><td>跳几 word</td></tr>
+    <tr><td><code>BitSetIterator.advance(big)</code></td><td>跨距 1M</td><td>~150 µs</td><td>15K 空 word 扫</td></tr>
+    <tr><td><code>SparseFixedBitSet.get(i)</code></td><td>已分配 block</td><td>3-5 ns</td><td>2 次 array load</td></tr>
+    <tr><td><code>SparseFixedBitSet.and(other)</code></td><td>1000 命中</td><td>5-15 µs</td><td>block 比对 + 字级</td></tr>
+    <tr><td><code>RoaringDocIdSet.iterator</code></td><td>桶 + 容器跳转</td><td>10-30 ns</td><td>容器类型分支</td></tr>
+    <tr><td><code>ConjunctionDISI 求交</code></td><td>3 子句 1M 命中</td><td>~3-5 ms</td><td>leapfrog</td></tr>
+  </tbody>
+</table>
+
+<h3>BitSetIterator vs PostingsEnum 全面对比</h3>
+
+<table>
+  <thead>
+    <tr><th>维度</th><th>BitSetIterator</th><th>BlockPostingsEnum</th><th>建议</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>来源</td><td>内存 BitSet</td><td>磁盘 .doc 文件</td><td>—</td></tr>
+    <tr><td>初始化</td><td>包装现成 BitSet</td><td>seek + open IndexInput</td><td>BitSet 命中后零开销</td></tr>
+    <tr><td>nextDoc</td><td>2-4 ns</td><td>2-4 ns(block 内)</td><td>持平</td></tr>
+    <tr><td>advance(短)</td><td>2-4 ns(字级)</td><td>4-8 ns(block 内)</td><td>BitSet 略胜</td></tr>
+    <tr><td>advance(中)</td><td>10-30 ns</td><td>20-50 ns</td><td>BitSet 略胜</td></tr>
+    <tr><td>advance(大跨)</td><td>150 µs(全 word 扫)</td><td>500-1500 ns(三级 skip)</td><td>PostingsEnum 完胜</td></tr>
+    <tr><td>评分能力</td><td>无 freq</td><td>有 freq + Impacts</td><td>评分必须 PostingsEnum</td></tr>
+    <tr><td>典型用法</td><td>FILTER + LiveDocs</td><td>MUST + 评分</td><td>—</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s18-16">18.16 生产陷阱:8 个真实故障案例</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead>
+    <tr><th>#</th><th>陷阱</th><th>现象</th><th>根因</th><th>修复</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td>高删除率不 forceMerge</td><td>磁盘膨胀 + P99 抖</td><td>LiveDocs 不释放 postings 空间</td><td>定期 <code>forceMergeDeletes</code></td></tr>
+    <tr><td>2</td><td>误用密集 BitSet</td><td>内存大,cache miss 多</td><td>稀疏数据用 FixedBitSet</td><td>用 SparseFixedBitSet 或 DocIdSetBuilder</td></tr>
+    <tr><td>3</td><td>DISI 不按顺序</td><td>异常或死循环</td><td>advance 跳到比 docID() 小的值</td><td>必须严格升序</td></tr>
+    <tr><td>4</td><td>TwoPhase matches 慢</td><td>查询慢</td><td>大候选 + 验证慢</td><td>缩小 approximation 集合</td></tr>
+    <tr><td>5</td><td>LiveDocs 滞后</td><td>删除不可见</td><td>reader 未刷新</td><td><code>SearcherManager.maybeRefresh</code></td></tr>
+    <tr><td>6</td><td>List&lt;Integer&gt; 求交</td><td>OOM 或超时</td><td>O(N²) 求交</td><td>改 FixedBitSet 字级 AND</td></tr>
+    <tr><td>7</td><td>自定义 Query cost 错</td><td>BooleanQuery P99 退化</td><td>cost 返回 0 或 MAX_VALUE</td><td>给真实接近的命中估计</td></tr>
+    <tr><td>8</td><td>SHOULD 子句过多</td><td>P99 高</td><td>堆深度大,sift 多</td><td>合并到多值字段 TermsQuery</td></tr>
+  </tbody>
+</table>
+
+<div class="real-world">
+  <strong>"删了 30% 的 doc,P99 从 5ms 飙到 60ms"</strong>。某电商订单库的真实故障:每周末批量归档 1 周前的订单(15-20%),累积到第 3 周后 LiveDocs 删除率 30%+,P99 从 5ms 飙到 60ms。剖析发现 LRUQueryCache 命中率不变(filter 还是同样),但 BlockPostingsEnum.advance 次数翻 1.5 倍——因为 conjunction 推进时大量 candidate 是 deleted doc,需要继续 nextDoc。修复:把 cron job 加上 <code>writer.forceMergeDeletes()</code>(每周末归档后立即执行),P99 回到 6ms。<em>LiveDocs 是查询路径上的"沉默税",删除率监控应该是搜索集群的标准告警项。</em>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s18-17">18.17 源码入口与调试</h2>
+<!-- ============================================================ -->
+
+<p>本章最后把核心源码入口梳理一遍。所有类位于 <code>org.apache.lucene.search</code> 和 <code>org.apache.lucene.util</code> 两个核心包,Lucene 9.x 起稳定。</p>
+
+<h3>核心类速查</h3>
+
+<table>
+  <thead>
+    <tr><th>类 / 文件</th><th>角色</th><th>本章对应</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>DocIdSetIterator</code></td><td>所有 DISI 的抽象基类</td><td>§18.1</td></tr>
+    <tr><td><code>BitSet</code></td><td>FixedBitSet / SparseFixedBitSet 的抽象</td><td>§18.2 §18.3</td></tr>
+    <tr><td><code>FixedBitSet</code></td><td>稠密 long[] 位图实现</td><td>§18.2 §18.5</td></tr>
+    <tr><td><code>SparseFixedBitSet</code></td><td>双层 bucket 稀疏位图</td><td>§18.3</td></tr>
+    <tr><td><code>RoaringDocIdSet</code></td><td>三 container 自适应</td><td>§18.4</td></tr>
+    <tr><td><code>BitSetIterator</code></td><td>BitSet 到 DISI 的适配</td><td>§18.6 §18.7</td></tr>
+    <tr><td><code>ConjunctionDISI</code></td><td>MUST / FILTER 求交 leapfrog</td><td>§18.9</td></tr>
+    <tr><td><code>DisjunctionDISIPriorityQueue</code></td><td>SHOULD 求并最小堆</td><td>§18.10</td></tr>
+    <tr><td><code>TwoPhaseIterator</code></td><td>cheap + expensive 拆分</td><td>§18.11</td></tr>
+    <tr><td><code>DocIdSetBuilder</code></td><td>稀疏到稠密自适应</td><td>§18.12</td></tr>
+    <tr><td><code>ConstantScoreScorer</code></td><td>FILTER 的常量评分包装</td><td>§18.14</td></tr>
+    <tr><td><code>BitUtil</code></td><td>POPCNT / pop_intersect 等字级工具</td><td>§18.5</td></tr>
+    <tr><td><code>Lucene90LiveDocsFormat</code></td><td>.liv 文件读写</td><td>§18.13</td></tr>
+  </tbody>
+</table>
+
+<h3>调试工具</h3>
+
+<table>
+  <thead>
+    <tr><th>工具</th><th>用途</th><th>典型用法</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>BitSet.cardinality()</code></td><td>数 set bit</td><td>验证 LiveDocs / Filter 缓存大小</td></tr>
+    <tr><td><code>DISI.cost()</code></td><td>估计代价</td><td>调试 leapfrog 顺序问题</td></tr>
+    <tr><td><code>LeafReader.getLiveDocs()</code></td><td>取段内 LiveDocs</td><td>计算实际 alive doc</td></tr>
+    <tr><td><code>numDocs() vs maxDoc()</code></td><td>活 doc 数 vs 含已删</td><td>判断删除率</td></tr>
+    <tr><td><code>CheckIndex</code></td><td>索引完整性</td><td><code>java org.apache.lucene.index.CheckIndex /path</code></td></tr>
+    <tr><td>JFR(Flight Recorder)</td><td>BitSet 操作 CPU 热点</td><td><code>jcmd &lt;pid&gt; JFR.start</code></td></tr>
+  </tbody>
+</table>
+
+<h3>调试代码模板</h3>
+
+<pre><code class="language-java">try (DirectoryReader reader = DirectoryReader.open(dir)) {
+    int totalLive = 0;
+    int totalMax = 0;
+    for (LeafReaderContext ctx : reader.leaves()) {
+        LeafReader leaf = ctx.reader();
+        Bits liveDocs = leaf.getLiveDocs();
+        int maxDoc = leaf.maxDoc();
+        int alive = leaf.numDocs();
+        totalLive += alive;
+        totalMax += maxDoc;
+
+        double deletePct = 100.0 * (maxDoc - alive) / maxDoc;
+        System.out.printf("Segment %s: maxDoc=%d alive=%d delete=%.1f%%%n",
+            leaf, maxDoc, alive, deletePct);
+        if (deletePct &gt; 25) {
+            System.out.println("  ⚠ 高删除率,建议 forceMergeDeletes");
+        }
+    }
+
+    double overall = 100.0 * (totalMax - totalLive) / totalMax;
+    System.out.printf("Overall delete rate: %.2f%%%n", overall);
+}</code></pre>
+
+<!-- ============================================================ -->
+<!-- Chapter Summary -->
+<!-- ============================================================ -->
+
+<div class="chapter-summary" id="s18-summary">
+  <h2>18.18 本章小结</h2>
+  <table>
+    <thead>
+      <tr><th>关注点</th><th>核心 API / 概念</th><th>关键建议</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>DISI 接口</td><td><code>nextDoc / advance / docID / cost</code></td><td>所有 docID 流的统一抽象,严格升序契约</td></tr>
+      <tr><td>FixedBitSet</td><td><code>long[] bits</code></td><td>密度 ≥ 5% 默认选择,1.25 MiB / 10M doc</td></tr>
+      <tr><td>SparseFixedBitSet</td><td>双层 bucket</td><td>0.5%-5% 密度区间,内存节省 5-12×</td></tr>
+      <tr><td>RoaringDocIdSet</td><td>三 container 自适应</td><td>极不均匀分布最优,LRUQueryCache 备选</td></tr>
+      <tr><td>字级位运算</td><td>AND/OR/ANDNOT 字级</td><td>O(N/64) + SIMD 自动向量化,1000 万 docID 求交亚毫秒</td></tr>
+      <tr><td>BitSetIterator</td><td>BitSet → DISI 适配</td><td>nextSetBit 字级跳跃,O(1) 同 word 内</td></tr>
+      <tr><td>advance 算法</td><td>字级 vs 多级 skip</td><td>BitSet 字级 ≤ 1K 跨距,大跨距 PostingsEnum 三级 skip 胜</td></tr>
+      <tr><td>cost() 估计</td><td>子句驱动顺序</td><td>自定义 Query 必须返回真实接近的命中估计</td></tr>
+      <tr><td>ConjunctionDISI</td><td>leapfrog 求交</td><td>cost 最小当 lead,O(min(cost))</td></tr>
+      <tr><td>DisjunctionDISIPriorityQueue</td><td>最小堆求并</td><td>SHOULD 子句 K 越大堆越深,合并多值字段</td></tr>
+      <tr><td>TwoPhaseIterator</td><td>approximation + matches</td><td>matchCost 大时 BooleanQuery 推迟到必要 doc 才调</td></tr>
+      <tr><td>DocIdSetBuilder</td><td>maxDoc/128 阈值</td><td>业务无需关心密度,builder 自适应</td></tr>
+      <tr><td>LiveDocs</td><td>段内删除位图</td><td>每候选 1 bit 过滤,删除率 &gt; 25% 必须 forceMergeDeletes</td></tr>
+      <tr><td>.liv 文件</td><td>generation 命名</td><td>每次更新自增,旧版本异步删除</td></tr>
+      <tr><td>ConstantScoreScorer</td><td>FILTER 的包装</td><td>常量评分,maxScore = boost</td></tr>
+      <tr><td>性能基线</td><td>NVMe + L1 cache</td><td>get/set 1 ns、cardinality 50 µs / 10M、AND 200 µs / 10M</td></tr>
+    </tbody>
+  </table>
+  <p class="next-hint">下一章 <a href="19-write-lock.html">第 19 章 · write.lock 与目录锁</a> 转入文件系统层面的并发控制。<code>write.lock</code> 是 Lucene 防止并发写入的目录锁文件——只有几字节,但其语义、生命周期、JVM 崩溃后的残留处理是生产事故高发区。下一章用字节级视图拆解 NativeFSLockFactory 的 <code>FileChannel.tryLock</code> 路径、SimpleFSLockFactory 的"创建文件即上锁"、以及 Solr / Elasticsearch 在容器化环境下的 LockObtainFailedException 排查流程。</p>
+</div>
+
+<!-- ============================================================ -->
+<!-- Chapter navigation -->
+<!-- ============================================================ -->
+<div class="chapter-nav">
+  <a href="17-doc-store-fields.html">&larr; 第 17 章 &middot; Stored Fields 与列存</a>
+  <a href="19-write-lock.html">第 19 章 &middot; write.lock 与目录锁 &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 Lucene &middot; 第 18 章 &middot; BitSet 与 DocIdSetIterator</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){setTimeout(function(){document.querySelectorAll('.mermaid svg,.diagram svg').forEach(function(svg){var h=parseInt(svg.getAttribute('height')||svg.getBoundingClientRect().height);if(h>500){svg.style.maxHeight='500px';svg.style.width='auto';var p=svg.closest('.diagram');if(p)p.style.overflowX='auto';}});},1500);});</script>
+</body>
+</html>

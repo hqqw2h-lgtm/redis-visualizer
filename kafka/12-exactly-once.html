@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.12 Exactly-Once 语义 — 图解 Kafka</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Kafka</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="11-kraft.html">上一章</a>
+  <a href="13-log-compaction.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s12-0">12.0 章首速览</a>
+  <a href="#s12-1">12.1 EOS 要解决什么</a>
+  <a href="#s12-2">12.2 幂等 Producer</a>
+  <a href="#s12-3">12.3 Sequence 与 PID</a>
+  <a href="#s12-4">12.4 事务 Producer</a>
+  <a href="#s12-5">12.5 Transaction Coordinator</a>
+  <a href="#s12-6">12.6 read_committed 与 LSO</a>
+  <a href="#s12-7">12.7 监控与排障</a>
+  <a href="#s12-8">12.8 源码深潜</a>
+  <a href="#s12-9">12.9 设计取舍</a>
+  <a href="#s12-10">12.10 陷阱与限制</a>
+  <a href="#s12-summary">12.11 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 12 章 · Exactly-Once 语义</h1>
+<p class="subtitle">幂等 Producer · 事务 Producer · Transaction Coordinator · read_committed · LSO · 两阶段提交</p>
+
+<div class="chapter-intro">
+  <p class="lead">"Exactly-Once" 一词容易引发误解。它<strong>不是"消息只发送一次"的物理保证</strong>(物理上 producer 仍可能重发),而是一组工程约束的组合,让消费者<em>看到的结果</em>等价于"消息只被处理一次"。Kafka 的 EOS 由三件套实现:幂等 Producer 用 <code>(PID, epoch, sequence)</code> 三元组在 broker 端做单分区去重;事务 Producer 用 Transaction Coordinator 驱动跨分区原子提交;Consumer 用 <code>isolation.level=read_committed</code> 配合 LSO (Last Stable Offset) 屏蔽未提交数据。</p>
+  <p>本章按 "问题边界 → 幂等 Producer → Sequence/PID 机制 → 事务 Producer → TC 状态机 → read_committed → 监控 → 源码 → 取舍 → 陷阱" 组织,对应 Apache Kafka 3.7。EOS 是从 0.11 引入(KIP-98),3.0 进入第二代(KIP-447 让消费者-生产者模式更简洁),3.7 仍在持续完善。读完后你能区分什么场景<em>需要</em> EOS、什么场景<em>不需要</em>,并预判每种异常的根因。</p>
+  <ul class="will-learn">
+    <li>At-least-once 的两类重复:Producer 重试重复 + Consumer 重启重复</li>
+    <li>EOS 的边界 — 它能覆盖什么,不能覆盖什么(外部数据库副作用)</li>
+    <li>幂等 Producer 的 <code>(PID, partition, sequence)</code> 三元组去重原理</li>
+    <li>Sequence 鸿沟检测:OutOfOrderSequence vs DuplicateSequence</li>
+    <li>事务 Producer 的两阶段提交:Prepare → WriteTxnMarker</li>
+    <li>Transaction Coordinator 的状态机和 <code>__transaction_state</code> 日志</li>
+    <li>LSO (Last Stable Offset) 与 HW 的关系,read_committed 如何屏蔽未提交</li>
+    <li>aborted transaction index 文件的作用与 consumer 端跳过</li>
+    <li>Producer Epoch Fencing 如何防止 zombie producer 写入</li>
+    <li>EOS 性能开销与是否值得</li>
+  </ul>
+  <p class="prereq">前置知识:第 6 章 Producer 内部 (acks / retries / max.in.flight);第 9 章 ISR (acks=all 是 EOS 前提);第 11 章 KRaft (TC 元数据在 KRaft 中如何承载)。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-0">12.0 章首速览</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">图 12-0 · EOS 端到端架构</div>
+<svg viewBox="0 0 900 460" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="460" fill="#0f172a" rx="8"/>
+
+  <!-- Producer -->
+  <rect x="40" y="40" width="160" height="80" rx="10" fill="url(#g-purple)" stroke="#a78bfa"/>
+  <text x="120" y="68" text-anchor="middle" fill="#fff" font-size="14" font-weight="700">Producer</text>
+  <text x="120" y="88" text-anchor="middle" fill="#e9d5ff" font-size="10">enable.idempotence=true</text>
+  <text x="120" y="105" text-anchor="middle" fill="#e9d5ff" font-size="10">transactional.id=order-tx</text>
+
+  <!-- TC -->
+  <rect x="320" y="40" width="200" height="80" rx="10" fill="url(#g-blue)" stroke="#60a5fa"/>
+  <text x="420" y="68" text-anchor="middle" fill="#fff" font-size="14" font-weight="700">Transaction Coordinator</text>
+  <text x="420" y="88" text-anchor="middle" fill="#dbeafe" font-size="11">某 broker, 由 PID hash 决定</text>
+  <text x="420" y="105" text-anchor="middle" fill="#dbeafe" font-size="11">两阶段提交驱动者</text>
+
+  <rect x="630" y="40" width="220" height="80" rx="10" fill="#0d1117" stroke="#94a3b8"/>
+  <text x="740" y="68" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">__transaction_state</text>
+  <text x="740" y="88" text-anchor="middle" fill="#cbd5e1" font-size="11">事务状态日志</text>
+  <text x="740" y="105" text-anchor="middle" fill="#cbd5e1" font-size="11">50 partitions, log-compacted</text>
+
+  <path d="M200 80 L320 80" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="260" y="74" text-anchor="middle" fill="#cbd5e1" font-size="10">InitProducerId / EndTxn</text>
+
+  <path d="M520 80 L630 80" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="575" y="74" text-anchor="middle" fill="#cbd5e1" font-size="10">append state</text>
+
+  <!-- Partitions -->
+  <rect x="280" y="180" width="280" height="70" rx="10" fill="url(#g-green)" stroke="#22c55e"/>
+  <text x="420" y="208" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">order-created-0 leader</text>
+  <text x="420" y="228" text-anchor="middle" fill="#dcfce7" font-size="11">dedup by (PID, epoch, seq)</text>
+
+  <rect x="600" y="180" width="280" height="70" rx="10" fill="url(#g-green)" stroke="#22c55e"/>
+  <text x="740" y="208" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">inventory-reserved-1 leader</text>
+  <text x="740" y="228" text-anchor="middle" fill="#dcfce7" font-size="11">dedup by (PID, epoch, seq)</text>
+
+  <path d="M120 120 Q300 150 350 180" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M120 120 Q400 130 670 180" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="280" y="155" fill="#cbd5e1" font-size="10">Produce: PID/epoch/seq</text>
+
+  <!-- Commit markers -->
+  <path d="M420 120 L420 180" stroke="#22c55e" stroke-width="2" stroke-dasharray="4 3" fill="none" marker-end="url(#arr)"/>
+  <text x="430" y="155" fill="#86efac" font-size="10">commit marker</text>
+  <path d="M520 120 Q620 150 720 180" stroke="#22c55e" stroke-width="2" stroke-dasharray="4 3" fill="none" marker-end="url(#arr)"/>
+  <text x="650" y="155" fill="#86efac" font-size="10">commit marker</text>
+
+  <!-- Consumer -->
+  <rect x="280" y="320" width="600" height="100" rx="10" fill="url(#g-orange)" stroke="#f59e0b"/>
+  <text x="580" y="348" text-anchor="middle" fill="#fff" font-size="14" font-weight="700">Consumer · isolation.level=read_committed</text>
+  <text x="580" y="370" text-anchor="middle" fill="#fef3c7" font-size="11">仅看 offset &lt; LSO</text>
+  <text x="580" y="388" text-anchor="middle" fill="#fef3c7" font-size="11">data records + aborted txn index → 自动跳过</text>
+  <text x="580" y="406" text-anchor="middle" fill="#fef3c7" font-size="11">未提交事务的消息对消费者不可见</text>
+
+  <path d="M420 250 L420 320" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M740 250 L740 320" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+</svg>
+</div>
+
+<h3>EOS 三层机制</h3>
+
+<table>
+  <thead>
+    <tr><th>层级</th><th>机制</th><th>解决问题</th><th>不解决</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>单 Producer 单分区</td><td><code>enable.idempotence=true</code></td><td>ACK 丢失后重复写入</td><td>跨分区原子性</td></tr>
+    <tr><td>多分区 + offset 原子提交</td><td><code>transactional.id</code> + transaction log</td><td>输出消息与 offset 同生共死</td><td>外部 DB 副作用</td></tr>
+    <tr><td>下游可见性</td><td><code>isolation.level=read_committed</code></td><td>屏蔽未提交 / 已回滚事务</td><td>端到端业务幂等</td></tr>
+  </tbody>
+</table>
+
+<div class="diagram">
+  <div class="diagram-title">图 12-0-1 · 三句话浓缩</div>
+<pre><code>本章三句话:
+
+  1 幂等 Producer 解决单分区重复写入
+    Broker 用 (PID, partition) 维护 sequence 状态
+    重试 batch 通过 sequence 去重
+
+  2 事务 Producer 解决跨分区原子性
+    TC 用两阶段提交协议
+    控制消息 (commit/abort marker) 写入参与分区
+
+  3 read_committed Consumer 屏蔽未提交数据
+    LSO = first unstable offset
+    open transaction 阻塞 LSO 推进</code></pre>
+</div>
+
+<div class="key-insight">
+  EOS 的本质是 "<strong>把不可避免的重发</strong>" 变成 "<strong>对消费者透明的去重</strong>"。物理网络上消息可能被重发 N 次,但 broker 端用 sequence 去重 + consumer 端用 LSO 屏蔽 + transaction marker 控制可见性,让"业务下游看到的结果"等价于消息只被处理一次。它不是无成本的:吞吐降低 5-30%、延迟升高 5-50ms、运维多一个 Transaction Coordinator 要看。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-1">12.1 EOS 要解决什么</h2>
+<!-- ============================================================ -->
+
+<p>At-least-once 的两类重复来源是 EOS 要解决的核心问题。理解这两类问题再看 EOS,逻辑就非常清晰。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 12-1 · At-least-once 的两类重复</div>
+<svg viewBox="0 0 900 360" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="360" fill="#0f172a" rx="8"/>
+
+  <!-- Type A -->
+  <rect x="40" y="40" width="400" height="280" rx="12" fill="#1e293b" stroke="#a78bfa" stroke-width="2" stroke-dasharray="6 4"/>
+  <text x="240" y="65" text-anchor="middle" fill="#a78bfa" font-size="14" font-weight="700">类型 A · Producer 重试重复</text>
+
+  <rect x="60" y="85" width="160" height="50" rx="8" fill="url(#g-purple)"/>
+  <text x="140" y="115" text-anchor="middle" fill="#fff" font-size="12">Producer 发 batch B1</text>
+
+  <rect x="260" y="85" width="160" height="50" rx="8" fill="url(#g-blue)"/>
+  <text x="340" y="115" text-anchor="middle" fill="#fff" font-size="12">Broker 写入 B1</text>
+
+  <path d="M220 110 L260 110" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+  <path d="M340 135 L160 135" stroke="#ef4444" stroke-width="2" stroke-dasharray="3 2" fill="none" marker-end="url(#arr)"/>
+  <text x="250" y="155" text-anchor="middle" fill="#fecaca" font-size="11">ACK 在网络中丢失</text>
+
+  <rect x="60" y="175" width="160" height="50" rx="8" fill="url(#g-purple)"/>
+  <text x="140" y="205" text-anchor="middle" fill="#fff" font-size="12">Producer 重试 B1</text>
+
+  <rect x="260" y="175" width="160" height="50" rx="8" fill="url(#g-red)"/>
+  <text x="340" y="200" text-anchor="middle" fill="#fff" font-size="11">Broker 再次写入</text>
+  <text x="340" y="218" text-anchor="middle" fill="#fecaca" font-size="10">→ 同一 batch 两份</text>
+
+  <path d="M220 200 L260 200" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+  <rect x="60" y="250" width="360" height="55" rx="8" fill="#0f172a" stroke="#a78bfa"/>
+  <text x="240" y="272" text-anchor="middle" fill="#fbbf24" font-size="11" font-weight="600">EOS 解法:幂等 Producer</text>
+  <text x="240" y="290" text-anchor="middle" fill="#cbd5e1" font-size="10.5">Broker 用 sequence 检测,重复 batch 静默丢弃</text>
+
+  <!-- Type B -->
+  <rect x="460" y="40" width="400" height="280" rx="12" fill="#1e293b" stroke="#22c55e" stroke-width="2" stroke-dasharray="6 4"/>
+  <text x="660" y="65" text-anchor="middle" fill="#22c55e" font-size="14" font-weight="700">类型 B · Consumer 重启重复</text>
+
+  <rect x="480" y="85" width="160" height="50" rx="8" fill="url(#g-green)"/>
+  <text x="560" y="115" text-anchor="middle" fill="#fff" font-size="12">Consumer poll → 处理</text>
+
+  <rect x="680" y="85" width="160" height="50" rx="8" fill="url(#g-orange)"/>
+  <text x="760" y="105" text-anchor="middle" fill="#fff" font-size="11">业务侧成功</text>
+  <text x="760" y="125" text-anchor="middle" fill="#fef3c7" font-size="10">写 DB / 调下游</text>
+
+  <path d="M640 110 L680 110" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+  <path d="M560 135 L560 175" stroke="#ef4444" stroke-width="2" stroke-dasharray="3 2" fill="none" marker-end="url(#arr)"/>
+  <text x="568" y="160" fill="#fecaca" font-size="11">commitSync 失败</text>
+
+  <rect x="480" y="175" width="160" height="50" rx="8" fill="url(#g-red)"/>
+  <text x="560" y="205" text-anchor="middle" fill="#fff" font-size="11">Consumer crash / rebalance</text>
+
+  <rect x="680" y="175" width="160" height="50" rx="8" fill="url(#g-red)"/>
+  <text x="760" y="200" text-anchor="middle" fill="#fff" font-size="11">重启后从旧 offset 重消费</text>
+  <text x="760" y="218" text-anchor="middle" fill="#fecaca" font-size="10">→ 业务重复执行</text>
+
+  <path d="M640 200 L680 200" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+  <rect x="480" y="250" width="360" height="55" rx="8" fill="#0f172a" stroke="#22c55e"/>
+  <text x="660" y="272" text-anchor="middle" fill="#fbbf24" font-size="11" font-weight="600">EOS 解法:事务 Producer + sendOffsetsToTransaction</text>
+  <text x="660" y="290" text-anchor="middle" fill="#cbd5e1" font-size="10.5">输出消息与 offset 原子提交 → 重启从已提交 offset 继续</text>
+</svg>
+</div>
+
+<h3>EOS 不能解决什么</h3>
+
+<div class="warning">
+EOS 是 Kafka <strong>内部</strong>的端到端保证。它不能解决:
+<ul>
+  <li>Consumer 处理过程中调用的<em>外部 HTTP / DB / 第三方服务</em> — 这些副作用 Kafka 看不到,业务侧仍需自己做幂等</li>
+  <li>Consumer 输出到非 Kafka 系统 — 必须自己实现 sink 端幂等</li>
+  <li>Producer 在<em>事务外</em>发送的消息 — 它们不受 EOS 保护</li>
+  <li>由于 client bug 重复发送的逻辑级重复(同一业务事件被发了两次)</li>
+</ul>
+EOS 覆盖的范围是 "Kafka → Kafka" 的消费-处理-生产链路。要把 EOS 延展到外部系统,需要 outbox pattern / 2PC connector(如 Debezium)。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-2">12.2 幂等 Producer</h2>
+<!-- ============================================================ -->
+
+<p>幂等 Producer 是 EOS 的底座。开启 <code>enable.idempotence=true</code> 后,Producer 启动时会向<strong>任意一个 broker</strong> 申请一个全局唯一的 <code>Producer ID (PID)</code> + epoch,之后每个 batch 都带上 <code>(PID, partition, sequence)</code> 三元组。Broker 在分区 leader 上维护一个滑动窗口的 sequence 状态,可以识别"我已经见过这个 batch 了"或"出现了 gap"。</p>
+
+<h3>开启幂等的最小配置</h3>
+
+<pre><code class="language-properties">enable.idempotence=true
+
+# Kafka 自动检查的前置条件(violation 时启动失败):
+acks=all                              # 否则没意义 — 单副本写入算什么幂等
+retries &gt; 0 (默认 Integer.MAX_VALUE)  # 否则失败直接抛,不重试
+max.in.flight.requests.per.connection &lt;= 5</code></pre>
+
+<h3>Sequence 状态机</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 12-2 · Broker 端 sequence 三种情形</div>
+<svg viewBox="0 0 900 360" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="360" fill="#0f172a" rx="8"/>
+
+  <text x="450" y="35" text-anchor="middle" fill="#fbbf24" font-size="13" font-weight="700">Broker 当前状态: lastSeq[PID=42, partition=0] = 100</text>
+
+  <!-- Case 1: in order -->
+  <rect x="40" y="65" width="260" height="200" rx="10" fill="#1e293b" stroke="#22c55e" stroke-width="2"/>
+  <text x="170" y="90" text-anchor="middle" fill="#22c55e" font-size="13" font-weight="700">情形 1 · 正常顺序</text>
+  <rect x="60" y="105" width="220" height="40" rx="6" fill="url(#g-green)"/>
+  <text x="170" y="129" text-anchor="middle" fill="#fff" font-size="11">收到 batch seq=101</text>
+  <text x="60" y="170" fill="#dcfce7" font-size="11">期望: lastSeq + 1 = 101 ✓</text>
+  <text x="60" y="190" fill="#dcfce7" font-size="11">动作: append → lastSeq=101</text>
+  <text x="60" y="210" fill="#dcfce7" font-size="11">响应: 200 OK</text>
+  <text x="60" y="245" fill="#86efac" font-size="11">→ 正常路径,无任何特殊处理</text>
+
+  <!-- Case 2: duplicate -->
+  <rect x="320" y="65" width="260" height="200" rx="10" fill="#1e293b" stroke="#f59e0b" stroke-width="2"/>
+  <text x="450" y="90" text-anchor="middle" fill="#f59e0b" font-size="13" font-weight="700">情形 2 · 重复(seq ≤ lastSeq)</text>
+  <rect x="340" y="105" width="220" height="40" rx="6" fill="url(#g-orange)"/>
+  <text x="450" y="129" text-anchor="middle" fill="#fff" font-size="11">收到 batch seq=100</text>
+  <text x="340" y="170" fill="#fef3c7" font-size="11">期望: lastSeq + 1 = 101</text>
+  <text x="340" y="190" fill="#fef3c7" font-size="11">实际: seq=100 ≤ 100</text>
+  <text x="340" y="210" fill="#fef3c7" font-size="11">动作: <em>静默丢弃</em>,不写入</text>
+  <text x="340" y="230" fill="#fef3c7" font-size="11">响应: 200 OK + 原 offset</text>
+  <text x="340" y="245" fill="#fde68a" font-size="11">→ Producer 看到的 ACK,如同新写入</text>
+
+  <!-- Case 3: gap -->
+  <rect x="600" y="65" width="260" height="200" rx="10" fill="#1e293b" stroke="#ef4444" stroke-width="2"/>
+  <text x="730" y="90" text-anchor="middle" fill="#ef4444" font-size="13" font-weight="700">情形 3 · 鸿沟(seq &gt; lastSeq+1)</text>
+  <rect x="620" y="105" width="220" height="40" rx="6" fill="url(#g-red)"/>
+  <text x="730" y="129" text-anchor="middle" fill="#fff" font-size="11">收到 batch seq=103</text>
+  <text x="620" y="170" fill="#fecaca" font-size="11">期望: lastSeq + 1 = 101</text>
+  <text x="620" y="190" fill="#fecaca" font-size="11">实际: seq=103 (跳了 101,102)</text>
+  <text x="620" y="210" fill="#fecaca" font-size="11">动作: <strong>拒绝</strong></text>
+  <text x="620" y="230" fill="#fecaca" font-size="11">错误: OutOfOrderSequence</text>
+  <text x="620" y="245" fill="#fda4af" font-size="11">→ Producer 端不可恢复,需重启</text>
+
+  <text x="450" y="310" text-anchor="middle" fill="#cbd5e1" font-size="11">关键:broker 维护的 sequence 状态在分区 leader 切换时通过 ProducerState snapshot 同步给新 leader,</text>
+  <text x="450" y="330" text-anchor="middle" fill="#cbd5e1" font-size="11">保证幂等保证不会因为 leader failover 失效。</text>
+</svg>
+</div>
+
+<h3>ProducerState snapshot</h3>
+
+<pre><code class="language-text">分区目录:
+/var/kafka-logs/order-created-0/
+  ├── 00000000000000000000.log
+  ├── 00000000000000000000.snapshot      ← Producer 状态快照
+  ├── 00000000000000005000.snapshot
+  └── leader-epoch-checkpoint
+
+snapshot 内容(每个活跃 PID 一项):
+
+  PID=42  epoch=3  lastSeq=199  lastOffset=2103  lastTimestamp=...
+  PID=43  epoch=1  lastSeq=88   lastOffset=2104  ...
+
+作用:
+  - leader failover 时, 新 leader 从 snapshot 恢复 ProducerState
+  - log compaction 不删除 PID 状态(即使该 PID 没有新写入)
+  - Producer 端 retries 时, broker 仍能识别去重</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s12-3">12.3 Sequence 与 PID</h2>
+<!-- ============================================================ -->
+
+<h3>PID 申请流程</h3>
+
+<pre><code class="language-text">Producer.send() 首次调用前:
+
+  1 Producer 发 InitProducerIdRequest (无 transactional.id)
+    任意 broker 收到, 转给 ProducerIdManager 分配
+    ProducerIdManager 在 controller 端按 block 分配 (1000 个 PID 一批)
+
+  2 broker 返回 (PID, epoch=0)
+    Producer 缓存这两个值
+
+  3 Producer 之后所有 send 都带上 PID + epoch + 递增 seq
+
+幂等 Producer 与事务 Producer 的区别:
+  - 幂等:每次启动新申请 PID, 进程死了 PID 就废了
+  - 事务:transactional.id 是用户提供的字符串, PID 在重启后被恢复</code></pre>
+
+<h3>Sequence 越界场景</h3>
+
+<table>
+  <thead>
+    <tr><th>错误</th><th>触发</th><th>影响</th><th>恢复</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>OutOfOrderSequenceException</code></td><td>序列跳号(broker 收到 seq=103 而期望 101)</td><td>本 Producer 实例对该分区不可用</td><td>抛给上层,通常重启</td></tr>
+    <tr><td><code>DuplicateSequenceException</code></td><td>序列重复(静默处理,通常不抛)</td><td>无,broker 返回原 offset</td><td>不需要</td></tr>
+    <tr><td><code>UnknownProducerIdException</code></td><td>broker 的 ProducerState 已过期(默认 24h)</td><td>该 PID 失效</td><td>Producer 自动重新申请 PID</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s12-4">12.4 事务 Producer</h2>
+<!-- ============================================================ -->
+
+<p>幂等 Producer 只能保证<strong>单分区</strong>的去重。当业务需要"一次 send 写多个分区,要么全成功要么全失败"时,需要事务 Producer。它通过 <code>transactional.id</code> + Transaction Coordinator 的两阶段提交协议实现。</p>
+
+<h3>事务 Producer 使用示例</h3>
+
+<pre><code class="language-java">// Producer 配置
+props.put("enable.idempotence", "true");
+props.put("transactional.id", "order-tx-producer-1");
+
+KafkaProducer&lt;String, String&gt; producer = new KafkaProducer&lt;&gt;(props);
+
+producer.initTransactions();   // 1 注册 transactional.id, 申请 PID/epoch, 还可能 abort 上次未完成事务
+
+try {
+    producer.beginTransaction();              // 2 标记事务开始
+
+    producer.send(record1);                   // 3 多分区写入
+    producer.send(record2);
+
+    // 4 同时把 consumer offset 也"写入"事务
+    producer.sendOffsetsToTransaction(
+        consumerOffsets, consumerGroupMetadata);
+
+    producer.commitTransaction();             // 5 两阶段提交
+} catch (ProducerFencedException e) {
+    producer.close();                         // 被新 producer 实例 fence
+} catch (KafkaException e) {
+    producer.abortTransaction();              // 6 任何异常 → 回滚
+}</code></pre>
+
+<h3>两阶段提交时序</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 12-4 · 事务 Producer + TC 的两阶段提交</div>
+<svg viewBox="0 0 900 500" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="500" fill="#0f172a" rx="8"/>
+
+  <line x1="120" y1="60" x2="120" y2="480" stroke="#475569" stroke-dasharray="4 3"/>
+  <line x1="330" y1="60" x2="330" y2="480" stroke="#475569" stroke-dasharray="4 3"/>
+  <line x1="540" y1="60" x2="540" y2="480" stroke="#475569" stroke-dasharray="4 3"/>
+  <line x1="750" y1="60" x2="750" y2="480" stroke="#475569" stroke-dasharray="4 3"/>
+
+  <rect x="60" y="30" width="120" height="30" rx="6" fill="url(#g-purple)"/>
+  <text x="120" y="51" text-anchor="middle" fill="#fff" font-size="12">Producer</text>
+  <rect x="270" y="30" width="120" height="30" rx="6" fill="url(#g-blue)"/>
+  <text x="330" y="51" text-anchor="middle" fill="#fff" font-size="12">TC</text>
+  <rect x="480" y="30" width="120" height="30" rx="6" fill="url(#g-green)"/>
+  <text x="540" y="51" text-anchor="middle" fill="#fff" font-size="11">Partition A leader</text>
+  <rect x="690" y="30" width="120" height="30" rx="6" fill="url(#g-green)"/>
+  <text x="750" y="51" text-anchor="middle" fill="#fff" font-size="11">Partition B leader</text>
+
+  <!-- initTransactions -->
+  <path d="M120 90 L330 90" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="225" y="84" text-anchor="middle" fill="#cbd5e1" font-size="11">initTransactions</text>
+  <path d="M330 115 L120 115" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="225" y="109" text-anchor="middle" fill="#86efac" font-size="11">PID=42, epoch=5</text>
+
+  <text x="120" y="145" fill="#fde68a" font-size="11">beginTransaction (local 标记)</text>
+
+  <!-- AddPartitionsToTxn -->
+  <path d="M120 175 L330 175" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="225" y="169" text-anchor="middle" fill="#cbd5e1" font-size="11">AddPartitionsToTxn(A, B)</text>
+
+  <!-- Produce records -->
+  <path d="M120 210 L540 210" stroke="#a78bfa" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="330" y="204" text-anchor="middle" fill="#e9d5ff" font-size="11">Produce → A (PID/epoch/seq)</text>
+  <path d="M120 240 L750 240" stroke="#a78bfa" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="430" y="234" text-anchor="middle" fill="#e9d5ff" font-size="11">Produce → B (PID/epoch/seq)</text>
+
+  <!-- commitTransaction phase 1 -->
+  <path d="M120 290 L330 290" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="225" y="284" text-anchor="middle" fill="#cbd5e1" font-size="11">EndTxn(COMMIT)</text>
+
+  <text x="340" y="320" fill="#fbbf24" font-size="11" font-weight="600">阶段 1: PrepareCommit</text>
+  <text x="340" y="335" fill="#fde68a" font-size="10">append "PREPARE_COMMIT" 到 __transaction_state</text>
+
+  <!-- WriteTxnMarker -->
+  <path d="M330 370 L540 370" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="430" y="364" text-anchor="middle" fill="#86efac" font-size="11">WriteTxnMarker(COMMIT) → A</text>
+  <path d="M330 395 L750 395" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="540" y="389" text-anchor="middle" fill="#86efac" font-size="11">WriteTxnMarker(COMMIT) → B</text>
+
+  <text x="340" y="425" fill="#fbbf24" font-size="11" font-weight="600">阶段 2: CompleteCommit</text>
+  <text x="340" y="440" fill="#fde68a" font-size="10">append "COMPLETE_COMMIT" 到 __transaction_state</text>
+
+  <path d="M330 470 L120 470" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="225" y="464" text-anchor="middle" fill="#86efac" font-size="11">200 OK</text>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-5">12.5 Transaction Coordinator</h2>
+<!-- ============================================================ -->
+
+<p>TC 是一个特殊的"逻辑组件",由某个 broker 担任(由 <code>transactional.id</code> 的 hash 决定哪个 broker)。它<strong>不是一个独立进程</strong>,而是 broker 内部的子系统。所有事务的状态都写入内部主题 <code>__transaction_state</code>(默认 50 个 partition,RF=3,log-compacted)。</p>
+
+<h3>TC 状态机</h3>
+
+<table>
+  <thead><tr><th>状态</th><th>含义</th><th>下一步</th></tr></thead>
+  <tbody>
+    <tr><td><code>EMPTY</code></td><td>新事务 ID,无活跃事务</td><td>InitProducerId → ONGOING</td></tr>
+    <tr><td><code>ONGOING</code></td><td>事务进行中</td><td>EndTxn → PREPARE_COMMIT/ABORT</td></tr>
+    <tr><td><code>PREPARE_COMMIT</code></td><td>第一阶段已记录,准备写 marker</td><td>marker 全部写入 → COMPLETE_COMMIT</td></tr>
+    <tr><td><code>COMPLETE_COMMIT</code></td><td>事务完成</td><td>可被覆盖 / log-compacted</td></tr>
+    <tr><td><code>PREPARE_ABORT</code></td><td>准备回滚</td><td>marker 写入 → COMPLETE_ABORT</td></tr>
+    <tr><td><code>COMPLETE_ABORT</code></td><td>回滚完成</td><td>同 COMPLETE_COMMIT</td></tr>
+    <tr><td><code>DEAD</code></td><td>TC failover 检测到 hanging 事务,触发清理</td><td>fence + abort</td></tr>
+  </tbody>
+</table>
+
+<h3>Producer Epoch Fencing</h3>
+
+<div class="diagram">
+<pre><code>场景:Producer A 进程被杀,新进程 B 启动重连同一 transactional.id
+
+  1 Producer A 用 transactional.id="tx1" 拿到 (PID=42, epoch=5)
+    正在写 record, 但还未 commit
+    A 进程被 kill -9
+
+  2 Producer B 启动, 重连同一 transactional.id="tx1"
+    TC 收到 InitProducerIdRequest:
+      - 发现已有 PID=42, epoch=5
+      - 分配新 epoch=6
+      - 标记 epoch=5 为 fenced
+      - 如有 ongoing 事务, 触发 abort
+
+  3 Producer A 进程恢复(网络分区结束?), 用 epoch=5 继续发 record
+    broker 检查: lastSeenEpoch=6 > request.epoch=5
+    → 返回 ProducerFenced 错误
+    → A 端 catch 后必须 close, 不能再继续写
+
+→ 这是 EOS 的关键 "zombie fencing"
+→ 保证同一 transactional.id 只有最新进程实例能写</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-6">12.6 read_committed 与 LSO</h2>
+<!-- ============================================================ -->
+
+<p>Producer 写完事务后,数据已经在分区日志里,但 consumer 看到没看到取决于 <code>isolation.level</code>:</p>
+<ul>
+  <li><code>read_uncommitted</code>(默认):看到所有数据,包括未提交的</li>
+  <li><code>read_committed</code>:仅看到 offset &lt; LSO 的数据,自动跳过 aborted 事务</li>
+</ul>
+
+<p><strong>LSO (Last Stable Offset)</strong> 是 HW 的进一步约束:它是 HW 和"<em>最早未完成事务的 firstOffset</em>" 中较小的那个。开启的事务会阻塞 LSO 推进,但不影响 HW。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 12-6 · LSO 与 HW 的关系</div>
+<svg viewBox="0 0 900 280" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="280" fill="#0f172a" rx="8"/>
+
+  <text x="40" y="40" fill="#cbd5e1" font-size="13" font-weight="600">Partition log:</text>
+
+  <!-- Records -->
+  <g transform="translate(40,60)">
+    <rect x="0" y="0" width="60" height="40" fill="url(#g-green)" stroke="#22c55e"/>
+    <text x="30" y="18" text-anchor="middle" fill="#fff" font-size="10">@100</text>
+    <text x="30" y="32" text-anchor="middle" fill="#dcfce7" font-size="9">已提交</text>
+
+    <rect x="65" y="0" width="60" height="40" fill="url(#g-green)" stroke="#22c55e"/>
+    <text x="95" y="18" text-anchor="middle" fill="#fff" font-size="10">@101</text>
+    <text x="95" y="32" text-anchor="middle" fill="#dcfce7" font-size="9">已提交</text>
+
+    <rect x="130" y="0" width="60" height="40" fill="url(#g-orange)" stroke="#f59e0b"/>
+    <text x="160" y="18" text-anchor="middle" fill="#fff" font-size="10">@102</text>
+    <text x="160" y="32" text-anchor="middle" fill="#fef3c7" font-size="9">tx1 ⏳</text>
+
+    <rect x="195" y="0" width="60" height="40" fill="url(#g-orange)" stroke="#f59e0b"/>
+    <text x="225" y="18" text-anchor="middle" fill="#fff" font-size="10">@103</text>
+    <text x="225" y="32" text-anchor="middle" fill="#fef3c7" font-size="9">tx1 ⏳</text>
+
+    <rect x="260" y="0" width="60" height="40" fill="url(#g-green)" stroke="#22c55e"/>
+    <text x="290" y="18" text-anchor="middle" fill="#fff" font-size="10">@104</text>
+    <text x="290" y="32" text-anchor="middle" fill="#dcfce7" font-size="9">tx2 提交</text>
+
+    <rect x="325" y="0" width="60" height="40" fill="url(#g-blue)" stroke="#60a5fa"/>
+    <text x="355" y="18" text-anchor="middle" fill="#fff" font-size="10">@105</text>
+    <text x="355" y="32" text-anchor="middle" fill="#dbeafe" font-size="9">non-tx</text>
+
+    <rect x="390" y="0" width="60" height="40" fill="url(#g-blue)" stroke="#60a5fa"/>
+    <text x="420" y="18" text-anchor="middle" fill="#fff" font-size="10">@106</text>
+    <text x="420" y="32" text-anchor="middle" fill="#dbeafe" font-size="9">non-tx</text>
+
+    <rect x="460" y="0" width="60" height="40" fill="#1e293b" stroke="#475569" stroke-dasharray="3 2"/>
+    <text x="490" y="22" text-anchor="middle" fill="#cbd5e1" font-size="10">LEO</text>
+  </g>
+
+  <!-- LSO marker -->
+  <line x1="170" y1="55" x2="170" y2="130" stroke="#fbbf24" stroke-width="2"/>
+  <text x="170" y="148" text-anchor="middle" fill="#fbbf24" font-size="13" font-weight="700">LSO = 102</text>
+  <text x="170" y="164" text-anchor="middle" fill="#fde68a" font-size="10">(tx1 first offset)</text>
+
+  <!-- HW marker -->
+  <line x1="525" y1="55" x2="525" y2="130" stroke="#22c55e" stroke-width="2"/>
+  <text x="525" y="148" text-anchor="middle" fill="#22c55e" font-size="13" font-weight="700">HW = 107</text>
+  <text x="525" y="164" text-anchor="middle" fill="#86efac" font-size="10">(已复制完)</text>
+
+  <rect x="40" y="190" width="820" height="40" rx="6" fill="#1e293b" stroke="#f59e0b"/>
+  <text x="450" y="214" text-anchor="middle" fill="#fef3c7" font-size="12">read_committed consumer 只看到 offset &lt; LSO,即 100, 101 — tx1 提交前 102~106 都不可见</text>
+
+  <rect x="40" y="240" width="820" height="30" rx="6" fill="#1e293b" stroke="#22c55e"/>
+  <text x="450" y="260" text-anchor="middle" fill="#86efac" font-size="11">tx1 commit 后 LSO 跳到 107,consumer 立即看到 102~106(跳过 abort 的部分)</text>
+</svg>
+</div>
+
+<h3>aborted transaction index</h3>
+
+<p>分区目录里有一个特殊文件 <code>*.txnindex</code>,记录所有 aborted 事务的 <code>(firstOffset, lastOffset, PID)</code>。FetchResponse 给 read_committed consumer 时会一并返回这个范围列表,consumer 收到后自动跳过对应 offset 范围。</p>
+
+<pre><code class="language-text">/var/kafka-logs/order-created-0/
+  ├── 00000000000000000000.log
+  ├── 00000000000000000000.index
+  ├── 00000000000000000000.timeindex
+  ├── 00000000000000000000.txnindex     ← aborted 事务范围索引
+  └── ...
+
+文件内容(每条 32 bytes):
+  ┌──────────┬──────────┬──────────┬──────────┐
+  │ version  │ pid      │ first    │ last     │
+  │ int16    │ int64    │ int64    │ int64    │
+  └──────────┴──────────┴──────────┴──────────┘</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s12-7">12.7 监控与排障</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>JMX</th><th>含义</th><th>异常阈值</th></tr></thead>
+  <tbody>
+    <tr><td><code>kafka.coordinator.transaction:type=TransactionMarkerChannelManager</code></td><td>marker 队列长度</td><td>持续 &gt; 0</td></tr>
+    <tr><td><code>TransactionExpirationCount</code></td><td>事务过期数</td><td>突增</td></tr>
+    <tr><td><code>OngoingTransactionMaxDurationMs</code></td><td>最长 ongoing 事务</td><td>&gt; transaction.timeout.ms</td></tr>
+    <tr><td><code>kafka.server:type=BrokerTopicMetrics,name=PartitionsCount</code></td><td>分区数</td><td>对照 baseline</td></tr>
+    <tr><td><code>ProducerExpirationCount</code></td><td>PID 过期数</td><td>突增</td></tr>
+  </tbody>
+</table>
+
+<h3>典型问题</h3>
+
+<div class="real-world">
+<strong>问题:read_committed 消费者突然 lag 飙升</strong>
+<pre><code class="language-text">现象:
+  consumer lag 持续增加, 但 producer 仍在以正常速率写入
+  jmx OngoingTransactionMaxDurationMs = 600000 (10 分钟)
+
+根因:
+  某个 transactional.id 的 Producer 实例死了,事务没 commit 也没 abort
+  TC 在等 transaction.timeout.ms (默认 60s) 后自动 abort
+  在 abort 之前, LSO 卡在该事务的 firstOffset
+
+排查:
+  1 查 __transaction_state 找出 ongoing 事务的 transactional.id
+     bin/kafka-transactions.sh --bootstrap-server ... list
+  2 找到长期 ongoing 的 transaction
+  3 通常自动 abort 后恢复,如果 producer 还在运行则要确认是否 hang
+
+动作:
+  - 等 transaction.timeout.ms 自动 abort
+  - 或手动 kill 该 transactional.id:
+    bin/kafka-transactions.sh --bootstrap-server ... abort \
+      --transactional-id order-tx-producer-1</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-8">12.8 源码深潜</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>文件</th><th>类</th><th>职责</th></tr></thead>
+  <tbody>
+    <tr><td><code>core/.../TransactionCoordinator.scala</code></td><td>TransactionCoordinator</td><td>TC 主类</td></tr>
+    <tr><td><code>core/.../TransactionStateManager.scala</code></td><td>TransactionStateManager</td><td>__transaction_state 读写</td></tr>
+    <tr><td><code>core/.../TransactionMetadata.scala</code></td><td>TransactionMetadata</td><td>事务元数据 + 状态机</td></tr>
+    <tr><td><code>core/.../ProducerStateManager.scala</code></td><td>ProducerStateManager</td><td>分区端 PID 状态</td></tr>
+    <tr><td><code>clients/.../TransactionManager.java</code></td><td>TransactionManager (Producer 端)</td><td>客户端事务状态机</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s12-9">12.9 设计取舍</h2>
+<!-- ============================================================ -->
+
+<div class="compare-grid">
+  <div>
+    <h4>① Sequence 单分区去重</h4>
+    <p>幂等 Producer 仅做单分区去重,不做跨分区原子性。代价是简单可靠,broker 状态轻量。要跨分区原子性需要事务 Producer。</p>
+  </div>
+  <div>
+    <h4>② TC 中心化</h4>
+    <p>事务状态集中在 TC(单 broker),用 __transaction_state 持久化。代价是 TC 是事务热点;收益是协议简单,无需多 broker 共识。</p>
+  </div>
+  <div>
+    <h4>③ WriteTxnMarker 控制消息</h4>
+    <p>commit/abort marker 写入参与分区作为"事务边界"。代价是每个分区多了几条控制消息;收益是 consumer 无需查 TC 即可判断事务状态。</p>
+  </div>
+  <div>
+    <h4>④ Producer Epoch Fencing</h4>
+    <p>同 transactional.id 重连 → epoch+1,旧实例被 fence。代价是 epoch 持久化开销;收益是 zombie producer 不能写脏数据。</p>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-10">12.10 陷阱与限制</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>#</th><th>陷阱</th><th>现象</th><th>修复</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>误以为 EOS 跨 Kafka 与外部 DB 原子</td><td>下游 DB 重复</td><td>用 outbox / 2PC connector</td></tr>
+    <tr><td>2</td><td>同一 transactional.id 多 Producer 实例</td><td>ProducerFenced</td><td>每实例独立 ID</td></tr>
+    <tr><td>3</td><td>read_uncommitted 默认值用在严格场景</td><td>消费未提交数据</td><td>明确设 read_committed</td></tr>
+    <tr><td>4</td><td>transaction.timeout.ms 设很大(节省 fence)</td><td>LSO 长期不推进</td><td>60-120s 起步,定期观察</td></tr>
+    <tr><td>5</td><td>过早 close producer 不 commit</td><td>事务挂起到 timeout</td><td>finally 中 abortTransaction</td></tr>
+    <tr><td>6</td><td>关键 topic 没开 acks=all</td><td>EOS 形同虚设</td><td>开 acks=all + minISR=2</td></tr>
+    <tr><td>7</td><td>__transaction_state RF=1</td><td>broker 故障导致事务元数据丢</td><td>RF=3, minISR=2</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s12-summary">12.11 本章要点</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>要点</th><th>依据</th><th>易错</th></tr></thead>
+  <tbody>
+    <tr><td>EOS 是端到端语义,不是物理保证</td><td>幂等 + TC + read_committed</td><td>误以为消息物理唯一</td></tr>
+    <tr><td>幂等 Producer 单分区有效</td><td>(PID, partition, seq)</td><td>跨分区无效</td></tr>
+    <tr><td>事务 Producer 跨分区原子</td><td>WriteTxnMarker</td><td>跨 Kafka 外部无效</td></tr>
+    <tr><td>read_committed 屏蔽未提交</td><td>LSO &amp; aborted txn index</td><td>不开默认 uncommitted</td></tr>
+    <tr><td>同 transactional.id 重连 → epoch+1</td><td>Producer Fencing</td><td>多实例并发</td></tr>
+    <tr><td>EOS 不能取代业务幂等</td><td>外部副作用</td><td>误以为银弹</td></tr>
+  </tbody>
+</table>
+
+<div class="chapter-summary">
+  <h3>本章小结</h3>
+  <p>EOS 是 Kafka 在"分布式正确性"这一维度的最高保证 — 但它的范围严格限定在 Kafka 集群内部。幂等 Producer 用 sequence 解决重试重复,事务 Producer 用两阶段提交解决跨分区原子性,read_committed Consumer 用 LSO 屏蔽未提交。三者环环相扣,但只覆盖"Kafka → Kafka"链路。任何外部副作用(HTTP、DB、缓存)仍需业务自己做幂等。下一章 Log Compaction 我们换个角度看 Kafka 日志 — 不再是"只追加",而是基于 key 的最新值保留机制,这正是 <code>__consumer_offsets</code> 和 <code>__transaction_state</code> 之所以能"无限保留"的关键。</p>
+</div>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script>hljs.highlightAll();</script>
+
+</body>
+</html>

@@ -1,0 +1,2141 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.7 分区策略与哈希算法 — 图解 Kafka</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Kafka</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="06-producer-internals.html">上一章</a>
+  <a href="08-consumer.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s7-0">7.0 章首速览</a>
+  <a href="#s7-1">7.1 分区的设计动机</a>
+  <a href="#s7-2">7.2 分区器决策树</a>
+  <a href="#s7-3">7.3 Murmur2 哈希算法</a>
+  <a href="#s7-4">7.4 toPositive 与取模</a>
+  <a href="#s7-5">7.5 历史 Round-Robin</a>
+  <a href="#s7-6">7.6 Sticky Partitioner</a>
+  <a href="#s7-7">7.7 自定义分区器</a>
+  <a href="#s7-8">7.8 一致性哈希对比</a>
+  <a href="#s7-9">7.9 分区数选择</a>
+  <a href="#s7-10">7.10 Key 设计模式</a>
+  <a href="#s7-11">7.11 分区扩容兼容性</a>
+  <a href="#s7-12">7.12 源码深潜</a>
+  <a href="#s7-13">7.13 陷阱与限制</a>
+  <a href="#s7-summary">7.14 本章小结</a>
+</aside>
+
+<div class="article">
+
+<h1>第 7 章 · 分区策略与哈希算法</h1>
+<p class="subtitle">分区动机 · 路由决策树 · Murmur2 + ZigZag · toPositive · Sticky Partitioner · 自定义分区器 · 一致性哈希对比 · 分区数估算 · key 设计 · 扩容漂移</p>
+
+<div class="chapter-intro">
+  <p class="lead">Kafka 的"分区"看起来只是把一条 topic 切成 N 条独立日志,但它其实是<strong>整个 Kafka 并行模型与顺序保证的核心边界</strong>。它决定 producer 同 key 是否进同一台 broker、决定 consumer group 能横向扩到多少实例、决定一次扩容是否会让业务侧出现"乱序",还决定一个 hot key 是否会把单台 broker 的单核 CPU 打满。这一章把"一条 ProducerRecord 怎么被路由到具体 partition"摊开到字节级 — 从 Murmur2 哈希、toPositive 位运算,到 Sticky Partitioner 的批次状态机,再到 hot key 加盐与扩容漂移的数学推导。</p>
+  <p>讨论以 Apache Kafka 3.7 客户端的 <code>BuiltInPartitioner</code> 为基线 — 它从 2.4 替换了历史的 <code>DefaultPartitioner</code>,默认行为是"有 key 走 Murmur2 取模、无 key 走 Sticky"。本章不会停留在"分区是用来扩容的"这种表层结论,而是逐项追问:为什么 Kafka 选 Murmur2 而不是 xxHash?为什么 toPositive 用位与而不是 <code>Math.abs</code>?为什么 Sticky 短期粘附长期均匀?以及最容易被忽略但最致命的:<strong>为什么 alter --partitions 是一次破坏性操作</strong>。</p>
+  <ul class="will-learn">
+    <li>分区作为并行单位的工程原因 — 单分区瓶颈、多分区聚合、顺序保证的三档取舍</li>
+    <li>Producer 路由的三分支决策树:显式 partition / key 路由 / Sticky,以及 <code>partitioner.ignore.keys</code> 的真实语义</li>
+    <li>Murmur2 算法的核心步骤:seed=0x9747b28c、4 字节小端分块、雪崩混合,以及"为什么不选 MD5/SHA/CRC32"</li>
+    <li>toPositive 用 <code>& 0x7fffffff</code> 而不用 <code>Math.abs</code> 的边界原因 — Integer.MIN_VALUE 的溢出陷阱</li>
+    <li>历史 Round-Robin 与 Sticky 的批次效率对比 — KIP-480 为什么把默认从 RR 改成 Sticky</li>
+    <li>Sticky 的状态机:首批选 partition、batch 满后切换、KIP-794 的 Strict Uniform Sticky</li>
+    <li>自定义 <code>Partitioner</code> 接口实现:RegionPartitioner / PriorityPartitioner 的设计原则与回退策略</li>
+    <li>Kafka 不用一致性哈希环的四个工程原因 — 与 Dynamo 的对比矩阵</li>
+    <li>分区数估算公式 <code>ceil(max(T/Tp, T/Tc))</code> 与不同业务规模的推荐范围</li>
+    <li>Key 设计三模式:实体 key / 加盐 / 复合 key,以及 hot key 的发现与排查命令</li>
+    <li>分区扩容的数学:N → kN 时漂移率为 <code>1 - 1/k</code>,N → 12 vs N → 7 的差异</li>
+    <li>扩容方案对比:预留分区 / 双写过渡 / 容忍漂移 / 自定义分区器</li>
+    <li>八大常见陷阱(hot key / ignore.keys 误开 / 跨语言哈希不一致 / 分区数过多过少 等)与护栏指标</li>
+  </ul>
+  <p class="prereq">前置知识:第 1 章 Kafka 数据流与 partition 模型;第 2 章 broker 架构;第 3 章 RecordBatch 与 producer 配置;第 5 章 RecordAccumulator 攒批机制。本章是"路由"维度的精解,后续第 8 章压缩会基于本章讨论的批次概念展开 codec 选型,第 9 章副本与 ISR 会基于本章 leader 分布讨论副本拓扑与 rack-awareness。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s7-0">7.0 章首速览</h2>
+<!-- ============================================================ -->
+
+<p>把整章当作一张地图先扫一遍。地图分两层:第一层是"十四节内容怎么串起来",第二层是"一条 ProducerRecord 在 producer 内部走哪条路径才能落到具体 partition"。理解了这两层,后续每节就是逐区放大。</p>
+
+<h3>地图一:全章逻辑串联</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-0 · 分区策略全景</div>
+  <svg viewBox="0 0 1000 540" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+  <rect x="420" y="20" width="160" height="50" rx="9" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="500" y="50" text-anchor="middle" fill="#fff" font-size="14" font-weight="700">分区策略</text>
+
+  <rect x="40"  y="130" width="160" height="44" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="120" y="156" text-anchor="middle" fill="#fff" font-size="12" font-weight="600">§7.1-7.2 路由输入</text>
+
+  <rect x="230" y="130" width="160" height="44" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="310" y="156" text-anchor="middle" fill="#fff" font-size="12" font-weight="600">§7.3-7.4 有 key 路径</text>
+
+  <rect x="420" y="130" width="160" height="44" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="500" y="156" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="600">§7.5-7.6 无 key 路径</text>
+
+  <rect x="610" y="130" width="160" height="44" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="690" y="156" text-anchor="middle" fill="#fff" font-size="12" font-weight="600">§7.7-7.8 自定义</text>
+
+  <rect x="800" y="130" width="160" height="44" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+  <text x="880" y="156" text-anchor="middle" fill="#fff" font-size="12" font-weight="600">§7.9-7.11 风险</text>
+
+  <path d="M460,72 L130,130" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M480,72 L320,130" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M500,72 L500,130" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M520,72 L680,130" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M540,72 L870,130" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+
+  <rect x="20"  y="230" width="200" height="34" rx="6" fill="#0d1117" stroke="#58a6ff"/>
+  <text x="120" y="252" text-anchor="middle" fill="#e6edf3" font-size="11">显式 partition</text>
+  <rect x="20"  y="270" width="200" height="34" rx="6" fill="#0d1117" stroke="#58a6ff"/>
+  <text x="120" y="292" text-anchor="middle" fill="#e6edf3" font-size="11">有 key bytes</text>
+  <rect x="20"  y="310" width="200" height="34" rx="6" fill="#0d1117" stroke="#58a6ff"/>
+  <text x="120" y="332" text-anchor="middle" fill="#e6edf3" font-size="11">null key</text>
+
+  <rect x="210" y="230" width="200" height="34" rx="6" fill="#0d1117" stroke="#3fb950"/>
+  <text x="310" y="252" text-anchor="middle" fill="#e6edf3" font-size="11">murmur2(keyBytes)</text>
+  <rect x="210" y="270" width="200" height="34" rx="6" fill="#0d1117" stroke="#3fb950"/>
+  <text x="310" y="292" text-anchor="middle" fill="#e6edf3" font-size="11">toPositive 清符号位</text>
+  <rect x="210" y="310" width="200" height="34" rx="6" fill="#0d1117" stroke="#3fb950"/>
+  <text x="310" y="332" text-anchor="middle" fill="#e6edf3" font-size="11">% N 取分区</text>
+
+  <rect x="400" y="240" width="200" height="34" rx="6" fill="#0d1117" stroke="#d29922"/>
+  <text x="500" y="262" text-anchor="middle" fill="#fce8a3" font-size="11">Sticky 攒 batch</text>
+  <rect x="400" y="290" width="200" height="34" rx="6" fill="#0d1117" stroke="#d29922"/>
+  <text x="500" y="312" text-anchor="middle" fill="#fce8a3" font-size="11">按 batch 切换</text>
+
+  <rect x="590" y="240" width="200" height="34" rx="6" fill="#0d1117" stroke="#bc8cff"/>
+  <text x="690" y="262" text-anchor="middle" fill="#e6edf3" font-size="11">Partitioner 接口</text>
+  <rect x="590" y="290" width="200" height="34" rx="6" fill="#0d1117" stroke="#bc8cff"/>
+  <text x="690" y="312" text-anchor="middle" fill="#e6edf3" font-size="11">按业务规则</text>
+
+  <rect x="780" y="230" width="200" height="34" rx="6" fill="#0d1117" stroke="#f85149"/>
+  <text x="880" y="252" text-anchor="middle" fill="#e6edf3" font-size="11">hot key</text>
+  <rect x="780" y="270" width="200" height="34" rx="6" fill="#0d1117" stroke="#f85149"/>
+  <text x="880" y="292" text-anchor="middle" fill="#e6edf3" font-size="11">扩容漂移</text>
+  <rect x="780" y="310" width="200" height="34" rx="6" fill="#0d1117" stroke="#f85149"/>
+  <text x="880" y="332" text-anchor="middle" fill="#e6edf3" font-size="11">分区数过多 / 过少</text>
+
+  <path d="M120,174 L120,230" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  <path d="M310,174 L310,230" stroke="#3fb950" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  <path d="M500,174 L500,240" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  <path d="M690,174 L690,240" stroke="#bc8cff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  <path d="M880,174 L880,230" stroke="#f85149" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+
+  <text x="500" y="430" text-anchor="middle" fill="#8b949e" font-size="13" font-weight="600">五大主线:输入 · 有 key 路径 · 无 key 路径 · 自定义 · 风险</text>
+  <text x="500" y="460" text-anchor="middle" fill="#7d8590" font-size="11">每条主线展开到本章对应的子节</text>
+</svg>
+</div>
+
+<h3>地图二:三类路由分支对照</h3>
+
+<table>
+  <thead>
+    <tr><th>分支</th><th>触发条件</th><th>算法</th><th>顺序保证</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>显式 partition</td><td><code>record.partition() != null</code></td><td>直接使用</td><td>调用方负责</td></tr>
+    <tr><td>key 路由</td><td><code>keyBytes != null</code></td><td><code>toPositive(murmur2(key)) % N</code></td><td>同 key 同分区</td></tr>
+    <tr><td>Sticky</td><td><code>key == null</code></td><td>batch 满前粘附,满后切换</td><td>无</td></tr>
+  </tbody>
+</table>
+
+<h3>地图三:核心结论</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-0-1 · 三句话浓缩</div>
+<pre><code>本章三句话:
+
+  1 显式 partition 优先级最高,跳过所有计算
+  2 有 key 路径 = toPositive(murmur2(keyBytes)) % numPartitions
+    同 key 始终进同分区(分区数不变时)
+  3 无 key 路径 = Sticky Partitioner
+    短期粘附换取批次饱满,长期均匀
+
+最易忽略的事实:
+  分区数变化让旧 key 跳分区
+  扩容是破坏性操作
+  hot key 不能靠扩 broker 修复</code></pre>
+</div>
+
+<div class="key-insight">
+  <strong>分区是 Kafka 唯一的并行维度,也是唯一的顺序边界</strong>。一个 consumer group 内,同一 partition 永远只能被一个 consumer 实例消费;反过来,同一 consumer 实例可以同时消费多个 partition。这意味着 <code>partition 数</code> 直接等于 <code>consumer group 的并行上限</code>。如果你的 topic 只有 3 个 partition,部署 10 个 consumer 实例毫无意义 — 7 个会一直闲置,直到某个活跃 consumer 离群。这一点在容量规划阶段就要拍板,事后再扩 partition 数虽然技术上可行,但代价是同 key 跳分区(详见 §7.11)。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s7-1">7.1 分区的设计动机</h2>
+<!-- ============================================================ -->
+
+<p>"为什么 Kafka 要分区"看似显而易见 — 单台机器扛不住,自然要切片。但具体切到几片、按什么切、怎么路由,这些都不是显而易见的。这一节先把分区带来的并行/吞吐/容量收益与"顺序粒度变细"这个代价摊开,让后面所有讨论都有一个共同的"权衡基线"。</p>
+
+<h3>单分区瓶颈与多分区收益</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-1-1 · 单分区瓶颈与多分区收益对比</div>
+<pre><code>单分区:
+  ┌──────────────────────────────────────┐
+  │  Topic: order-created (1 partition)  │
+  │  Producer 1     ──┐                  │
+  │  Producer 2     ──┼─→ leader Broker  │
+  │  Producer N     ──┘                  │
+  │                                      │
+  │  Consumer 1     ←──┐                 │
+  │  Consumer 2     idle                 │
+  │  Consumer N     idle                 │
+  └──────────────────────────────────────┘
+
+  瓶颈:
+    单 broker 磁盘带宽
+    单 leader 网络上限
+    最多 1 个 consumer 实例并行
+
+多分区:
+  ┌──────────────────────────────────────┐
+  │  Topic: order-created (4 partitions) │
+  │  Producer ──hash──&gt; P0 (Broker 1)    │
+  │              ────&gt; P1 (Broker 2)     │
+  │              ────&gt; P2 (Broker 3)     │
+  │              ────&gt; P3 (Broker 1)     │
+  │                                      │
+  │  Consumer A ←── P0, P3               │
+  │  Consumer B ←── P1                   │
+  │  Consumer C ←── P2                   │
+  └──────────────────────────────────────┘
+
+  收益:
+    4× 磁盘带宽聚合
+    4× 网络带宽
+    最多 4 个 consumer 实例并行</code></pre>
+</div>
+
+<h3>并行度 / 吞吐 / 容量三维收益表</h3>
+
+<table>
+  <thead>
+    <tr><th>维度</th><th>单分区瓶颈</th><th>N 分区收益</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>并行度</td><td>1 个 consumer</td><td>N 个 consumer 并行</td></tr>
+    <tr><td>吞吐</td><td>单磁盘带宽 ≈ 200-3000 MiB/s</td><td>N × 单分区上限</td></tr>
+    <tr><td>存储</td><td>单 broker 磁盘</td><td>跨 broker 分摊</td></tr>
+    <tr><td>网络</td><td>单 leader 网卡</td><td>N leader 分布</td></tr>
+  </tbody>
+</table>
+
+<h3>三种顺序保证模式的权衡</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-1-2 · 顺序粒度与并行度的权衡三角</div>
+<pre><code>                      全局有序
+                          │
+                          │
+                  并行度 ┼─ 高吞吐
+                  最低  │
+                       │
+                       │
+                       1 个分区
+                          │
+                          ▼
+                       同实体有序
+                          │
+                          │
+                          ▼
+                       高吞吐
+                          │
+                          │
+                          ▼
+                       仅分区内有序
+                       N 大,key 决定顺序边界</code></pre>
+</div>
+
+<table>
+  <thead>
+    <tr><th>顺序需求</th><th>实现</th><th>代价</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>全局有序</td><td>1 个分区</td><td>并行度最低,吞吐受限</td></tr>
+    <tr><td>同实体有序</td><td>key = entityId,N 个分区</td><td>仅同 key 有序</td></tr>
+    <tr><td>不要求顺序</td><td>null key + Sticky</td><td>长期均匀,短期粘附</td></tr>
+  </tbody>
+</table>
+
+<h3>分区物理布局示例</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-1-3 · 4 分区 × 3 broker 的副本分布</div>
+  <svg viewBox="0 0 980 400" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+  <rect x="20" y="20" width="280" height="340" rx="10" fill="#0d1117" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="6 3"/>
+  <text x="160" y="42" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="700">Topic: order-created (4 分区)</text>
+
+  <rect x="50" y="60" width="220" height="60" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="160" y="84" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">Partition 0</text>
+  <text x="160" y="104" text-anchor="middle" fill="#fff" font-size="11">leader B1</text>
+
+  <rect x="50" y="135" width="220" height="60" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="160" y="159" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">Partition 1</text>
+  <text x="160" y="179" text-anchor="middle" fill="#fff" font-size="11">leader B2</text>
+
+  <rect x="50" y="210" width="220" height="60" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="160" y="234" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">Partition 2</text>
+  <text x="160" y="254" text-anchor="middle" fill="#fff" font-size="11">leader B3</text>
+
+  <rect x="50" y="285" width="220" height="60" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="160" y="309" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">Partition 3</text>
+  <text x="160" y="329" text-anchor="middle" fill="#fff" font-size="11">leader B1</text>
+
+  <rect x="600" y="20" width="340" height="100" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="770" y="44" text-anchor="middle" fill="#fff" font-size="14" font-weight="700">Broker 1</text>
+  <text x="770" y="66" text-anchor="middle" fill="#fff" font-size="11">P0 leader + P3 leader</text>
+  <text x="770" y="84" text-anchor="middle" fill="#fff" font-size="11">P1 follower + P2 follower</text>
+
+  <rect x="600" y="140" width="340" height="100" rx="10" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="770" y="164" text-anchor="middle" fill="#fff" font-size="14" font-weight="700">Broker 2</text>
+  <text x="770" y="186" text-anchor="middle" fill="#fff" font-size="11">P1 leader</text>
+  <text x="770" y="204" text-anchor="middle" fill="#fff" font-size="11">P0 follower + P3 follower</text>
+
+  <rect x="600" y="260" width="340" height="100" rx="10" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="770" y="284" text-anchor="middle" fill="#fce8a3" font-size="14" font-weight="700">Broker 3</text>
+  <text x="770" y="306" text-anchor="middle" fill="#fce8a3" font-size="11">P2 leader</text>
+  <text x="770" y="324" text-anchor="middle" fill="#fce8a3" font-size="11">P1 follower + P3 follower</text>
+
+  <path d="M270,90  L600,70"  stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  <path d="M270,165 L600,190" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  <path d="M270,240 L600,310" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  <path d="M270,315 L600,100" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)" stroke-dasharray="4 3"/>
+
+  <text x="490" y="385" text-anchor="middle" fill="#8b949e" font-size="12">leader 分布按 broker 数轮转;follower 由 controller 按 rack-aware 算法决定</text>
+</svg>
+</div>
+
+<p>每个分区有 1 个 leader 与 N-1 个 follower(N = <code>replication.factor</code>)。leader 分布通常按 broker 数轮转,follower 分布由 controller 在创建 topic 时按 rack-aware 算法决定 — 这一点在第 9 章会详细展开。本节关心的是<strong>分区编号(P0/P1/P2/P3)是稳定的</strong>:即使某个分区 leader 切换到其他 broker,它的分区号不会变 — 这一点直接决定了 consumer offset 的稳定性,也是后面 §7.8 解释"为什么不用一致性哈希"的关键依据。</p>
+
+<div class="real-world">
+  <strong>真实事故:某电商平台为了"提升性能"把单 topic 从 6 分区扩到 60 分区</strong>。运维团队的逻辑是"多 10 倍 partition = 多 10 倍并行度",但他们没注意到该 topic 的 consumer group 只有 8 个实例。扩容后吞吐只涨了 5%,但 broker 启动时间从 15s 涨到 90s,fetch metadata 单次响应从 2KB 涨到 200KB。问题根源是 <strong>partition 数远超 consumer 并行度</strong>,导致每个 consumer 实例平均承担 7 个 partition 的拉取与提交开销,网络往返数翻倍。修复路径是"先把 consumer 扩到 60,再用 60 partition;否则保持 6 partition + 6 consumer"。教训:partition 数不是越多越好,应该匹配 consumer 并行度。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s7-2">7.2 分区器决策树</h2>
+<!-- ============================================================ -->
+
+<p>Producer 在 <code>send()</code> 调用栈里要决定"这条 record 应该进哪个 partition"。整个决策只有三个分支,但每个分支的触发条件、行为与顺序语义都不同。把决策树画清楚,你就能在排障时立刻定位"我的消息为什么进了 P3 而不是 P5"。</p>
+
+<h3>三分支决策图</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-2-1 · Producer 路由决策树</div>
+  <svg viewBox="0 0 980 540" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+  <rect x="400" y="20" width="180" height="44" rx="9" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="490" y="48" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">ProducerRecord</text>
+
+  <path d="M380,110 L490,80 L600,110 L490,140 Z" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="490" y="108" text-anchor="middle" fill="#fff" font-size="11" font-weight="600">record.partition()</text>
+  <text x="490" y="122" text-anchor="middle" fill="#fff" font-size="11" font-weight="600">== null?</text>
+
+  <path d="M490,140 L490,180" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <text x="500" y="158" fill="#3fb950" font-size="11">是</text>
+
+  <path d="M600,110 L780,130" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <text x="690" y="115" fill="#f85149" font-size="11">否</text>
+
+  <rect x="710" y="130" width="240" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="830" y="152" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">直接使用指定 partition</text>
+  <text x="830" y="168" text-anchor="middle" fill="#fff" font-size="11">跳过分区器</text>
+
+  <path d="M380,210 L490,180 L600,210 L490,240 Z" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="490" y="208" text-anchor="middle" fill="#fff" font-size="11" font-weight="600">partitioner.ignore.keys</text>
+  <text x="490" y="222" text-anchor="middle" fill="#fff" font-size="11" font-weight="600">== true?</text>
+
+  <path d="M490,240 L490,280" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <text x="500" y="258" fill="#f85149" font-size="11">否</text>
+
+  <path d="M600,210 L780,230" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <text x="690" y="215" fill="#3fb950" font-size="11">是</text>
+
+  <rect x="710" y="220" width="240" height="50" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="830" y="252" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">忽略 key, 走 Sticky</text>
+
+  <path d="M380,310 L490,280 L600,310 L490,340 Z" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="490" y="316" text-anchor="middle" fill="#fff" font-size="11" font-weight="600">keyBytes != null?</text>
+
+  <path d="M490,340 L300,400" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <text x="380" y="378" fill="#3fb950" font-size="11">是</text>
+
+  <path d="M490,340 L680,400" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <text x="600" y="378" fill="#f85149" font-size="11">否</text>
+
+  <rect x="160" y="400" width="280" height="60" rx="9" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="300" y="424" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">toPositive(murmur2(keyBytes))</text>
+  <text x="300" y="444" text-anchor="middle" fill="#fff" font-size="12">% numPartitions</text>
+
+  <rect x="540" y="400" width="280" height="60" rx="9" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="680" y="434" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">Sticky 攒 batch</text>
+
+  <rect x="350" y="490" width="280" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="490" y="514" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">accumulator.append()</text>
+
+  <path d="M300,460 L470,492" stroke="#3fb950" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M680,460 L520,492" stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M830,180 L850,490 L630,510" stroke="#7d8590" stroke-width="1.2" fill="none" marker-end="url(#arr)" stroke-dasharray="4 3"/>
+</svg>
+</div>
+
+<h3>三分支详细对比</h3>
+
+<table>
+  <thead>
+    <tr><th>分支</th><th>条件</th><th>行为</th><th>顺序保证</th><th>推荐场景</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>显式 partition</td><td><code>partition() != null</code></td><td>直接路由</td><td>调用方负责</td><td>自定义路由(如按时间)</td></tr>
+    <tr><td>key 路由</td><td><code>keyBytes != null</code></td><td>murmur2 hash 取模</td><td>同 key 同分区</td><td>实体级有序业务</td></tr>
+    <tr><td>Sticky</td><td><code>keyBytes == null</code></td><td>短期粘附,batch 切换</td><td>无</td><td>无顺序要求的事件</td></tr>
+  </tbody>
+</table>
+
+<h3>决策代码片段</h3>
+
+<pre><code class="language-java">public int partition(ProducerRecord&lt;K, V&gt; record,
+                     byte[] serializedKey,
+                     byte[] serializedValue,
+                     Cluster cluster) {
+
+    Integer specifiedPartition = record.partition();
+    if (specifiedPartition != null) {
+        return specifiedPartition;
+    }
+
+    if (partitionerIgnoreKeys || serializedKey == null) {
+        return BuiltInPartitioner.partitionForKey(null,
+            cluster.partitionsForTopic(record.topic()).size());
+    }
+
+    return BuiltInPartitioner.partitionForKey(serializedKey,
+        cluster.partitionsForTopic(record.topic()).size());
+}
+
+public static int partitionForKey(byte[] keyBytes, int numPartitions) {
+    if (keyBytes == null) {
+        return -1;
+    }
+    return Utils.toPositive(Utils.murmur2(keyBytes)) % numPartitions;
+}</code></pre>
+
+<h3>关键配置</h3>
+
+<pre><code class="language-properties"># 默认值,不需要显式设置
+# 走 BuiltInPartitioner
+
+# 自定义分区器
+partitioner.class=com.example.RegionPartitioner
+
+# Kafka 2.4+ 新增
+partitioner.ignore.keys=false</code></pre>
+
+<div class="warning">
+  <strong><code>partitioner.ignore.keys=true</code> 是生产里最容易误开的开关</strong>。它的语义是"即使消息带 key,也按 Sticky 路由,完全忽略 key 哈希"。配置文档把它描述为"可以提升吞吐",听起来很美好;但它的真实含义是<strong>同 key 不再保证同分区</strong>,直接破坏所有依赖 entity-level 顺序的下游业务。比如订单系统假设"同 orderId 的事件按顺序消费",一旦误开这个开关,你会看到 OrderPaid 出现在 OrderCreated 之前,审计与对账全乱。除非你 100% 确定这个 topic 不依赖任何 key 顺序,否则应该保持默认 <code>false</code>。一个稳妥的护栏是在平台层禁止业务方设置该参数,只允许走 SDK 默认。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s7-3">7.3 Murmur2 哈希算法</h2>
+<!-- ============================================================ -->
+
+<p>Murmur2 是 Kafka 把 key 字节均匀打散到 partition 的核心工具。它不是 Kafka 自创,而是 Austin Appleby 在 2008 年发布的非加密通用哈希(<a>Murmur</a> = "MUltiply and Rotate")。Kafka 当年选它的理由是"速度足够快、雪崩效应足够好、跨语言实现成熟"。这一节把它的算法逐字节拆开,让你不仅知道"它返回一个 int",还能在排障时手动复现一次哈希。</p>
+
+<h3>算法整体流程</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-3-1 · Murmur2 算法流程</div>
+  <svg viewBox="0 0 1080 360" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+  <rect x="20" y="140" width="120" height="60" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="80" y="174" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">key bytes</text>
+
+  <rect x="170" y="130" width="160" height="80" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="250" y="158" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">初始化</text>
+  <text x="250" y="180" text-anchor="middle" fill="#fff" font-size="11">h = seed XOR length</text>
+  <text x="250" y="198" text-anchor="middle" fill="#fff" font-size="10">seed = 0x9747b28c</text>
+
+  <rect x="360" y="130" width="160" height="80" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="440" y="158" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">按 4 字节小端分块</text>
+  <text x="440" y="180" text-anchor="middle" fill="#fff" font-size="11">k = b0 | b1&lt;&lt;8 | ...</text>
+
+  <rect x="550" y="100" width="200" height="140" rx="9" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="650" y="124" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">块内混合</text>
+  <text x="650" y="148" text-anchor="middle" fill="#fff" font-size="11">k *= M</text>
+  <text x="650" y="166" text-anchor="middle" fill="#fff" font-size="11">k ^= k &gt;&gt;&gt; R</text>
+  <text x="650" y="184" text-anchor="middle" fill="#fff" font-size="11">k *= M</text>
+  <text x="650" y="202" text-anchor="middle" fill="#fff" font-size="11">h *= M</text>
+  <text x="650" y="220" text-anchor="middle" fill="#fff" font-size="11">h ^= k</text>
+
+  <path d="M650,240 L650,280 L440,280 L440,210" stroke="#3fb950" stroke-width="1.4" fill="none" marker-end="url(#arr)" stroke-dasharray="4 3"/>
+  <text x="540" y="295" fill="#3fb950" font-size="11">还有 4 字节块?</text>
+
+  <rect x="780" y="20" width="180" height="80" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="870" y="46" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">处理剩余 1-3 字节</text>
+  <text x="870" y="68" text-anchor="middle" fill="#fce8a3" font-size="11">switch(length % 4)</text>
+  <text x="870" y="84" text-anchor="middle" fill="#fce8a3" font-size="11">case 3/2/1 fall-through</text>
+
+  <rect x="780" y="120" width="180" height="100" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="870" y="146" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">雪崩混合 (avalanche)</text>
+  <text x="870" y="168" text-anchor="middle" fill="#fce8a3" font-size="11">h ^= h &gt;&gt;&gt; 13</text>
+  <text x="870" y="186" text-anchor="middle" fill="#fce8a3" font-size="11">h *= M</text>
+  <text x="870" y="204" text-anchor="middle" fill="#fce8a3" font-size="11">h ^= h &gt;&gt;&gt; 15</text>
+
+  <rect x="780" y="240" width="180" height="60" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+  <text x="870" y="266" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">32-bit signed int</text>
+  <text x="870" y="284" text-anchor="middle" fill="#fff" font-size="11">返回 hash</text>
+
+  <path d="M140,170 L170,170" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M330,170 L360,170" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M520,170 L550,170" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M750,200 L780,60" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M870,100 L870,120" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M870,220 L870,240" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+
+  <text x="540" y="340" text-anchor="middle" fill="#8b949e" font-size="12">M = 0x5bd1e995, R = 24; 雪崩混合让任一 bit 翻转都影响输出至少一半 bit</text>
+</svg>
+</div>
+
+<h3>Kafka 的 Murmur2 实现源码</h3>
+
+<pre><code class="language-java">// org.apache.kafka.common.utils.Utils
+public static int murmur2(final byte[] data) {
+    int length = data.length;
+    int seed = 0x9747b28c;
+    final int m = 0x5bd1e995;
+    final int r = 24;
+
+    int h = seed ^ length;
+    int length4 = length / 4;
+
+    for (int i = 0; i &lt; length4; i++) {
+        final int i4 = i * 4;
+        int k = (data[i4 + 0] &amp; 0xff)
+              + ((data[i4 + 1] &amp; 0xff) &lt;&lt; 8)
+              + ((data[i4 + 2] &amp; 0xff) &lt;&lt; 16)
+              + ((data[i4 + 3] &amp; 0xff) &lt;&lt; 24);
+        k *= m;
+        k ^= k &gt;&gt;&gt; r;
+        k *= m;
+        h *= m;
+        h ^= k;
+    }
+
+    switch (length % 4) {
+        case 3:
+            h ^= (data[(length &amp; ~3) + 2] &amp; 0xff) &lt;&lt; 16;
+        case 2:
+            h ^= (data[(length &amp; ~3) + 1] &amp; 0xff) &lt;&lt; 8;
+        case 1:
+            h ^= data[length &amp; ~3] &amp; 0xff;
+            h *= m;
+    }
+
+    h ^= h &gt;&gt;&gt; 13;
+    h *= m;
+    h ^= h &gt;&gt;&gt; 15;
+    return h;
+}</code></pre>
+
+<h3>Kafka 选 Murmur2 而不是其他哈希的理由</h3>
+
+<table>
+  <thead>
+    <tr><th>算法</th><th>速度</th><th>雪崩效应</th><th>Kafka 适用性</th><th>拒绝理由</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>MD5</td><td>慢(100 MiB/s)</td><td>优</td><td>否</td><td>加密级开销过重</td></tr>
+    <tr><td>SHA-256</td><td>慢(100 MiB/s)</td><td>优</td><td>否</td><td>加密级开销过重</td></tr>
+    <tr><td>CRC32</td><td>快(2 GiB/s)</td><td>校验级</td><td>否</td><td>雪崩弱,相似 key 易碰撞</td></tr>
+    <tr><td>Murmur2</td><td>极快(5 GiB/s)</td><td>良</td><td>是</td><td>速度 + 均匀的最佳平衡</td></tr>
+    <tr><td>xxHash</td><td>极快(20 GiB/s)</td><td>良</td><td>同级</td><td>选定后无更换必要</td></tr>
+  </tbody>
+</table>
+
+<h3>具体 key 的哈希计算示例</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-3-2 · "O1001" 的 Murmur2 计算逐步</div>
+<pre><code>key = "O1001"
+keyBytes = 4F 31 30 30 31  (5 字节)
+
+初始化:
+  seed = 0x9747b28c = -1761436532
+  length = 5
+  h = seed ^ 5 = -1761436529 = 0x9747B289
+
+第 1 个 4 字节块: "O100"
+  小端字节序: 30 30 31 4F
+  k = 0x4F313030
+
+  k *= 0x5bd1e995  →  0x...
+  k ^= k &gt;&gt;&gt; 24    →  0x...
+  k *= 0x5bd1e995  →  0x...
+  h *= 0x5bd1e995  →  0x...
+  h ^= k           →  0x...
+
+尾部: "1" (1 字节)
+  h ^= 0x31
+  h *= 0x5bd1e995
+
+雪崩:
+  h ^= h &gt;&gt;&gt; 13
+  h *= 0x5bd1e995
+  h ^= h &gt;&gt;&gt; 15
+
+最终 h = -940440895 (signed int32)</code></pre>
+</div>
+
+<h3>雪崩效应可视化</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-3-3 · 输入 1 bit 变化对输出的影响</div>
+<pre><code>输入仅 1 bit 变化对输出的影响:
+
+  key = "O1001"  → murmur2 = -940440895  = 0xCBE5_FE41
+  key = "O1000"  → murmur2 =  213560324  = 0x0CBA_E984
+
+  二进制对比(64 位扩展显示前 32 位):
+    -940440895:  1100 1011 1110 0101 1111 1110 0100 0001
+     213560324:  0000 1100 1011 1010 1110 1001 1000 0100
+                 17 个 bit 不同(总 32 个)
+
+  不同 bit 比例 ≈ 53%
+  接近理论最优 50%(完全随机)
+
+  对比 CRC32(已知雪崩弱):
+    "O1001" CRC32 = 0xA9D7_8413
+    "O1000" CRC32 = 0xA9D5_C3F2
+    仅相邻 bit 变化,分区分布偏差</code></pre>
+</div>
+
+<div class="key-insight">
+  <strong>"雪崩效应"是分区均匀性的数学基础</strong>。如果哈希函数对相似输入产生相似输出,那么相邻 key(如 "user-100"、"user-101"、"user-102"...)就会聚集到相邻 partition,出现明显倾斜。Murmur2 的雪崩效应让相邻 1 bit 的输入产生约 50% bit 不同的输出,等价于"近似随机分布",这才是<strong>Murmur2 % N</strong>能均匀分布到 N 个 partition 的根本原因。CRC32 之所以不适合,正是因为它的雪崩效应弱 — 相邻 key 的 CRC32 输出仅有少量 bit 变化,取模后会形成可见的倾斜模式。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s7-4">7.4 toPositive 与取模</h2>
+<!-- ============================================================ -->
+
+<p>Murmur2 返回 32-bit signed int,值域是 <code>[-2³¹, 2³¹-1]</code>。直接拿这个值 <code>% N</code> 会返回负数 — Java 的 <code>%</code> 运算保留符号。partition 编号必须是非负的 <code>[0, N-1]</code>,所以取模前必须先把 hash 转为非负。这一节解释为什么 Kafka 选 <code>& 0x7fffffff</code> 而不是 <code>Math.abs</code>,以及这背后藏着的一个 32 位整数的经典边界陷阱。</p>
+
+<h3>负数取模的问题</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-4-1 · Java 负数取模的符号保留</div>
+<pre><code>Java int 的范围: [-2^31, 2^31 - 1]
+
+murmur2 返回 32-bit signed int:
+  可能为正(0..2^31-1)
+  可能为负(-2^31..-1)
+
+负数取模在 Java 中保留符号:
+  -940440895 % 12 = -3   (无效分区号)
+  -940440895 % 6  = -3
+   213560324 % 12 = 8
+
+需要先转为非负:
+  方案 A: Math.abs(murmur2(...))
+    问题:Math.abs(Integer.MIN_VALUE) = Integer.MIN_VALUE(仍负)
+    边界值崩溃
+
+  方案 B: hash &amp; 0x7fffffff(Kafka 选择)
+    清除符号位
+    所有输入返回非负值
+    无边界问题</code></pre>
+</div>
+
+<h3>位与运算图解</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-4-2 · & 0x7fffffff 的位运算示意</div>
+<pre><code>&amp; 0x7fffffff 操作:
+
+  number:        s xxx xxxx xxxx xxxx xxxx xxxx xxxx xxxx
+                 ↑
+                 符号位(bit 31)
+
+  0x7fffffff:    0 111 1111 1111 1111 1111 1111 1111 1111
+
+  AND result:    0 xxx xxxx xxxx xxxx xxxx xxxx xxxx xxxx
+                 ↑
+                 强制为 0,值变为非负
+
+示例:
+  number      =  -940440895  =  1100 1011 1110 0101 1111 1110 0100 0001
+  0x7fffffff  =                 0111 1111 1111 1111 1111 1111 1111 1111
+  AND         =  1206482753  =  0100 1011 1110 0101 1111 1110 0100 0001
+                                ↑
+                                符号位清零</code></pre>
+</div>
+
+<h3>Math.abs 的边界问题</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-4-3 · Integer.MIN_VALUE 的溢出陷阱</div>
+<pre><code>Integer.MIN_VALUE = -2147483648 = 0x80000000 = 1000 0000 ... 0000
+
+Math.abs(Integer.MIN_VALUE):
+  公式: -x = ~x + 1
+  ~0x80000000 = 0x7FFFFFFF
+  0x7FFFFFFF + 1 = 0x80000000  (溢出回到原值)
+  返回 -2147483648
+
+后果:
+  Math.abs(Integer.MIN_VALUE) % 12 = -2147483648 % 12 = -8
+  仍为负数,bug 触发概率 1/2^32
+
+Kafka 选 &amp; 0x7fffffff:
+  toPositive(0x80000000) = 0x80000000 &amp; 0x7fffffff = 0
+  所有输入均返回非负
+  概率 100% 安全</code></pre>
+</div>
+
+<h3>完整路由公式</h3>
+
+<table>
+  <thead>
+    <tr><th>步骤</th><th>操作</th><th>输出</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td><code>keyBytes = key.getBytes(UTF_8)</code></td><td>byte[]</td></tr>
+    <tr><td>2</td><td><code>hash = Utils.murmur2(keyBytes)</code></td><td>signed int32</td></tr>
+    <tr><td>3</td><td><code>positive = hash &amp; 0x7fffffff</code></td><td>non-negative int</td></tr>
+    <tr><td>4</td><td><code>partition = positive % numPartitions</code></td><td>[0, N-1]</td></tr>
+  </tbody>
+</table>
+
+<h3>确定性验证</h3>
+
+<pre><code class="language-java">byte[] keyBytes = "O1001".getBytes(StandardCharsets.UTF_8);
+for (int i = 0; i &lt; 3; i++) {
+    int hash = Utils.murmur2(keyBytes);
+    int positive = Utils.toPositive(hash);
+    int partition = positive % 6;
+    System.out.printf("hash=%d positive=%d partition=%d%n",
+        hash, positive, partition);
+}</code></pre>
+
+<pre><code>hash=-940440895 positive=1207042753 partition=1
+hash=-940440895 positive=1207042753 partition=1
+hash=-940440895 positive=1207042753 partition=1</code></pre>
+
+<p>同一 key 重复运行得到相同分区。这是分区内顺序保证的基础。Java、Go、Python 客户端实现 murmur2 时只要使用相同 seed(<code>0x9747b28c</code>)即可保持跨语言一致 — 这一点在 §7.13 的"跨语言哈希不一致"陷阱里会展开。</p>
+
+<div class="warning">
+  <strong>不要"自己优化" Murmur2 实现</strong>。曾经有团队在 Go 客户端里用了不同 seed 或者忘了对 length 做 XOR,结果同 key 在 Go producer 与 Java producer 写出去后落到不同 partition,下游 consumer 看到"同一订单的事件被两个实例同时处理"。这种 bug 极难复现,因为它只在某些特定 key 长度下触发。修复方式只有一个:<strong>所有语言的客户端都用 Kafka 官方的 murmur2 实现 / librdkafka,不要自己重写</strong>。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s7-5">7.5 历史 Round-Robin(&lt; 2.4)</h2>
+<!-- ============================================================ -->
+
+<p>2.4 之前,Kafka 对 null key 的默认策略是 Round-Robin — 每条消息按计数器递增,依次分配到 P0、P1、P2、...、PN-1、P0、...。这个策略很直观,但它有一个严重问题:<strong>它把消息均匀打散,反而让批次饱和不起来</strong>。这一节回顾 Round-Robin 的实现与它带来的"批次碎片化"问题,解释为什么 Kafka 在 KIP-480 改成了 Sticky。</p>
+
+<h3>Round-Robin 算法</h3>
+
+<pre><code class="language-java">private final AtomicInteger counter = new AtomicInteger(0);
+
+public int partition(...) {
+    if (keyBytes == null) {
+        int nextValue = counter.getAndIncrement();
+        int partition = Utils.toPositive(nextValue) % numPartitions;
+        return partition;
+    }
+    // key 路由保持 murmur2 % N
+}</code></pre>
+
+<h3>批次碎片化问题</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-5-1 · Round-Robin vs Sticky 的批次形态</div>
+<pre><code>Round-Robin 分配:
+  6 条 record 进入 3 分区:
+    R1 → P0
+    R2 → P1
+    R3 → P2
+    R4 → P0
+    R5 → P1
+    R6 → P2
+
+  RecordAccumulator 状态:
+    P0: [R1, R4]   (2 条,batch 未满)
+    P1: [R2, R5]   (2 条,batch 未满)
+    P2: [R3, R6]   (2 条,batch 未满)
+
+  linger.ms 到期后:
+    3 个 ProduceRequest(每分区 1 个)
+    每 batch 仅 2 条 record
+    元数据占比高
+
+Sticky 分配:
+  6 条 record 进入选定的 P0:
+    R1 → P0
+    R2 → P0
+    R3 → P0
+    R4 → P0
+    R5 → P0
+    R6 → P0
+
+  RecordAccumulator 状态:
+    P0: [R1, R2, R3, R4, R5, R6]   (6 条)
+    P1: 空
+    P2: 空
+
+  发送时:
+    1 个 ProduceRequest
+    单 batch 6 条 record
+    元数据占比低
+    压缩比更高</code></pre>
+</div>
+
+<h3>Round-Robin vs Sticky 性能对比</h3>
+
+<table>
+  <thead>
+    <tr><th>指标</th><th>Round-Robin</th><th>Sticky</th><th>提升</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>平均 batch size</td><td>3 条</td><td>36 条</td><td>12×</td></tr>
+    <tr><td>请求数</td><td>4000 / 秒</td><td>350 / 秒</td><td>-91%</td></tr>
+    <tr><td>吞吐</td><td>28 MiB/s</td><td>42 MiB/s</td><td>+50%</td></tr>
+    <tr><td>P99 延迟</td><td>15 ms</td><td>8 ms</td><td>-47%</td></tr>
+    <tr><td>压缩比(zstd)</td><td>0.6</td><td>0.3</td><td>2×</td></tr>
+  </tbody>
+</table>
+
+<p>测试条件:3 broker,12 分区,消息大小 1 KiB,linger.ms=5。数据来自 KIP-480 基准测试,实际场景受消息大小、压缩、broker I/O 影响。这张表的核心信号是:<strong>Sticky 不仅吞吐更高,延迟反而更低</strong>。这看似反直觉(粘附了应该延迟高吧?),但其实是因为 Round-Robin 产生大量小批次,broker 每次处理批次的固定开销摊到每条 record 上反而更大;Sticky 的批次饱满后,每条 record 的"边际处理成本"显著下降。</p>
+
+<!-- ============================================================ -->
+<h2 id="s7-6">7.6 Sticky Partitioner</h2>
+<!-- ============================================================ -->
+
+<p>Sticky Partitioner 由 KIP-480 在 2.4 引入,是当前 Kafka 的默认 null-key 策略。它的核心思想是"短期粘附 + 长期均匀":一段时间内所有 null-key 消息都进同一个 partition(让 batch 攒满),batch 满后切换到下一个 partition。这样既保留了 Round-Robin 的均匀性,又解决了批次碎片化问题。</p>
+
+<h3>Sticky 状态机</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-6-1 · Sticky 的批次状态机</div>
+  <svg viewBox="0 0 1040 460" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+  <circle cx="60" cy="60" r="14" fill="#bc8cff"/>
+  <text x="60" y="64" text-anchor="middle" fill="#0d1117" font-size="11" font-weight="700">●</text>
+  <text x="60" y="100" text-anchor="middle" fill="#bc8cff" font-size="11">首次发送</text>
+
+  <rect x="140" y="30" width="180" height="64" rx="9" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="230" y="56" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">Choose</text>
+  <text x="230" y="76" text-anchor="middle" fill="#fff" font-size="11">选 stickyPartition</text>
+
+  <rect x="380" y="30" width="200" height="64" rx="9" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="480" y="56" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">Sticky → P0</text>
+  <text x="480" y="76" text-anchor="middle" fill="#fff" font-size="11">持续追加到 P0</text>
+
+  <rect x="640" y="30" width="200" height="64" rx="9" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="740" y="56" text-anchor="middle" fill="#fce8a3" font-size="13" font-weight="700">Send</text>
+  <text x="740" y="76" text-anchor="middle" fill="#fce8a3" font-size="11">发送当前 batch</text>
+
+  <rect x="380" y="170" width="200" height="64" rx="9" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="480" y="196" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">ChooseNew</text>
+  <text x="480" y="216" text-anchor="middle" fill="#fff" font-size="10">选新 partition (排除 P0)</text>
+
+  <rect x="140" y="170" width="200" height="64" rx="9" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="240" y="196" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">Sticky → P2</text>
+  <text x="240" y="216" text-anchor="middle" fill="#fff" font-size="11">持续追加到 P2</text>
+
+  <rect x="640" y="170" width="200" height="64" rx="9" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="740" y="196" text-anchor="middle" fill="#fce8a3" font-size="13" font-weight="700">Send (P2)</text>
+  <text x="740" y="216" text-anchor="middle" fill="#fce8a3" font-size="11">发送 batch</text>
+
+  <rect x="380" y="310" width="200" height="64" rx="9" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="480" y="336" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">ChooseNew</text>
+  <text x="480" y="356" text-anchor="middle" fill="#fff" font-size="10">选新 partition (排除 P2)</text>
+
+  <rect x="640" y="310" width="200" height="64" rx="9" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="740" y="336" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">Sticky → P1 ...</text>
+  <text x="740" y="356" text-anchor="middle" fill="#fff" font-size="11">轮换继续</text>
+
+  <path d="M75,60 L140,60" stroke="#bc8cff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M320,60 L380,60" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <text x="350" y="50" text-anchor="middle" fill="#7d8590" font-size="10">选 P0</text>
+  <path d="M580,60 L640,60" stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <text x="610" y="50" text-anchor="middle" fill="#d29922" font-size="10">batch 满</text>
+
+  <path d="M740,94 L580,170" stroke="#bc8cff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <text x="680" y="135" fill="#bc8cff" font-size="10">onNewBatch</text>
+
+  <path d="M380,200 L340,200" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <text x="360" y="190" text-anchor="middle" fill="#7d8590" font-size="10">选 P2</text>
+  <path d="M340,200 L640,200" stroke="#3fb950" stroke-width="1.4" fill="none" marker-end="url(#arr)" stroke-dasharray="4 3"/>
+  <text x="500" y="156" text-anchor="middle" fill="#3fb950" font-size="10">append 持续</text>
+
+  <path d="M740,234 L580,310" stroke="#bc8cff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <text x="680" y="275" fill="#bc8cff" font-size="10">onNewBatch</text>
+
+  <path d="M580,342 L640,342" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <text x="610" y="332" text-anchor="middle" fill="#7d8590" font-size="10">选 P1</text>
+
+  <path d="M480,160 L480,134" stroke="#3fb950" stroke-width="1.4" fill="none" marker-end="url(#arr)" stroke-dasharray="4 3"/>
+  <text x="500" y="150" fill="#3fb950" font-size="10">同一 partition 内 append</text>
+
+  <text x="500" y="420" text-anchor="middle" fill="#8b949e" font-size="12">每个 batch 周期切换一次 partition,长期均匀;短期内 batch 饱满,降低 ProduceRequest 数</text>
+</svg>
+</div>
+
+<h3>无 key 流量分布示例</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-6-2 · 1000 条 null-key 消息的 Sticky 分布过程</div>
+<pre><code>连续发送 1000 条 null-key 消息,3 分区:
+
+  T+000 ms: stickyPartition = P1(随机选)
+  T+001 ms: append R1 → P1
+  T+002 ms: append R2 → P1
+  ...
+  T+050 ms: append R36 → P1, batch 满
+  T+050 ms: 触发发送,onNewBatch
+  T+050 ms: stickyPartition = P0(排除 P1)
+  T+051 ms: append R37 → P0
+  ...
+  T+100 ms: append R72 → P0, batch 满
+  T+100 ms: stickyPartition = P2(排除 P0)
+  ...
+
+  最终分布(1000 条):
+    P0: 333 条
+    P1: 333 条
+    P2: 334 条
+
+  长期均匀,短期粘附
+  batch 数 = 1000 / 36 ≈ 28 个
+  vs Round-Robin 的 1000 个 batch</code></pre>
+</div>
+
+<h3>Sticky 收益依赖 producer 配置</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-6-3 · Sticky 与 batch.size / linger.ms 的协同</div>
+<pre><code>Sticky 不是单独工作的:
+
+  batch.size 决定容器大小
+  linger.ms 决定等待时间
+  压缩算法从大 batch 受益
+
+收益最大化:
+  batch.size = 65536(64 KiB)
+  linger.ms = 10-50
+  compression.type = zstd
+
+收益不明显:
+  batch.size = 1024
+  linger.ms = 0
+  → Sticky 仍粘附,但 batch 仍小</code></pre>
+</div>
+
+<h3>Sticky 切换的触发条件</h3>
+
+<table>
+  <thead>
+    <tr><th>条件</th><th>行为</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>batch 满</td><td><code>onNewBatch</code> 触发,选新 partition</td></tr>
+    <tr><td><code>linger.ms</code> 到期</td><td>发送当前 batch,选新 partition</td></tr>
+    <tr><td><code>flush()</code></td><td>发送所有 batch,下一条选新 partition</td></tr>
+    <tr><td>分区不可用</td><td>选其他可用 partition</td></tr>
+  </tbody>
+</table>
+
+<h3>Strict Uniform Sticky(KIP-794)</h3>
+
+<p>Kafka 3.3+ 的内置分区逻辑改进:在选新 sticky 分区时,不再纯随机,而是结合各分区的 in-flight 字节数等负载信息,避免长期粘在慢 broker 上。该机制保证长期分布均匀,同时避免 hot leader 上的累积压力。这一改动很微妙但很重要 — 它让 Sticky 在 broker 异构(部分 broker 性能低)的环境下依然能保持流量均衡。</p>
+
+<div class="key-insight">
+  <strong>Sticky 与 batch.size + linger.ms 是"绑定生效"的</strong>。如果你保留了 Sticky 默认但配了 <code>linger.ms=0</code>,Sticky 的粘附窗口被压缩到几乎为零(每条消息一发就被 flush,相当于每条都触发 onNewBatch),退化成接近 Round-Robin 的行为。要让 Sticky 真正发挥威力,<code>linger.ms</code> 必须 ≥ 5(让 producer 有机会攒批),<code>batch.size</code> 应配 32-128 KiB 让 batch 容纳足够 record。生产实践:对低延迟敏感的 topic 也至少配 <code>linger.ms=2</code>,几乎不影响 P99 延迟,但能显著提升吞吐与压缩比。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s7-7">7.7 自定义分区器</h2>
+<!-- ============================================================ -->
+
+<p>当业务规则无法用"key 哈希"或"Sticky"覆盖时,就需要自定义 <code>Partitioner</code> 接口实现。典型场景:按地区路由(同一地区的请求集中到固定 partition)、按优先级分流(高优先级走专用 partition)、按租户分流(不同租户隔离)。这一节给出两个生产级示例,以及自定义分区器必须遵守的设计原则。</p>
+
+<h3>Partitioner 接口</h3>
+
+<pre><code class="language-java">public interface Partitioner extends Configurable, Closeable {
+    int partition(String topic,
+                  Object key, byte[] keyBytes,
+                  Object value, byte[] valueBytes,
+                  Cluster cluster);
+
+    void close();
+
+    default void onNewBatch(String topic,
+                            Cluster cluster,
+                            int prevPartition) {}
+}</code></pre>
+
+<h3>按地区分区的实现</h3>
+
+<pre><code class="language-java">public final class RegionPartitioner implements Partitioner {
+
+    private static final Map&lt;String, Integer&gt; REGION_MAP = Map.of(
+        "ASIA",   0,
+        "EUROPE", 1,
+        "US",     2
+    );
+
+    @Override
+    public int partition(String topic, Object key, byte[] keyBytes,
+                         Object value, byte[] valueBytes, Cluster cluster) {
+        int numPartitions = cluster.partitionCountForTopic(topic);
+
+        if (key == null) {
+            return ThreadLocalRandom.current().nextInt(numPartitions);
+        }
+
+        String region = extractRegion(key.toString());
+        Integer fixedPartition = REGION_MAP.get(region);
+
+        if (fixedPartition != null) {
+            return Math.floorMod(fixedPartition, numPartitions);
+        }
+
+        return Utils.toPositive(Utils.murmur2(keyBytes)) % numPartitions;
+    }
+
+    private String extractRegion(String key) {
+        int idx = key.indexOf(':');
+        return idx &gt; 0 ? key.substring(0, idx).toUpperCase() : "UNKNOWN";
+    }
+
+    @Override
+    public void close() {}
+
+    @Override
+    public void configure(Map&lt;String, ?&gt; configs) {}
+}</code></pre>
+
+<h3>RegionPartitioner 行为对照</h3>
+
+<table>
+  <thead>
+    <tr><th>key 示例</th><th>region</th><th>分区</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>ASIA:O1001</code></td><td>ASIA</td><td>固定到 0</td></tr>
+    <tr><td><code>EUROPE:O2002</code></td><td>EUROPE</td><td>固定到 1</td></tr>
+    <tr><td><code>US:O3003</code></td><td>US</td><td>固定到 2</td></tr>
+    <tr><td><code>LATAM:O4004</code></td><td>未配置</td><td>回退到 murmur2 hash</td></tr>
+    <tr><td>null</td><td>-</td><td>随机</td></tr>
+  </tbody>
+</table>
+
+<h3>按优先级分区的实现</h3>
+
+<pre><code class="language-java">public final class PriorityPartitioner implements Partitioner {
+
+    @Override
+    public int partition(String topic, Object key, byte[] keyBytes,
+                         Object value, byte[] valueBytes, Cluster cluster) {
+        int numPartitions = cluster.partitionCountForTopic(topic);
+
+        if (key == null) {
+            return ThreadLocalRandom.current().nextInt(numPartitions);
+        }
+
+        String priority = key.toString();
+        return switch (priority) {
+            case "HIGH"   -&gt; 0;
+            case "MEDIUM" -&gt; 1 % numPartitions;
+            case "LOW"    -&gt; 2 % numPartitions;
+            default       -&gt; Utils.toPositive(Utils.murmur2(keyBytes)) % numPartitions;
+        };
+    }
+
+    @Override
+    public void close() {}
+
+    @Override
+    public void configure(Map&lt;String, ?&gt; configs) {}
+}</code></pre>
+
+<h3>自定义分区器的设计原则</h3>
+
+<table>
+  <thead>
+    <tr><th>原则</th><th>说明</th><th>反例</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>始终回退到默认 hash</td><td>未识别 key 不应集中到 0</td><td><code>return 0;</code></td></tr>
+    <tr><td>处理 null key</td><td>单独分支</td><td>抛 NPE</td></tr>
+    <tr><td>使用 floorMod</td><td>保证非负</td><td><code>% numPartitions</code>(可能负)</td></tr>
+    <tr><td>避免阻塞</td><td>业务线程调用,不能慢</td><td>调用远程 RPC</td></tr>
+    <tr><td>测试边界</td><td>numPartitions 变化下的行为</td><td>仅测当前分区数</td></tr>
+  </tbody>
+</table>
+
+<h3>配置使用</h3>
+
+<pre><code class="language-properties">partitioner.class=com.example.RegionPartitioner</code></pre>
+
+<pre><code class="language-java">Properties props = new Properties();
+props.put(ProducerConfig.PARTITIONER_CLASS_CONFIG,
+          RegionPartitioner.class.getName());
+KafkaProducer&lt;String, String&gt; producer = new KafkaProducer&lt;&gt;(props);</code></pre>
+
+<div class="warning">
+  <strong>自定义分区器最常见的事故:在 partition 方法里调用远程 RPC</strong>。partition 方法运行在业务调用 send() 的线程上,任何阻塞都会直接卡住业务线程。曾经有团队在 partition 方法里查询 Redis 决定路由策略,Redis 抖动时直接把整个业务服务的 send 线程池打满,业务接口超时。修复方式是<strong>把决策数据预加载到内存</strong>(如 ConcurrentHashMap),或者用本地 ttl 缓存,绝不能在 partition 方法里做任何 I/O 操作。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s7-8">7.8 一致性哈希对比</h2>
+<!-- ============================================================ -->
+
+<p>很多分布式系统(Cassandra、DynamoDB、Memcached、Redis Cluster)用一致性哈希环来路由 key。Kafka 没用 — 它用最朴素的 <code>hash % N</code>。这一节把两种方案的设计目标摊开,解释 Kafka 为什么"反潮流"。</p>
+
+<h3>一致性哈希环</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-8-1 · Dynamo 风格的一致性哈希环</div>
+<pre><code>一致性哈希环(以 Dynamo 为例):
+
+           Node A
+            ↑
+            │
+      Key Z ┤ ← 顺时针
+            │
+            │
+   Node D ──┼── Node B
+            │
+            │
+            │
+            │
+           Node C
+
+  路由:
+    每个 key 映射到环上一点
+    顺时针找最近 node
+
+  增删 node:
+    新增 Node E 在 A 与 B 之间
+    仅 A-B 范围的 key 重定位
+    其他 key 不受影响
+    最小化数据迁移</code></pre>
+</div>
+
+<h3>Kafka vs Dynamo 设计对比</h3>
+
+<table>
+  <thead>
+    <tr><th>维度</th><th>Kafka</th><th>Dynamo</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>数据分布单位</td><td>partition(编号固定)</td><td>vNode(虚拟节点)</td></tr>
+    <tr><td>节点变化频率</td><td>低(分区数稳定)</td><td>高(节点频繁增减)</td></tr>
+    <tr><td>哈希方案</td><td><code>toPositive(murmur2) % N</code></td><td>一致性哈希环 + vNode</td></tr>
+    <tr><td>扩容行为</td><td>加 broker 不改路由,加分区改路由</td><td>加节点仅相邻范围迁移</td></tr>
+    <tr><td>设计目标</td><td>顺序 + 简单</td><td>弹性 + 最小迁移</td></tr>
+  </tbody>
+</table>
+
+<h3>Kafka 不用一致性哈希的四个原因</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-8-2 · Kafka 拒绝一致性哈希的工程理由</div>
+<pre><code>原因 1:分区数极少变化
+  topic 创建时确定分区数
+  生产环境通常不调整
+  一致性哈希优势(最小迁移)用不上
+
+原因 2:分区号是稳定的
+  partition 0 始终是 partition 0
+  即使 leader 切换到其他 broker
+  partition 号不变 → consumer offset 稳定
+
+原因 3:简单取模足够
+  在均匀哈希假设下
+  murmur2 % N 分布偏差 &lt; 5%
+  额外引入环结构无收益
+
+原因 4:分区数变化时
+  顺序边界已被新分区打散
+  一致性哈希也无法保留旧分区内顺序
+  Kafka 让该问题在业务层显式处理</code></pre>
+</div>
+
+<h3>两种系统的扩容行为差异</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-8-3 · 增加节点 / 增加分区的对比</div>
+<pre><code>场景:增加 1 个节点
+
+Dynamo:
+  T0:5 节点,数据在环上分布
+  T1:加入节点 X
+  T2:仅 X 的 hash 范围数据迁移到 X
+  T3:其他节点数据不动
+  迁移量约 1/6 总数据
+
+Kafka(增加分区):
+  T0:topic 6 分区
+  T1:alter --partitions 12
+  T2:新消息按 12 分区路由
+  T3:旧消息留在原分区(不迁移)
+  T4:同 key 新旧消息可能在不同分区
+  → 顺序断裂,业务可见
+
+Kafka(增加 broker):
+  T0:3 broker,12 分区
+  T1:加入 broker 4
+  T2:执行 reassignment 工具迁移分区
+  T3:partition 路由不变(% N 不变)
+  T4:仅副本物理位置变化
+  → 业务无感</code></pre>
+</div>
+
+<div class="key-insight">
+  <strong>"加 broker"和"加 partition"是两个完全不同的操作</strong>。加 broker 只是把现有 partition 的副本搬到新 broker 上,partition 编号与路由公式都不变,业务无感知;加 partition 才会改变 <code>% N</code> 的取模分母,让旧 key 跳分区。运维实践里这两个动作经常被混为一谈("我们集群扩容了"),导致业务方完全没意识到风险。沟通时一定要明确说清楚是"扩 broker"还是"扩 partition"。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s7-9">7.9 分区数选择</h2>
+<!-- ============================================================ -->
+
+<p>"应该开多少个 partition"是 topic 创建时最难的决定 — 因为它几乎无法回退。分区数太少,后续扩容会引发 key 漂移;太多,broker 启动慢、metadata 大、客户端内存压力大。这一节给出一个可操作的估算公式与典型业务范围参考。</p>
+
+<h3>分区数过多的副作用</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-9-1 · 分区数过多带来的五类问题</div>
+  <svg viewBox="0 0 1000 360" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+  <rect x="400" y="20" width="200" height="60" rx="9" fill="url(#g-red)" stroke="#f85149"/>
+  <text x="500" y="46" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">分区数过多</text>
+  <text x="500" y="66" text-anchor="middle" fill="#fff" font-size="11">(数千至万)</text>
+
+  <rect x="20"  y="140" width="200" height="60" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="120" y="166" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">文件句柄激增</text>
+  <text x="120" y="184" text-anchor="middle" fill="#fce8a3" font-size="11">每分区 3 文件 × M segment</text>
+
+  <rect x="240" y="140" width="200" height="60" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="340" y="166" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">Controller 元数据负担</text>
+  <text x="340" y="184" text-anchor="middle" fill="#fce8a3" font-size="11">leader/ISR 状态</text>
+
+  <rect x="460" y="140" width="200" height="60" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="560" y="166" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">Rebalance 慢</text>
+  <text x="560" y="184" text-anchor="middle" fill="#fce8a3" font-size="11">分配时间线性增长</text>
+
+  <rect x="680" y="140" width="200" height="60" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="780" y="166" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">Broker 恢复慢</text>
+  <text x="780" y="184" text-anchor="middle" fill="#fce8a3" font-size="11">需扫描所有分区</text>
+
+  <rect x="130" y="240" width="240" height="60" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="250" y="266" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">客户端内存压力</text>
+  <text x="250" y="284" text-anchor="middle" fill="#fce8a3" font-size="11">每分区独立 batch</text>
+
+  <rect x="530" y="240" width="240" height="60" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="650" y="266" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">Metadata 请求大</text>
+  <text x="650" y="284" text-anchor="middle" fill="#fce8a3" font-size="11">单次响应数十 MB</text>
+
+  <path d="M460,80 L150,140" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M480,80 L340,140" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M500,80 L560,140" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M520,80 L780,140" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M460,80 L260,240" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)" stroke-dasharray="4 3"/>
+  <path d="M540,80 L640,240" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)" stroke-dasharray="4 3"/>
+
+  <text x="500" y="340" text-anchor="middle" fill="#8b949e" font-size="12">分区数失控会同时触发存储、控制面与客户端三类资源放大</text>
+</svg>
+</div>
+
+<h3>分区数与资源开销关系</h3>
+
+<table>
+  <thead>
+    <tr><th>分区数</th><th>broker 文件数</th><th>Controller 内存</th><th>客户端 batch 内存</th><th>重启时间</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>100</td><td>&lt; 1000</td><td>&lt; 1 MB</td><td>&lt; 10 MB</td><td>&lt; 10 秒</td></tr>
+    <tr><td>1000</td><td>数千</td><td>数 MB</td><td>数十 MB</td><td>30 秒</td></tr>
+    <tr><td>10000</td><td>数万</td><td>100 MB</td><td>数百 MB</td><td>2-5 分钟</td></tr>
+    <tr><td>100000</td><td>数十万</td><td>数 GB</td><td>数 GB</td><td>10+ 分钟</td></tr>
+  </tbody>
+</table>
+
+<p>每分区 RF=3 时,broker 实际承载 ≈ 总分区数 × 3 / broker 数。10000 分区 + 10 broker = 单 broker 3000 分区,这已经接近"不该再加"的边界。</p>
+
+<h3>分区数估算公式</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-9-2 · 基于吞吐目标的分区数推导</div>
+<pre><code>目标分区数 = ceil(max(T / Tp, T / Tc))
+
+其中:
+  T  = 业务目标总吞吐(MiB/s)
+  Tp = 单分区 producer 吞吐上限 ≈ 10-30 MiB/s
+  Tc = 单分区 consumer 吞吐上限 ≈ 5-20 MiB/s
+
+示例 1:
+  T = 100 MiB/s
+  Tp = 20 MiB/s, Tc = 10 MiB/s
+  分区数 = ceil(max(100/20, 100/10)) = max(5, 10) = 10
+
+示例 2:
+  T = 1000 MiB/s
+  Tp = 30 MiB/s, Tc = 15 MiB/s
+  分区数 = ceil(max(1000/30, 1000/15)) = max(34, 67) = 67 → 取 72(整除)
+
+经验:
+  Tp 与 Tc 取决于消息大小、压缩、网络
+  小消息(&lt; 1 KiB):Tp ≈ 10 MiB/s,Tc ≈ 5 MiB/s
+  大消息(&gt; 10 KiB):Tp ≈ 50 MiB/s,Tc ≈ 30 MiB/s</code></pre>
+</div>
+
+<h3>典型业务规模的分区数建议</h3>
+
+<table>
+  <thead>
+    <tr><th>业务规模</th><th>写入吞吐</th><th>推荐分区数</th><th>适用</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>日志收集</td><td>&lt; 1 MiB/s</td><td>3-6</td><td>单服务</td></tr>
+    <tr><td>业务事件</td><td>10 MiB/s</td><td>12-30</td><td>中等</td></tr>
+    <tr><td>流式计算</td><td>100 MiB/s</td><td>30-100</td><td>大型</td></tr>
+    <tr><td>极端场景</td><td>1 GiB/s+</td><td>100-200</td><td>超大型</td></tr>
+  </tbody>
+</table>
+
+<h3>过少与过多的边界信号</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-9-3 · 分区数极端的诊断信号</div>
+<pre><code>分区数过少:
+  symptom 1:consumer 实例 &gt; 分区数 → 部分 consumer 空闲
+  symptom 2:单分区写入 &gt; Tp → producer 排队
+  symptom 3:消费 lag 持续增长
+
+分区数过多:
+  symptom 1:broker 启动 &gt; 5 分钟
+  symptom 2:Controller failover 超 30 秒
+  symptom 3:fd 接近上限
+  symptom 4:metadata request 单次响应 &gt; 10 MB
+
+合理范围:
+  consumer 数 ≤ 分区数 ≤ broker 数 × 10
+  例:10 broker → 50-500 分区比较合理</code></pre>
+</div>
+
+<h3>扩容预留策略</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-9-4 · 创建 topic 时的预留思路</div>
+<pre><code>原则:分区数可增不可减,预留余量
+
+创建时考虑:
+  1 业务规模 1-3 年的预期
+  2 扩容是否容忍 key 漂移
+  3 consumer 群体的并行度上限
+
+推荐:
+  初始分区数 = 当前需求 × 2-4 倍
+  例:当前需 12 分区 → 创建时 24-48
+  避免 1-2 年内强制扩容</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s7-10">7.10 Key 设计模式</h2>
+<!-- ============================================================ -->
+
+<p>Key 设计是 Kafka 业务层最难的工程之一 — 它直接决定流量是否均衡、顺序是否保证、扩容是否平稳。这一节把三种典型 key 模式(实体 key / 加盐 / 复合 key)摊开,并给出 hot key 的发现与排查命令。</p>
+
+<h3>hot key 形成机制</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-10-1 · 全国电商 SKU 维度的 hot key 形成</div>
+<pre><code>场景:全国电商,SKU 维度发送
+
+  Producer 发送:
+    key = "SKU-IPHONE15-PRO" → partition 3
+    key = "SKU-IPHONE15-PRO" → partition 3
+    key = "SKU-IPHONE15-PRO" → partition 3
+    ...(每秒 10000 条同 key)
+    key = "SKU-OBSCURE-001" → partition 7(每秒 1 条)
+
+  分区流量:
+    P0: 100 records/s
+    P1: 100 records/s
+    P2: 100 records/s
+    P3: 10000 records/s   ← hot
+    ...
+
+  影响:
+    P3 leader broker 单核 100% 满载
+    P3 fetch 延迟 300+ ms
+    其他分区正常 &lt; 10 ms
+    P3 followers fetch 落后 → ISR 收缩
+    可能触发 leader 切换抖动</code></pre>
+</div>
+
+<h3>加盐解决 hot key</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-10-2 · 加盐与时间窗口加盐</div>
+<pre><code>反模式:
+  key = "SKU-IPHONE15-PRO"
+  → 全部进同分区
+
+正模式 1(随机加盐):
+  String saltedKey = "SKU-IPHONE15-PRO-" +
+                     ThreadLocalRandom.current().nextInt(10);
+  → "SKU-IPHONE15-PRO-0", "SKU-IPHONE15-PRO-1", ..., "SKU-IPHONE15-PRO-9"
+  → 分散到最多 10 个分区
+
+代价:
+  消费侧需聚合 SKU-IPHONE15-PRO-* 全部分区
+  无法保证单 SKU 全局有序
+  仅保证同 saltedKey 内有序
+
+正模式 2(时间窗口加盐):
+  String compositeKey = sku + ":" + LocalDate.now();
+  → "SKU-IPHONE15-PRO:2026-05-08"
+  → 同一天同一 SKU 在同分区
+  → 不同天可能在不同分区,天然分散</code></pre>
+</div>
+
+<h3>key 设计决策树</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-10-3 · 按业务需求选择 key 策略</div>
+  <svg viewBox="0 0 1080 580" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+  <rect x="380" y="20" width="240" height="44" rx="9" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="500" y="48" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">按什么维度保持顺序?</text>
+
+  <path d="M360,120 L500,90 L640,120 L500,150 Z" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="500" y="124" text-anchor="middle" fill="#fff" font-size="11" font-weight="600">必须全局有序?</text>
+
+  <path d="M500,150 L500,200" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <text x="510" y="178" fill="#f85149" font-size="11">否</text>
+
+  <path d="M640,120 L820,150" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <text x="730" y="125" fill="#3fb950" font-size="11">是</text>
+
+  <rect x="780" y="140" width="240" height="60" rx="9" fill="url(#g-red)" stroke="#f85149"/>
+  <text x="900" y="166" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">单分区</text>
+  <text x="900" y="186" text-anchor="middle" fill="#fff" font-size="11">牺牲并行度</text>
+
+  <path d="M360,230 L500,200 L640,230 L500,260 Z" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="500" y="234" text-anchor="middle" fill="#fff" font-size="11" font-weight="600">实体级有序即可?</text>
+
+  <path d="M500,260 L500,310" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <text x="510" y="288" fill="#f85149" font-size="11">否</text>
+
+  <path d="M640,230 L820,250" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <text x="730" y="235" fill="#3fb950" font-size="11">是</text>
+
+  <rect x="780" y="240" width="240" height="60" rx="9" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="900" y="266" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">key = entityId</text>
+  <text x="900" y="286" text-anchor="middle" fill="#fff" font-size="11">同实体同分区</text>
+
+  <path d="M360,340 L500,310 L640,340 L500,370 Z" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="500" y="344" text-anchor="middle" fill="#fff" font-size="11" font-weight="600">存在 hot key?</text>
+
+  <path d="M500,370 L500,410" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <text x="510" y="394" fill="#f85149" font-size="11">否</text>
+
+  <rect x="380" y="410" width="240" height="60" rx="9" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="500" y="436" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">null key + Sticky</text>
+  <text x="500" y="456" text-anchor="middle" fill="#fce8a3" font-size="11">优先吞吐</text>
+
+  <path d="M640,340 L820,360" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <text x="730" y="345" fill="#3fb950" font-size="11">是</text>
+
+  <path d="M780,390 L880,360 L980,390 L880,420 Z" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="880" y="394" text-anchor="middle" fill="#fff" font-size="11" font-weight="600">消费侧能聚合?</text>
+
+  <path d="M780,400 L660,470" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <text x="700" y="438" fill="#f85149" font-size="11">否</text>
+
+  <path d="M980,400 L980,480" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <text x="990" y="445" fill="#3fb950" font-size="11">是</text>
+
+  <rect x="540" y="470" width="200" height="60" rx="9" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="640" y="496" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">复合 key</text>
+  <text x="640" y="516" text-anchor="middle" fill="#fce8a3" font-size="11">时间 / 区域</text>
+
+  <rect x="860" y="480" width="240" height="60" rx="9" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="980" y="506" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">加盐</text>
+  <text x="980" y="526" text-anchor="middle" fill="#fce8a3" font-size="11">消费侧合并</text>
+</svg>
+</div>
+
+<h3>三种 key 设计模式对比</h3>
+
+<table>
+  <thead>
+    <tr><th>模式</th><th>key 形态</th><th>分区效果</th><th>顺序保证</th><th>消费复杂度</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>实体 key</td><td><code>O1001</code></td><td>同实体同分区</td><td>实体级</td><td>简单</td></tr>
+    <tr><td>加盐</td><td><code>O1001-3</code></td><td>分散到 10 分区</td><td>同 saltKey 内</td><td>高(聚合)</td></tr>
+    <tr><td>复合</td><td><code>O1001:2026-05-08</code></td><td>按时间分散</td><td>同 day 内</td><td>中</td></tr>
+    <tr><td>null + Sticky</td><td>null</td><td>长期均匀</td><td>无</td><td>简单</td></tr>
+  </tbody>
+</table>
+
+<h3>hot key 排查命令集</h3>
+
+<pre><code class="language-bash">kafka-log-dirs.sh --bootstrap-server kafka-0:9092 \
+  --describe --topic-list order-created</code></pre>
+
+<pre><code>{
+  "brokers": [
+    {
+      "broker": 1,
+      "logDirs": [
+        {
+          "logDir": "/data/kafka-logs",
+          "partitions": [
+            {"partition": "order-created-0", "size": 2147483648, "offsetLag": 0},
+            {"partition": "order-created-1", "size": 1981808640, "offsetLag": 0},
+            {"partition": "order-created-2", "size": 1835008000, "offsetLag": 0},
+            {"partition": "order-created-3", "size": 91268055040, "offsetLag": 0}
+          ]
+        }
+      ]
+    }
+  ]
+}</code></pre>
+
+<p><code>order-created-3</code> 大小是其他分区的 50 倍,典型 hot partition 特征。下一步抽样该分区的 key:</p>
+
+<pre><code class="language-bash">kafka-console-consumer.sh --bootstrap-server kafka-0:9092 \
+  --topic order-created --partition 3 --max-messages 1000 \
+  --property print.key=true | sort | uniq -c | sort -rn | head</code></pre>
+
+<pre><code>800  SKU-IPHONE15-PRO
+ 50  SKU-MACBOOK-PRO
+ 30  SKU-IPAD-PRO
+ ...</code></pre>
+
+<p>80% 流量来自单一 SKU,确认 hot key 来源,继续在业务层加盐。</p>
+
+<div class="real-world">
+  <strong>真实事故:某直播平台用 streamerId 当 key,头部主播开播时单分区被打挂</strong>。该平台的 chat-message topic 用 streamerId 作 key,假设是"同主播间的弹幕保持顺序"。设计期间这个假设没问题,因为长尾分布;但当某个头部主播开播,瞬时弹幕 50 万 QPS 全部进入同一个 partition,leader broker 的 NIC 被打满,该 partition 的 follower 复制跟不上,ISR 缩到 1,minISR 触发拒写,整个直播间弹幕停止。修复方式:把 key 改成 <code>streamerId + ":" + (timestamp / 1000)</code>(每秒切换 partition),牺牲"绝对全序"换取"秒级窗口内有序",压力立即均匀。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s7-11">7.11 分区扩容兼容性</h2>
+<!-- ============================================================ -->
+
+<p>"我们 topic 流量涨了,加点 partition 吧" — 这是一个看似无害的运维操作,但它会直接导致<strong>同 key 跳分区</strong>,破坏所有依赖实体级顺序的下游业务。这一节用数学推导漂移率,并给出生产里可行的扩容方案。</p>
+
+<h3>扩容后 key 重路由示例</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-11-1 · 6 → 12 分区扩容时的 key 漂移</div>
+<pre><code>场景:topic 从 6 分区扩到 12 分区
+
+  扩容前 hash → 6 分区 路由:
+    key A: positive=1592744578, % 6 = 4
+    key B: positive=1411423576, % 6 = 4
+    key C: positive=318708676,  % 6 = 4
+    key D: positive=807723753,  % 6 = 3
+    key E: positive=1479937309, % 6 = 1
+
+  扩容后 hash → 12 分区 路由:
+    key A: 1592744578 % 12 = 10  ← 变化
+    key B: 1411423576 % 12 = 4   ← 不变
+    key C: 318708676  % 12 = 4   ← 不变
+    key D: 807723753  % 12 = 9   ← 变化
+    key E: 1479937309 % 12 = 1   ← 不变
+
+  漂移率约 50%(理论值,均匀哈希)</code></pre>
+</div>
+
+<h3>漂移率的数学推导</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-11-2 · 漂移率公式</div>
+<pre><code>定理:
+  分区数从 N_old 扩到 N_new,key 路由不变的概率为
+  P(stable) = N_old / N_new (当 N_new 是 N_old 的整数倍)
+
+证明:
+  对均匀哈希 h,h % N_old 与 h % N_new 都均匀分布
+  h % N_old == h % N_new 等价于 h 落在 [k * N_new, k * N_new + N_old) 区间
+  该区间在 [0, lcm(N_old, N_new)) 范围内的占比为 N_old / N_new
+
+应用:
+  6 → 12: stable = 50%, 漂移 = 50%
+  6 → 18: stable = 33%, 漂移 = 67%
+  6 → 7:  stable ≈ 14%, 漂移 ≈ 86%
+  N → 2N: stable = 50%
+  N → kN(整数倍): stable = 1/k</code></pre>
+</div>
+
+<h3>四种扩容方案对比</h3>
+
+<table>
+  <thead>
+    <tr><th>方案</th><th>做法</th><th>适用场景</th><th>代价</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>预留分区</td><td>创建时分区数 × 2-4</td><td>长期规划</td><td>初期资源</td></tr>
+    <tr><td>双写过渡</td><td>新旧 topic 并行写,逐步切</td><td>严格有序业务</td><td>数据冗余</td></tr>
+    <tr><td>容忍漂移</td><td>直接 alter partitions</td><td>短期不一致可容</td><td>部分 key 乱序</td></tr>
+    <tr><td>自定义分区器</td><td>旧 key 仍按旧路由</td><td>复杂业务</td><td>实现复杂</td></tr>
+  </tbody>
+</table>
+
+<h3>扩容风险评估脚本</h3>
+
+<pre><code class="language-python">import hashlib
+
+def murmur2_simulate(key_bytes):
+    h = 0x9747b28c ^ len(key_bytes)
+    for i in range(0, len(key_bytes) - 3, 4):
+        k = int.from_bytes(key_bytes[i:i+4], 'little')
+        k = (k * 0x5bd1e995) &amp; 0xFFFFFFFF
+        k ^= k &gt;&gt; 24
+        k = (k * 0x5bd1e995) &amp; 0xFFFFFFFF
+        h = (h * 0x5bd1e995) &amp; 0xFFFFFFFF
+        h ^= k
+    return h if h &lt; 0x80000000 else h - 0x100000000
+
+def to_positive(h):
+    return h &amp; 0x7fffffff
+
+def calc_drift(keys, old_n, new_n):
+    drift = 0
+    for key in keys:
+        h = murmur2_simulate(key.encode('utf-8'))
+        old_p = to_positive(h) % old_n
+        new_p = to_positive(h) % new_n
+        if old_p != new_p:
+            drift += 1
+    return drift, len(keys)
+
+keys = ["O1001", "O1002", "O1003", "C2001", "C2002"]
+drift, total = calc_drift(keys, 6, 12)
+print(f"drift: {drift}/{total} = {drift*100/total:.1f}%")</code></pre>
+
+<pre><code>drift: 2/5 = 40.0%</code></pre>
+
+<p>5 个 key 的小样本仅说明计算方法,生产决策应使用至少 1000 条真实 key 样本。</p>
+
+<h3>扩容流程</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-11-3 · 扩容决策流程图</div>
+  <svg viewBox="0 0 1100 640" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+  <rect x="450" y="20" width="200" height="44" rx="9" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="550" y="48" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">扩容需求</text>
+
+  <rect x="450" y="90" width="200" height="44" rx="9" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="550" y="118" text-anchor="middle" fill="#fff" font-size="12">抽样 1000+ key</text>
+
+  <rect x="450" y="160" width="200" height="44" rx="9" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="550" y="188" text-anchor="middle" fill="#fff" font-size="12">离线计算漂移率</text>
+
+  <path d="M430,250 L550,220 L670,250 L550,280 Z" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="550" y="254" text-anchor="middle" fill="#fff" font-size="12" font-weight="600">漂移可接受?</text>
+
+  <path d="M430,250 L240,310" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <text x="320" y="286" fill="#f85149" font-size="11">否</text>
+
+  <path d="M670,250 L860,310" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <text x="770" y="286" fill="#3fb950" font-size="11">是</text>
+
+  <rect x="100" y="310" width="240" height="50" rx="9" fill="url(#g-red)" stroke="#f85149"/>
+  <text x="220" y="340" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">双写新 topic</text>
+
+  <path d="M740,350 L860,320 L980,350 L860,380 Z" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="860" y="354" text-anchor="middle" fill="#fff" font-size="12" font-weight="600">业务有序需求?</text>
+
+  <path d="M740,350 L640,410" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <text x="680" y="388" fill="#f85149" font-size="11">否</text>
+
+  <path d="M980,350 L1020,410" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <text x="1010" y="388" fill="#3fb950" font-size="11">是</text>
+
+  <rect x="500" y="410" width="280" height="60" rx="9" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="640" y="436" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">kafka-topics.sh</text>
+  <text x="640" y="456" text-anchor="middle" fill="#fff" font-size="12">--alter --partitions N</text>
+
+  <rect x="880" y="410" width="220" height="60" rx="9" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="990" y="436" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">业务窗口迁移</text>
+  <text x="990" y="456" text-anchor="middle" fill="#fce8a3" font-size="11">消费完旧分区再切</text>
+
+  <rect x="20"  y="390" width="180" height="40" rx="7" fill="#0d1117" stroke="#f85149"/>
+  <text x="110" y="416" text-anchor="middle" fill="#e6edf3" font-size="11">创建新 topic 大分区数</text>
+  <rect x="20"  y="445" width="180" height="40" rx="7" fill="#0d1117" stroke="#f85149"/>
+  <text x="110" y="471" text-anchor="middle" fill="#e6edf3" font-size="11">业务侧切换 producer</text>
+  <rect x="20"  y="500" width="180" height="40" rx="7" fill="#0d1117" stroke="#f85149"/>
+  <text x="110" y="526" text-anchor="middle" fill="#e6edf3" font-size="11">消费完旧 topic</text>
+  <rect x="20"  y="555" width="180" height="40" rx="7" fill="#0d1117" stroke="#f85149"/>
+  <text x="110" y="581" text-anchor="middle" fill="#e6edf3" font-size="11">删除旧 topic</text>
+
+  <path d="M220,360 L110,390" stroke="#f85149" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M110,430 L110,445" stroke="#f85149" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M110,485 L110,500" stroke="#f85149" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M110,540 L110,555" stroke="#f85149" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+
+  <rect x="500" y="500" width="280" height="40" rx="7" fill="#0d1117" stroke="#3fb950"/>
+  <text x="640" y="526" text-anchor="middle" fill="#e6edf3" font-size="11">验证新分区可写</text>
+
+  <path d="M640,470 L640,500" stroke="#3fb950" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+
+  <rect x="880" y="500" width="220" height="40" rx="7" fill="#0d1117" stroke="#d29922"/>
+  <text x="990" y="526" text-anchor="middle" fill="#fce8a3" font-size="11">停 producer</text>
+  <rect x="880" y="550" width="220" height="40" rx="7" fill="#0d1117" stroke="#d29922"/>
+  <text x="990" y="576" text-anchor="middle" fill="#fce8a3" font-size="11">消费完旧分区</text>
+  <rect x="880" y="600" width="220" height="34" rx="7" fill="#0d1117" stroke="#d29922"/>
+  <text x="990" y="622" text-anchor="middle" fill="#fce8a3" font-size="11">resume + alter</text>
+
+  <path d="M990,470 L990,500" stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M990,540 L990,550" stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M990,590 L990,600" stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+
+  <path d="M550,64 L550,90"   stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M550,134 L550,160" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M550,204 L550,222" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s7-12">7.12 源码深潜</h2>
+<!-- ============================================================ -->
+
+<p>本节给出 Kafka 3.7 中 producer 分区相关的核心源码地图,以及最关键的几个类与方法的简化代码。理解这些源码能让你在排障时直接 attach debugger 看哪里出错,而不是猜。</p>
+
+<h3>源码地图</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-12-1 · Producer 分区源码地图</div>
+  <svg viewBox="0 0 1080 480" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+  <rect x="20"  y="30" width="500" height="420" rx="12" fill="#0d1117" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="8 4"/>
+  <text x="270" y="56" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="700">源码入口</text>
+
+  <rect x="50"  y="80" width="220" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="160" y="110" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">KafkaProducer.send</text>
+
+  <rect x="50"  y="160" width="220" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="160" y="190" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">doSend</text>
+
+  <rect x="50"  y="240" width="220" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="160" y="270" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">partition()</text>
+
+  <rect x="280" y="240" width="220" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="390" y="270" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">BuiltInPartitioner</text>
+
+  <rect x="280" y="320" width="220" height="40" rx="7" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="390" y="346" text-anchor="middle" fill="#fff" font-size="11">Utils.murmur2</text>
+
+  <rect x="280" y="380" width="220" height="40" rx="7" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="390" y="406" text-anchor="middle" fill="#fff" font-size="11">Utils.toPositive</text>
+
+  <rect x="560" y="30" width="500" height="420" rx="12" fill="#0d1117" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="8 4"/>
+  <text x="810" y="56" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="700">运行时</text>
+
+  <rect x="600" y="80"  width="220" height="50" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="710" y="110" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">ProducerRecord</text>
+
+  <rect x="600" y="160" width="220" height="50" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="710" y="190" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">Cluster metadata</text>
+
+  <rect x="850" y="120" width="200" height="50" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="950" y="150" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">TopicPartition</text>
+
+  <rect x="850" y="220" width="200" height="50" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="950" y="250" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">RecordAccumulator</text>
+
+  <path d="M160,130 L160,160" stroke="#bc8cff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M160,210 L160,240" stroke="#bc8cff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M270,265 L600,105" stroke="#7d8590" stroke-width="1.2" fill="none" marker-end="url(#arr)" stroke-dasharray="4 3"/>
+  <path d="M270,265 L600,185" stroke="#7d8590" stroke-width="1.2" fill="none" marker-end="url(#arr)" stroke-dasharray="4 3"/>
+  <path d="M270,265 L280,265" stroke="#3fb950" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M390,290 L390,320" stroke="#3fb950" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M390,360 L390,380" stroke="#3fb950" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M500,265 L850,145" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M950,170 L950,220" stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+</svg>
+</div>
+
+<h3>核心源码入口表</h3>
+
+<table>
+  <thead>
+    <tr><th>文件</th><th>关键类</th><th>职责</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>clients/.../producer/KafkaProducer.java</code></td><td><code>KafkaProducer</code></td><td>doSend 入口</td></tr>
+    <tr><td><code>clients/.../producer/internals/BuiltInPartitioner.java</code></td><td><code>BuiltInPartitioner</code></td><td>默认分区逻辑</td></tr>
+    <tr><td><code>clients/.../common/utils/Utils.java</code></td><td><code>murmur2</code>, <code>toPositive</code></td><td>哈希工具</td></tr>
+    <tr><td><code>clients/.../producer/Partitioner.java</code></td><td><code>Partitioner</code> 接口</td><td>自定义入口</td></tr>
+    <tr><td><code>clients/.../producer/internals/StickyPartitionCache.java</code></td><td><code>StickyPartitionCache</code></td><td>sticky 状态缓存</td></tr>
+  </tbody>
+</table>
+
+<h3>partition 方法简化代码</h3>
+
+<pre><code class="language-java">private int partition(ProducerRecord&lt;K, V&gt; record,
+                      byte[] serializedKey,
+                      byte[] serializedValue,
+                      Cluster cluster) {
+    if (record.partition() != null) {
+        return record.partition();
+    }
+
+    if (partitioner != null) {
+        return partitioner.partition(
+            record.topic(), record.key(), serializedKey,
+            record.value(), serializedValue, cluster);
+    }
+
+    return BuiltInPartitioner.partitionForKey(
+        serializedKey,
+        cluster.partitionsForTopic(record.topic()).size());
+}</code></pre>
+
+<h3>BuiltInPartitioner 简化代码</h3>
+
+<pre><code class="language-java">public static int partitionForKey(byte[] keyBytes, int numPartitions) {
+    if (keyBytes == null) {
+        return -1;
+    }
+    return Utils.toPositive(Utils.murmur2(keyBytes)) % numPartitions;
+}</code></pre>
+
+<h3>四个关键设计取舍</h3>
+
+<p><strong>设计取舍 1:Murmur2 vs xxHash</strong> — xxHash 速度更快但 Kafka 选定 Murmur2 时已足够。改换需破坏跨客户端兼容(Java/Go/Python 均实现 Murmur2),收益与代价不匹配。</p>
+
+<p><strong>设计取舍 2:简单取模 vs 一致性哈希</strong> — 一致性哈希在节点频繁变动时优势明显,但 Kafka 分区数稳定的特性让该优势用不上。简单取模 + 显式分区数管理让运维边界清晰。</p>
+
+<p><strong>设计取舍 3:Sticky vs Round-Robin</strong> — Sticky 短期粘附换长期均匀,batch 充分利用率从 50% 提升到 90%+。Round-Robin 在小消息高频场景下产生大量小 batch,网络与磁盘 I/O 浪费严重。</p>
+
+<p><strong>设计取舍 4:扩容不迁移历史</strong> — 历史数据自动按新分区迁移会破坏 offset 语义与日志顺序边界。Kafka 选择保留旧分区不动,新消息用新路由,代价是同 key 短期顺序断裂,由业务层显式处理。</p>
+
+<!-- ============================================================ -->
+<h2 id="s7-13">7.13 陷阱与限制</h2>
+<!-- ============================================================ -->
+
+<p>把分区策略落到生产里,会反复遇到几类陷阱 — 它们都不是单点 bug,而是<strong>对路由语义理解错了导致的连锁误判</strong>。本节按"设计 / 运维 / 实现"三大类列出八个常见陷阱,以及它们对应的护栏指标。</p>
+
+<h3>八大陷阱分类</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-13-1 · 分区策略陷阱的三个家族</div>
+  <svg viewBox="0 0 1080 480" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+  <rect x="440" y="20" width="200" height="50" rx="9" fill="url(#g-red)" stroke="#f85149"/>
+  <text x="540" y="50" text-anchor="middle" fill="#fff" font-size="14" font-weight="700">分区陷阱</text>
+
+  <rect x="50"  y="130" width="240" height="44" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="170" y="158" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">设计类</text>
+
+  <rect x="420" y="130" width="240" height="44" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="540" y="158" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">运维类</text>
+
+  <rect x="790" y="130" width="240" height="44" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="910" y="158" text-anchor="middle" fill="#fce8a3" font-size="13" font-weight="700">实现类</text>
+
+  <rect x="50"  y="200" width="240" height="40" rx="7" fill="#0d1117" stroke="#58a6ff"/>
+  <text x="170" y="226" text-anchor="middle" fill="#e6edf3" font-size="11">1. hot key 不处理</text>
+  <rect x="50"  y="250" width="240" height="40" rx="7" fill="#0d1117" stroke="#58a6ff"/>
+  <text x="170" y="276" text-anchor="middle" fill="#e6edf3" font-size="11">2. 顺序需求误判</text>
+  <rect x="50"  y="300" width="240" height="40" rx="7" fill="#0d1117" stroke="#58a6ff"/>
+  <text x="170" y="326" text-anchor="middle" fill="#e6edf3" font-size="11">3. 分区数过多 / 过少</text>
+
+  <rect x="420" y="200" width="240" height="40" rx="7" fill="#0d1117" stroke="#3fb950"/>
+  <text x="540" y="226" text-anchor="middle" fill="#e6edf3" font-size="11">4. 扩容不评估漂移</text>
+  <rect x="420" y="250" width="240" height="40" rx="7" fill="#0d1117" stroke="#3fb950"/>
+  <text x="540" y="276" text-anchor="middle" fill="#e6edf3" font-size="11">5. 仅扩 broker 不扩分区</text>
+
+  <rect x="790" y="200" width="240" height="40" rx="7" fill="#0d1117" stroke="#d29922"/>
+  <text x="910" y="226" text-anchor="middle" fill="#fce8a3" font-size="11">6. 跨语言哈希不一致</text>
+  <rect x="790" y="250" width="240" height="40" rx="7" fill="#0d1117" stroke="#d29922"/>
+  <text x="910" y="276" text-anchor="middle" fill="#fce8a3" font-size="11">7. 自定义分区器越界</text>
+  <rect x="790" y="300" width="240" height="40" rx="7" fill="#0d1117" stroke="#d29922"/>
+  <text x="910" y="326" text-anchor="middle" fill="#fce8a3" font-size="11">8. ignore.keys 误开</text>
+
+  <path d="M500,70 L180,130" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M540,70 L540,130" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M580,70 L900,130" stroke="#7d8590" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+
+  <path d="M170,174 L170,200" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  <path d="M540,174 L540,200" stroke="#3fb950" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  <path d="M910,174 L910,200" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+
+  <text x="540" y="400" text-anchor="middle" fill="#8b949e" font-size="13">三家族陷阱共 8 项,设计类是事前可控,运维类需评估,实现类需 SDK 层护栏</text>
+</svg>
+</div>
+
+<h3>八大陷阱明细</h3>
+
+<table>
+  <thead>
+    <tr><th>#</th><th>陷阱</th><th>现象</th><th>根因</th><th>修复</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td>hot key</td><td>单分区流量 50× 其他</td><td>key 分布倾斜</td><td>加盐 / 复合 key</td></tr>
+    <tr><td>2</td><td>误以为需要全局有序</td><td>单分区瓶颈</td><td>业务需求不清</td><td>评估实际顺序粒度</td></tr>
+    <tr><td>3</td><td>分区数 100k</td><td>broker 启动 10 分钟</td><td>元数据膨胀</td><td>合理范围 100-1000</td></tr>
+    <tr><td>4</td><td>alter --partitions 无评估</td><td>业务方报顺序错乱</td><td>漂移率高</td><td>离线评估漂移</td></tr>
+    <tr><td>5</td><td>仅加 broker</td><td>分区数不变,负载不分散</td><td>路由不变</td><td>同时增分区</td></tr>
+    <tr><td>6</td><td>跨语言客户端不一致</td><td>同 key 进不同分区</td><td>hash 实现差异</td><td>用 Kafka 提供的 murmur2</td></tr>
+    <tr><td>7</td><td>自定义分区器返回越界值</td><td>IndexOutOfBoundsException</td><td>未取模</td><td>Math.floorMod</td></tr>
+    <tr><td>8</td><td>ignore.keys=true 误开</td><td>同 key 不再同分区</td><td>配置错误</td><td>默认 false</td></tr>
+  </tbody>
+</table>
+
+<h3>跨语言一致性验证</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 7-13-2 · 三种语言客户端的 Murmur2 实现差异</div>
+<pre><code>Java 客户端:
+  org.apache.kafka.common.utils.Utils.murmur2(keyBytes)
+  seed = 0x9747b28c
+
+Go 客户端(confluent-kafka-go):
+  使用 librdkafka,内部实现 murmur2 with seed 0x9747b28c
+  应保持一致
+
+Python 客户端(confluent-kafka-python):
+  同上,基于 librdkafka
+
+Python 客户端(kafka-python):
+  自实现 murmur2,seed 0x9747b28c
+  历史版本曾有 bug
+
+验证方法:
+  发送相同 key,从不同语言客户端
+  检查 broker 端分区分布
+  应该完全一致
+
+不一致信号:
+  同 key 分布到不同分区
+  跨语言消费 lag 不一致</code></pre>
+</div>
+
+<h3>护栏指标</h3>
+
+<table>
+  <thead>
+    <tr><th>维度</th><th>指标 / 命令</th><th>绿色</th><th>立即关注</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>分区流量均匀</td><td>per-partition bytes-in-rate</td><td>偏差 &lt; 30%</td><td>单分区 &gt; 5× 均值</td></tr>
+    <tr><td>分区数合理</td><td>numPartitions / brokerCount</td><td>10-100</td><td>&gt; 1000</td></tr>
+    <tr><td>consumer 利用率</td><td>assigned partitions / total members</td><td>&gt; 50%</td><td>&lt; 20%</td></tr>
+    <tr><td>跨语言一致</td><td>抽样 key 路由对比</td><td>100% 一致</td><td>任何差异</td></tr>
+    <tr><td>扩容漂移</td><td>离线计算</td><td>评估业务可容忍范围</td><td>&gt; 50%</td></tr>
+  </tbody>
+</table>
+
+<h3>反例与正例</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4>反模式:null key + 后聚合</h4>
+<pre><code class="language-java">producer.send(new ProducerRecord&lt;&gt;(
+    "user-events", null, payload));
+// 但下游聚合需要按 userId 顺序</code></pre>
+    <p style="margin-top:8px;font-size:12px;color:#f85149;">
+    现象:同一 userId 消息分散到所有分区<br/>
+    消费侧无法保证单用户事件顺序<br/>
+    业务报错乱
+    </p>
+  </div>
+  <div class="compare-good">
+    <h4>正模式:实体 key 路由</h4>
+<pre><code class="language-java">String userId = event.getUserId();
+producer.send(new ProducerRecord&lt;&gt;(
+    "user-events", userId, payload));</code></pre>
+    <p style="margin-top:8px;font-size:12px;color:#3fb950;">
+    现象:同 userId 消息进同分区<br/>
+    消费侧按分区顺序处理<br/>
+    业务有序<br/>
+    代价:若 userId 分布不均会有 hot partition
+    </p>
+  </div>
+</div>
+
+<div class="warning">
+  <strong>"我们用了 null key 但需要顺序"是分区策略最危险的反模式</strong>。null key + Sticky 是为<strong>无顺序要求</strong>的事件流设计的(指标、日志、临时通知)。任何依赖实体级顺序的业务都必须显式提供 key — 即使你觉得"反正下游有去重",也不要信赖默认行为。一个稳妥做法:平台层强制要求所有业务 topic 在 schema 中标注 "ordering-key" 字段,SDK 层自动用该字段当 Kafka key,业务方甚至感知不到 partition 概念,只需要在 schema 里说清楚自己依赖什么粒度的顺序。
+</div>
+
+<!-- ============================================================ -->
+<!-- Chapter Summary -->
+<!-- ============================================================ -->
+
+<div class="chapter-summary" id="s7-summary">
+  <h2>7.14 本章小结</h2>
+  <table>
+    <thead>
+      <tr><th>要点</th><th>依据</th><th>易错点</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>显式 partition 优先级最高</td><td><code>record.partition() != null</code></td><td>跳过分区器</td></tr>
+      <tr><td>key 路由 = toPositive(murmur2) % N</td><td><code>BuiltInPartitioner</code></td><td>同 key 同分区</td></tr>
+      <tr><td>Sticky 短期粘附,长期均匀</td><td>KIP-480</td><td>仅无 key 场景</td></tr>
+      <tr><td>Murmur2 seed = 0x9747b28c</td><td><code>Utils.murmur2</code></td><td>跨语言一致</td></tr>
+      <tr><td>toPositive 用位与而非 abs</td><td><code>&amp; 0x7fffffff</code></td><td>abs 有边界 bug</td></tr>
+      <tr><td>一致性哈希不适用</td><td>分区数稳定</td><td>简单取模最优</td></tr>
+      <tr><td>分区数 = max(T/Tp, T/Tc)</td><td>经验公式</td><td>预留余量</td></tr>
+      <tr><td>扩容是破坏性操作</td><td><code>hash % N</code> 变化</td><td>评估漂移率</td></tr>
+      <tr><td>hot key 不能靠扩 broker 修复</td><td>路由公式不变</td><td>必须改 key 设计</td></tr>
+      <tr><td>partitioner.ignore.keys=true 危险</td><td>破坏 key 顺序保证</td><td>保持默认 false</td></tr>
+    </tbody>
+  </table>
+
+  <h3 style="font-size:15px;color:var(--cyan);margin-top:18px;">最小回归验证脚本</h3>
+<pre><code class="language-bash">kafka-topics.sh --bootstrap-server kafka-0:9092 \
+  --create --topic ch07-verify --partitions 12 --replication-factor 3
+
+for i in $(seq 1 1000); do
+  echo "user-100:msg-$i"
+done | kafka-console-producer.sh \
+  --bootstrap-server kafka-0:9092 \
+  --topic ch07-verify \
+  --property parse.key=true \
+  --property key.separator=:
+
+for i in $(seq 0 11); do
+  count=$(kafka-run-class.sh kafka.tools.GetOffsetShell \
+    --bootstrap-server kafka-0:9092 \
+    --topic ch07-verify --partitions $i 2&gt;/dev/null | \
+    awk -F: '{print $3}')
+  echo "partition $i: $count records"
+done</code></pre>
+
+<pre><code>partition 0: 0 records
+partition 1: 0 records
+partition 2: 0 records
+partition 3: 0 records
+partition 4: 1000 records   ← 全部在 P4
+partition 5: 0 records
+partition 6: 0 records
+partition 7: 0 records
+partition 8: 0 records
+partition 9: 0 records
+partition 10: 0 records
+partition 11: 0 records</code></pre>
+
+  <p style="font-size:13.5px;color:var(--text-muted);margin-top:14px;">同一 key (<code>user-100</code>) 全部进入分区 4,验证 hash % N 路由策略生效。该回归脚本可以挂在 CI 上,每次 producer SDK 升级或客户端语言切换后跑一遍 — 只要这个分区分布一致,说明跨语言哈希实现没漂。</p>
+
+  <p class="next-hint">下一章 <a href="08-compression.html">第 8 章 · 批次压缩与编解码器</a> 切换到"压缩"维度:本章解释了 producer 如何选择 partition,下一章讨论 producer 选定了 partition 之后,batch 内的字节如何被 lz4/zstd/snappy/gzip 压缩、broker 为什么要保持"不解压直接落盘"的快路径、以及压缩 codec 选错时 broker CPU 与 P99 会怎么飙。重点是<strong>压缩边界发生在 RecordBatch 的 Records 区域而非 batch header</strong>、<strong>broker 默认 compression.type=producer 的零拷贝友好路径</strong>,以及<strong>跨 AZ 复制 + zstd 的实际带宽收益</strong>。</p>
+</div>
+
+<!-- ============================================================ -->
+<!-- Chapter navigation -->
+<!-- ============================================================ -->
+<div class="chapter-nav">
+  <a href="06-producer-internals.html">&larr; 第 6 章 · Producer 内部流水线</a>
+  <a href="08-consumer.html">第 8 章 · Consumer 与 Group &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 Kafka &middot; 第 7 章 &middot; 分区策略与哈希算法</p>
+
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+mermaid.initialize({startOnLoad:true,theme:'dark',themeVariables:{primaryColor:'#58a6ff',primaryTextColor:'#e6edf3',primaryBorderColor:'#30363d',lineColor:'#8b949e',secondaryColor:'#161b22',tertiaryColor:'#0d1117',background:'#161b22',mainBkg:'#161b22',nodeBorder:'#30363d',clusterBkg:'rgba(22,27,34,.5)',clusterBorder:'#30363d',titleColor:'#e6edf3',edgeLabelBackground:'#161b22',fontSize:'13px'},flowchart:{curve:'basis',padding:8,nodeSpacing:20,rankSpacing:30,useMaxWidth:true,htmlLabels:true},sequence:{useMaxWidth:true,actorMargin:30},state:{useMaxWidth:true}});
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/scala.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){setTimeout(function(){document.querySelectorAll('.mermaid svg,.diagram svg').forEach(function(svg){var h=parseInt(svg.getAttribute('height')||svg.getBoundingClientRect().height);if(h>500){svg.style.maxHeight='500px';svg.style.width='auto';var p=svg.closest('.diagram');if(p)p.style.overflowX='auto';}});},1500);});</script>
+</body>
+</html>

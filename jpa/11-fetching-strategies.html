@@ -1,0 +1,1435 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.11 抓取策略与 EntityGraph — 图解 JPA & Hibernate</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 JPA &amp; Hibernate</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="10-native-sql.html">上一章</a>
+  <a href="12-n-plus-one.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s11-overview">11.0 章首速览</a>
+  <a href="#s11-1">11.1 业务模型</a>
+  <a href="#s11-2">11.2 默认 FetchType</a>
+  <a href="#s11-3">11.3 LAZY 代理机制</a>
+  <a href="#s11-4">11.4 JOIN FETCH</a>
+  <a href="#s11-5">11.5 EntityGraph</a>
+  <a href="#s11-6">11.6 BatchSize 与 SUBSELECT</a>
+  <a href="#s11-7">11.7 DTO 投影</a>
+  <a href="#s11-8">11.8 SQL 数量预算</a>
+  <a href="#s11-9">11.9 源码深潜</a>
+  <a href="#s11-10">11.10 选型指南</a>
+  <a href="#s11-11">11.11 陷阱与回归护栏</a>
+  <a href="#s11-summary">11.12 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 11 章 · 抓取策略与 EntityGraph</h1>
+<p class="subtitle">FetchType.LAZY/EAGER · 代理与 PersistentCollection · JOIN FETCH · @EntityGraph · @BatchSize · @Fetch(SUBSELECT) · DTO 投影 · SQL 数量预算 · LoadQueryInfluencers · BatchFetchQueue · OSIV · 回归护栏</p>
+
+<div class="chapter-intro">
+  <p class="lead">同样一段代码 <code>em.find(Order.class, 1L)</code> 可能产生 1 条 SQL,也可能产生 100 条 — 差异不在 ORM 代码,在 <strong>抓取策略(fetching strategy)</strong>。一个 Order 实体后面挂着 customer / items / payment / auditEvents / shippingAddress / discounts 等关联,每一个都有"是否本次访问"、"几条 SQL"、"什么时候触发"的具体决策。所有这些决策的乘积就是一个接口的 SQL 预算与延迟分布。理解抓取策略 = 理解"对象图遍历"被翻译成"SQL 集合"的全部规则。</p>
+  <p>本章把 JPA + Hibernate 提供的全部抓取工具列成清单 — <strong>JPA 标准的 6 件武器</strong>:默认 FetchType / JOIN FETCH / EntityGraph(fetchgraph + loadgraph) / DTO 投影,加上 <strong>Hibernate 扩展的 2 件</strong>:@BatchSize / @Fetch(SUBSELECT)。每件工具都有"擅长的形状 + 不能解决的问题",没有任何一件能覆盖所有场景。本章的核心论点是:<strong>抓取策略不是某一个方法的属性,而是某一个用例的契约</strong>。同一个 Order 实体在"详情查询"用 JOIN FETCH、在"列表 + 过滤"用 EntityGraph、在"导出报表"用 DTO,这三条路径互不冲突,也都不能省略。把"我整个项目用 LAZY 还是 EAGER"问错的人,八成已经踩到 N+1 或 LazyInitializationException 至少一次。</p>
+  <ul class="will-learn">
+    <li>JPA 标准默认值:<code>@ManyToOne</code> / <code>@OneToOne</code> 默认 EAGER, <code>@OneToMany</code> / <code>@ManyToMany</code> / <code>@ElementCollection</code> 默认 LAZY — 为什么 EAGER 默认是"标准的失误"</li>
+    <li>LAZY 代理的内部结构:<code>HibernateProxy</code> / <code>$$ $$_hibernate_initialize</code> / <code>AbstractLazyInitializer</code> — 为什么 <code>customer.getId()</code> 不触发 SQL 而 <code>customer.getName()</code> 触发</li>
+    <li><code>LazyInitializationException</code> 的根因:Session 已关闭后访问代理 — 修复方向是 <strong>声明加载形状</strong> 而不是 <strong>延长 Session</strong>(为什么 OSIV 是反模式)</li>
+    <li><code>JOIN FETCH</code> 的边界:单页详情完美,集合 + 分页冲突(<code>HHH90003004</code>),多 List 同时 fetch(<code>MultipleBagFetchException</code>)</li>
+    <li><code>@EntityGraph</code> 的两种类型:fetchgraph(图外转 LAZY) vs loadgraph(图外尊重原注解)— 为什么 fetchgraph 是更安全的默认</li>
+    <li><code>@NamedEntityGraph</code> + <code>@NamedSubgraph</code> 的多层结构,Spring Data 集成,编程式 EntityGraph 与 query hint</li>
+    <li><code>@BatchSize</code> 的"分批加载"机制:1 + ceil(N/size) 公式,16-32 是 Web API 的合理默认</li>
+    <li><code>@Fetch(FetchMode.SUBSELECT)</code> 的"二次子查询"模式:严格 2 条 SQL,适合"必访问全集合"</li>
+    <li>DTO 投影 + record:为什么报表 API 应该绕过实体图直接走 SQL → DTO</li>
+    <li>SQL 数量预算表:不同策略下加载 100 个 customer + orders 的 SQL 数公式与权衡</li>
+    <li>Hibernate 内部类:<code>LoadQueryInfluencers</code> / <code>BatchFetchQueue</code> / <code>AbstractPersistentCollection</code> — 它们如何把策略翻译成 SQL</li>
+    <li>三个回归护栏模板:SQL count 断言、N+1 上限断言、EntityGraph shape 断言</li>
+  </ul>
+  <p class="prereq">前置知识:第 5-6 章关联映射(<code>@ManyToOne</code> / <code>@OneToMany</code> / <code>@ManyToMany</code> 的方向、所有方、外键列);第 3 章 PersistenceContext 与 Identity Map(本章解释 BatchFetchQueue 如何利用 PC 中收集 owner id);第 7-8 章 JPQL(本章 JOIN FETCH 是 JPQL 语法的一部分)。后续第 12 章 N+1 问题(把本章工具按"修复 N+1"重新组织)、第 13 章二级缓存(本章 @BatchSize 与 L2 的协作)、第 15 章性能调优(SQL 预算的实战调优)。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s11-overview">11.0 章首速览</h2>
+<!-- ============================================================ -->
+
+<p>把所有抓取工具放在一张决策树上,后续每节展开一个分支。任何时候面对"这个查询用什么策略",先回到这张树过一遍。</p>
+
+<h3>抓取策略决策树</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 11-0-1 · 抓取策略从需求到工具的判定路径</div>
+  <svg viewBox="0 0 920 540" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="380" y="14" width="160" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="36" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">读取用例</text>
+    <text x="460" y="54" text-anchor="middle" fill="#c9d1d9" font-size="11">查询入口</text>
+
+    <text x="180" y="100" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">查询点声明</text>
+    <text x="740" y="100" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">映射默认行为</text>
+
+    <polygon points="180,114 290,150 180,186 70,150" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="180" y="146" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">本次需要关联?</text>
+    <text x="180" y="164" text-anchor="middle" fill="#c9d1d9" font-size="10">用例驱动</text>
+
+    <path d="M420,50 Q300,90 260,130" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="20"  y="220" width="200" height="60" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="120" y="244" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">DTO 投影</text>
+    <text x="120" y="262" text-anchor="middle" fill="#c9d1d9" font-size="11">不进 PC · 只读 API</text>
+
+    <path d="M120,186 Q120,200 120,220" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="80" y="210" fill="#3fb950" font-size="11" font-weight="bold">不需要</text>
+
+    <polygon points="380,114 480,150 380,186 280,150" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="380" y="146" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">关联形状?</text>
+
+    <path d="M240,150 L280,150" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="260" y="142" text-anchor="middle" fill="#3fb950" font-size="10">需要</text>
+
+    <rect x="240" y="220" width="170" height="56" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="325" y="244" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">JOIN FETCH</text>
+    <text x="325" y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">单端 / 1 集合 / 一次性</text>
+
+    <rect x="430" y="220" width="160" height="56" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="510" y="244" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">EntityGraph</text>
+    <text x="510" y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">Repository 复用</text>
+
+    <rect x="610" y="220" width="160" height="56" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="690" y="244" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">@BatchSize</text>
+    <text x="690" y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">访问一批 LAZY</text>
+
+    <rect x="790" y="220" width="120" height="56" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="850" y="244" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">SUBSELECT</text>
+    <text x="850" y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">必访问全集合</text>
+
+    <path d="M340,180 Q330,200 325,220" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M395,186 Q450,200 510,220" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M420,180 Q550,200 690,220" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M450,170 Q650,195 850,220" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="660" y="120" width="220" height="60" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="770" y="144" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">默认映射</text>
+    <text x="770" y="162" text-anchor="middle" fill="#c9d1d9" font-size="11">FetchType.LAZY / EAGER</text>
+
+    <path d="M540,40 Q620,80 730,120" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="640" y="320" width="120" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="700" y="342" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">显式 LAZY</text>
+    <text x="700" y="360" text-anchor="middle" fill="#c9d1d9" font-size="10">推荐</text>
+
+    <rect x="780" y="320" width="120" height="50" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="840" y="342" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">EAGER</text>
+    <text x="840" y="360" text-anchor="middle" fill="#c9d1d9" font-size="10">不推荐</text>
+
+    <path d="M740,180 Q720,250 700,320" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M800,180 Q820,250 840,320" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="540" y="410" width="200" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="640" y="432" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">Proxy / Collection</text>
+    <text x="640" y="450" text-anchor="middle" fill="#c9d1d9" font-size="10">字节码代理</text>
+
+    <path d="M700,370 Q670,390 640,410" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+
+    <polygon points="640,475 740,500 640,525 540,500" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="640" y="498" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">事务外访问?</text>
+    <text x="640" y="514" text-anchor="middle" fill="#c9d1d9" font-size="10">Session 状态</text>
+
+    <path d="M640,460 L640,475" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="350" y="490" width="170" height="40" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="435" y="514" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">LIE 异常</text>
+
+    <rect x="760" y="490" width="150" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="835" y="514" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">按需 SELECT</text>
+
+    <path d="M540,500 L520,500" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="555" y="492" fill="#f85149" font-size="10" font-weight="bold">是</text>
+    <path d="M740,500 L760,500" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="745" y="492" fill="#3fb950" font-size="10" font-weight="bold">否</text>
+  </svg>
+</div>
+
+<h3>策略全维度对比</h3>
+
+<table>
+  <thead>
+    <tr><th>策略</th><th>声明位置</th><th>SQL 数</th><th>适用</th><th>风险</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>LAZY</td><td>关联映射</td><td>按访问触发</td><td>默认</td><td>事务外异常 LIE</td></tr>
+    <tr><td>EAGER</td><td>关联映射</td><td>自动 1+N</td><td>不可分割小关联(基本无)</td><td>列表 N+1</td></tr>
+    <tr><td>JOIN FETCH</td><td>JPQL 查询</td><td>1</td><td>详情 / 单页</td><td>集合 + 分页内存执行</td></tr>
+    <tr><td>EntityGraph</td><td>注解 / 编程式</td><td>1</td><td>多查询复用形状</td><td>图过宽行积爆炸</td></tr>
+    <tr><td>BatchSize</td><td>关联 / 全局</td><td>1 + ceil(N/size)</td><td>不确定访问</td><td>IN 列表过长</td></tr>
+    <tr><td>SUBSELECT</td><td>关联</td><td>2</td><td>一批均会访问</td><td>父查询复杂时风险</td></tr>
+    <tr><td>DTO 投影</td><td>JPQL / SQL</td><td>1</td><td>只读响应</td><td>不能修改实体</td></tr>
+  </tbody>
+</table>
+
+<div class="key-insight">
+  <strong>"加载形状"是查询的契约,不是映射的属性</strong> — 把 <code>fetch = FetchType.LAZY/EAGER</code> 写在 <code>@OneToMany</code> 上,看起来是"实体级的固定属性",但实际上对每个用例的需求是不同的:订单详情页要 customer + items,而订单 CSV 导出要 customer + items + payment + audit。把所有 EAGER 都写到映射上 → 列表查询附带加载所有关联 → N+1。把所有 LAZY 都写到映射上 → 详情查询变 N+1 + LIE。正解是:<strong>映射上一律 LAZY,加载形状用 JPQL JOIN FETCH 或 EntityGraph 在查询点声明</strong>。映射只表达"默认安全姿态",查询表达"本次具体需要"。这是 Vlad Mihalcea / Thorben Janssen 等 JPA 专家反复强调的核心规范,没有第二条更重要的规则。
+</div>
+
+<h3>SQL 预算指标</h3>
+
+<div class="metric-row">
+  <div class="metric"><div class="value">1</div><div class="label">JOIN FETCH 详情</div></div>
+  <div class="metric"><div class="value">1+N</div><div class="label">默认 LAZY 循环</div></div>
+  <div class="metric"><div class="value">1+ceil(N/B)</div><div class="label">@BatchSize</div></div>
+  <div class="metric"><div class="value">2</div><div class="label">SUBSELECT</div></div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s11-1">11.1 业务模型</h2>
+<!-- ============================================================ -->
+
+<p>本章使用一个典型的电商对象图:Order 关联 Customer(单端),Order 拥有 OrderItem 集合,OrderItem 关联 Product。同时 Order 有 AuditEvent 集合作为"低频访问的旁路集合"。</p>
+
+<pre><code class="language-java">@Entity
+@Table(name = "orders")
+public class Order {
+    @Id
+    private Long id;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "customer_id")
+    private Customer customer;
+
+    @OneToMany(mappedBy = "order", fetch = FetchType.LAZY)
+    private List&lt;OrderItem&gt; items = new ArrayList&lt;&gt;();
+
+    @OneToMany(mappedBy = "order", fetch = FetchType.LAZY)
+    private List&lt;AuditEvent&gt; auditEvents = new ArrayList&lt;&gt;();
+
+    private BigDecimal total;
+}
+
+@Entity
+@Table(name = "customer")
+public class Customer {
+    @Id private Long id;
+    private String name;
+}
+
+@Entity
+@Table(name = "order_item")
+public class OrderItem {
+    @Id private Long id;
+    @ManyToOne(fetch = FetchType.LAZY) private Order order;
+    @ManyToOne(fetch = FetchType.LAZY) private Product product;
+    private String sku;
+    private int quantity;
+}</code></pre>
+
+<pre><code class="language-sql">insert into customer(id, name) values (1, 'Ada');
+insert into product(id, name) values (501, 'Redis Guide'), (502, 'JPA Visualizer');
+insert into orders(id, customer_id, total) values (10, 1, 99.00);
+insert into order_item(id, order_id, product_id, sku, quantity) values
+    (100, 10, 501, 'SKU-REDIS-001', 1),
+    (101, 10, 502, 'SKU-KAFKA-002', 3);</code></pre>
+
+<p>注意映射上所有关联都被显式标记为 <code>FetchType.LAZY</code>,这是经验法则。本章后续每个例子都基于这个模型展开。</p>
+
+<!-- ============================================================ -->
+<h2 id="s11-2">11.2 默认 FetchType</h2>
+<!-- ============================================================ -->
+
+<p>JPA 规范规定的默认 FetchType 是个争议焦点:<code>@ManyToOne</code> / <code>@OneToOne</code> 默认 <strong>EAGER</strong>,而 <code>@OneToMany</code> / <code>@ManyToMany</code> 默认 <strong>LAZY</strong>。</p>
+
+<h3>JPA 关联默认值</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 11-2-1 · JPA 各关联类型的默认 FetchType</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="340" y="14" width="240" height="56" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="38" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">JPA 关联默认</text>
+    <text x="460" y="56" text-anchor="middle" fill="#c9d1d9" font-size="11">五种关联,两条路径</text>
+
+    <rect x="20"  y="120" width="160" height="60" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="100" y="144" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">@ManyToOne</text>
+    <text x="100" y="164" text-anchor="middle" fill="#c9d1d9" font-size="11">EAGER (规范)</text>
+
+    <rect x="200" y="120" width="160" height="60" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="280" y="144" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">@OneToOne</text>
+    <text x="280" y="164" text-anchor="middle" fill="#c9d1d9" font-size="11">EAGER (规范)</text>
+
+    <rect x="380" y="120" width="160" height="60" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="460" y="144" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">@OneToMany</text>
+    <text x="460" y="164" text-anchor="middle" fill="#c9d1d9" font-size="11">LAZY</text>
+
+    <rect x="560" y="120" width="160" height="60" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="640" y="144" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">@ManyToMany</text>
+    <text x="640" y="164" text-anchor="middle" fill="#c9d1d9" font-size="11">LAZY</text>
+
+    <rect x="740" y="120" width="170" height="60" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="825" y="144" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">@ElementCollection</text>
+    <text x="825" y="164" text-anchor="middle" fill="#c9d1d9" font-size="11">LAZY</text>
+
+    <path d="M420,70 Q260,90 100,120" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M440,70 Q360,90 280,120" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,70 L460,120" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M500,70 Q580,90 640,120" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M540,70 Q700,90 825,120" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="100" y="240" width="280" height="80" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="240" y="266" text-anchor="middle" fill="#f85149" font-size="13" font-weight="bold">列表查询级联加载</text>
+    <text x="240" y="286" text-anchor="middle" fill="#c9d1d9" font-size="11">每行额外触发关联 SELECT</text>
+    <text x="240" y="304" text-anchor="middle" fill="#c9d1d9" font-size="11">→ 典型 N+1 反模式</text>
+
+    <rect x="540" y="240" width="280" height="80" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="680" y="266" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">集合先不加载</text>
+    <text x="680" y="286" text-anchor="middle" fill="#c9d1d9" font-size="11">访问时再 SELECT</text>
+    <text x="680" y="304" text-anchor="middle" fill="#c9d1d9" font-size="11">→ 安全姿态</text>
+
+    <path d="M100,180 Q150,210 200,240" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M280,180 Q260,210 240,240" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,180 Q570,210 620,240" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M640,180 Q660,210 680,240" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M825,180 Q780,210 720,240" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <text x="460" y="358" text-anchor="middle" fill="#39d2c0" font-size="12" font-weight="bold">推荐:全部关联显式 fetch = FetchType.LAZY,把"加载形状"留给查询点声明</text>
+  </svg>
+</div>
+
+<h3>默认值与推荐</h3>
+
+<table>
+  <thead>
+    <tr><th>关联类型</th><th>JPA 默认</th><th>推荐</th><th>理由</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>@ManyToOne</td><td>EAGER</td><td>LAZY</td><td>列表页避免级联</td></tr>
+    <tr><td>@OneToOne</td><td>EAGER</td><td>LAZY</td><td>一对一也可能 N+1</td></tr>
+    <tr><td>@OneToMany</td><td>LAZY</td><td>LAZY</td><td>集合按用例加载</td></tr>
+    <tr><td>@ManyToMany</td><td>LAZY</td><td>LAZY</td><td>谨慎使用</td></tr>
+    <tr><td>@ElementCollection</td><td>LAZY</td><td>LAZY</td><td>值集合可能很大</td></tr>
+  </tbody>
+</table>
+
+<h3>11.2.1 EAGER 默认带来的列表 N+1</h3>
+
+<pre><code class="language-java">@Entity
+public class Order {
+    @ManyToOne   // 默认 EAGER!
+    private Customer customer;
+}
+
+List&lt;Order&gt; orders = em.createQuery("""
+    select o from Order o order by o.id
+    """, Order.class).getResultList();
+// 应用代码什么都没做,只是查列表</code></pre>
+
+<pre><code class="language-sql">-- SELECT 1: 查 Order 列表
+select o.id, o.customer_id, o.total
+from orders o
+order by o.id;
+
+-- SELECT 2..N+1: 每个 Order 触发一次 customer 查询
+select c.id, c.name from customer c where c.id = ?;
+select c.id, c.name from customer c where c.id = ?;
+... 重复 N 次 ...</code></pre>
+
+<pre><code>[100 orders + 100 distinct customers]
+SQL count = 101
+[根因] EAGER 默认在业务代码触碰前就触发 N+1
+[特征] 你看不到任何 customer.getName() 调用,SQL 已经发出去了</code></pre>
+
+<div class="warning">
+  <strong>"@ManyToOne 默认 EAGER"是 JPA 规范的历史包袱</strong> — JPA 1.0 时代认为"单端关联开销小,默认加载方便",这个判断在"列表查询返回 100 行"的场景立刻翻车。修改默认值需要破坏向后兼容,Jakarta EE 委员会到 2026 年仍未修订。今天的工程实践共识:<strong>所有 @ManyToOne / @OneToOne 都显式写 fetch = FetchType.LAZY</strong>,把默认值当不存在。Spring Initializr 的 Spring Data JPA starter 已经在文档里把这条规则标为 P0 best practice,Hibernate 6 的 ddl validator 也提供了 <code>hibernate.default_eager_to_one_associations=false</code> 但默认仍未启用——它知道改默认会破坏老项目。
+</div>
+
+<h3>11.2.2 显式 LAZY 修正</h3>
+
+<pre><code class="language-java">@Entity
+public class Order {
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    private Customer customer;
+}</code></pre>
+
+<pre><code class="language-sql">select o.id, o.customer_id, o.total
+from orders o
+order by o.id;
+-- 仅 1 条 SQL</code></pre>
+
+<pre><code>SQL count = 1
+customer  = uninitialized proxy (访问时才发 SELECT)</code></pre>
+
+<p><code>optional = false</code> 告诉 Hibernate "这个关联在数据库层是 NOT NULL 的",结合 <code>FetchType.LAZY</code> 可以让 Hibernate 用更精确的代理(无需做 null 判断)。生产代码里 <code>optional</code> 应该按数据库列定义如实声明,而不是为了"图省事"全写 true。</p>
+
+<!-- ============================================================ -->
+<h2 id="s11-3">11.3 LAZY 代理机制</h2>
+<!-- ============================================================ -->
+
+<p>LAZY 之所以能"延后加载",是因为 Hibernate 给关联字段塞了一个 <strong>代理对象</strong>(<code>HibernateProxy</code>)。代理在访问非 id 字段时触发底层加载,这是 LAZY 的核心机制。理解代理 = 理解何时会触发 SQL、何时会抛 LIE。</p>
+
+<h3>Proxy 初始化时机</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 11-3-1 · LAZY Proxy 的初始化触发链</div>
+  <svg viewBox="0 0 920 480" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="40"  y="20" width="160" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="120" y="44" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">应用代码</text>
+    <rect x="260" y="20" width="160" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="340" y="44" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">EntityManager</text>
+    <rect x="480" y="20" width="180" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="570" y="44" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">Customer 代理</text>
+    <rect x="720" y="20" width="160" height="40" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="800" y="44" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">数据库</text>
+
+    <line x1="120" y1="70" x2="120" y2="450" stroke="#30363d" stroke-width="1" stroke-dasharray="4,3"/>
+    <line x1="340" y1="70" x2="340" y2="450" stroke="#30363d" stroke-width="1" stroke-dasharray="4,3"/>
+    <line x1="570" y1="70" x2="570" y2="450" stroke="#30363d" stroke-width="1" stroke-dasharray="4,3"/>
+    <line x1="800" y1="70" x2="800" y2="450" stroke="#30363d" stroke-width="1" stroke-dasharray="4,3"/>
+
+    <path d="M120,98 L340,98" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="230" y="92" text-anchor="middle" fill="#c9d1d9" font-size="11">em.find(Order, 10)</text>
+
+    <path d="M340,138 L800,138" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="570" y="132" text-anchor="middle" fill="#c9d1d9" font-size="11">select order  (含 customer_id 外键)</text>
+
+    <path d="M800,178 L340,178" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5,3" fill="none" marker-end="url(#arr)"/>
+    <text x="570" y="172" text-anchor="middle" fill="#3fb950" font-size="11">order + customer_id</text>
+
+    <path d="M340,218 L120,218" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="5,3" fill="none" marker-end="url(#arr)"/>
+    <text x="230" y="212" text-anchor="middle" fill="#bc8cff" font-size="11">Order(customer = proxy)</text>
+
+    <rect x="370" y="240" width="350" height="32" rx="6" fill="rgba(63,185,80,0.06)" stroke="#3fb950" stroke-dasharray="6,3"/>
+    <text x="545" y="261" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">opt — getId() 不触发 SQL(外键已知)</text>
+
+    <path d="M120,290 L570,290" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="345" y="284" text-anchor="middle" fill="#c9d1d9" font-size="11">getId()</text>
+
+    <path d="M570,318 L120,318" stroke="#d29922" stroke-width="1.5" stroke-dasharray="5,3" fill="none" marker-end="url(#arr)"/>
+    <text x="345" y="312" text-anchor="middle" fill="#d29922" font-size="11">1  (无 SQL,proxy 持外键)</text>
+
+    <rect x="370" y="335" width="350" height="32" rx="6" fill="rgba(248,81,73,0.06)" stroke="#f85149" stroke-dasharray="6,3"/>
+    <text x="545" y="356" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">opt — getName() 触发 SQL(初始化代理)</text>
+
+    <path d="M120,385 L570,385" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="345" y="379" text-anchor="middle" fill="#c9d1d9" font-size="11">getName()</text>
+
+    <path d="M570,408 L800,408" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="685" y="402" text-anchor="middle" fill="#f85149" font-size="11">select customer where id = 1</text>
+
+    <path d="M800,432 L120,432" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5,3" fill="none" marker-end="url(#arr)"/>
+    <text x="460" y="426" text-anchor="middle" fill="#3fb950" font-size="11">Ada  (proxy 已初始化)</text>
+  </svg>
+</div>
+
+<h3>11.3.1 代理观察实验</h3>
+
+<pre><code class="language-java">@Transactional
+public void inspectLazyProxy() {
+    Order order = em.find(Order.class, 10L);
+    Customer customer = order.getCustomer();
+
+    String proxyClass = customer.getClass().getName();
+    boolean initBeforeId = Hibernate.isInitialized(customer);
+    Long id = customer.getId();
+    boolean initAfterId = Hibernate.isInitialized(customer);
+    String name = customer.getName();
+    boolean initAfterName = Hibernate.isInitialized(customer);
+
+    System.out.println("proxyClass = " + proxyClass);
+    System.out.println("initBeforeId = " + initBeforeId);
+    System.out.println("id = " + id);
+    System.out.println("initAfterId = " + initAfterId);
+    System.out.println("name = " + name);
+    System.out.println("initAfterName = " + initAfterName);
+}</code></pre>
+
+<pre><code>[proxyClass]      com.acme.Customer$HibernateProxy$xxxx
+[initBeforeId]    false
+[id]              1                   ← 不触发 SQL
+[initAfterId]     false               ← getId() 不初始化
+[name]            Ada                 ← 触发 SQL
+[initAfterName]   true</code></pre>
+
+<p>关键观察:<strong>访问 <code>getId()</code> 不会触发初始化</strong>。原因是外键列已经在父实体加载时拿到了,代理不需要查询数据库就能返回 id。<code>getName()</code> 才需要去 customer 表 SELECT。这一点对"只需要 id 的场景"非常友好——例如序列化 customerId 时不会意外触发 N+1。</p>
+
+<h3>11.3.2 LazyInitializationException 的根因</h3>
+
+<pre><code class="language-java">@Service
+class OrderService {
+    @Transactional(readOnly = true)
+    Order loadOrder(Long id) {
+        return em.find(Order.class, id);
+    }
+}
+
+@RestController
+class OrderController {
+    @GetMapping("/orders/{id}")
+    OrderResponse get(@PathVariable Long id) {
+        Order order = orderService.loadOrder(id);  // 事务在这里结束
+        // 现在 Session 已关闭,代理失去上下文
+        String customerName = order.getCustomer().getName();
+        return new OrderResponse(order.getId(), customerName);
+    }
+}</code></pre>
+
+<pre><code>[异常]
+org.hibernate.LazyInitializationException:
+could not initialize proxy [com.acme.Customer 1] - no Session
+
+[根因]
+Service 方法返回时事务已 commit + Session close
+Controller 拿到的 order 持有的 customer proxy 失去 Session
+访问 getName() 试图触发 SQL,但没有连接</code></pre>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4>反例:OSIV 掩盖问题</h4>
+    <pre><code class="language-yaml">spring:
+  jpa:
+    open-in-view: true   # 默认</code></pre>
+    <p style="margin-top:8px;font-size:12px;color:#f85149;">
+    OSIV 把 Session 延长到 View 渲染结束。<br/>
+    LIE 不再出现,但 Controller 序列化时<br/>
+    仍触发 LAZY → 隐式 N+1 + DB 连接占用整个请求。
+    </p>
+  </div>
+  <div class="compare-good">
+    <h4>正例:声明加载形状 + DTO</h4>
+    <pre><code class="language-yaml">spring:
+  jpa:
+    open-in-view: false</code></pre>
+    <pre><code class="language-java">@Transactional(readOnly = true)
+OrderDetailDto loadOrder(Long id) {
+    return em.createQuery("""
+        select new OrderDetailDto(
+            o.id, c.name, o.total)
+        from Order o join o.customer c
+        where o.id = :id
+        """, OrderDetailDto.class)
+        .setParameter("id", id)
+        .getSingleResult();
+}</code></pre>
+    <p style="margin-top:8px;font-size:12px;color:#3fb950;">
+    Service 直接返回 DTO,无 Proxy 越界。<br/>
+    Controller 不持有任何懒加载对象。
+    </p>
+  </div>
+</div>
+
+<p>修复方向是<strong>显式声明加载形状</strong>(JOIN FETCH / EntityGraph / DTO),而非<strong>延长会话</strong>(OSIV)。OSIV 让 Session 跨越 Service / Controller / View 三层,看起来"修了" LIE,实际上把 SQL 触发分散到 View 层 — 这是序列化期 N+1 的主要来源。</p>
+
+<!-- ============================================================ -->
+<h2 id="s11-4">11.4 JOIN FETCH</h2>
+<!-- ============================================================ -->
+
+<p><code>JOIN FETCH</code> 是 JPQL 在查询级别声明加载形状的语法:它告诉 Hibernate "在这条查询里,顺带把这些关联也加载好,加进 PC 后标记为已初始化"。结果是<strong>一条 SQL 完成多实体加载</strong>。</p>
+
+<h3>查询级精确加载</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 11-4-1 · JOIN FETCH 把关联折成单条 SQL</div>
+  <svg viewBox="0 0 920 320" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="20"  y="100" width="220" height="120" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="130" y="124" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">JPQL</text>
+    <text x="130" y="146" text-anchor="middle" fill="#c9d1d9" font-size="11">select distinct o</text>
+    <text x="130" y="164" text-anchor="middle" fill="#c9d1d9" font-size="11">from Order o</text>
+    <text x="130" y="182" text-anchor="middle" fill="#c9d1d9" font-size="11">join fetch o.customer</text>
+    <text x="130" y="200" text-anchor="middle" fill="#c9d1d9" font-size="11">left join fetch o.items</text>
+
+    <rect x="290" y="130" width="180" height="60" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="380" y="156" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">1 条 SQL</text>
+    <text x="380" y="174" text-anchor="middle" fill="#c9d1d9" font-size="11">含 LEFT JOIN</text>
+
+    <rect x="520" y="130" width="200" height="60" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="620" y="156" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">PersistenceContext</text>
+    <text x="620" y="174" text-anchor="middle" fill="#c9d1d9" font-size="11">DISTINCT 应用层去重</text>
+
+    <path d="M240,160 L290,160" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M470,160 L520,160" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="760" y="40" width="140" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="830" y="62" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">Order 实体</text>
+    <text x="830" y="80" text-anchor="middle" fill="#c9d1d9" font-size="10">root</text>
+
+    <rect x="760" y="135" width="140" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="830" y="157" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">Customer</text>
+    <text x="830" y="175" text-anchor="middle" fill="#c9d1d9" font-size="10">已初始化</text>
+
+    <rect x="760" y="230" width="140" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="830" y="252" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">items</text>
+    <text x="830" y="270" text-anchor="middle" fill="#c9d1d9" font-size="10">已初始化</text>
+
+    <path d="M720,150 Q740,100 760,70" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M720,160 L760,160" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M720,170 Q740,210 760,250" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<h3>11.4.1 单实体详情查询</h3>
+
+<pre><code class="language-java">public Order findOrderDetail(Long id) {
+    return em.createQuery("""
+        select distinct o from Order o
+        join fetch o.customer
+        left join fetch o.items
+        where o.id = :id
+        """, Order.class)
+        .setParameter("id", id)
+        .getSingleResult();
+}</code></pre>
+
+<pre><code class="language-sql">select distinct
+    o.id, o.customer_id, o.total,
+    c.id, c.name,
+    i.id, i.order_id, i.product_id, i.sku, i.quantity
+from orders o
+join customer c on c.id = o.customer_id
+left join order_item i on i.order_id = o.id
+where o.id = ?;</code></pre>
+
+<pre><code>[order.id]                10
+[customer initialized]     true
+[items initialized]        true
+[items.size]               2
+[SQL count]                1
+[JDBC 行]                  2 (Order × items)
+[实体]                     1 Order + 2 OrderItem</code></pre>
+
+<p><code>distinct</code> 关键字在 JOIN FETCH 集合时<strong>不影响 SQL 层</strong>(SQL 仍然返回笛卡尔行),它只在 Hibernate 应用层去重 — 把 (Order, item1) 与 (Order, item2) 两行去重为同一个 Order 实体的 items 集合。Hibernate 6 后 <code>spring.jpa.properties.hibernate.query.passDistinctThrough=false</code> 默认开启,SQL 不带 distinct 也能正确去重,执行计划更优。</p>
+
+<h3>JOIN FETCH 限制</h3>
+
+<table>
+  <thead>
+    <tr><th>限制</th><th>现象</th><th>替代</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>集合 fetch + 分页</td><td><code>HHH90003004</code> in-memory pagination warning</td><td>两步分页(先查 id,再 JOIN FETCH)</td></tr>
+    <tr><td>多 List 同时 fetch</td><td><code>MultipleBagFetchException</code></td><td>一个改 Set 或拆查</td></tr>
+    <tr><td>多集合笛卡尔</td><td>行数爆炸</td><td>EntityGraph 限 1 大集合</td></tr>
+    <tr><td>count 查询</td><td>count 含 fetch 列</td><td>count 单独查</td></tr>
+    <tr><td>子集合 fetch</td><td>3 层 join 行积过大</td><td>分两条查询</td></tr>
+  </tbody>
+</table>
+
+<div class="warning">
+  <strong>"集合 fetch + 分页"是 JOIN FETCH 最大的禁区</strong> — 当 JPQL 含 <code>join fetch o.items</code> 又用 <code>setMaxResults / setFirstResult</code> 时,Hibernate 在日志里抛 <code>HHH000104: firstResult/maxResults specified with collection fetch; applying in memory!</code>。它的处理方式是:<strong>把所有数据一次性拉回内存,然后在 Java 里分页</strong>。如果你以为"分页 10 条"就只查 10 条,实际可能查了几十万条,内存直接爆。修复模式是"两步分页":第一步 <code>select o.id from Order o ... limit 10 offset N</code> 拿到 10 个 id,第二步 <code>select o from Order o join fetch o.items where o.id in (:ids)</code>。这是 Hibernate 6 推荐的标准做法。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s11-5">11.5 EntityGraph</h2>
+<!-- ============================================================ -->
+
+<p><code>@EntityGraph</code> 是 JPA 2.1 引入的"加载形状声明" — 把"本次需要加载哪些路径"从查询语句里抽出来,作为可复用的注解或编程式对象。它解决的核心问题是:同一个对象图在 5 个不同的 Repository 方法里都需要加载,JOIN FETCH 要把同样的语句写 5 次,EntityGraph 只写 1 次共享。</p>
+
+<h3>EntityGraph 与 JPQL 协作</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 11-5-1 · EntityGraph 通过 hint 影响加载计划</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="40"  y="20" width="220" height="60" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="150" y="44" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">Repository 方法</text>
+    <text x="150" y="62" text-anchor="middle" fill="#c9d1d9" font-size="11">findDetailById(...)</text>
+
+    <rect x="320" y="20" width="280" height="60" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="460" y="44" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">jakarta.persistence.fetchgraph</text>
+    <text x="460" y="62" text-anchor="middle" fill="#c9d1d9" font-size="11">JPA 标准 hint</text>
+
+    <rect x="660" y="20" width="220" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="770" y="44" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">@NamedEntityGraph</text>
+    <text x="770" y="62" text-anchor="middle" fill="#c9d1d9" font-size="11">"Order.detail"</text>
+
+    <path d="M260,50 L320,50" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M600,50 L660,50" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="500" y="140" width="180" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="590" y="162" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">customer</text>
+    <text x="590" y="180" text-anchor="middle" fill="#c9d1d9" font-size="10">@NamedAttributeNode</text>
+
+    <rect x="700" y="140" width="180" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="790" y="162" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">items</text>
+    <text x="790" y="180" text-anchor="middle" fill="#c9d1d9" font-size="10">subgraph items</text>
+
+    <rect x="700" y="220" width="180" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="790" y="242" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">items.product</text>
+    <text x="790" y="260" text-anchor="middle" fill="#c9d1d9" font-size="10">@NamedSubgraph</text>
+
+    <path d="M740,80 Q660,110 590,140" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M780,80 Q780,110 790,140" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M790,190 L790,220" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="40"  y="310" width="540" height="50" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="310" y="332" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">SQL</text>
+    <text x="310" y="350" text-anchor="middle" fill="#c9d1d9" font-size="11">SELECT ... FROM orders LEFT JOIN customer LEFT JOIN order_item LEFT JOIN product</text>
+
+    <path d="M150,80 Q150,200 310,310" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <text x="100" y="190" fill="#8b949e" font-size="10">解析 + 翻译</text>
+  </svg>
+</div>
+
+<h3>11.5.1 命名图定义</h3>
+
+<pre><code class="language-java">@Entity
+@NamedEntityGraph(
+    name = "Order.detail",
+    attributeNodes = {
+        @NamedAttributeNode("customer"),
+        @NamedAttributeNode(value = "items", subgraph = "items-subgraph")
+    },
+    subgraphs = @NamedSubgraph(
+        name = "items-subgraph",
+        attributeNodes = @NamedAttributeNode("product")
+    ))
+public class Order { /* ... */ }</code></pre>
+
+<h3>11.5.2 Spring Data 集成</h3>
+
+<pre><code class="language-java">public interface OrderRepository extends JpaRepository&lt;Order, Long&gt; {
+
+    @EntityGraph(value = "Order.detail",
+                 type = EntityGraph.EntityGraphType.FETCH)
+    Optional&lt;Order&gt; findDetailById(Long id);
+}</code></pre>
+
+<pre><code class="language-sql">select o.id, o.customer_id, o.total,
+       c.id, c.name,
+       i.id, i.order_id, i.product_id, i.sku, i.quantity,
+       p.id, p.name
+from orders o
+left join customer c on c.id = o.customer_id
+left join order_item i on i.order_id = o.id
+left join product p on p.id = i.product_id
+where o.id = ?;</code></pre>
+
+<h3>fetchgraph vs loadgraph</h3>
+
+<table>
+  <thead>
+    <tr><th>维度</th><th>FETCH (fetchgraph)</th><th>LOAD (loadgraph)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>图内关联</td><td>加载</td><td>加载</td></tr>
+    <tr><td>图外关联</td><td>转 LAZY</td><td>尊重原实体注解</td></tr>
+    <tr><td>推荐</td><td>是 (默认)</td><td>仅遗留兼容</td></tr>
+    <tr><td>风险</td><td>低</td><td>EAGER 漏网</td></tr>
+    <tr><td>典型用法</td><td>明确声明本次形状</td><td>在 EAGER 基础上加补充</td></tr>
+  </tbody>
+</table>
+
+<div class="key-insight">
+  <strong>fetchgraph 是更安全的默认</strong> — fetchgraph 把"图外关联一律 LAZY"作为统一保证,意味着无论你的实体上有多少 EAGER 漏网,fetchgraph 都强制"只加载我列出的"。loadgraph 反其道而行 — 它说"图内的我加载,图外的看你映射怎么写"。如果实体有遗留的 EAGER(常见于老项目),loadgraph 会让你的"看似精简"的图实际触发额外 SQL。所以 Spring Data 的 <code>@EntityGraph</code> 默认就是 FETCH 类型 — 这是经过深思熟虑的安全姿态。如果你看到代码里写 <code>EntityGraphType.LOAD</code>,通常是历史代码迁移过来的,可以考虑改成 FETCH 后跑回归测试观察是否有 SQL 变少(变少 = 之前有 EAGER 漏网 = 现在更精确)。
+</div>
+
+<h3>11.5.3 编程式 EntityGraph</h3>
+
+<pre><code class="language-java">EntityGraph&lt;Order&gt; graph = em.createEntityGraph(Order.class);
+graph.addAttributeNodes("customer");
+
+Order order = em.find(Order.class, 10L,
+    Map.of("jakarta.persistence.fetchgraph", graph));
+
+boolean custInit = Hibernate.isInitialized(order.getCustomer());
+boolean itemsInit = Hibernate.isInitialized(order.getItems());</code></pre>
+
+<pre><code>[custInit]   true
+[itemsInit]  false
+[SQL count]  1</code></pre>
+
+<p>编程式 EntityGraph 适合"加载形状由运行时决定"的场景 — 例如 GraphQL 查询根据用户 selection set 动态决定加载哪些字段。<code>em.find</code> 接受 hint Map,jakarta.persistence.fetchgraph 是标准 hint 名称。</p>
+
+<!-- ============================================================ -->
+<h2 id="s11-6">11.6 BatchSize 与 SUBSELECT</h2>
+<!-- ============================================================ -->
+
+<p>当查询入口已经写好(没法改成 JOIN FETCH),但代码会循环访问 LAZY 关联,JOIN FETCH 不适用,EntityGraph 也不在调用方掌控,这时 <code>@BatchSize</code> 和 <code>@Fetch(SUBSELECT)</code> 是兜底方案 — 它们在<strong>映射层</strong>声明"如果有人触发我,我应该怎样批量加载"。</p>
+
+<h3>批量补取机制</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 11-6-1 · BatchSize 与 SUBSELECT 的对比</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="20"  y="160" width="180" height="60" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="110" y="184" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">SELECT 1</text>
+    <text x="110" y="202" text-anchor="middle" fill="#c9d1d9" font-size="11">select 25 customers</text>
+
+    <rect x="240" y="160" width="180" height="60" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="330" y="184" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">触发 LAZY 访问</text>
+    <text x="330" y="202" text-anchor="middle" fill="#c9d1d9" font-size="11">customers[0].orders</text>
+
+    <path d="M200,190 L240,190" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="480" y="40" width="220" height="80" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="590" y="64" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">@BatchSize(10)</text>
+    <text x="590" y="84" text-anchor="middle" fill="#c9d1d9" font-size="11">SELECT * FROM orders</text>
+    <text x="590" y="102" text-anchor="middle" fill="#c9d1d9" font-size="11">WHERE customer_id IN (...10 ids...)</text>
+
+    <rect x="720" y="40" width="180" height="80" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="810" y="64" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">第 11 / 21</text>
+    <text x="810" y="84" text-anchor="middle" fill="#c9d1d9" font-size="11">访问下一批 owner</text>
+    <text x="810" y="102" text-anchor="middle" fill="#c9d1d9" font-size="11">→ 再发 IN(10) 一条</text>
+
+    <path d="M700,80 L720,80" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="480" y="260" width="220" height="80" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="590" y="284" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">@Fetch(SUBSELECT)</text>
+    <text x="590" y="304" text-anchor="middle" fill="#c9d1d9" font-size="11">SELECT * FROM orders</text>
+    <text x="590" y="322" text-anchor="middle" fill="#c9d1d9" font-size="11">WHERE customer_id IN (子查询)</text>
+
+    <rect x="720" y="260" width="180" height="80" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="810" y="284" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">一次性加载</text>
+    <text x="810" y="304" text-anchor="middle" fill="#c9d1d9" font-size="11">所有 orders</text>
+    <text x="810" y="322" text-anchor="middle" fill="#c9d1d9" font-size="11">SQL 总数 = 2</text>
+
+    <path d="M700,300 L720,300" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <path d="M420,180 Q450,140 480,80" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="430" y="135" fill="#d29922" font-size="11" font-weight="bold">分批加载</text>
+
+    <path d="M420,200 Q450,240 480,290" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="430" y="240" fill="#3fb950" font-size="11" font-weight="bold">原查询作子查询</text>
+
+    <text x="100" y="260" fill="#c9d1d9" font-size="11">SQL 总数公式:</text>
+    <text x="100" y="280" fill="#d29922" font-size="11">@BatchSize(B):  1 + ceil(N/B)</text>
+    <text x="100" y="300" fill="#3fb950" font-size="11">SUBSELECT:        1 + 1  = 2</text>
+    <text x="100" y="320" fill="#8b949e" font-size="11">N=25, B=10  →  4 vs 2</text>
+  </svg>
+</div>
+
+<h3>11.6.1 BatchSize</h3>
+
+<pre><code class="language-java">@Entity
+public class Customer {
+    @OneToMany(mappedBy = "customer", fetch = FetchType.LAZY)
+    @BatchSize(size = 10)
+    private List&lt;Order&gt; orders = new ArrayList&lt;&gt;();
+}
+
+List&lt;Customer&gt; customers = em.createQuery("""
+    select c from Customer c order by c.id
+    """, Customer.class)
+    .setMaxResults(25)
+    .getResultList();
+
+customers.get(0).getOrders().size();   // 触发第 1 批
+customers.get(10).getOrders().size();  // 触发第 2 批
+customers.get(20).getOrders().size();  // 触发第 3 批</code></pre>
+
+<pre><code class="language-sql">-- SELECT 1
+select id, name from customer order by id fetch first 25 rows only;
+
+-- SELECT 2 (第 1 批 — Hibernate 收集 10 个待初始化 owner id)
+select id, customer_id, total from orders
+where customer_id in (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+-- SELECT 3 (第 2 批)
+select id, customer_id, total from orders
+where customer_id in (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+-- SELECT 4 (剩余 5 个)
+select id, customer_id, total from orders
+where customer_id in (?, ?, ?, ?, ?);</code></pre>
+
+<pre><code>[父行] 25
+[batch] 10
+[SQL]   1 + ceil(25 / 10) = 4 条</code></pre>
+
+<h3>11.6.2 SUBSELECT (Hibernate 专属)</h3>
+
+<pre><code class="language-java">@Entity
+public class Customer {
+    @OneToMany(mappedBy = "customer", fetch = FetchType.LAZY)
+    @Fetch(FetchMode.SUBSELECT)
+    private List&lt;Order&gt; orders = new ArrayList&lt;&gt;();
+}
+
+List&lt;Customer&gt; customers = em.createQuery("""
+    select c from Customer c
+    where c.active = true
+    order by c.id
+    """, Customer.class).getResultList();
+
+customers.get(0).getOrders().size();   // 触发一次,加载所有 active 客户的 orders</code></pre>
+
+<pre><code class="language-sql">-- SELECT 1
+select id, name, active from customer where active = true order by id;
+
+-- SELECT 2 (首次集合访问触发,把原父查询作为子查询)
+select id, customer_id, total from orders
+where customer_id in (
+    select id from customer where active = true
+);</code></pre>
+
+<pre><code>[active customers] 100
+[SQL count]        2
+[代价]              原父查询作为子查询重复执行</code></pre>
+
+<h3>11.6.3 全局兜底</h3>
+
+<pre><code class="language-properties">spring.jpa.properties.hibernate.default_batch_fetch_size=16</code></pre>
+
+<p>这一行配置开启全局 BatchSize,所有未显式标注 <code>@BatchSize</code> 的 LAZY 关联都按 16 批量加载。生产经验:这是<strong>每个新 Spring + JPA 项目第一行该加的配置</strong>,它把"潜在的 N+1"转成"最差 N/16",10 倍以上数量级降低事故频率。</p>
+
+<h3>BatchSize 取值建议</h3>
+
+<table>
+  <thead>
+    <tr><th>范围</th><th>适用</th><th>风险</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>5-10</td><td>小批量 / 关联较少</td><td>仍多 SQL</td></tr>
+    <tr><td>16-32</td><td>Web API 默认</td><td>平衡</td></tr>
+    <tr><td>50-100</td><td>后台批量</td><td>IN 列表过长</td></tr>
+    <tr><td>&gt; 200</td><td>不推荐</td><td>计划缓存抖动</td></tr>
+  </tbody>
+</table>
+
+<div class="real-world">
+  <strong>BatchSize 太大会触发"绑定参数过多"错误</strong> — Oracle JDBC 默认单 PreparedStatement 参数上限是 1000;PostgreSQL 是 32767;SQL Server 是 2100;DB2 是 32767。如果 <code>@BatchSize(size = 1000)</code> 加上某次查询正好凑到 1000 个 customer 一起初始化,Oracle 会抛 <code>ORA-01795: maximum number of expressions in a list is 1000</code>。解决:<strong>BatchSize 不要超过 100</strong>(给应用层留 buffer),如果某些超大批量场景需要,改用 <code>@Fetch(SUBSELECT)</code> 把"IN 列表"换成"子查询"。Hibernate 6 还内置了 <code>BatchLoader</code> 的 IN 切片机制(<code>hibernate.dialect.batch_versioned_data</code>),会自动按方言上限切分,但仍以"单查询 ≤ 数据库参数上限"为前提。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s11-7">11.7 DTO 投影</h2>
+<!-- ============================================================ -->
+
+<p>DTO 投影是<strong>绕开实体图</strong>的策略 — 直接 select 列,封装到 DTO/record,不进入 PersistenceContext。适合"只读 API"、"报表"、"导出"场景:这些场景不需要"对象身份"和"dirty checking",反而需要"少加载、少内存、快响应"。</p>
+
+<h3>11.7.1 record DTO</h3>
+
+<pre><code class="language-java">public record OrderSummaryDto(
+    Long orderId,
+    String customerName,
+    BigDecimal total,
+    Long itemCount) {}
+
+public OrderSummaryDto findSummary(Long orderId) {
+    return em.createQuery("""
+        select new com.acme.OrderSummaryDto(
+            o.id, c.name, o.total, count(i)
+        )
+        from Order o
+        join o.customer c
+        left join o.items i
+        where o.id = :orderId
+        group by o.id, c.name, o.total
+        """, OrderSummaryDto.class)
+        .setParameter("orderId", orderId)
+        .getSingleResult();
+}</code></pre>
+
+<pre><code class="language-sql">select o.id, c.name, o.total, count(i.id)
+from orders o
+join customer c on c.id = o.customer_id
+left join order_item i on i.order_id = o.id
+where o.id = ?
+group by o.id, c.name, o.total;</code></pre>
+
+<pre><code>[结果]
+{
+  "orderId": 10,
+  "customerName": "Ada",
+  "total": 99.00,
+  "itemCount": 2
+}
+
+[特点]
+- 一条 SQL 完成所有聚合
+- 不进入 PersistenceContext
+- 无 dirty checking 开销
+- 不能修改后保存(本来就不该)</code></pre>
+
+<p>DTO 不进入 PersistenceContext,无脏检查与级联。修改场景应重新加载实体。这是 DTO 模式的核心约束:<strong>读路径与写路径分离</strong>。CQRS 架构在这里有天然的契合度。</p>
+
+<!-- ============================================================ -->
+<h2 id="s11-8">11.8 SQL 数量预算</h2>
+<!-- ============================================================ -->
+
+<p>把每种策略对"100 客户读取 + 访问每个客户的 orders 集合"这个标准场景的 SQL 数量列成表,直观对比:</p>
+
+<h3>100 客户读取场景对比</h3>
+
+<table>
+  <thead>
+    <tr><th>策略</th><th>SQL 数</th><th>公式</th><th>适用</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>无优化 LAZY 循环</td><td>101</td><td>1 + N</td><td>仅暴露问题</td></tr>
+    <tr><td>@BatchSize(5)</td><td>21</td><td>1 + ceil(100 / 5)</td><td>小批量</td></tr>
+    <tr><td>@BatchSize(10)</td><td>11</td><td>1 + ceil(100 / 10)</td><td>常用兜底</td></tr>
+    <tr><td>@BatchSize(25)</td><td>5</td><td>1 + ceil(100 / 25)</td><td>较大批</td></tr>
+    <tr><td>SUBSELECT</td><td>2</td><td>1 + 1</td><td>全量遍历</td></tr>
+    <tr><td>JOIN FETCH</td><td>1</td><td>1 join</td><td>单页详情</td></tr>
+    <tr><td>EntityGraph</td><td>1</td><td>1 join</td><td>复用形状</td></tr>
+    <tr><td>DTO</td><td>1</td><td>1 select</td><td>只读</td></tr>
+  </tbody>
+</table>
+
+<h3>11.8.1 SQL 计数代码</h3>
+
+<pre><code class="language-java">@Autowired
+EntityManagerFactory emf;
+
+private Statistics stats() {
+    return emf.unwrap(SessionFactory.class).getStatistics();
+}
+
+@Test
+void countSqlForCustomerListAccess() {
+    long before = stats().getPrepareStatementCount();
+
+    List&lt;Customer&gt; customers = repo.findFirst100ByOrderByIdAsc();
+    customers.forEach(c -&gt; c.getOrders().size());
+
+    long after = stats().getPrepareStatementCount();
+    long sqlCount = after - before;
+
+    System.out.println("SQL count = " + sqlCount);
+    assertThat(sqlCount).isLessThanOrEqualTo(8L);
+}</code></pre>
+
+<p>开启 Hibernate 统计需要配置 <code>spring.jpa.properties.hibernate.generate_statistics=true</code>。这个统计是"测试环境用的可观测开关",生产环境通常关闭(它有少量性能开销)。</p>
+
+<!-- ============================================================ -->
+<h2 id="s11-9">11.9 源码深潜</h2>
+<!-- ============================================================ -->
+
+<p>把抓取策略落到 Hibernate 源码,核心几个类:<code>LoadQueryInfluencers</code>(收集策略输入)、<code>BatchFetchQueue</code>(批量补取实现)、<code>AbstractPersistentCollection</code>(集合代理)、<code>HibernateProxy</code>(单端代理)、<code>SqlAstTranslator</code>(把策略翻成 SQL)。</p>
+
+<h3>加载计划组装</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 11-9-1 · 抓取策略从映射/查询/hint 到 SQL 的全链路</div>
+  <svg viewBox="0 0 920 540" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <text x="200" y="22" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">输入:三类策略源</text>
+    <text x="720" y="22" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">输出:SQL + 实体水合</text>
+
+    <rect x="20"  y="50" width="200" height="60" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="120" y="74" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">JPA 映射</text>
+    <text x="120" y="92" text-anchor="middle" fill="#c9d1d9" font-size="11">FetchType + 关联元数据</text>
+
+    <rect x="20"  y="130" width="200" height="60" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="120" y="154" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">JPQL / Criteria / find</text>
+    <text x="120" y="172" text-anchor="middle" fill="#c9d1d9" font-size="11">查询点 / API 入口</text>
+
+    <rect x="20"  y="210" width="200" height="60" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="120" y="234" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">EntityGraph hint</text>
+    <text x="120" y="252" text-anchor="middle" fill="#c9d1d9" font-size="11">jakarta.persistence.fetchgraph</text>
+
+    <rect x="20"  y="290" width="200" height="60" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="120" y="314" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">@BatchSize / 全局</text>
+    <text x="120" y="332" text-anchor="middle" fill="#c9d1d9" font-size="11">default_batch_fetch_size</text>
+
+    <rect x="280" y="50"  width="180" height="44" rx="6" fill="#0d1117" stroke="#58a6ff"/>
+    <text x="370" y="76" text-anchor="middle" fill="#58a6ff" font-size="11">Hibernate metamodel</text>
+
+    <rect x="280" y="140" width="180" height="44" rx="6" fill="#0d1117" stroke="#58a6ff"/>
+    <text x="370" y="166" text-anchor="middle" fill="#58a6ff" font-size="11">SessionImpl / SqmImpl</text>
+
+    <rect x="280" y="240" width="180" height="80" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="370" y="266" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">LoadQuery</text>
+    <text x="370" y="284" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">Influencers</text>
+    <text x="370" y="304" text-anchor="middle" fill="#c9d1d9" font-size="10">汇总 hint + batch</text>
+
+    <path d="M220,80  L280,75"  stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M220,160 L280,160" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M220,240 L280,265" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M220,310 L280,300" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="510" y="160" width="200" height="80" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="610" y="186" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">Load Plan / SQL AST</text>
+    <text x="610" y="206" text-anchor="middle" fill="#c9d1d9" font-size="11">SqlAstTranslator</text>
+    <text x="610" y="224" text-anchor="middle" fill="#c9d1d9" font-size="11">三源汇总加工</text>
+
+    <path d="M460,75  Q500,120 510,170" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,160 L510,180" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,275 Q500,250 510,220" stroke="#bc8cff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="750" y="160" width="160" height="80" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="830" y="186" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">JdbcSelect</text>
+    <text x="830" y="204" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">Executor</text>
+    <text x="830" y="222" text-anchor="middle" fill="#c9d1d9" font-size="10">真正发 SQL</text>
+
+    <path d="M710,200 L750,200" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="510" y="290" width="200" height="60" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="610" y="314" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">PersistenceContext</text>
+    <text x="610" y="332" text-anchor="middle" fill="#c9d1d9" font-size="11">实体身份注册</text>
+
+    <path d="M830,240 Q800,280 710,320" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="380" y="400" width="200" height="60" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="480" y="424" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">HibernateProxy</text>
+    <text x="480" y="442" text-anchor="middle" fill="#c9d1d9" font-size="11">to-one 单端代理</text>
+
+    <rect x="620" y="400" width="240" height="60" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="740" y="424" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">PersistentCollection</text>
+    <text x="740" y="442" text-anchor="middle" fill="#c9d1d9" font-size="11">to-many 集合代理</text>
+
+    <path d="M580,350 Q530,380 480,400" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M640,350 Q700,380 740,400" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="380" y="490" width="200" height="40" rx="6" fill="#0d1117" stroke="#58a6ff"/>
+    <text x="480" y="514" text-anchor="middle" fill="#c9d1d9" font-size="11">proxy 初始化 → 回到 Executor</text>
+
+    <rect x="620" y="490" width="240" height="40" rx="6" fill="#0d1117" stroke="#d29922"/>
+    <text x="740" y="514" text-anchor="middle" fill="#c9d1d9" font-size="11">BatchFetchQueue → IN / SUBSELECT</text>
+
+    <path d="M480,460 L480,490" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M740,460 L740,490" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+
+    <path d="M380,510 Q200,470 200,440 Q200,400 280,380 Q500,300 750,250" stroke="#8b949e" stroke-width="1" fill="none" stroke-dasharray="4,4" marker-end="url(#arr)"/>
+    <text x="200" y="425" fill="#8b949e" font-size="10">回环触发新 JDBC</text>
+  </svg>
+</div>
+
+<h3>核心源码入口</h3>
+
+<table>
+  <thead>
+    <tr><th>类</th><th>职责</th><th>关键方法</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>SessionImpl</td><td>find / getReference 入口</td><td>find / load</td></tr>
+    <tr><td>QuerySqmImpl</td><td>JPQL / Criteria 执行</td><td>list / getSingleResult</td></tr>
+    <tr><td>LoadQueryInfluencers</td><td>fetch profile / EntityGraph / batch 配置</td><td>getEffectiveEntityGraph</td></tr>
+    <tr><td>RootGraphImplementor</td><td>EntityGraph 解析</td><td>resolveAttributeNode</td></tr>
+    <tr><td>AbstractPersistentCollection</td><td>集合延迟初始化</td><td>readSize / initialize</td></tr>
+    <tr><td>BatchFetchQueue</td><td>同类待初始化代理 / 集合</td><td>getCollectionBatch / getEntityBatch</td></tr>
+    <tr><td>SqlAstTranslator</td><td>SQL 生成</td><td>translate</td></tr>
+    <tr><td>JdbcSelectExecutor</td><td>执行</td><td>list</td></tr>
+  </tbody>
+</table>
+
+<h3>11.9.1 设计取舍</h3>
+
+<p><strong>取舍 1:三层职责分工</strong></p>
+<p>映射层提供安全默认值 (LAZY),查询层声明本次形状 (JOIN FETCH / EntityGraph),运行时根据 PersistenceContext 与代理状态决定补取。任一层当作万能解决方案都会制造新问题。映射 EAGER → 列表 N+1;查询 JOIN FETCH 应付所有 → 笛卡尔行积;运行时 BatchSize 全靠 → 仍随 N 增长。三层各司其职是 Hibernate 加载架构的核心。</p>
+
+<p><strong>取舍 2:LoadQueryInfluencers 不修改谓词</strong></p>
+<p>EntityGraph 只声明加载路径,<strong>不能表达 WHERE 过滤</strong>。复杂过滤须 JPQL / Criteria。这种限制使得加载契约可复用,与查询过滤独立演进。如果 EntityGraph 同时表达过滤,就会出现"同一个图 + 不同过滤"的语义混乱。</p>
+
+<p><strong>取舍 3:BatchFetchQueue 限于补取</strong></p>
+<p>BatchSize 只能减少 SQL 次数,<strong>不能让接口变成严格 1 条 SQL</strong>。需要严格 1 条 SQL 时必须用 JOIN FETCH 或 EntityGraph。BatchFetchQueue 的设计目标是"已经在 LAZY 触发的现实下,把 N 条 SQL 合并成 N/B 条",而不是"消灭 LAZY"。</p>
+
+<p><strong>取舍 4:HibernateProxy 用字节码生成,不依赖反射</strong></p>
+<p>代理类在启动期由 Byte Buddy(以前是 Javassist / CGLIB)生成,不走 JDK 动态代理(后者只能代理接口)。Hibernate 选择字节码代理是为了支持"实体类是普通 class 而非接口",这与 JPA 规范契合 — 实体不要求实现任何 marker interface。代价是构建期需要字节码增强工具链,Spring Boot starter 默认配置好了所以业务无感。</p>
+
+<!-- ============================================================ -->
+<h2 id="s11-10">11.10 选型指南</h2>
+<!-- ============================================================ -->
+
+<p>把所有策略组装成"选型决策流",任何新接口都按这条流过一遍,不会再纠结"该用什么"。</p>
+
+<h3>策略选型流程</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 11-10-1 · 抓取策略选型决策流</div>
+  <svg viewBox="0 0 920 540" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="380" y="14" width="160" height="44" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="42" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">返回什么?</text>
+
+    <polygon points="460,80 580,118 460,156 340,118" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="460" y="112" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">只读响应?</text>
+    <text x="460" y="130" text-anchor="middle" fill="#c9d1d9" font-size="10">无需 setter 改对象</text>
+
+    <path d="M460,58 L460,80" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="700" y="100" width="180" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="790" y="122" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">DTO 投影</text>
+    <text x="790" y="140" text-anchor="middle" fill="#c9d1d9" font-size="10">不进 PC</text>
+
+    <path d="M580,118 L700,125" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="635" y="105" fill="#3fb950" font-size="11" font-weight="bold">是</text>
+
+    <polygon points="460,180 600,220 460,260 320,220" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="460" y="216" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">查询时知道</text>
+    <text x="460" y="234" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">关联形状?</text>
+
+    <path d="M460,156 L460,180" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="430" y="173" fill="#f85149" font-size="11" font-weight="bold">否</text>
+
+    <polygon points="200,260 320,300 200,340 80,300" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="200" y="296" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">多方法复用?</text>
+
+    <path d="M380,235 Q280,260 240,265" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="295" y="245" fill="#3fb950" font-size="11" font-weight="bold">是</text>
+
+    <rect x="40"  y="380" width="160" height="50" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="120" y="402" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">EntityGraph</text>
+    <text x="120" y="420" text-anchor="middle" fill="#c9d1d9" font-size="10">命名图复用</text>
+
+    <rect x="240" y="380" width="160" height="50" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="320" y="402" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">JOIN FETCH</text>
+    <text x="320" y="420" text-anchor="middle" fill="#c9d1d9" font-size="10">单次详情</text>
+
+    <path d="M150,340 Q140,360 120,380" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="100" y="365" fill="#3fb950" font-size="10" font-weight="bold">是</text>
+    <path d="M260,340 Q280,360 320,380" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="290" y="365" fill="#f85149" font-size="10" font-weight="bold">否</text>
+
+    <polygon points="700,260 820,300 700,340 580,300" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="700" y="296" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">访问一批 LAZY?</text>
+
+    <path d="M540,235 Q620,260 660,265" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="600" y="245" fill="#f85149" font-size="11" font-weight="bold">否</text>
+
+    <rect x="540" y="380" width="160" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="620" y="402" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">保持 LAZY</text>
+    <text x="620" y="420" text-anchor="middle" fill="#c9d1d9" font-size="10">默认安全姿态</text>
+
+    <path d="M650,340 Q630,360 620,380" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="595" y="365" fill="#f85149" font-size="10" font-weight="bold">否</text>
+
+    <polygon points="800,380 880,420 800,460 720,420" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="800" y="416" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">必访问</text>
+    <text x="800" y="432" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">全集合?</text>
+
+    <path d="M740,335 Q780,355 800,380" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="755" y="365" fill="#3fb950" font-size="10" font-weight="bold">是</text>
+
+    <rect x="640" y="490" width="160" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="720" y="514" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">SUBSELECT</text>
+
+    <rect x="820" y="490" width="170" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="905" y="514" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">BatchSize 16-32</text>
+
+    <path d="M780,460 Q750,475 720,490" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="730" y="478" fill="#3fb950" font-size="10" font-weight="bold">是</text>
+    <path d="M820,460 Q860,475 905,490" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="870" y="478" fill="#f85149" font-size="10" font-weight="bold">否</text>
+  </svg>
+</div>
+
+<h3>策略适用矩阵</h3>
+
+<table>
+  <thead>
+    <tr><th>策略</th><th>适用</th><th>不适用</th><th>必备守护</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>LAZY</td><td>默认</td><td>事务外访问</td><td>shape 断言</td></tr>
+    <tr><td>EAGER</td><td>不可分小关联</td><td>大多数</td><td>SQL count baseline</td></tr>
+    <tr><td>JOIN FETCH</td><td>详情 / 单页</td><td>集合 + 分页 / 多 bag</td><td>SQL count + snapshot</td></tr>
+    <tr><td>EntityGraph</td><td>共享形状</td><td>多大集合</td><td>shape 断言</td></tr>
+    <tr><td>@BatchSize</td><td>兜底</td><td>严格 1 SQL</td><td>上限断言</td></tr>
+    <tr><td>SUBSELECT</td><td>必访问全集合</td><td>复杂分页</td><td>SQL count = 2</td></tr>
+    <tr><td>DTO</td><td>只读 API</td><td>修改实体</td><td>response contract</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s11-11">11.11 陷阱与回归护栏</h2>
+<!-- ============================================================ -->
+
+<h3>陷阱明细</h3>
+
+<table>
+  <thead>
+    <tr><th>#</th><th>陷阱</th><th>现象</th><th>修复</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td>@ManyToOne 默认 EAGER</td><td>列表 N+1</td><td>显式 LAZY</td></tr>
+    <tr><td>2</td><td>OSIV 掩盖 LIE</td><td>View 层触发 SQL</td><td>关闭 OSIV + DTO</td></tr>
+    <tr><td>3</td><td>序列化实体</td><td>JSON 触发 LAZY</td><td>DTO 响应</td></tr>
+    <tr><td>4</td><td>集合 fetch + 分页</td><td>HHH90003004 内存分页</td><td>两步分页</td></tr>
+    <tr><td>5</td><td>多 List 同 fetch</td><td>MultipleBagFetchException</td><td>Set 或拆查</td></tr>
+    <tr><td>6</td><td>EntityGraph 过宽</td><td>行积爆炸</td><td>限 1 大集合</td></tr>
+    <tr><td>7</td><td>LOAD graph</td><td>图外 EAGER 漏网</td><td>改 FETCH</td></tr>
+    <tr><td>8</td><td>BatchSize 过大</td><td>IN 长 / 计划抖动</td><td>16-32</td></tr>
+    <tr><td>9</td><td>反射 / toString 触发集合</td><td>调试期 N+1</td><td>@ToString.Exclude</td></tr>
+  </tbody>
+</table>
+
+<h3>11.11.1 SQL 计数守护</h3>
+
+<pre><code class="language-java">@Test
+void orderDetailUsesSingleSql() {
+    Order order = orders.findDetailById(10L).orElseThrow();
+    String custName = order.getCustomer().getName();
+    int itemSize = order.getItems().size();
+
+    long sqlCount = stats().getPrepareStatementCount();
+
+    assertThat(custName).isEqualTo("Ada");
+    assertThat(itemSize).isEqualTo(2);
+    assertThat(sqlCount).isEqualTo(1L);
+}</code></pre>
+
+<h3>11.11.2 N+1 守护</h3>
+
+<pre><code class="language-java">@Test
+void customerListShouldNotGrowLinearly() {
+    List&lt;Customer&gt; customers = customerRepository.findFirst100ByOrderByIdAsc();
+    customers.forEach(c -&gt; c.getOrders().size());
+
+    long sqlCount = stats().getPrepareStatementCount();
+
+    assertThat(sqlCount).isLessThanOrEqualTo(8L);
+}</code></pre>
+
+<h3>11.11.3 EntityGraph Shape 守护</h3>
+
+<pre><code class="language-java">@Test
+void orderDetailGraphShape() {
+    Order order = orders.findDetailById(10L).orElseThrow();
+
+    boolean custInit = Hibernate.isInitialized(order.getCustomer());
+    boolean itemsInit = Hibernate.isInitialized(order.getItems());
+    boolean auditInit = Hibernate.isInitialized(order.getAuditEvents());
+
+    assertThat(custInit).isTrue();
+    assertThat(itemsInit).isTrue();
+    assertThat(auditInit).isFalse();   // 关键:图外不该被加载
+}</code></pre>
+
+<div class="real-world">
+  <strong>"shape 断言"是被严重低估的回归护栏</strong> — SQL count 只能告诉你"几条 SQL",但不能告诉你"是哪些关联被加载/没被加载"。Shape 断言用 <code>Hibernate.isInitialized(field)</code> 直接验证"customer 已初始化、items 已初始化、auditEvents 未初始化"。这种断言对 EntityGraph 重构特别有用 — 当你修改 NamedEntityGraph 的 attributeNodes,shape 断言立刻告诉你"这个图比之前少加载了 X" 或 "多加载了 Y"。Vlad Mihalcea 的 db-util 库提供了 SQLStatementCountValidator 自动化这类断言,值得在测试 dependency 里引入。
+</div>
+
+<!-- ============================================================ -->
+<!-- Chapter Summary -->
+<!-- ============================================================ -->
+
+<div class="chapter-summary" id="s11-summary">
+  <h2>11.12 本章要点</h2>
+  <table>
+    <thead>
+      <tr><th>维度</th><th>要点</th><th>源码依据</th><th>易错点</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>默认值</td><td>显式 LAZY 全部关联</td><td>FetchType 注解</td><td>EAGER 隐藏 N+1</td></tr>
+      <tr><td>代理</td><td>访问 id 不触发,访问其他字段触发</td><td>HibernateProxy / AbstractLazyInitializer</td><td>事务外抛 LIE</td></tr>
+      <tr><td>声明位置</td><td>查询点声明形状,不是映射</td><td>JOIN FETCH / EntityGraph</td><td>映射 EAGER 全局污染</td></tr>
+      <tr><td>JOIN FETCH</td><td>单页详情最优</td><td>SqmJoinFetch</td><td>集合 + 分页冲突</td></tr>
+      <tr><td>EntityGraph</td><td>多查询复用形状</td><td>RootGraphImplementor</td><td>fetchgraph 默认更安全</td></tr>
+      <tr><td>BatchSize</td><td>16-32 是 Web API 兜底</td><td>BatchFetchQueue</td><td>仍随父行变化</td></tr>
+      <tr><td>SUBSELECT</td><td>严格 2 条 SQL</td><td>@Fetch(SUBSELECT)</td><td>父查询复杂时风险</td></tr>
+      <tr><td>DTO</td><td>只读 API 优先</td><td>record + new</td><td>实体图过宽</td></tr>
+      <tr><td>OSIV</td><td>关闭 + DTO</td><td>spring.jpa.open-in-view=false</td><td>掩盖 N+1</td></tr>
+      <tr><td>SQL 预算</td><td>测试断言守护</td><td>SessionStatistics</td><td>没断言会退化</td></tr>
+      <tr><td>Shape</td><td>Hibernate.isInitialized 断言</td><td>—</td><td>测多还是少加载</td></tr>
+      <tr><td>全局兜底</td><td>default_batch_fetch_size=16</td><td>—</td><td>第一行该加的配置</td></tr>
+    </tbody>
+  </table>
+
+  <h3>最小验证</h3>
+  <pre><code class="language-java">@Test
+void fetchStrategyKeepsSqlBudget() {
+    long before = stats().getPrepareStatementCount();
+
+    Order detail = repository.findDetailById(10L).orElseThrow();
+    String name = detail.getCustomer().getName();
+    int size = detail.getItems().size();
+
+    long after = stats().getPrepareStatementCount();
+    long delta = after - before;
+
+    assertThat(delta).isEqualTo(1L);
+    assertThat(name).isEqualTo("Ada");
+    assertThat(size).isEqualTo(2);
+}</code></pre>
+
+  <pre><code>[SQL 增量]  1 条
+[结论]       JOIN FETCH 实现详情查询单 SQL 预算</code></pre>
+
+  <p class="next-hint">下一章 <a href="12-n-plus-one.html">第 12 章 · N+1 问题全解</a> 把抓取工具按"修复 N+1"的视角重新组织。本章覆盖了"加载形状的工具箱",下一章聚焦最常见的性能反模式:N+1 的成因分类(LAZY 触发、EAGER 提前、OSIV 序列化、Spring Data 派生方法、双向 toString)、四种主修复(JOIN FETCH / EntityGraph / BatchSize / DTO)的对比与选型,以及 SQL 数量观测、Hibernate Statistics 断言、SqlRecorder 形状断言等回归测试模板。理解了第 11 章的工具,第 12 章就是"工具箱针对一个具体病的临床应用",把单兵作战变成战术体系。</p>
+</div>
+
+<!-- ============================================================ -->
+<!-- Chapter navigation -->
+<!-- ============================================================ -->
+<div class="chapter-nav">
+  <a href="10-native-sql.html">&larr; 第 10 章 &middot; Native SQL</a>
+  <a href="12-n-plus-one.html">第 12 章 &middot; N+1 问题全解 &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 JPA &amp; Hibernate &middot; 第 11 章 &middot; 抓取策略与 EntityGraph</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){setTimeout(function(){document.querySelectorAll('.mermaid svg,.diagram svg').forEach(function(svg){var h=parseInt(svg.getAttribute('height')||svg.getBoundingClientRect().height);if(h>500){svg.style.maxHeight='500px';svg.style.width='auto';var p=svg.closest('.diagram');if(p)p.style.overflowX='auto';}});},1500);});</script>
+</body>
+</html>

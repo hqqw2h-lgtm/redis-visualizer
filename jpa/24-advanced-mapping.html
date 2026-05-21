@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.24 Hibernate 高级映射 — 图解 JPA &amp; Hibernate</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📘 图解 JPA &amp; Hibernate</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="23-collection-mapping.html">上一章</a>
+  <a href="25-bean-validation.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s24-0">24.0 扩展全景</a>
+  <a href="#s24-1">24.1 @NaturalId</a>
+  <a href="#s24-2">24.2 @Formula</a>
+  <a href="#s24-3">24.3 @Filter</a>
+  <a href="#s24-4">24.4 @SecondaryTable</a>
+  <a href="#s24-5">24.5 @SoftDelete</a>
+  <a href="#s24-6">24.6 @Any 多态</a>
+  <a href="#s24-7">24.7 @DynamicUpdate</a>
+  <a href="#s24-8">24.8 @Generated</a>
+  <a href="#s24-9">24.9 @ColumnTransformer</a>
+  <a href="#s24-10">24.10 陷阱</a>
+  <a href="#s24-summary">24.11 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 24 章 · Hibernate 高级映射</h1>
+<p class="subtitle">业务键 · 派生列 · 动态过滤 · 多表 · 软删除 · 多态 · 动态 DML</p>
+
+<div class="chapter-intro">
+  <p class="lead">标准 JPA 注解覆盖 80% 的映射需求,剩下 20% 的真实场景需要 Hibernate 扩展注解:业务主键查找、计算属性、动态过滤、多表映射、软删除、多态关联。</p>
+  <p>这些注解不是可选的高级玩具,而是生产系统中日复一日被使用的工具。本章逐一拆解七个核心扩展,配以流程图、表结构、SQL 验证。</p>
+  <ul class="will-learn">
+    <li>@NaturalId + @NaturalIdCache 让 byNaturalId 查询命中二级缓存</li>
+    <li>@Formula 的 SELECT 表达式如何插入 SQL,以及它带来的性能代价</li>
+    <li>@Filter(参数化运行时) vs @SQLRestriction(静态默认)的本质差异</li>
+    <li>@SecondaryTable 拆大表 → 自动 LEFT JOIN 多表的代价</li>
+    <li>@SoftDelete(Hibernate 6.4+ 内置)vs @SQLDelete + @Where 老方案</li>
+    <li>@Any / @ManyToAny 无继承多态关联与查询代价</li>
+    <li>@DynamicUpdate 只更新变化字段,但会导致 PreparedStatement 缓存膨胀</li>
+    <li>@TenantId(Hibernate 6 多租户)与 @Filter 的取舍</li>
+    <li>@ColumnTransformer 读写 SQL 转换(加密列经典场景)</li>
+  </ul>
+  <p class="prereq">前置知识:JPA 标准注解(第 4 章)、二级缓存(第 13 章)、SQL 生成(第 18 章)。</p>
+</div>
+
+<h2 id="s24-0">24.0 Hibernate 扩展全景</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 24-0-1 · 标准 JPA 覆盖常规 CRUD,7 个 Hibernate 扩展填补生产缺口</div>
+  <svg viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1f6feb"/><stop offset="100%" stop-color="#1158c7"/></linearGradient>
+      <linearGradient id="g-green" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#238636"/><stop offset="100%" stop-color="#196c2e"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#d29922"/><stop offset="100%" stop-color="#9e6a03"/></linearGradient>
+      <linearGradient id="g-red" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#da3633"/><stop offset="100%" stop-color="#a40e26"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#8957e5"/><stop offset="100%" stop-color="#6e40c9"/></linearGradient>
+      <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="320" y="14" width="280" height="44" rx="10" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="460" y="42" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">标准 JPA 覆盖常规 CRUD</text>
+
+    <polygon points="460,90 580,140 460,190 340,140" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="460" y="146" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">生产映射缺口</text>
+
+    <rect x="20"  y="220" width="200" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="120" y="244" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">@NaturalId</text>
+    <text x="120" y="261" text-anchor="middle" fill="#cae3ff" font-size="11">业务键 + 缓存</text>
+
+    <rect x="240" y="220" width="200" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="340" y="244" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">@Formula</text>
+    <text x="340" y="261" text-anchor="middle" fill="#cae3ff" font-size="11">派生 SELECT 列</text>
+
+    <rect x="460" y="220" width="200" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="560" y="244" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">@Filter</text>
+    <text x="560" y="261" text-anchor="middle" fill="#cae3ff" font-size="11">动态参数化过滤</text>
+
+    <rect x="680" y="220" width="200" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="780" y="244" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">@SecondaryTable</text>
+    <text x="780" y="261" text-anchor="middle" fill="#cae3ff" font-size="11">一对多表映射</text>
+
+    <rect x="20"  y="290" width="200" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="120" y="314" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">@SoftDelete</text>
+    <text x="120" y="331" text-anchor="middle" fill="#caf0d0" font-size="11">声明式软删 6.4+</text>
+
+    <rect x="240" y="290" width="200" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="340" y="314" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">@Any / @ManyToAny</text>
+    <text x="340" y="331" text-anchor="middle" fill="#caf0d0" font-size="11">无继承多态</text>
+
+    <rect x="460" y="290" width="200" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="560" y="314" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">@DynamicUpdate</text>
+    <text x="560" y="331" text-anchor="middle" fill="#caf0d0" font-size="11">仅 dirty 字段</text>
+
+    <rect x="680" y="290" width="200" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="780" y="314" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">@TenantId</text>
+    <text x="780" y="331" text-anchor="middle" fill="#caf0d0" font-size="11">多租户标记</text>
+
+    <path d="M460,58 L460,90" stroke="#8b949e" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M390,170 L150,220" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M425,180 L350,220" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M495,180 L560,220" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M530,170 L770,220" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<h2 id="s24-1">24.1 @NaturalId — 业务键查询 + 缓存</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 24-1-1 · byNaturalId 缓存命中 — sku → id → entity,无 SQL</div>
+  <svg viewBox="0 0 920 280" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <text x="40"  y="30" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="700">App</text>
+    <text x="220" y="30" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="700">L1 Cache</text>
+    <text x="430" y="30" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="700">NaturalIdCache</text>
+    <text x="630" y="30" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="700">L2 EntityCache</text>
+    <text x="820" y="30" text-anchor="middle" fill="#f85149" font-size="11" font-weight="700">DB</text>
+
+    <line x1="40"  y1="40" x2="40"  y2="260" stroke="#bc8cff" stroke-width="1.4"/>
+    <line x1="220" y1="40" x2="220" y2="260" stroke="#58a6ff" stroke-width="1.4"/>
+    <line x1="430" y1="40" x2="430" y2="260" stroke="#58a6ff" stroke-width="1.4"/>
+    <line x1="630" y1="40" x2="630" y2="260" stroke="#58a6ff" stroke-width="1.4"/>
+    <line x1="820" y1="40" x2="820" y2="260" stroke="#f85149" stroke-width="1.4" stroke-dasharray="4,3"/>
+
+    <path d="M40,70 L220,70"   stroke="#8b949e" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <text x="130" y="64" text-anchor="middle" fill="#bc8cff" font-size="11">byNaturalId.using('sku','X')</text>
+
+    <path d="M220,100 L40,100" stroke="#8b949e" stroke-width="1.4" fill="none" stroke-dasharray="3,3" marker-end="url(#arr)"/>
+    <text x="130" y="94" text-anchor="middle" fill="#f85149" font-size="11">未命中</text>
+
+    <path d="M40,135 L430,135" stroke="#8b949e" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <text x="235" y="129" text-anchor="middle" fill="#bc8cff" font-size="11">lookup sku → id</text>
+
+    <path d="M430,165 L630,165" stroke="#8b949e" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <text x="530" y="159" text-anchor="middle" fill="#58a6ff" font-size="11">lookup id → entity</text>
+
+    <path d="M630,200 L40,200" stroke="#8b949e" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <text x="335" y="194" text-anchor="middle" fill="#3fb950" font-size="11">命中,返回实体</text>
+
+    <text x="820" y="240" text-anchor="middle" fill="#f85149" font-size="11" font-weight="700">无 SQL</text>
+  </svg>
+</div>
+
+<pre><code class="language-java">@Entity
+@NaturalIdCache
+@Cache(usage = CacheConcurrencyStrategy.READ_WRITE)
+public class Product {
+
+    @Id @GeneratedValue
+    private Long id;
+
+    @NaturalId
+    @Column(nullable = false, unique = true)
+    private String sku;
+
+    private String name;
+}
+
+Product p = session.byNaturalId(Product.class)
+    .using("sku", "SKU-2026-001")
+    .load();</code></pre>
+
+<table>
+<thead><tr><th>维度</th><th>@NaturalId</th><th>普通 unique 列</th></tr></thead>
+<tbody>
+<tr><td>缓存</td><td>NaturalIdCache</td><td>无</td></tr>
+<tr><td>API</td><td>byNaturalId</td><td>findBy / @Query</td></tr>
+<tr><td>修改</td><td>默认 mutable=false</td><td>可变</td></tr>
+<tr><td>性能</td><td>二级缓存命中</td><td>每次查 DB</td></tr>
+</tbody>
+</table>
+
+<h2 id="s24-2">24.2 @Formula — SELECT 表达式派生字段</h2>
+
+<pre><code class="language-java">@Entity
+@Table(name = "orders")
+public class Order {
+
+    @Id @GeneratedValue
+    private Long id;
+
+    private BigDecimal subtotal;
+    private BigDecimal taxRate;
+
+    @Formula("subtotal + (subtotal * tax_rate / 100)")
+    private BigDecimal totalAmount;
+
+    @Formula("(SELECT count(*) FROM order_items i WHERE i.order_id = id)")
+    private Integer itemCount;
+}</code></pre>
+
+<pre><code class="language-sql">SELECT o.id, o.subtotal, o.tax_rate,
+       o.subtotal + (o.subtotal * o.tax_rate / 100) AS totalAmount,
+       (SELECT count(*) FROM order_items i WHERE i.order_id = o.id) AS itemCount
+FROM orders o
+WHERE o.id = ?;</code></pre>
+
+<div class="warning"><p><strong>子查询 @Formula 慢</strong>。每次 SELECT 实体都跑一次子查询,对 100 行结果集就是 100 个子查询。如果是热路径,考虑物化为冗余字段 + 触发器维护,或改 @Subselect。</p></div>
+
+<h2 id="s24-3">24.3 @Filter — 动态参数化过滤</h2>
+
+<pre><code class="language-java">@Entity
+@Table(name = "orders")
+@FilterDef(name = "tenantFilter",
+    parameters = @ParamDef(name = "tenantId", type = Long.class))
+@Filter(name = "tenantFilter", condition = "tenant_id = :tenantId")
+public class Order {
+    @Id @GeneratedValue private Long id;
+    @Column(name = "tenant_id", nullable = false) private Long tenantId;
+}
+
+@Service
+public class TenantContext {
+    @Autowired private EntityManager em;
+
+    public void setCurrentTenant(Long tenantId) {
+        Session session = em.unwrap(Session.class);
+        Filter filter = session.enableFilter("tenantFilter");
+        filter.setParameter("tenantId", tenantId);
+    }
+}</code></pre>
+
+<pre><code class="language-sql">-- 启用 Filter 后所有 Order 查询自动附加
+SELECT o.* FROM orders o WHERE o.id = ? AND o.tenant_id = ?;
+SELECT o.* FROM orders o WHERE o.status = ? AND o.tenant_id = ?;</code></pre>
+
+<table>
+<thead><tr><th>维度</th><th>@Filter</th><th>@SQLRestriction</th></tr></thead>
+<tbody>
+<tr><td>启用</td><td>enableFilter 显式</td><td>默认应用</td></tr>
+<tr><td>参数化</td><td>是</td><td>否</td></tr>
+<tr><td>适用</td><td>多租户 / 权限</td><td>软删除 / 状态过滤</td></tr>
+<tr><td>关闭</td><td>disableFilter</td><td>不可关</td></tr>
+</tbody>
+</table>
+
+<h2 id="s24-4">24.4 @SecondaryTable — 一实体多表</h2>
+
+<pre><code class="language-java">@Entity
+@Table(name = "products")
+@SecondaryTable(name = "product_details",
+    pkJoinColumns = @PrimaryKeyJoinColumn(name = "product_id"))
+@SecondaryTable(name = "product_seo",
+    pkJoinColumns = @PrimaryKeyJoinColumn(name = "product_id"))
+public class Product {
+
+    @Id @GeneratedValue
+    private Long id;
+
+    @Column(table = "products")
+    private String sku;
+
+    @Column(table = "product_details")
+    private String description;
+
+    @Column(table = "product_seo")
+    private String metaTitle;
+}</code></pre>
+
+<pre><code class="language-sql">-- INSERT 三表
+INSERT INTO products (id, sku) VALUES (1, 'X');
+INSERT INTO product_details (product_id, description) VALUES (1, '...');
+INSERT INTO product_seo (product_id, meta_title) VALUES (1, '...');
+
+-- SELECT 自动 LEFT JOIN
+SELECT p.id, p.sku, d.description, s.meta_title
+FROM products p
+LEFT JOIN product_details d ON p.id = d.product_id
+LEFT JOIN product_seo s ON p.id = s.product_id
+WHERE p.id = ?;</code></pre>
+
+<h2 id="s24-5">24.5 @SoftDelete — Hibernate 6.4+ 内置软删除</h2>
+
+<pre><code class="language-java">@Entity
+@Table(name = "orders")
+@SoftDelete(columnName = "deleted")
+public class Order {
+    @Id @GeneratedValue private Long id;
+    private BigDecimal amount;
+}</code></pre>
+
+<pre><code class="language-sql">-- em.remove(order)
+UPDATE orders SET deleted = true WHERE id = ?;
+
+-- em.find / 任意查询自动加条件
+SELECT o.* FROM orders o WHERE o.id = ? AND o.deleted = false;</code></pre>
+
+<table>
+<thead><tr><th>方案</th><th>实现</th><th>优势</th></tr></thead>
+<tbody>
+<tr><td>@SQLDelete + @Where</td><td>手写 SQL</td><td>Hibernate 5+ 兼容</td></tr>
+<tr><td>@SoftDelete</td><td>注解</td><td>Hibernate 6.4+,语义清晰</td></tr>
+<tr><td>字段标记</td><td>业务代码</td><td>完全可控</td></tr>
+</tbody>
+</table>
+
+<h2 id="s24-6">24.6 @Any — 无继承多态关联</h2>
+
+<pre><code class="language-java">@Entity
+@Table(name = "tasks")
+public class Task {
+
+    @Id @GeneratedValue
+    private Long id;
+
+    @Any
+    @AnyDiscriminator(DiscriminatorType.STRING)
+    @AnyDiscriminatorValue(discriminator = "ORDER", entity = Order.class)
+    @AnyDiscriminatorValue(discriminator = "INVOICE", entity = Invoice.class)
+    @JoinColumn(name = "target_id")
+    @Column(name = "target_type")
+    private Object target;
+}</code></pre>
+
+<pre><code class="language-sql">-- INSERT
+INSERT INTO tasks (id, target_type, target_id) VALUES (?, 'ORDER', 100);
+
+-- SELECT 两步:先查 task,再按 type 加载关联实体
+SELECT id, target_type, target_id FROM tasks WHERE id = ?;
+-- 然后按 type 加载 Order/Invoice</code></pre>
+
+<h2 id="s24-7">24.7 @DynamicUpdate — 仅更新变化字段</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 24-7-1 · 默认 UPDATE 7 列 vs @DynamicUpdate 仅 1 列</div>
+  <svg viewBox="0 0 920 220" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-red" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#da3633"/><stop offset="100%" stop-color="#a40e26"/></linearGradient>
+      <linearGradient id="g-green" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#238636"/><stop offset="100%" stop-color="#196c2e"/></linearGradient>
+    </defs>
+
+    <rect x="20"  y="14" width="420" height="190" rx="10" fill="rgba(248,81,73,0.07)" stroke="#f85149" stroke-dasharray="4,4"/>
+    <text x="230" y="40" text-anchor="middle" fill="#f85149" font-size="14" font-weight="700">默认 UPDATE</text>
+    <rect x="50" y="60" width="360" height="130" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="230" y="88" text-anchor="middle" fill="#fff" font-size="11">UPDATE products</text>
+    <text x="230" y="106" text-anchor="middle" fill="#fff" font-size="11">SET sku=?, name=?, price=?, stock=?,</text>
+    <text x="230" y="124" text-anchor="middle" fill="#fff" font-size="11">description=?, meta_title=?, updated_at=?</text>
+    <text x="230" y="146" text-anchor="middle" fill="#fff" font-size="11">WHERE id=?</text>
+    <text x="230" y="174" text-anchor="middle" fill="#ffd0cc" font-size="10">1 PS 缓存,SQL 长,无差异感知</text>
+
+    <rect x="480" y="14" width="420" height="190" rx="10" fill="rgba(63,185,80,0.07)" stroke="#3fb950" stroke-dasharray="4,4"/>
+    <text x="690" y="40" text-anchor="middle" fill="#3fb950" font-size="14" font-weight="700">@DynamicUpdate</text>
+    <rect x="510" y="60" width="360" height="130" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="690" y="106" text-anchor="middle" fill="#fff" font-size="11">UPDATE products SET stock=? WHERE id=?</text>
+    <text x="690" y="142" text-anchor="middle" fill="#caf0d0" font-size="11">仅修改 dirty 字段</text>
+    <text x="690" y="174" text-anchor="middle" fill="#caf0d0" font-size="10">N 个 PS 缓存(每种组合)</text>
+  </svg>
+</div>
+
+<table>
+<thead><tr><th>维度</th><th>默认</th><th>@DynamicUpdate</th></tr></thead>
+<tbody>
+<tr><td>SQL 长度</td><td>长</td><td>短</td></tr>
+<tr><td>PreparedStatement 缓存</td><td>1 个</td><td>N 个(每种组合)</td></tr>
+<tr><td>网络</td><td>多</td><td>少</td></tr>
+<tr><td>适用</td><td>字段少</td><td>字段多 / 大字段(BLOB/TEXT)</td></tr>
+<tr><td>启用代价</td><td>无</td><td>PS cache 膨胀</td></tr>
+</tbody>
+</table>
+
+<h2 id="s24-8">24.8 @Generated — 数据库生成字段</h2>
+
+<pre><code class="language-java">@Entity
+public class AuditEntity {
+
+    @Id @GeneratedValue
+    private Long id;
+
+    @Generated(GenerationTime.INSERT)
+    @Column(insertable = false,
+            columnDefinition = "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+    private LocalDateTime createdAt;
+
+    @Generated(GenerationTime.ALWAYS)
+    @Column(insertable = false, updatable = false,
+            columnDefinition = "TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP")
+    private LocalDateTime updatedAt;
+}</code></pre>
+
+<h2 id="s24-9">24.9 @ColumnTransformer — 读写 SQL 转换(加密列)</h2>
+
+<pre><code class="language-java">@Entity
+public class User {
+    @Id @GeneratedValue private Long id;
+
+    @ColumnTransformer(
+        read  = "pgp_sym_decrypt(email::bytea, current_setting('app.encrypt_key'))",
+        write = "pgp_sym_encrypt(?, current_setting('app.encrypt_key'))"
+    )
+    private String email;
+}</code></pre>
+
+<pre><code class="language-sql">INSERT INTO users (id, email)
+VALUES (?, pgp_sym_encrypt(?, current_setting('app.encrypt_key')));
+
+SELECT id, pgp_sym_decrypt(email::bytea, current_setting('app.encrypt_key'))
+FROM users WHERE id = ?;</code></pre>
+
+<h2 id="s24-10">24.10 陷阱与限制</h2>
+
+<table>
+<thead><tr><th>#</th><th>陷阱</th><th>现象</th><th>修复</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>NaturalId 缓存未启用</td><td>总查 DB</td><td>加 @NaturalIdCache</td></tr>
+<tr><td>2</td><td>@Formula 影响性能</td><td>子查询慢</td><td>加索引或物化</td></tr>
+<tr><td>3</td><td>@Filter 忘启用</td><td>数据泄漏</td><td>拦截器统一启用</td></tr>
+<tr><td>4</td><td>@SecondaryTable LEFT JOIN</td><td>总查多表</td><td>仅必要时用</td></tr>
+<tr><td>5</td><td>@SoftDelete native query</td><td>不过滤</td><td>手动加条件</td></tr>
+<tr><td>6</td><td>@Any 性能差</td><td>无 join 优化</td><td>按业务批量加载</td></tr>
+<tr><td>7</td><td>@DynamicUpdate 缓存膨胀</td><td>PS 缓存大</td><td>字段少时不开</td></tr>
+<tr><td>8</td><td>@Generated 不读回</td><td>字段为 null</td><td>insertable=false</td></tr>
+</tbody>
+</table>
+
+<h2 id="s24-summary">24.11 本章要点</h2>
+
+<div class="chapter-summary">
+<table>
+<thead><tr><th>要点</th><th>注解</th><th>易错点</th></tr></thead>
+<tbody>
+<tr><td>@NaturalId 业务键</td><td>+ @NaturalIdCache</td><td>缓存未启用</td></tr>
+<tr><td>@Formula 派生字段</td><td>SQL 表达式</td><td>子查询慢</td></tr>
+<tr><td>@Filter 动态过滤</td><td>enableFilter</td><td>忘启用 → 数据泄漏</td></tr>
+<tr><td>@SecondaryTable 多表</td><td>pkJoinColumns</td><td>总 JOIN 多表</td></tr>
+<tr><td>@SoftDelete 声明</td><td>Hibernate 6.4+</td><td>native query 不过滤</td></tr>
+<tr><td>@Any 无继承多态</td><td>AnyDiscriminator</td><td>查询慢</td></tr>
+<tr><td>@DynamicUpdate</td><td>仅 dirty 字段</td><td>PS 缓存膨胀</td></tr>
+<tr><td>@TenantId(6+)</td><td>自动多租户</td><td>updatable=false</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>下一章讨论 Bean Validation。本章覆盖了高级映射,下一章进入 @NotNull、@Size、@Email、自定义校验、Group 校验、Cross-field 校验。</p>
+
+<div class="chapter-nav">
+  <a href="23-collection-mapping.html">&larr; 第 23 章 &middot; 集合映射</a>
+  <a href="25-bean-validation.html">第 25 章 &middot; Bean Validation &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 JPA &amp; Hibernate &middot; 第 24 章 &middot; Hibernate 高级映射</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

@@ -1,0 +1,1815 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.23 淘汰策略 — 图解 Redis</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="d-purple" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-purple-fill-start)"/><stop offset="100%" stop-color="var(--diagram-purple-fill-end)"/></linearGradient>
+    <linearGradient id="d-green" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-green-fill-start)"/><stop offset="100%" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <linearGradient id="d-blue" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-blue-fill-start)"/><stop offset="100%" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <linearGradient id="d-orange" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-orange-fill-start)"/><stop offset="100%" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+    <linearGradient id="d-red" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-red-fill-start)"/><stop offset="100%" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+    <filter id="d-shadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="var(--diagram-text)" flood-opacity="0.4"/></filter>
+    <marker id="d-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-muted)"/></marker>
+    <marker id="d-arr-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-green-stroke)"/></marker>
+    <marker id="d-arr-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-red-stroke)"/></marker>
+    <marker id="d-arr-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-blue-stroke)"/></marker>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Redis</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="22-jemalloc.html">上一章</a>
+  <a href="24-lazyfree.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s23-0">23.0 章首速览</a>
+  <a href="#s23-1">23.1 淘汰的必要性</a>
+  <a href="#s23-2">23.2 八种策略的语义</a>
+  <a href="#s23-3">23.3 采样机制与淘汰池</a>
+  <a href="#s23-4">23.4 近似 LRU:24-bit 时钟</a>
+  <a href="#s23-5">23.5 近似 LFU:Morris 计数器</a>
+  <a href="#s23-6">23.6 volatile-ttl:预测性淘汰</a>
+  <a href="#s23-7">23.7 多部署模式</a>
+  <a href="#s23-8">23.8 性能与基线</a>
+  <a href="#s23-9">23.9 陷阱与限制</a>
+  <a href="#s23-10">23.10 源码深潜</a>
+  <a href="#s23-summary">23.11 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 23 章 · 淘汰策略</h1>
+<p class="subtitle">八种 maxmemory-policy · 采样 + 16 槽淘汰池 · 24-bit LRU 时钟 · Morris 概率计数器 · LFU 衰减 · volatile-ttl 预测性淘汰 · Cluster 一致性</p>
+
+<div class="chapter-intro">
+  <p class="lead">Redis 是内存数据库,内存容量是<strong>硬约束</strong>。当数据量增长至 <code>maxmemory</code> 上限时,必须在"写入新 key"与"淘汰旧 key"之间作出选择。Redis 的淘汰机制由三部分组成:<strong>八种策略</strong>覆盖"范围 × 算法"二维取舍空间,<strong>随机采样 + 淘汰池</strong>实现 O(1) 时间复杂度的近似 LRU/LFU,<strong>redisObject 内嵌 24-bit lru 字段</strong>使元数据开销近零。</p>
+  <p>精确 LRU 需要全局双向链表,每节点至少 16 字节指针开销,千万级 key 下额外内存约 152 MB,且每次访问都需链表移动维护。精确 LFU 需要全局优先队列,空间 O(N) + 维护 O(log N)。Redis 的近似方案以"命中率损失约 3-5%"换取"元数据开销近零 + 维护 O(1)",该取舍在缓存场景下显著优于精确算法。本章按"必要性 → 八种策略 → 采样机制 → LRU/LFU 算法 → 部署适配 → 陷阱"组织,聚焦淘汰决策的工程权衡与生产可观测性。</p>
+  <ul class="will-learn">
+    <li><code>processCommand</code> 写命令前置淘汰检查的执行时机与延迟影响</li>
+    <li>八种 <code>maxmemory-policy</code> 策略的语义、候选集与退化情形</li>
+    <li>缓存角色与数据库角色的策略选择决策树</li>
+    <li>淘汰池 16 槽位的 idle 升序排列与跨轮次累积机制</li>
+    <li>采样数 <code>maxmemory-samples</code> 与单轮命中率 9.6% 跨 50 轮放大到 99.4% 的概率推导</li>
+    <li><code>redisObject.lru</code> 字段在 LRU/LFU 模式下的双重解读</li>
+    <li>24-bit LRU 时钟的回绕周期 194 天与 LFU ldt 回绕周期 45 天</li>
+    <li>Morris 概率递增使 8-bit logc 表达 6 个数量级访问频率的对数关系</li>
+    <li>LFU 衰减 <code>lfu-decay-time</code> 对历史热点的影响</li>
+    <li><code>volatile-ttl</code> 预测性淘汰与过期删除机制的独立关系</li>
+    <li>主从、Sentinel、Cluster 三种部署下淘汰行为差异与一致性约束</li>
+    <li>命中率基线、samples 调优、核心 INFO/OBJECT 监控指标</li>
+    <li>八类典型陷阱及其根因、症状、修复路径与监控指标</li>
+  </ul>
+  <p class="prereq">前置知识:第 4 章 redisObject 与 encoding(理解 <code>type:4 / encoding:4 / lru:24 / refcount:32 / ptr</code> 五字段布局);第 22 章 jemalloc(理解 <code>used_memory</code> / <code>RSS</code> / <code>mem_fragmentation_ratio</code> 三层关系);第 24 章预读 lazyfree(理解 <code>lazyfree-lazy-eviction yes</code> 的 bio 异步释放);Linux 内存基础(物理内存、cgroup、OOM Killer)。读者最好亲手跑过 <code>redis-cli CONFIG SET maxmemory 10mb</code> 后写入大量数据并观察 <code>INFO stats</code> 中的 <code>evicted_keys</code> 变化。</p>
+</div>
+
+<h3>本章全景图</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 23-0 · 本章导览 — 4 大模块 12 节</div>
+  <svg viewBox="0 0 940 470" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="470" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="370" y="14" width="200" height="44" rx="10" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="470" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">淘汰策略</text>
+      <text x="470" y="52" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">11 节模块 · 4 大主题</text>
+
+      <line x1="470" y1="58" x2="120" y2="100" stroke="var(--diagram-border)"/>
+      <line x1="470" y1="58" x2="370" y2="100" stroke="var(--diagram-border)"/>
+      <line x1="470" y1="58" x2="600" y2="100" stroke="var(--diagram-border)"/>
+      <line x1="470" y1="58" x2="820" y2="100" stroke="var(--diagram-border)"/>
+
+      <rect x="20"  y="100" width="200" height="44" rx="6" fill="url(#d-blue)"/>
+      <text x="120" y="120" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">§23.1 必要性</text>
+      <text x="120" y="134" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">processCommand 触发点</text>
+
+      <rect x="270" y="100" width="200" height="44" rx="6" fill="url(#d-green)"/>
+      <text x="370" y="120" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">§23.2 八种策略</text>
+      <text x="370" y="134" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">范围 × 算法 二维分类</text>
+
+      <rect x="500" y="100" width="200" height="44" rx="6" fill="url(#d-orange)"/>
+      <text x="600" y="120" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">§23.3-23.6 算法</text>
+      <text x="600" y="134" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">LRU · LFU · TTL · 采样</text>
+
+      <rect x="720" y="100" width="200" height="44" rx="6" fill="url(#d-red)"/>
+      <text x="820" y="120" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">§23.7-23.11 部署陷阱</text>
+      <text x="820" y="134" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">基线 · 8 类陷阱 · 源码</text>
+
+      <g font-size="10" fill="var(--diagram-blue-text)">
+        <rect x="20"  y="160" width="200" height="120" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+        <text x="120" y="178" text-anchor="middle" fill="var(--diagram-blue-text)" font-weight="700">为什么必要</text>
+        <text x="120" y="196" text-anchor="middle">同步阻塞淘汰</text>
+        <text x="120" y="214" text-anchor="middle">直接进 P99 延迟</text>
+        <text x="120" y="232" text-anchor="middle">maxmemory ≠ 物理内存</text>
+        <text x="120" y="258" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">必须留 30-40% 给 fork</text>
+        <text x="120" y="272" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">CoW + 输出缓冲 + 碎片</text>
+
+        <rect x="270" y="160" width="200" height="120" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="370" y="178" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="700">8 种策略</text>
+        <text x="370" y="196" text-anchor="middle">noeviction(默认)</text>
+        <text x="370" y="214" text-anchor="middle">allkeys-{lru/lfu/random}</text>
+        <text x="370" y="232" text-anchor="middle">volatile-{lru/lfu/random/ttl}</text>
+        <text x="370" y="258" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">volatile-* 候选集为空</text>
+        <text x="370" y="272" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">→ 退化为 noeviction</text>
+
+        <rect x="500" y="160" width="200" height="120" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+        <text x="600" y="178" text-anchor="middle" fill="var(--diagram-orange-text)" font-weight="700">采样 + 淘汰池</text>
+        <text x="600" y="196" text-anchor="middle">maxmemory-samples=5</text>
+        <text x="600" y="214" text-anchor="middle">16 槽 evictionPool</text>
+        <text x="600" y="232" text-anchor="middle">跨轮次累积最差候选</text>
+        <text x="600" y="258" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">24-bit LRU clock</text>
+        <text x="600" y="272" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">8-bit Morris LFU 计数器</text>
+
+        <rect x="720" y="160" width="200" height="120" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+        <text x="820" y="178" text-anchor="middle" fill="var(--diagram-red-text)" font-weight="700">部署 8 类陷阱</text>
+        <text x="820" y="196" text-anchor="middle">DB 角色错配 allkeys-*</text>
+        <text x="820" y="214" text-anchor="middle">volatile-* 但无 TTL</text>
+        <text x="820" y="232" text-anchor="middle">samples 太大 → CPU 飙</text>
+        <text x="820" y="258" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">主从淘汰由主控</text>
+        <text x="820" y="272" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">Cluster 各节点独立淘汰</text>
+      </g>
+
+      <rect x="120" y="310" width="700" height="60" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="470" y="332" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="700">本章主线:为什么 Redis 用"采样近似"而不是"全局有序"</text>
+      <text x="470" y="352" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">同步淘汰 = 进 P99 延迟 → 必须 O(s) 而非 O(log N)</text>
+
+      <g font-size="10" fill="var(--diagram-muted)">
+        <text x="470" y="396" text-anchor="middle">读完本章你能:</text>
+        <text x="470" y="416" text-anchor="middle" fill="var(--diagram-blue-text)">为缓存/数据库角色选对策略 · 调 maxmemory-samples 平衡精度与延迟</text>
+        <text x="470" y="436" text-anchor="middle" fill="var(--diagram-blue-text)">看懂 INFO stats evicted_keys / keyspace_misses · 排查 OOM 与命中率塌方</text>
+        <text x="470" y="458" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">前置:Ch.22 jemalloc · 后续:Ch.24 Lazy Free</text>
+      </g>
+    </g>
+  </svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s23-0">23.0 章首速览</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">图 23-0-1 · 淘汰决策全景</div>
+  <svg viewBox="0 0 940 580" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="580" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="370" y="14" width="200" height="40" rx="6" fill="url(#d-blue)" filter="url(#d-shadow)"/>
+      <text x="470" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">写命令到达</text>
+      <text x="470" y="48" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">SET · HSET · LPUSH ...</text>
+
+      <line x1="470" y1="54" x2="470" y2="74" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <polygon points="350,80 590,80 620,108 590,136 350,136 320,108" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="1.5"/>
+      <text x="470" y="106" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="800">used_memory &gt; maxmemory ?</text>
+      <text x="470" y="122" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">processCommand 前置检查</text>
+
+      <path d="M620,108 L 820,108" stroke="var(--diagram-green-stroke)" stroke-width="1.5" marker-end="url(#d-arr-g)"/>
+      <text x="700" y="100" fill="var(--diagram-green-text)" font-size="10" font-weight="700">否</text>
+      <rect x="820" y="92" width="100" height="32" rx="6" fill="url(#d-green)"/>
+      <text x="870" y="113" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">直接执行</text>
+
+      <line x1="470" y1="136" x2="470" y2="156" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+      <text x="478" y="152" fill="var(--diagram-orange-text)" font-size="10">是</text>
+
+      <polygon points="350,160 590,160 620,188 590,216 350,216 320,188" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="1.5"/>
+      <text x="470" y="186" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="800">maxmemory-policy ?</text>
+      <text x="470" y="202" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">8 选 1</text>
+
+      <path d="M320,188 L 100,250" stroke="var(--diagram-red-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr-r)"/>
+      <text x="180" y="225" fill="var(--diagram-red-text)" font-size="9" font-weight="700">noeviction</text>
+
+      <path d="M460,216 L 360,250" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr-b)"/>
+      <text x="380" y="240" fill="var(--diagram-blue-text)" font-size="9" font-weight="700">allkeys-*</text>
+
+      <path d="M480,216 L 600,250" stroke="var(--diagram-purple-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr)"/>
+      <text x="540" y="240" fill="var(--diagram-purple-text)" font-size="9" font-weight="700">volatile-*</text>
+
+      <rect x="40"  y="250" width="160" height="50" rx="6" fill="url(#d-red)"/>
+      <text x="120" y="270" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">返回 -OOM</text>
+      <text x="120" y="288" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">denyoom 命令被拒</text>
+
+      <rect x="240" y="250" width="240" height="50" rx="6" fill="url(#d-blue)"/>
+      <text x="360" y="270" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">候选集 = db-&gt;dict</text>
+      <text x="360" y="288" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">所有 key,主字典</text>
+
+      <rect x="500" y="250" width="240" height="50" rx="6" fill="url(#d-purple)"/>
+      <text x="620" y="270" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">候选集 = db-&gt;expires</text>
+      <text x="620" y="288" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">仅有 TTL 的子集</text>
+
+      <line x1="360" y1="300" x2="360" y2="324" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+      <line x1="620" y1="300" x2="620" y2="324" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <polygon points="370,328 590,328 620,356 590,384 370,384 340,356" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="1.5"/>
+      <text x="480" y="354" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="800">算法?</text>
+      <text x="480" y="370" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">lru / lfu / random / ttl</text>
+
+      <g font-size="9" fill="var(--diagram-blue-text)">
+        <rect x="20"  y="400" width="170" height="46" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+        <text x="105" y="418" text-anchor="middle" fill="var(--diagram-blue-text)" font-weight="700">LRU</text>
+        <text x="105" y="434" text-anchor="middle">24-bit clock idle</text>
+
+        <rect x="200" y="400" width="170" height="46" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+        <text x="285" y="418" text-anchor="middle" fill="var(--diagram-orange-text)" font-weight="700">LFU</text>
+        <text x="285" y="434" text-anchor="middle">Morris counter + decay</text>
+
+        <rect x="380" y="400" width="170" height="46" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="465" y="418" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="700">RANDOM</text>
+        <text x="465" y="434" text-anchor="middle">直接随机一个</text>
+
+        <rect x="560" y="400" width="170" height="46" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+        <text x="645" y="418" text-anchor="middle" fill="var(--diagram-purple-text)" font-weight="700">TTL</text>
+        <text x="645" y="434" text-anchor="middle">最快过期优先</text>
+      </g>
+
+      <line x1="105" y1="446" x2="320" y2="466" stroke="var(--diagram-blue-stroke)" stroke-width="1" marker-end="url(#d-arr-b)"/>
+      <line x1="285" y1="446" x2="370" y2="466" stroke="var(--diagram-orange-stroke)" stroke-width="1" marker-end="url(#d-arr)"/>
+      <line x1="645" y1="446" x2="500" y2="466" stroke="var(--diagram-purple-stroke)" stroke-width="1" marker-end="url(#d-arr)"/>
+      <line x1="465" y1="446" x2="465" y2="540" stroke="var(--diagram-green-stroke)" stroke-width="1.5" marker-end="url(#d-arr-g)"/>
+
+      <rect x="320" y="466" width="300" height="44" rx="6" fill="url(#d-orange)"/>
+      <text x="470" y="486" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">evictionPoolPopulate(samples)</text>
+      <text x="470" y="502" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">采 N 个候选,按 idle/freq 排</text>
+
+      <line x1="470" y1="510" x2="470" y2="534" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <rect x="320" y="534" width="300" height="34" rx="6" fill="url(#d-purple)"/>
+      <text x="470" y="554" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">16 槽淘汰池 → dbDelete</text>
+
+      <line x1="620" y1="551" x2="700" y2="551" stroke="var(--diagram-red-stroke)" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#d-arr-r)"/>
+      <text x="710" y="555" fill="var(--diagram-red-text)" font-size="9">仍超 → 再采</text>
+    </g>
+  </svg>
+</div>
+
+<p>淘汰由 <code>processCommand</code> 在写命令前置检查中触发。检查路径上同步执行 <code>performEvictions()</code>,直至内存压回上限或候选集耗尽。该路径的延迟会反馈到客户端,因此<strong>淘汰算法的复杂度直接影响主线程性能</strong>。</p>
+
+<div class="key-insight">
+  <strong>核心洞察:</strong> Redis 淘汰是"<strong>同步阻塞</strong>"操作——写命令在执行业务逻辑之前必须先把内存压回 maxmemory。这意味着淘汰算法的 CPU 开销直接进入客户端 P99 延迟。这就是 Redis 选择"采样近似 O(s)"而非"全局有序 O(log N)"的根本原因。
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">图 23-0-2 · 八种策略的二维分类</div>
+  <table class="data-table">
+    <thead>
+      <tr><th>范围 \ 算法</th><th>LRU</th><th>LFU</th><th>RANDOM</th><th>TTL</th><th>NONE</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>所有 key</strong></td><td>allkeys-lru</td><td>allkeys-lfu</td><td>allkeys-random</td><td>(无,LRU 替代)</td><td>—</td></tr>
+      <tr><td><strong>仅 TTL key</strong></td><td>volatile-lru</td><td>volatile-lfu</td><td>volatile-random</td><td>volatile-ttl</td><td>—</td></tr>
+      <tr><td><strong>任意</strong></td><td>—</td><td>—</td><td>—</td><td>—</td><td>noeviction</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p><code>noeviction</code> 是默认策略,等价于"内存满则拒绝写入"。其余七种策略沿"<strong>范围(allkeys / volatile)</strong>" × "<strong>算法(lru / lfu / random / ttl)</strong>"两维度组合。<code>volatile-*</code> 仅在候选集非空时工作,所有 key 无 TTL 时退化为 noeviction。</p>
+
+<!-- ============================================================ -->
+<h2 id="s23-1">23.1 淘汰的必要性</h2>
+<!-- ============================================================ -->
+
+<h3>23.1.1 Redis 的两种使用角色</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 23-1-1 · 缓存角色 vs 数据库角色</div>
+  <svg viewBox="0 0 940 410" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="410" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="40"  y="14" width="420" height="40" rx="8" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="250" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="800">缓存角色</text>
+      <text x="250" y="48" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">允许丢数据 · 上游有持久数据源</text>
+
+      <rect x="480" y="14" width="420" height="40" rx="8" fill="url(#d-red)" filter="url(#d-shadow)"/>
+      <text x="690" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="800">数据库角色</text>
+      <text x="690" y="48" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">主副本数据 · 丢失即永久损失</text>
+
+      <g font-size="11" fill="var(--diagram-blue-text)">
+        <rect x="40"  y="74" width="420" height="200" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="60" y="98" fill="var(--diagram-green-text)" font-weight="700">特征</text>
+        <text x="60" y="120">上游有 MySQL/HBase 持久数据源</text>
+        <text x="60" y="138">key 数量不可控(URL/SessionId 等长尾)</text>
+        <text x="60" y="156">丢失可重新加载(再去查 DB)</text>
+        <text x="60" y="174">读多写少 · 高 QPS · 命中率敏感</text>
+
+        <text x="60" y="206" fill="var(--diagram-green-text)" font-weight="700">推荐策略</text>
+        <text x="60" y="224" fill="var(--diagram-green-text)">allkeys-lru(时间局部性) 或</text>
+        <text x="60" y="242" fill="var(--diagram-green-text)">allkeys-lfu(频率分布倾斜)</text>
+        <text x="60" y="262" fill="var(--diagram-muted)" font-size="9">不要选 volatile-*,长尾 key 多无 TTL</text>
+
+        <rect x="480" y="74" width="420" height="200" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+        <text x="500" y="98" fill="var(--diagram-red-text)" font-weight="700">特征</text>
+        <text x="500" y="120">主副本数据 · 唯一来源</text>
+        <text x="500" y="138">key 集合可控 · 容量可估</text>
+        <text x="500" y="156">丢失永久损失 · 写入需可靠</text>
+        <text x="500" y="174">RDB / AOF 双持久化</text>
+
+        <text x="500" y="206" fill="var(--diagram-red-text)" font-weight="700">推荐策略</text>
+        <text x="500" y="224" fill="var(--diagram-red-text)">noeviction + 容量告警</text>
+        <text x="500" y="242" fill="var(--diagram-red-text)">写满返回 OOM,业务感知降级</text>
+        <text x="500" y="262" fill="var(--diagram-muted)" font-size="9">不要选 allkeys-*,会静默丢主数据</text>
+      </g>
+
+      <line x1="250" y1="274" x2="250" y2="300" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#d-arr-b)"/>
+      <line x1="690" y1="274" x2="690" y2="300" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <rect x="40"  y="300" width="420" height="50" rx="8" fill="url(#d-blue)" filter="url(#d-shadow)"/>
+      <text x="250" y="320" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">allkeys-lru / allkeys-lfu</text>
+      <text x="250" y="336" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">配 maxmemory + 监控 hit_ratio</text>
+
+      <rect x="480" y="300" width="420" height="50" rx="8" fill="url(#d-orange)" filter="url(#d-shadow)"/>
+      <text x="690" y="320" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">noeviction + 容量告警</text>
+      <text x="690" y="336" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">used_memory &gt; 80% 即报警</text>
+
+      <rect x="40" y="370" width="860" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="470" y="390" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="700">⚠ 生产最大配置错误:数据库角色实例上配 allkeys-* → 静默丢失主数据</text>
+    </g>
+  </svg>
+</div>
+
+<p>两种角色的策略选择截然相反。<strong>缓存角色</strong>优先选择 <code>allkeys-lru</code> 或 <code>allkeys-lfu</code>,允许淘汰任意 key 以保持服务可用;<strong>数据库角色</strong>选择 <code>noeviction</code>,以 OOM 拒绝写入换取数据完整性。</p>
+
+<div class="warning">
+  <strong>生产环境最大的配置错误:</strong> "在数据库角色实例上配置 <code>allkeys-*</code>",会静默丢失主副本数据。一旦内存达到上限,业务关键数据会被悄无声息地淘汰,而应用层往往要等到读取时才发现数据"消失"。
+</div>
+
+<h3>23.1.2 processCommand 的淘汰触发点</h3>
+
+<pre><code class="language-c">/* src/server.c: 简化的写命令前置检查 */
+int processCommand(client *c) {
+    if (server.maxmemory && !mustObeyClient(c)) {
+        int out_of_memory = (performEvictions() == EVICT_FAIL);
+        if (out_of_memory && is_denyoom_command(c-&gt;cmd)) {
+            rejectCommand(c, shared.oomerr);
+            return C_OK;
+        }
+    }
+    /* 继续执行命令 */
+}</code></pre>
+
+<p>淘汰检查在命令分发前同步执行。<code>performEvictions()</code> 内部循环采样并删除候选 key,直至内存满足条件或返回 <code>EVICT_FAIL</code>。该路径阻塞当前命令的执行,故淘汰量大时会推高客户端 P99 延迟。<code>mustObeyClient</code> 用于排除从复制流执行命令的 replica 客户端,以保持主从淘汰逻辑由主节点统一控制。</p>
+
+<h3>23.1.3 maxmemory 与物理内存的关系</h3>
+
+<pre class="ascii-art"><code>配置层次:
+  系统物理内存            32 GB
+    ├── 操作系统           ~2 GB
+    ├── 其他进程           ~4 GB
+    └── Redis 总开销       ~26 GB
+          ├── used_memory          maxmemory 控制
+          ├── 复制 backlog         repl-backlog-size
+          ├── 客户端输出缓冲       client-output-buffer-limit
+          ├── lua 引擎             少量
+          ├── COW (RDB/AOF rewrite) 取决于写流量
+          └── 内存碎片             mem_fragmentation_ratio
+
+经验配置:
+  maxmemory 设为系统物理内存的 60-70%
+  其余 30-40% 留给:
+    fork() COW 内存峰值
+    输出缓冲、复制缓冲
+    内存碎片(jemalloc)
+
+例: 32 GB 系统物理内存
+  maxmemory 20 GB
+  保留 12 GB 容纳 RDB/AOF 重写期间的 COW</code></pre>
+
+<p><code>maxmemory</code> 仅控制 keyspace 数据 + 数据结构开销,<strong>不包括 fork COW、输出缓冲、复制 backlog、内部数据结构</strong>。生产配置必须为这些"非 keyspace 内存"预留充足余量,否则 <code>BGREWRITEAOF</code> / <code>BGSAVE</code> 期间会触发 OOM Killer。</p>
+
+<div class="real-world">
+  <strong>真实事故案例:</strong> 某电商大促前夜,运维将 <code>maxmemory</code> 设为系统物理内存的 90%(28.8 GB / 32 GB),意图最大化缓存容量。大促开始后写流量激增,触发 <code>BGREWRITEAOF</code>,fork 子进程时 COW 在 5 分钟内增长 6 GB,系统总内存使用达到 35 GB,kernel OOM Killer 选择 Redis 主进程(RSS 最大)杀掉,服务中断 12 分钟。事后将 <code>maxmemory</code> 调回 20 GB(62.5%),并增加 <code>repl-backlog-size</code> 监控。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s23-2">23.2 八种策略的语义</h2>
+<!-- ============================================================ -->
+
+<h3>23.2.1 八种策略详解</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 23-2-1 · 八种策略对照</div>
+  <table class="data-table">
+    <thead>
+      <tr><th>策略</th><th>范围</th><th>算法</th><th>候选集</th><th>淘汰目标</th><th>候选集为空时</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>noeviction</code></td><td>—</td><td>—</td><td>—</td><td>不淘汰,写命令返回 OOM</td><td>同状态</td></tr>
+      <tr><td><code>allkeys-lru</code></td><td>所有 key</td><td>近似 LRU</td><td>db-&gt;dict</td><td>idle time 最大的 key</td><td>不会发生</td></tr>
+      <tr><td><code>allkeys-lfu</code></td><td>所有 key</td><td>近似 LFU</td><td>db-&gt;dict</td><td>logc 最小的 key</td><td>不会发生</td></tr>
+      <tr><td><code>allkeys-random</code></td><td>所有 key</td><td>随机</td><td>db-&gt;dict</td><td>随机一个 key</td><td>不会发生</td></tr>
+      <tr><td><code>volatile-lru</code></td><td>有 TTL key</td><td>近似 LRU</td><td>db-&gt;expires</td><td>idle time 最大的 key</td><td>等价 noeviction</td></tr>
+      <tr><td><code>volatile-lfu</code></td><td>有 TTL key</td><td>近似 LFU</td><td>db-&gt;expires</td><td>logc 最小的 key</td><td>等价 noeviction</td></tr>
+      <tr><td><code>volatile-random</code></td><td>有 TTL key</td><td>随机</td><td>db-&gt;expires</td><td>随机一个有 TTL 的 key</td><td>等价 noeviction</td></tr>
+      <tr><td><code>volatile-ttl</code></td><td>有 TTL key</td><td>TTL 最小</td><td>db-&gt;expires</td><td>最快过期的 key</td><td>等价 noeviction</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>23.2.2 候选集的字典区分</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 23-2-2 · db-&gt;dict 与 db-&gt;expires</div>
+  <svg viewBox="0 0 940 380" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="380" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="380" y="20" width="180" height="44" rx="8" fill="url(#d-blue)" filter="url(#d-shadow)"/>
+      <text x="470" y="42" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">redisDb</text>
+      <text x="470" y="58" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">每个 DB 维护两张哈希表</text>
+
+      <line x1="430" y1="64" x2="200" y2="110" stroke="var(--diagram-green-stroke)" stroke-width="1.5" marker-end="url(#d-arr-g)"/>
+      <line x1="510" y1="64" x2="740" y2="110" stroke="var(--diagram-purple-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <rect x="40"  y="110" width="320" height="60" rx="8" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="200" y="134" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">db-&gt;dict</text>
+      <text x="200" y="152" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">主字典 · 所有 key → robj</text>
+      <text x="200" y="166" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">SET 即写入这里</text>
+
+      <rect x="580" y="110" width="320" height="60" rx="8" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="740" y="134" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">db-&gt;expires</text>
+      <text x="740" y="152" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">TTL 字典 · key → expire_ms</text>
+      <text x="740" y="166" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">仅 EXPIRE/PEXPIRE/SET EX</text>
+
+      <line x1="200" y1="170" x2="200" y2="194" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+      <line x1="740" y1="170" x2="740" y2="194" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <rect x="40"  y="196" width="320" height="46" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="200" y="216" text-anchor="middle" fill="var(--diagram-green-text)" font-size="12" font-weight="800">allkeys-* 候选集</text>
+      <text x="200" y="232" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">永远非空(只要 keyspace 有 key)</text>
+
+      <rect x="580" y="196" width="320" height="46" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="740" y="216" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="12" font-weight="800">volatile-* 候选集</text>
+      <text x="740" y="232" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">仅 db-&gt;expires,可能为空</text>
+
+      <rect x="40"  y="262" width="320" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="60" y="280" fill="var(--diagram-muted)" font-size="10">db-&gt;expires ⊆ db-&gt;dict</text>
+      <text x="60" y="296" fill="var(--diagram-muted)" font-size="10">仅持有过期时间的子集 · 共用 key 指针</text>
+
+      <rect x="580" y="262" width="320" height="44" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="600" y="280" fill="var(--diagram-red-text)" font-size="10" font-weight="700">⚠ 候选集为空 → 退化 noeviction</text>
+      <text x="600" y="296" fill="var(--diagram-red-text)" font-size="10">"配 volatile-lru 但全部 key 无 TTL"</text>
+
+      <rect x="40" y="324" width="860" height="44" rx="8" fill="url(#d-orange)" filter="url(#d-shadow)"/>
+      <text x="470" y="343" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">实战检查:DEBUG OBJECT &lt;key&gt; 看 ttl;统计 INFO keyspace 中 expires 比例</text>
+      <text x="470" y="360" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">expires=0 时改用 allkeys-* 或确保 SET 都带 EX 才用 volatile-*</text>
+    </g>
+  </svg>
+</div>
+
+<p><code>db-&gt;dict</code> 是主字典,存储所有 key 与值的映射;<code>db-&gt;expires</code> 是 TTL 字典,仅记录设置了过期时间的 key。<code>volatile-*</code> 策略从 <code>db-&gt;expires</code> 采样,该字典为空时采样池为空,淘汰失败,行为退化为 noeviction。<strong>生产环境最常见的故障模式即"配置 volatile-lru 但所有 key 都未设置 TTL"</strong>。</p>
+
+<h3>23.2.3 策略选择决策树</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 23-2-3 · 策略选择流程</div>
+  <svg viewBox="0 0 940 540" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="540" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="370" y="14" width="200" height="40" rx="8" fill="url(#d-blue)" filter="url(#d-shadow)"/>
+      <text x="470" y="38" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">选 maxmemory-policy</text>
+
+      <line x1="470" y1="54" x2="470" y2="74" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <polygon points="350,80 590,80 620,108 590,136 350,136 320,108" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="1.5"/>
+      <text x="470" y="106" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="12" font-weight="800">是否允许丢数据?</text>
+      <text x="470" y="124" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">缓存角色 vs 数据库角色</text>
+
+      <path d="M320,108 L 100,160" stroke="var(--diagram-red-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr-r)"/>
+      <text x="155" y="135" fill="var(--diagram-red-text)" font-size="10" font-weight="700">否(数据库)</text>
+
+      <path d="M620,108 L 800,160" stroke="var(--diagram-green-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="700" y="135" fill="var(--diagram-green-text)" font-size="10" font-weight="700">是(缓存)</text>
+
+      <rect x="20"  y="160" width="180" height="50" rx="6" fill="url(#d-red)"/>
+      <text x="110" y="180" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">noeviction</text>
+      <text x="110" y="198" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">+ 容量告警 + OOM 拒写</text>
+
+      <polygon points="700,168 900,168 920,196 900,224 700,224 680,196" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="1.5"/>
+      <text x="800" y="194" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="800">所有 key 都有 TTL?</text>
+
+      <path d="M680,196 L 470,260" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr)"/>
+      <text x="540" y="240" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">否</text>
+
+      <path d="M800,224 L 800,260" stroke="var(--diagram-purple-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+      <text x="808" y="252" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">是</text>
+
+      <polygon points="350,260 590,260 620,288 590,316 350,316 320,288" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)" stroke-width="1.5"/>
+      <text x="470" y="286" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="800">访问分布是否倾斜?</text>
+      <text x="470" y="302" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">Zipfian 80-20 vs 均匀</text>
+
+      <polygon points="700,260 900,260 920,288 900,316 700,316 680,288" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="1.5"/>
+      <text x="800" y="284" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="800">TTL 与业务价值相关?</text>
+      <text x="800" y="300" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">即将过期 = 价值最低?</text>
+
+      <path d="M380,316 L 200,380" stroke="var(--diagram-green-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="240" y="360" fill="var(--diagram-green-text)" font-size="9" font-weight="700">Zipfian</text>
+
+      <path d="M560,316 L 470,380" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr-b)"/>
+      <text x="510" y="360" fill="var(--diagram-blue-text)" font-size="9" font-weight="700">均匀</text>
+
+      <path d="M720,316 L 700,380" stroke="var(--diagram-purple-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr)"/>
+      <text x="690" y="360" fill="var(--diagram-purple-text)" font-size="9" font-weight="700">是</text>
+
+      <path d="M880,316 L 880,380" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+      <text x="888" y="360" fill="var(--diagram-orange-text)" font-size="9" font-weight="700">否</text>
+
+      <rect x="80"  y="380" width="200" height="50" rx="8" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="180" y="400" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">allkeys-lfu</text>
+      <text x="180" y="418" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">频率感知 · 推荐缓存默认</text>
+
+      <rect x="350" y="380" width="200" height="50" rx="8" fill="url(#d-blue)" filter="url(#d-shadow)"/>
+      <text x="450" y="400" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">allkeys-lru</text>
+      <text x="450" y="418" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">时间局部性</text>
+
+      <rect x="600" y="380" width="200" height="50" rx="8" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="700" y="400" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">volatile-ttl</text>
+      <text x="700" y="418" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">预测性淘汰</text>
+
+      <rect x="820" y="380" width="100" height="50" rx="8" fill="url(#d-orange)" filter="url(#d-shadow)"/>
+      <text x="870" y="400" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">看分布</text>
+      <text x="870" y="418" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">→ volatile-lfu/lru</text>
+
+      <rect x="40" y="460" width="860" height="60" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="60" y="482" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">默认建议:</text>
+      <text x="160" y="482" fill="var(--diagram-green-text)" font-size="10">缓存 → allkeys-lfu</text>
+      <text x="320" y="482" fill="var(--diagram-red-text)" font-size="10">数据库 → noeviction</text>
+      <text x="500" y="482" fill="var(--diagram-purple-text)" font-size="10">TTL 业务相关 → volatile-ttl</text>
+      <text x="60" y="502" fill="var(--diagram-muted)" font-size="9">注意:volatile-* 候选集为空时退化为 noeviction;allkeys-lru 是历史默认,但 lfu 在 Zipfian 实测命中率更高</text>
+    </g>
+  </svg>
+</div>
+
+<div class="key-insight">
+  <strong>推荐默认:</strong> 实际生产中,<code>allkeys-lfu</code> 是<strong>缓存角色</strong>的推荐默认值,Zipfian 分布(典型业务的访问模式)下命中率最高。<code>noeviction</code> 是<strong>数据库角色</strong>的推荐配置,以 OOM 错误反向触发容量扩容流程。<code>volatile-*</code> 仅在所有 key 都设置 TTL 且 TTL 与业务语义相关时使用。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s23-3">23.3 采样机制与淘汰池</h2>
+<!-- ============================================================ -->
+
+<h3>23.3.1 为什么不维护全局有序结构</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 23-3-1 · 三种 LRU 实现的内存与时间开销</div>
+  <table class="data-table">
+    <thead>
+      <tr><th>方案</th><th>元数据开销(每 key)</th><th>访问时维护成本</th><th>淘汰成本</th><th>1000 万 key 总开销</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>精确 LRU 双向链表</td><td>16 字节 (两指针)</td><td>O(1) 链表移动</td><td>O(1)</td><td>~152 MB</td></tr>
+      <tr><td>精确 LFU 优先队列</td><td>~24 字节 (堆节点)</td><td>O(log N) 调整堆</td><td>O(log N)</td><td>~228 MB</td></tr>
+      <tr><td><strong>采样近似 + 淘汰池</strong></td><td><strong>0 字节</strong> (复用 robj.lru)</td><td>O(1) 时间戳更新</td><td>O(s) 采样</td><td><strong>0</strong></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p><code>robj.lru</code> 是 redisObject 中的 24-bit 字段,无需额外内存。采样近似的代价是命中率较精确算法略低(典型 3-5%),但元数据开销节省可达数百 MB,在内存数据库语境下是显著正向收益。</p>
+
+<h3>23.3.2 performEvictions 主循环</h3>
+
+<pre><code class="language-c">/* src/evict.c: 简化的淘汰主循环 */
+int performEvictions(void) {
+    long long mem_used = zmalloc_used_memory();
+    long long mem_tofree = mem_used - server.maxmemory;
+    int result = EVICT_OK;
+
+    while (mem_tofree &gt; 0) {
+        /* 1. 选择候选集字典 */
+        int policy = server.maxmemory_policy;
+        struct evictionPoolEntry *pool = EvictionPoolLRU;
+
+        if (policy &amp; MAXMEMORY_FLAG_ALLKEYS) {
+            sampledict = db-&gt;dict;
+        } else {
+            sampledict = db-&gt;expires;
+        }
+        if (dictSize(sampledict) == 0) {
+            result = EVICT_FAIL;  /* 候选集为空 */
+            break;
+        }
+
+        /* 2. 采样填充淘汰池 */
+        evictionPoolPopulate(dbid, sampledict, db-&gt;dict, pool);
+
+        /* 3. 从淘汰池尾部取出最差候选 */
+        bestkey = pool[EVPOOL_SIZE - 1].key;
+        if (bestkey == NULL) {
+            result = EVICT_FAIL;
+            break;
+        }
+
+        /* 4. 删除该 key */
+        long long delta = (long long)zmalloc_used_memory();
+        if (server.lazyfree_lazy_eviction)
+            dbAsyncDelete(db, keyobj);
+        else
+            dbSyncDelete(db, keyobj);
+        delta -= (long long)zmalloc_used_memory();
+        mem_tofree -= delta;
+
+        server.stat_evictedkeys++;
+    }
+    return result;
+}</code></pre>
+
+<p>主循环每轮采样 <code>maxmemory-samples</code> 个 key,填充至 16 槽淘汰池,从池尾取出 idle 值最大的候选删除。删除一个 key 释放的内存可能不足以将 used_memory 压回 maxmemory,故循环可能多次迭代,直至条件满足或候选集耗尽。</p>
+
+<h3>23.3.3 淘汰池数据结构</h3>
+
+<pre><code class="language-c">/* src/evict.c */
+#define EVPOOL_SIZE 16
+#define EVPOOL_CACHED_SDS_SIZE 255
+
+struct evictionPoolEntry {
+    unsigned long long idle;  /* idle time (LRU) 或 idle value (LFU/TTL) */
+    sds key;                  /* key 名 SDS 拷贝 */
+    sds cached;               /* 可复用的 SDS 缓冲 */
+    int dbid;                 /* DB 编号 */
+};
+
+static struct evictionPoolEntry *EvictionPoolLRU;</code></pre>
+
+<pre class="ascii-art"><code>淘汰池槽位排列:
+
+  slot 0    slot 1    slot 2  ...  slot 14   slot 15
+  ┌─────┐  ┌─────┐  ┌─────┐      ┌─────┐  ┌─────┐
+  │idle │  │idle │  │idle │      │idle │  │idle │
+  │ 100 │  │ 250 │  │ 480 │  ... │1500 │  │2000 │
+  └─────┘  └─────┘  └─────┘      └─────┘  └─────┘
+   最佳                                   最差
+   候选                                   候选
+   (保留)                                 (淘汰)
+
+idle 值含义:
+  LRU 模式: idle = now_clock - obj.lru,值越大越久未访问
+  LFU 模式: idle = 255 - LFUDecrAndReturn(obj),值越大频率越低
+  TTL 模式: idle = ULLONG_MAX - expire_time,过期越早 idle 越大</code></pre>
+
+<p>槽位按 idle 值升序排列,槽 15 始终持有当前已观察到的"最差候选"。新采样的 key 通过二分查找插入到合适位置,如果新 key 的 idle 值小于槽 0,则丢弃。淘汰时从槽 15 取出。</p>
+
+<h3>23.3.4 采样如何填充淘汰池</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 23-3-4 · evictionPoolPopulate 时序</div>
+  <svg viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="460" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="20"  y="14" width="200" height="34" rx="6" fill="url(#d-purple)"/>
+      <text x="120" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">performEvictions</text>
+      <rect x="240" y="14" width="220" height="34" rx="6" fill="url(#d-blue)"/>
+      <text x="350" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">evictionPoolPopulate</text>
+      <rect x="480" y="14" width="200" height="34" rx="6" fill="url(#d-green)"/>
+      <text x="580" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">sampledict</text>
+      <rect x="700" y="14" width="220" height="34" rx="6" fill="url(#d-orange)"/>
+      <text x="810" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">淘汰池(16 槽)</text>
+
+      <line x1="120" y1="48" x2="120" y2="440" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="350" y1="48" x2="350" y2="440" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="580" y1="48" x2="580" y2="440" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="810" y1="48" x2="810" y2="440" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+
+      <line x1="120" y1="74" x2="350" y2="74" stroke="var(--diagram-purple-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+      <text x="235" y="68" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">调用采样填充</text>
+
+      <line x1="350" y1="100" x2="580" y2="100" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#d-arr-b)"/>
+      <text x="465" y="94" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">dictGetSomeKeys(samples=N)</text>
+
+      <line x1="580" y1="124" x2="350" y2="124" stroke="var(--diagram-green-stroke)" stroke-width="1.5" marker-end="url(#d-arr-g)"/>
+      <text x="465" y="118" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">返回 N 个随机 key</text>
+
+      <rect x="240" y="148" width="220" height="240" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="350" y="170" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">loop:每个采样 key</text>
+
+      <text x="260" y="194" fill="var(--diagram-blue-text)" font-size="10">① 计算 idle 值</text>
+      <text x="270" y="210" fill="var(--diagram-muted)" font-size="9">LRU: lruclock - obj.lru</text>
+      <text x="270" y="224" fill="var(--diagram-muted)" font-size="9">LFU: 255 - logc</text>
+      <text x="270" y="238" fill="var(--diagram-muted)" font-size="9">TTL: -expire_ms</text>
+
+      <text x="260" y="266" fill="var(--diagram-blue-text)" font-size="10">② 与 pool[0].idle 比较</text>
+
+      <rect x="252" y="278" width="200" height="44" rx="4" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="260" y="296" fill="var(--diagram-green-text)" font-size="9" font-weight="700">if idle &gt; pool[0].idle:</text>
+      <text x="270" y="312" fill="var(--diagram-green-text)" font-size="9">二分查找位置 → 移位 → 写入</text>
+
+      <rect x="252" y="328" width="200" height="36" rx="4" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="260" y="346" fill="var(--diagram-red-text)" font-size="9" font-weight="700">else: 丢弃(不入池)</text>
+      <text x="260" y="360" fill="var(--diagram-red-text)" font-size="9">已有 16 个比它差的</text>
+
+      <line x1="460" y1="266" x2="810" y2="220" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" stroke-dasharray="4,2" marker-end="url(#d-arr)"/>
+      <text x="600" y="240" fill="var(--diagram-orange-text)" font-size="9">入池(idle 大者)</text>
+
+      <rect x="700" y="160" width="220" height="160" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="810" y="178" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">淘汰池(idle 升序)</text>
+
+      <g font-size="9" fill="var(--diagram-blue-text)">
+        <rect x="710" y="186" width="200" height="14" fill="var(--diagram-green-fill)"/><text x="720" y="197">slot 0  · idle 最小(保留)</text>
+        <rect x="710" y="200" width="200" height="14" fill="var(--diagram-green-fill)"/><text x="720" y="211">slot 1</text>
+        <rect x="710" y="214" width="200" height="14" fill="var(--diagram-orange-fill)"/><text x="720" y="225">⋮</text>
+        <rect x="710" y="228" width="200" height="14" fill="var(--diagram-orange-fill)"/><text x="720" y="239">slot 7</text>
+        <rect x="710" y="242" width="200" height="14" fill="var(--diagram-red-fill)"/><text x="720" y="253">⋮</text>
+        <rect x="710" y="256" width="200" height="14" fill="var(--diagram-red-fill)"/><text x="720" y="267">slot 14</text>
+        <rect x="710" y="270" width="200" height="20" fill="url(#d-red)"/><text x="720" y="284" fill="var(--diagram-text)" font-weight="700">slot 15 · idle 最大 ← bestkey</text>
+
+        <text x="720" y="306" fill="var(--diagram-muted)">跨轮次累积,差候选不易被替换</text>
+      </g>
+
+      <line x1="350" y1="396" x2="120" y2="396" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+      <text x="235" y="390" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">完成填充</text>
+
+      <line x1="120" y1="420" x2="810" y2="420" stroke="var(--diagram-red-stroke)" stroke-width="1.5" marker-end="url(#d-arr-r)"/>
+      <text x="465" y="414" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10" font-weight="700">取 slot 15 作为 bestkey → dbDelete</text>
+    </g>
+  </svg>
+</div>
+
+<p><code>dictGetSomeKeys</code> 在 hash table 上随机起点采样,返回 N 个 key(可能少于 N,取决于 hash 表填充率)。每个 key 计算 idle 值并尝试插入淘汰池。该过程的关键工程价值在于"<strong>跨轮次累积</strong>":第一轮可能采到平庸候选,但好的候选会留在池中,后续轮次只替换为更差的候选。</p>
+
+<h3>23.3.5 采样质量的概率分析</h3>
+
+<pre class="ascii-art"><code>设 N 为候选集总 key 数, k 为目标 (期望淘汰的 top-k 最差候选数)
+单次采样 s 个 key,至少命中一个目标的概率:
+
+  P(命中) = 1 - C(N-k, s) / C(N, s)
+         ≈ 1 - (1 - k/N)^s   (N &gt;&gt; k, s 时近似)
+
+数值示例 (N = 1,000,000, k = 10,000 即 top-1%):
+
+  s = 10  (默认):
+    P = 1 - (1 - 0.01)^10 = 1 - 0.99^10 ≈ 9.6%
+  
+  连续 10 轮采样后,池中至少有一个 top-1% 的概率:
+    P_10轮 = 1 - (1 - 0.096)^10 ≈ 63.7%
+  
+  连续 50 轮:
+    P_50轮 = 1 - (1 - 0.096)^50 ≈ 99.4%
+
+结论: 采样数 s=10 单轮命中率 9.6%,但跨轮次淘汰池累积后,
+      50 轮内几乎必然将 top-1% 候选淘汰。</code></pre>
+
+<div class="key-insight">
+  <strong>核心洞察:</strong> 淘汰池的工程价值即"用 <strong>16 个槽位的 O(1) 内存</strong>,将单轮 9.6% 的命中率<strong>放大到多轮的 99%+</strong>"。该机制是 Redis 采样近似能逼近精确算法命中率的根本原因。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s23-4">23.4 近似 LRU:24-bit 时钟</h2>
+<!-- ============================================================ -->
+
+<h3>23.4.1 redisObject 中的 lru 字段</h3>
+
+<pre><code class="language-c">/* src/server.h */
+typedef struct redisObject {
+    unsigned type:4;       /* 数据类型 */
+    unsigned encoding:4;   /* 内部编码 */
+    unsigned lru:24;       /* LRU/LFU 复用字段 */
+    int refcount;          /* 引用计数 */
+    void *ptr;             /* 数据指针 */
+} robj;</code></pre>
+
+<pre class="ascii-art"><code>24-bit lru 字段的两种解读:
+
+  LRU 模式 (allkeys-lru / volatile-lru):
+    24 bits 全部记录访问时间戳的低 24 位 (秒级)
+    
+        bit 23                    bit 0
+        ┌─────────────────────────────┐
+        │   Redis LRU clock 低 24 位  │
+        └─────────────────────────────┘
+
+  LFU 模式 (allkeys-lfu / volatile-lfu):
+    高 16 bits 衰减时间, 低 8 bits 频率计数
+    
+        bit 23      bit 8  bit 7   bit 0
+        ┌───────────────┐ ┌──────────┐
+        │ ldt 衰减时间  │ │ logc 计数│
+        └───────────────┘ └──────────┘
+        分钟级时间戳        Morris 计数器</code></pre>
+
+<p>LRU 与 LFU 模式复用同一个 24-bit 字段,运行时根据 <code>maxmemory-policy</code> 动态决定该字段的语义。<strong>切换策略不需要重启 Redis,但已有 key 的 lru 字段会被新策略重新解读</strong>,可能导致短暂的命中率波动。</p>
+
+<h3>23.4.2 LRU clock 的更新</h3>
+
+<pre><code class="language-c">/* src/evict.c */
+unsigned int LRU_CLOCK(void) {
+    unsigned int lruclock;
+    if (1000 / server.hz &lt;= LRU_CLOCK_RESOLUTION) {
+        atomicGet(server.lruclock, lruclock);
+    } else {
+        lruclock = getLRUClock();
+    }
+    return lruclock;
+}
+
+unsigned int getLRUClock(void) {
+    return (mstime() / LRU_CLOCK_RESOLUTION) &amp; LRU_CLOCK_MAX;
+}
+
+#define LRU_BITS 24
+#define LRU_CLOCK_MAX ((1 &lt;&lt; LRU_BITS) - 1)  /* 16,777,215 */
+#define LRU_CLOCK_RESOLUTION 1000             /* 1 秒 */</code></pre>
+
+<p>LRU 时钟分辨率 1 秒。<code>serverCron</code> 以 <code>server.hz</code> 频率(默认 10 Hz)更新全局 <code>server.lruclock</code>,key 访问时直接读取该原子变量,避免每次访问都调用 <code>mstime()</code>。低于 1000 ms 的访问间隔无法区分,这是 24-bit 精度的工程取舍。</p>
+
+<h3>23.4.3 idle 时间计算与回绕</h3>
+
+<pre><code class="language-c">/* src/evict.c: 简化 */
+unsigned long long estimateObjectIdleTime(robj *o) {
+    unsigned long long lruclock = LRU_CLOCK();
+    if (lruclock &gt;= o-&gt;lru) {
+        return (lruclock - o-&gt;lru) * LRU_CLOCK_RESOLUTION;
+    } else {
+        /* 时钟回绕处理 */
+        return (lruclock + (LRU_CLOCK_MAX - o-&gt;lru))
+               * LRU_CLOCK_RESOLUTION;
+    }
+}</code></pre>
+
+<pre class="ascii-art"><code>24-bit clock 的回绕周期:
+
+  LRU_CLOCK_MAX = 2^24 - 1 = 16,777,215
+  LRU_CLOCK_RESOLUTION = 1 秒
+  回绕周期 = 16,777,215 秒 ≈ 194.18 天
+
+回绕场景:
+  obj.lru = 16,000,000 (约 185 天前)
+  当前 lruclock = 100,000 (回绕后)
+  
+  estimateObjectIdleTime:
+    lruclock &lt; obj.lru → 回绕分支
+    idle = 100,000 + (16,777,215 - 16,000,000) = 877,215 秒
+    ≈ 10.15 天
+
+精度损失分析:
+  实际 idle = (24*3600 - lruclock 启动时刻) + 回绕已过秒数
+  对于已经 194 天未访问的 key,精度损失数小时,
+  在淘汰决策中无影响 (该 key 在任何合理候选集中都是最差候选)</code></pre>
+
+<h3>23.4.4 LRU 与精确 LRU 的差异</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 23-4-4 · 精确 vs 近似 LRU</div>
+  <svg viewBox="0 0 940 380" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="380" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="20"  y="14" width="440" height="350" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="240" y="40" text-anchor="middle" fill="var(--diagram-red-text)" font-size="14" font-weight="800">精确 LRU(Memcached / Java LinkedHashMap)</text>
+
+      <rect x="50"  y="60" width="380" height="44" rx="6" fill="url(#d-blue)"/>
+      <text x="240" y="80" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">每次访问</text>
+      <text x="240" y="98" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">SET / GET / HGET / ZRANGEBYSCORE ...</text>
+
+      <line x1="240" y1="104" x2="240" y2="124" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <rect x="50" y="124" width="380" height="36" rx="6" fill="url(#d-purple)"/>
+      <text x="240" y="146" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="700">从全局双向链表移除节点</text>
+
+      <line x1="240" y1="160" x2="240" y2="180" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <rect x="50" y="180" width="380" height="36" rx="6" fill="url(#d-purple)"/>
+      <text x="240" y="202" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="700">插入链表头(MRU 端)</text>
+
+      <line x1="240" y1="216" x2="240" y2="236" stroke="var(--diagram-red-stroke)" stroke-width="1.5" marker-end="url(#d-arr-r)"/>
+
+      <rect x="50" y="236" width="380" height="50" rx="6" fill="url(#d-red)" filter="url(#d-shadow)"/>
+      <text x="240" y="258" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">O(1) 但每 key 多 16 字节(prev + next)</text>
+      <text x="240" y="276" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">1000 万 key → +152 MB · 链表 cache miss 高</text>
+
+      <text x="50" y="312" fill="var(--diagram-muted)" font-size="10">优点:严格 LRU 顺序</text>
+      <text x="50" y="330" fill="var(--diagram-muted)" font-size="10">缺点:内存浪费 + 高频读访问也要写链表(写穿)</text>
+      <text x="50" y="348" fill="var(--diagram-muted)" font-size="10">适用:小数据集 · 内存不敏感</text>
+
+      <rect x="480" y="14" width="440" height="350" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="700" y="40" text-anchor="middle" fill="var(--diagram-green-text)" font-size="14" font-weight="800">Redis 近似 LRU</text>
+
+      <rect x="510" y="60" width="380" height="44" rx="6" fill="url(#d-blue)"/>
+      <text x="700" y="80" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">每次访问</text>
+      <text x="700" y="98" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">同上</text>
+
+      <line x1="700" y1="104" x2="700" y2="124" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <rect x="510" y="124" width="380" height="36" rx="6" fill="url(#d-purple)"/>
+      <text x="700" y="146" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="700">obj.lru = LRU_CLOCK() (24-bit)</text>
+
+      <line x1="700" y1="160" x2="700" y2="180" stroke="var(--diagram-green-stroke)" stroke-width="1.5" marker-end="url(#d-arr-g)"/>
+
+      <rect x="510" y="180" width="380" height="44" rx="6" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="700" y="202" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">O(1) · 内存开销 0</text>
+      <text x="700" y="220" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">复用 robj 现有 24-bit 字段</text>
+
+      <line x1="700" y1="224" x2="700" y2="244" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <rect x="510" y="244" width="380" height="36" rx="6" fill="url(#d-orange)"/>
+      <text x="700" y="266" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="700">淘汰时采样 N 个 key + 16 槽池</text>
+
+      <line x1="700" y1="280" x2="700" y2="300" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <rect x="510" y="300" width="380" height="36" rx="6" fill="url(#d-purple)"/>
+      <text x="700" y="322" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="700">选 idle 最大的 → 跨轮累积逼近精确</text>
+
+      <text x="510" y="356" fill="var(--diagram-muted)" font-size="10">★ 单轮命中率 9.6% · 50 轮累积 99.4%</text>
+    </g>
+  </svg>
+</div>
+
+<p>精确 LRU 维护全局有序链表,需要每次访问时调整链表结构,且每个 key 增加两个指针(64-bit 系统 16 字节)。Redis 近似 LRU 仅在访问时更新一个 24-bit 字段,淘汰时采样 10 个 key 选择 idle 最大者。后者牺牲了一定的精度(单次淘汰可能选不到全局最差候选),但通过淘汰池跨轮次累积,最终命中率与精确 LRU 接近。</p>
+
+<!-- ============================================================ -->
+<h2 id="s23-5">23.5 近似 LFU:Morris 计数器</h2>
+<!-- ============================================================ -->
+
+<h3>23.5.1 LFU 字段的双重含义</h3>
+
+<pre class="ascii-art"><code>24-bit lru 字段在 LFU 模式下:
+
+  bit 23                    bit 8  bit 7        bit 0
+  ┌─────────────────────────────┐ ┌──────────────┐
+  │   ldt: 衰减时间 (16 bits)   │ │ logc: 8 bits │
+  │   分钟级时间戳              │ │ 0-255 计数器 │
+  └─────────────────────────────┘ └──────────────┘
+
+ldt (logarithmic decay time):
+  分辨率: 1 分钟
+  范围: 16 bits = 65,535 分钟 ≈ 45.5 天
+  超过范围回绕,与 LRU 同样需要回绕处理
+
+logc (logarithmic counter):
+  范围: 0-255 (8 bits)
+  初始值: LFU_INIT_VAL = 5 (新 key 默认)
+  增长: Morris 概率递增
+  衰减: 根据 lfu-decay-time 配置</code></pre>
+
+<p>LFU 字段的设计目标:用 24-bit 同时表达"频率"与"衰减时间",支持百万级访问的频率区分,且热度可随时间衰减。8-bit logc 表面上仅 0-255,但通过对数概率递增,实际可表达 10^6 量级的访问频率。</p>
+
+<h3>23.5.2 Morris 概率计数器</h3>
+
+<pre><code class="language-c">/* src/evict.c */
+#define LFU_INIT_VAL 5
+
+uint8_t LFULogIncr(uint8_t counter) {
+    if (counter == 255) return 255;
+    double r = (double)rand() / RAND_MAX;
+    double baseval = counter - LFU_INIT_VAL;
+    if (baseval &lt; 0) baseval = 0;
+    double p = 1.0 / (baseval * server.lfu_log_factor + 1);
+    if (r &lt; p) counter++;
+    return counter;
+}</code></pre>
+
+<pre class="ascii-art"><code>Morris 计数器递增概率表 (lfu_log_factor = 10, 默认):
+
+  当前 logc   递增概率           等价访问量级直觉
+  ────────  ─────────────────  ─────────────────
+  5 (初始)    100%               新 key
+  6           1/(1*10+1) = 9.1%   ~10 次访问
+  10          1/(5*10+1) = 1.96%  ~100 次访问
+  18          1/(13*10+1) = 0.77% ~1000 次访问
+  50          1/(45*10+1) = 0.22% ~10000 次访问
+  142         1/(137*10+1)≈0.073% ~100000 次访问
+  255         0 (饱和)            ~1000000+ 次访问
+
+含义:
+  低频 key 的 logc 增长快,容易区分访问 1 次 vs 10 次
+  高频 key 的 logc 增长慢,饱和需要百万次访问
+  对数关系使 8 bits 可表达 6 个数量级的频率范围</code></pre>
+
+<div class="key-insight">
+  <strong>历史脉络:</strong> Morris 计数器的核心思想是"用<strong>概率递增模拟对数计数</strong>"。当 counter = c 时,以概率 p ∝ 1/c 递增,使 counter 随访问次数对数增长。该机制最早由 Robert Morris 在 <strong>1978 年</strong>提出,用于在有限位宽下计数大数量级事件。Redis 复用该方案在 8 bits 内表达 10^6 量级访问频率。
+</div>
+
+<h3>23.5.3 LFU 衰减机制</h3>
+
+<pre><code class="language-c">/* src/evict.c */
+unsigned long LFUDecrAndReturn(robj *o) {
+    unsigned long ldt = o-&gt;lru &gt;&gt; 8;
+    unsigned long counter = o-&gt;lru &amp; 255;
+    unsigned long num_periods = server.lfu_decay_time
+        ? LFUTimeElapsed(ldt) / server.lfu_decay_time : 0;
+    if (num_periods)
+        counter = (num_periods &gt; counter) ? 0 : counter - num_periods;
+    return counter;
+}
+
+unsigned long LFUTimeElapsed(unsigned long ldt) {
+    unsigned long now = LFUGetTimeInMinutes();
+    if (now &gt;= ldt) return now - ldt;
+    return 65535 - ldt + now;  /* ldt 回绕处理 */
+}</code></pre>
+
+<pre class="ascii-art"><code>衰减计算示例 (lfu-decay-time = 1):
+
+  场景 1: 热 key 持续访问
+    访问时刻 t=0:  ldt=0, logc=5
+    访问时刻 t=10: 增 logc 到 ~10
+    访问时刻 t=60: 1 小时后,logc 已饱和到 ~50
+    
+  场景 2: 热 key 停止访问
+    最后访问 t=0: ldt=0, logc=50
+    查询时刻 t=120 分钟:
+      num_periods = 120 / 1 = 120
+      counter = 50 - 120 = max(0, 50-120) = 0
+    
+  场景 3: 中等访问
+    最后访问 t=0: ldt=0, logc=20
+    查询时刻 t=10 分钟:
+      num_periods = 10 / 1 = 10
+      counter = 20 - 10 = 10
+
+衰减目的:
+  避免历史热点永久占据高频位
+  允许新热点在合理时间内取代旧热点
+  lfu-decay-time 越大,衰减越慢,历史热点保留越久</code></pre>
+
+<p>衰减机制是 LFU 抵抗"<strong>僵尸热度</strong>"的关键。无衰减的 LFU 会让历史热点永久驻留(其 logc 已饱和),即使长期不再访问也不会被淘汰。<code>lfu-decay-time</code> 配置衰减速度,默认 1 分钟衰减 1 单位。</p>
+
+<h3>23.5.4 OBJECT FREQ 命令的语义</h3>
+
+<pre><code class="language-bash">$ redis-cli OBJECT FREQ user:hot:1
+(integer) 142
+
+$ redis-cli OBJECT FREQ user:cold:1
+(integer) 5</code></pre>
+
+<pre class="ascii-art"><code>OBJECT FREQ 返回的是 logc 值,不是真实访问次数:
+
+  logc = 5  → 新 key 或已衰减完
+  logc = 10 → 约百次访问
+  logc = 50 → 约万次访问
+  logc = 142 → 约十万次访问
+  logc = 255 → 已饱和,百万级访问
+
+误区:
+  ✗ logc = 100 不等于访问 100 次
+  ✗ logc 不可线性比较 (100 vs 200 不是 2 倍频率)
+
+正确用法:
+  ✓ 比较两 key logc 的相对大小,识别冷/热分布
+  ✓ 监控 logc 分布,验证 LFU 是否正确识别热点
+  ✓ logc 持续 &lt; 10 的 key 是淘汰候选</code></pre>
+
+<div class="warning">
+  <strong>常见误用:</strong> 监控大盘把 <code>OBJECT FREQ</code> 当作"访问次数"画折线图,实际是 logc 值。两 key logc=50 与 logc=100 不是"2 倍频率",而是大致"10000 vs 100000 量级"的访问差。只能用作冷/热分级,不能做精确流量统计。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s23-6">23.6 volatile-ttl:预测性淘汰</h2>
+<!-- ============================================================ -->
+
+<h3>23.6.1 volatile-ttl 的 idle 计算</h3>
+
+<pre><code class="language-c">/* src/evict.c: evictionPoolPopulate 中 */
+if (server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL) {
+    idle = ULLONG_MAX - (long)dictGetVal(de);
+    /* dictGetVal(de) 是 expire 字典的 value, 即过期时间戳(毫秒) */
+}</code></pre>
+
+<pre class="ascii-art"><code>idle 值计算逻辑:
+
+  expire_time   key 的过期时间戳 (毫秒)
+  idle = ULLONG_MAX - expire_time
+
+  过期越早 → expire_time 越小 → idle 越大 → 越优先淘汰
+
+示例:
+  key A: 1 分钟后过期, expire_time = now + 60_000
+  key B: 1 小时后过期, expire_time = now + 3_600_000
+  
+  A 的 idle &gt; B 的 idle
+  A 更可能被采样选为淘汰候选
+
+设计依据:
+  即将过期的 key 对业务的剩余价值最低
+  主动淘汰它们等价于"提前过期",释放空间给新写入
+  优于等待惰性删除/定期扫描</code></pre>
+
+<h3>23.6.2 volatile-ttl 与过期删除的关系</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 23-6-2 · 三种 TTL 删除机制</div>
+  <svg viewBox="0 0 940 380" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="380" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="20"  y="14" width="290" height="44" rx="8" fill="url(#d-blue)" filter="url(#d-shadow)"/>
+      <text x="165" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">① 主动过期删除</text>
+      <text x="165" y="52" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">activeExpireCycle</text>
+
+      <rect x="325" y="14" width="290" height="44" rx="8" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="470" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">② 惰性过期删除</text>
+      <text x="470" y="52" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">expireIfNeeded</text>
+
+      <rect x="630" y="14" width="290" height="44" rx="8" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="775" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">③ volatile-ttl 淘汰</text>
+      <text x="775" y="52" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">performEvictions</text>
+
+      <g font-size="11" fill="var(--diagram-blue-text)">
+        <rect x="20"  y="74" width="290" height="200" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+        <text x="40" y="98" fill="var(--diagram-blue-text)" font-weight="700">触发时机</text>
+        <text x="40" y="118">serverCron 周期性(10 Hz)</text>
+        <text x="40" y="136">不依赖内存压力</text>
+
+        <text x="40" y="166" fill="var(--diagram-blue-text)" font-weight="700">目标 key</text>
+        <text x="40" y="186">已到期的 key</text>
+        <text x="40" y="204">从 db-&gt;expires 抽样</text>
+
+        <text x="40" y="234" fill="var(--diagram-blue-text)" font-weight="700">动作</text>
+        <text x="40" y="252">propagateExpire → 复制 / AOF</text>
+        <text x="40" y="268" fill="var(--diagram-muted)" font-size="10">每周期最多 25% CPU 时间</text>
+
+        <rect x="325" y="74" width="290" height="200" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="345" y="98" fill="var(--diagram-green-text)" font-weight="700">触发时机</text>
+        <text x="345" y="118">每次 GET/SET/EXISTS</text>
+        <text x="345" y="136">不依赖内存压力</text>
+
+        <text x="345" y="166" fill="var(--diagram-green-text)" font-weight="700">目标 key</text>
+        <text x="345" y="186">访问到的已到期 key</text>
+        <text x="345" y="204">仅当前命令涉及的 key</text>
+
+        <text x="345" y="234" fill="var(--diagram-green-text)" font-weight="700">动作</text>
+        <text x="345" y="252">读返回 nil · dbDelete</text>
+        <text x="345" y="268" fill="var(--diagram-muted)" font-size="10">unaccessed 长尾不会被处理</text>
+
+        <rect x="630" y="74" width="290" height="200" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+        <text x="650" y="98" fill="var(--diagram-purple-text)" font-weight="700">触发时机</text>
+        <text x="650" y="118">used_memory &gt; maxmemory</text>
+        <text x="650" y="136">写命令前置检查</text>
+
+        <text x="650" y="166" fill="var(--diagram-purple-text)" font-weight="700">目标 key</text>
+        <text x="650" y="186">TTL 最小者(尚未到期)</text>
+        <text x="650" y="204">采样 + 16 槽淘汰池</text>
+
+        <text x="650" y="234" fill="var(--diagram-purple-text)" font-weight="700">动作</text>
+        <text x="650" y="252">主动提前删除 + 复制</text>
+        <text x="650" y="268" fill="var(--diagram-muted)" font-size="10">"将要过期 = 价值最低"假设</text>
+      </g>
+
+      <line x1="20"  y1="295" x2="920" y2="295" stroke="var(--diagram-border)"/>
+      <text x="40" y="316" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">三机制独立而互补:</text>
+      <text x="40" y="336" fill="var(--diagram-blue-text)" font-size="10">①+② 处理"已过期" · ③ 处理"即将过期",在内存压力下提前释放价值最低的 key</text>
+      <text x="40" y="354" fill="var(--diagram-muted)" font-size="9">↑ 三者都仅作用于 db-&gt;expires;无 TTL 的 key 永远不被它们处理</text>
+    </g>
+  </svg>
+</div>
+
+<p><code>volatile-ttl</code> 是独立于过期删除的机制。<strong>过期删除处理"已到期的 key",<code>volatile-ttl</code> 在内存压力下处理"即将到期的 key"</strong>。两者的触发条件、时机、目标 key 集合完全不同,但都作用于 <code>db-&gt;expires</code> 字典。</p>
+
+<h3>23.6.3 volatile-ttl 的适用场景</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 23-6-3 · volatile-ttl 适用性矩阵</div>
+  <table class="data-table">
+    <thead>
+      <tr><th>场景</th><th>是否适用</th><th>说明</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>会话缓存 (TTL 30 分钟)</td><td>✅ 适用</td><td>即将过期的会话价值低</td></tr>
+      <tr><td>验证码 (TTL 5 分钟)</td><td>✅ 适用</td><td>即将过期的验证码即将作废</td></tr>
+      <tr><td>排行榜快照 (TTL 1 小时)</td><td>✅ 适用</td><td>即将过期的快照将被新版本替换</td></tr>
+      <tr><td>长期 TTL 混合短期 TTL</td><td>❌ 不适用</td><td>TTL 与业务热度无关时退化</td></tr>
+      <tr><td>TTL 设置与业务无关</td><td>❌ 不适用</td><td>退化为 random</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s23-7">23.7 多部署模式</h2>
+<!-- ============================================================ -->
+
+<h3>23.7.1 不同模式下的淘汰行为</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 23-7-1 · 四种部署模式淘汰对照</div>
+  <table class="data-table">
+    <thead>
+      <tr><th>部署模式</th><th>淘汰执行者</th><th>复制行为</th><th>关键约束</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>单节点</td><td>主节点同步淘汰</td><td>无</td><td>lazyfree 减少阻塞</td></tr>
+      <tr><td>主从复制</td><td>仅主节点</td><td>主 → 从复制 DEL</td><td><code>replica-ignore-maxmemory yes</code></td></tr>
+      <tr><td>Sentinel</td><td>仅当前主节点</td><td>同主从</td><td>failover 后新主继承策略</td></tr>
+      <tr><td>Cluster</td><td>每个 master 独立</td><td>各自传播给本 shard 的 replica</td><td>各 master maxmemory 必须一致</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>23.7.2 主从淘汰的传播</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 23-7-2 · Master 淘汰复制到 Replica</div>
+  <svg viewBox="0 0 940 360" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="360" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="40"  y="14" width="220" height="34" rx="6" fill="url(#d-blue)"/>
+      <text x="150" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Client</text>
+
+      <rect x="340" y="14" width="260" height="34" rx="6" fill="url(#d-purple)"/>
+      <text x="470" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Master(执行淘汰)</text>
+
+      <rect x="680" y="14" width="220" height="34" rx="6" fill="url(#d-green)"/>
+      <text x="790" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Replica(被动接收)</text>
+
+      <line x1="150" y1="48" x2="150" y2="340" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="470" y1="48" x2="470" y2="340" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="790" y1="48" x2="790" y2="340" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+
+      <line x1="150" y1="74" x2="470" y2="74" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#d-arr-b)"/>
+      <text x="310" y="68" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">SET k v</text>
+
+      <rect x="320" y="84" width="300" height="50" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="470" y="104" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="700">used_memory &gt; maxmemory</text>
+      <text x="470" y="120" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">processCommand 前置检查触发淘汰</text>
+
+      <line x1="470" y1="142" x2="470" y2="162" stroke="var(--diagram-purple-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+      <rect x="380" y="162" width="180" height="30" rx="4" fill="url(#d-purple)"/>
+      <text x="470" y="182" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="700">performEvictions()</text>
+
+      <line x1="470" y1="192" x2="470" y2="212" stroke="var(--diagram-purple-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+      <rect x="380" y="212" width="180" height="30" rx="4" fill="url(#d-orange)"/>
+      <text x="470" y="232" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="700">dbDelete(victim_key)</text>
+
+      <line x1="470" y1="252" x2="790" y2="252" stroke="var(--diagram-red-stroke)" stroke-width="1.5" marker-end="url(#d-arr-r)"/>
+      <text x="630" y="246" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10" font-weight="700">DEL victim_key(复制流)</text>
+
+      <rect x="700" y="262" width="180" height="30" rx="4" fill="url(#d-green)"/>
+      <text x="790" y="282" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="700">dbDelete(本地 key)</text>
+
+      <line x1="470" y1="312" x2="150" y2="312" stroke="var(--diagram-green-stroke)" stroke-width="1.5" marker-end="url(#d-arr-g)"/>
+      <text x="310" y="306" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">+OK</text>
+
+      <text x="20" y="346" fill="var(--diagram-muted)" font-size="9">★ 必须 replica-ignore-maxmemory yes(默认),否则 replica 也会自己淘汰,导致主从数据不一致</text>
+    </g>
+  </svg>
+</div>
+
+<pre class="ascii-art"><code>主从淘汰的关键约束:
+
+  replica-ignore-maxmemory: yes (默认)
+    Replica 忽略本地 maxmemory 配置
+    不独立执行淘汰
+    完全依赖主节点淘汰后通过 DEL 复制
+  
+  replica-ignore-maxmemory: no
+    Replica 也独立执行淘汰
+    可能导致主从数据不一致
+    生产环境不推荐
+
+陷阱:
+  Replica 复制流有延迟,Replica 内存可能短暂高于 Master
+  复制流积压时,Replica 内存可能超过物理内存
+  → 需要为 Replica 设置系统级 cgroup 内存限制</code></pre>
+
+<h3>23.7.3 Cluster 各 master 独立淘汰的风险</h3>
+
+<pre class="ascii-art"><code>风险场景: maxmemory 配置不一致
+
+  shard A master: maxmemory 4 GB, 当前 used 3.5 GB
+  shard B master: maxmemory 2 GB, 当前 used 1.9 GB
+  
+  写入分布: 30% 进入 shard A, 70% 进入 shard B (slot 倾斜)
+  
+  结果:
+    shard B 先达到 maxmemory,触发淘汰
+    shard A 仍有 0.5 GB 空闲
+    业务热数据在 shard B 被淘汰,
+    但 shard A 上较冷的 key 未被淘汰
+    总命中率下降
+
+修复:
+  cluster-maxmemory: 统一所有 master 的 maxmemory
+  redis-cli --cluster call $ENTRY CONFIG SET maxmemory 4gb
+  
+  slot 分布检查:
+    redis-cli --cluster check
+    redis-cli CLUSTER COUNTKEYSINSLOT
+    
+  rebalance 不均时:
+    redis-cli --cluster rebalance</code></pre>
+
+<div class="real-world">
+  <strong>真实事故:</strong> 某社交平台扩容时新加 2 个 master 节点,运维忘记同步 <code>maxmemory</code> 配置(新节点默认 0,即无限制)。一个月后老节点频繁淘汰、命中率从 95% 跌到 78%,但新节点内存增长到接近物理上限。排查发现 <code>redis-cli --cluster call</code> 显示新老节点 maxmemory 不一致。修复后命中率回升,后续将 <code>maxmemory</code> 检查加入 cluster 健康检查脚本。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s23-8">23.8 性能与基线</h2>
+<!-- ============================================================ -->
+
+<h3>23.8.1 命中率基线 (Zipfian α=1.0)</h3>
+
+<pre class="ascii-art"><code>基准: 100,000 keys, maxmemory 容纳 50,000 keys (50%)
+负载: 1,000,000 GET 请求, Zipfian α=1.0
+maxmemory-samples: 10
+
+  策略             命中率      相对 Bélády
+  ──────────────  ─────────  ────────────
+  Bélády (理论)    95.2%      100.0%
+  allkeys-lfu      92.8%      97.5%
+  volatile-lfu     91.6%      96.2%
+  allkeys-lru      89.5%      94.0%
+  volatile-lru     88.2%      92.6%
+  volatile-ttl     82.4%      86.6%
+  allkeys-random   75.3%      79.1%
+  volatile-random  74.1%      77.8%
+
+观察:
+  LFU 在 Zipfian 下显著优于 LRU (3-4 个百分点)
+  random 是基线,所有智能策略至少应优于 random
+  volatile-* 比 allkeys-* 略低,因候选集受限</code></pre>
+
+<h3>23.8.2 maxmemory-samples 对命中率的影响</h3>
+
+<pre class="ascii-art"><code>策略: allkeys-lru, 其他条件同上
+
+  samples   命中率    每次淘汰 CPU 开销   推荐
+  ───────  ───────  ─────────────────  ──────────
+  1         71.2%    最低                极差,不推荐
+  3         83.6%    低                  低配可考虑
+  5         86.8%    中                  旧默认
+  10        89.5%    中-高               新默认,推荐
+  20        90.8%    较高                边际收益小
+  50        91.5%    高                  接近精确 LRU,代价大
+  精确 LRU  92.1%    持续维护链表        理论上限
+
+观察:
+  samples = 10 已达精确 LRU 命中率的 97.2%
+  从 10 提升到 50 仅获得 2% 命中率,但 CPU 显著增加
+  生产推荐保持默认值 10</code></pre>
+
+<h3>23.8.3 核心观测指标</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 23-8-3 · 淘汰可观测性核心指标</div>
+  <table class="data-table">
+    <thead>
+      <tr><th>指标</th><th>来源</th><th>含义</th><th>异常阈值</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>used_memory</code></td><td>INFO memory</td><td>当前 keyspace 内存占用</td><td>接近 maxmemory 告警</td></tr>
+      <tr><td><code>maxmemory</code></td><td>INFO memory</td><td>配置上限</td><td>—</td></tr>
+      <tr><td><code>mem_fragmentation_ratio</code></td><td>INFO memory</td><td>RSS / used_memory</td><td>&gt; 1.5 调查碎片</td></tr>
+      <tr><td><code>evicted_keys</code></td><td>INFO stats</td><td>累计淘汰 key 数</td><td>单位时间增量监控</td></tr>
+      <tr><td><code>keyspace_hits</code></td><td>INFO stats</td><td>累计命中数</td><td>与 misses 计算命中率</td></tr>
+      <tr><td><code>keyspace_misses</code></td><td>INFO stats</td><td>累计未命中数</td><td>—</td></tr>
+      <tr><td><code>OBJECT FREQ</code></td><td>LFU 模式</td><td>单 key 的 logc</td><td>抽样验证热点识别</td></tr>
+      <tr><td><code>OBJECT IDLETIME</code></td><td>LRU 模式</td><td>单 key 的 idle 秒数</td><td>抽样验证冷数据</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>23.8.4 PromQL 监控示例</h3>
+
+<pre><code class="language-yaml"># 命中率
+- record: redis:hit_ratio
+  expr: |
+    rate(redis_keyspace_hits_total[5m])
+    / (rate(redis_keyspace_hits_total[5m]) + rate(redis_keyspace_misses_total[5m]))
+
+# 淘汰速率 (keys/sec)
+- record: redis:eviction_rate
+  expr: rate(redis_evicted_keys_total[5m])
+
+# 内存压力百分比
+- record: redis:memory_pressure
+  expr: redis_memory_used_bytes / redis_config_maxmemory
+
+# 告警: 持续高淘汰
+- alert: RedisHighEviction
+  expr: rate(redis_evicted_keys_total[5m]) &gt; 1000
+  for: 10m
+  annotations:
+    summary: "Redis 持续淘汰 > 1000 keys/s (instance={{ $labels.instance }})"
+
+# 告警: 命中率跌破阈值
+- alert: RedisLowHitRatio
+  expr: redis:hit_ratio &lt; 0.85
+  for: 15m
+  annotations:
+    summary: "Redis 命中率 &lt; 85% (instance={{ $labels.instance }})"</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s23-9">23.9 陷阱与限制</h2>
+<!-- ============================================================ -->
+
+<h3>23.9.1 陷阱分类</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 23-9-1 · 四类淘汰陷阱</div>
+  <svg viewBox="0 0 940 470" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="470" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="370" y="14" width="200" height="44" rx="10" fill="url(#d-red)" filter="url(#d-shadow)"/>
+      <text x="470" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="800">淘汰陷阱</text>
+      <text x="470" y="52" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">8 类生产事故根因</text>
+
+      <line x1="430" y1="58" x2="120" y2="100" stroke="var(--diagram-border)"/>
+      <line x1="450" y1="58" x2="370" y2="100" stroke="var(--diagram-border)"/>
+      <line x1="490" y1="58" x2="600" y2="100" stroke="var(--diagram-border)"/>
+      <line x1="510" y1="58" x2="820" y2="100" stroke="var(--diagram-border)"/>
+
+      <rect x="20"  y="100" width="200" height="40" rx="6" fill="url(#d-orange)"/>
+      <text x="120" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">A 配置类</text>
+      <rect x="270" y="100" width="200" height="40" rx="6" fill="url(#d-purple)"/>
+      <text x="370" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">B 语义类</text>
+      <rect x="500" y="100" width="200" height="40" rx="6" fill="url(#d-blue)"/>
+      <text x="600" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">C 性能类</text>
+      <rect x="720" y="100" width="200" height="40" rx="6" fill="url(#d-green)"/>
+      <text x="820" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">D 分布式类</text>
+
+      <g font-size="10" fill="var(--diagram-blue-text)">
+        <rect x="20"  y="150" width="200" height="180" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+        <text x="32" y="170" fill="var(--diagram-orange-text)" font-weight="700">A1 未配 policy</text>
+        <text x="32" y="186" fill="var(--diagram-muted)" font-size="9">默认 noeviction → OOM</text>
+        <text x="32" y="208" fill="var(--diagram-orange-text)" font-weight="700">A2 maxmemory=0</text>
+        <text x="32" y="224" fill="var(--diagram-muted)" font-size="9">淘汰禁用 + 内存无限</text>
+        <text x="32" y="246" fill="var(--diagram-orange-text)" font-weight="700">A3 samples=1</text>
+        <text x="32" y="262" fill="var(--diagram-muted)" font-size="9">命中率塌方 → 频繁淘汰错 key</text>
+        <text x="32" y="290" fill="var(--diagram-red-text)" font-size="9" font-weight="700">→ INFO stats:</text>
+        <text x="32" y="306" fill="var(--diagram-red-text)" font-size="9">evicted_keys 持续 0</text>
+        <text x="32" y="320" fill="var(--diagram-red-text)" font-size="9">或 keyspace_misses 飙升</text>
+
+        <rect x="270" y="150" width="200" height="180" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+        <text x="282" y="170" fill="var(--diagram-purple-text)" font-weight="700">B1 volatile-* 无 TTL</text>
+        <text x="282" y="186" fill="var(--diagram-muted)" font-size="9">退化 noeviction</text>
+        <text x="282" y="208" fill="var(--diagram-purple-text)" font-weight="700">B2 DB 角色配 allkeys-*</text>
+        <text x="282" y="224" fill="var(--diagram-muted)" font-size="9">静默丢主数据(最严重)</text>
+        <text x="282" y="290" fill="var(--diagram-red-text)" font-size="9" font-weight="700">→ 检查:</text>
+        <text x="282" y="306" fill="var(--diagram-red-text)" font-size="9">INFO keyspace 看 expires 比例</text>
+        <text x="282" y="320" fill="var(--diagram-red-text)" font-size="9">业务对账 vs evicted_keys</text>
+
+        <rect x="500" y="150" width="200" height="180" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+        <text x="512" y="170" fill="var(--diagram-blue-text)" font-weight="700">C1 大 key 阻塞主线程</text>
+        <text x="512" y="186" fill="var(--diagram-muted)" font-size="9">lazyfree 未开</text>
+        <text x="512" y="208" fill="var(--diagram-blue-text)" font-weight="700">C2 maxmemory 接近 OS</text>
+        <text x="512" y="224" fill="var(--diagram-muted)" font-size="9">fork BGSAVE 时 OOM Kill</text>
+        <text x="512" y="246" fill="var(--diagram-blue-text)" font-weight="700">C3 samples 设过大</text>
+        <text x="512" y="262" fill="var(--diagram-muted)" font-size="9">单次淘汰 CPU 飙</text>
+        <text x="512" y="290" fill="var(--diagram-red-text)" font-size="9" font-weight="700">→ 监控:</text>
+        <text x="512" y="306" fill="var(--diagram-red-text)" font-size="9">latency / latest_fork_usec</text>
+        <text x="512" y="320" fill="var(--diagram-red-text)" font-size="9">mem_fragmentation_ratio</text>
+
+        <rect x="720" y="150" width="200" height="180" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="732" y="170" fill="var(--diagram-green-text)" font-weight="700">D1 Cluster maxmem 不一致</text>
+        <text x="732" y="186" fill="var(--diagram-muted)" font-size="9">部分 shard 频繁淘汰</text>
+        <text x="732" y="208" fill="var(--diagram-green-text)" font-weight="700">D2 Replica 内存超主</text>
+        <text x="732" y="224" fill="var(--diagram-muted)" font-size="9">replica-ignore-maxmem 默认</text>
+        <text x="732" y="246" fill="var(--diagram-green-text)" font-weight="700">D3 failover 后策略未同步</text>
+        <text x="732" y="262" fill="var(--diagram-muted)" font-size="9">新主继承自己的旧配置</text>
+        <text x="732" y="290" fill="var(--diagram-red-text)" font-size="9" font-weight="700">→ 工具:</text>
+        <text x="732" y="306" fill="var(--diagram-red-text)" font-size="9">redis-cli --cluster call</text>
+        <text x="732" y="320" fill="var(--diagram-red-text)" font-size="9">每节点 INFO 比对</text>
+      </g>
+
+      <rect x="20" y="350" width="900" height="100" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="40" y="372" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">陷阱速查 · 高频排查路径</text>
+      <text x="40" y="394" fill="var(--diagram-green-text)" font-size="10">缓存命中率塌方</text>
+      <text x="200" y="394" fill="var(--diagram-blue-text)" font-size="10">→ 检查 maxmemory-samples 是否被改小</text>
+
+      <text x="40" y="412" fill="var(--diagram-orange-text)" font-size="10">写命令大量 OOM</text>
+      <text x="200" y="412" fill="var(--diagram-blue-text)" font-size="10">→ 检查 policy 是否 noeviction / volatile-* 候选集是否为空</text>
+
+      <text x="40" y="430" fill="var(--diagram-red-text)" font-size="10">P99 写延迟尖刺</text>
+      <text x="200" y="430" fill="var(--diagram-blue-text)" font-size="10">→ 检查 lazyfree-lazy-eviction 是否 yes,有无大 key</text>
+
+      <text x="40" y="448" fill="var(--diagram-purple-text)" font-size="10">主进程被 OOM Killed</text>
+      <text x="200" y="448" fill="var(--diagram-blue-text)" font-size="10">→ maxmemory ≥ 80% 物理内存 + fork 期间 CoW</text>
+    </g>
+  </svg>
+</div>
+
+<h3>23.9.2 陷阱速查表</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 23-9-2 · 八类陷阱完整对照</div>
+  <table class="data-table">
+    <thead>
+      <tr><th>#</th><th>陷阱</th><th>症状</th><th>根因</th><th>修复</th><th>监控指标</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1</td><td>noeviction 默认</td><td>写命令报 OOM,读正常</td><td>未配置 maxmemory-policy</td><td><code>CONFIG SET maxmemory-policy allkeys-lfu</code></td><td><code>evicted_keys</code> 持续 0</td></tr>
+      <tr><td>2</td><td>volatile-* 无 TTL</td><td>看似配了淘汰但仍 OOM</td><td>db-&gt;expires 为空</td><td>改 allkeys-* 或统一加 EX</td><td>TTL 抽样</td></tr>
+      <tr><td>3</td><td>数据库实例配 allkeys-*</td><td>主数据被静默淘汰</td><td>角色识别错误</td><td>改回 noeviction</td><td>业务对账</td></tr>
+      <tr><td>4</td><td>maxmemory-samples=1</td><td>命中率暴跌</td><td>误改配置</td><td>改回 10</td><td>命中率监控</td></tr>
+      <tr><td>5</td><td>大 key 淘汰阻塞</td><td>写延迟 P99 尖刺</td><td>lazyfree 未开</td><td><code>CONFIG SET lazyfree-lazy-eviction yes</code></td><td>latest_fork / latency</td></tr>
+      <tr><td>6</td><td>maxmemory 过高</td><td>fork 时 OOM Kill</td><td>maxmemory ≥ 物理内存 80%</td><td>调低至 60-70%</td><td>mem_fragmentation_ratio</td></tr>
+      <tr><td>7</td><td>Cluster 配置不一致</td><td>部分 shard 频繁淘汰</td><td>各 master 独立配</td><td>统一通过 cluster call</td><td>各 shard evicted_keys</td></tr>
+      <tr><td>8</td><td>Replica 内存超主</td><td>Replica OOM</td><td>replica-ignore-maxmemory 默认 yes</td><td>cgroup 限制 + 监控</td><td>Replica used_memory</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>23.9.3 反模式与修复对比</h3>
+
+<div class="compare-grid">
+  <div class="compare-card bad">
+    <h4>❌ 反模式 · volatile-lru + 无 TTL</h4>
+<pre><code class="language-bash"># 配置看似启用了淘汰
+CONFIG SET maxmemory 4gb
+CONFIG SET maxmemory-policy volatile-lru
+
+# 但所有业务 key 都未设 TTL
+SET user:1 "..."         # 无 EXPIRE
+SET session:1 "..."      # 无 EXPIRE
+SET cache:1 "..."        # 无 EXPIRE
+
+# 内存达上限后写入失败
+SET new:1 "..."
+# (error) OOM command not allowed when used memory &gt; 'maxmemory'</code></pre>
+    <p>db-&gt;expires 为空,volatile-* 等价于 noeviction。所有"看起来配置了 LRU 淘汰"的实例,实际仍是 noeviction 行为。</p>
+  </div>
+  <div class="compare-card good">
+    <h4>✅ 正确做法 · allkeys-lfu</h4>
+<pre><code class="language-bash"># 缓存角色用 allkeys-lfu,不依赖 TTL
+CONFIG SET maxmemory 4gb
+CONFIG SET maxmemory-policy allkeys-lfu
+CONFIG SET maxmemory-samples 10
+CONFIG SET lazyfree-lazy-eviction yes
+
+# 业务 key 可以不设 TTL
+SET user:1 "..."
+SET session:1 "..."  # 可选:加 EXPIRE 加速淘汰冷数据
+
+# 内存达上限自动淘汰 logc 最低的 key
+SET new:1 "..."      # 触发淘汰,新 key 写入成功</code></pre>
+    <p>缓存角色优先 <code>allkeys-lfu</code>,不依赖业务给所有 key 加 TTL;同时开启 lazyfree 避免大 key 淘汰阻塞主线程。</p>
+  </div>
+</div>
+
+<h3>23.9.4 lazyfree 对淘汰的影响</h3>
+
+<pre class="ascii-art"><code>lazyfree-lazy-eviction yes:
+  
+  performEvictions 调用 dbAsyncDelete
+  ┌───────────────────────────────┐
+  │ dbAsyncDelete                 │
+  │   1. 主线程移除 key 索引       │  
+  │   2. 估算 value 大小           │
+  │   3. value 大 → 提交 bio 线程  │  ← 异步释放
+  │      value 小 → 主线程释放    │
+  └───────────────────────────────┘
+  主线程仅承担索引移除 O(1)
+  bio 线程异步释放数据结构内存
+
+lazyfree-lazy-eviction no:
+  
+  performEvictions 调用 dbSyncDelete
+  ┌───────────────────────────────┐
+  │ dbSyncDelete                  │
+  │   1. 主线程移除 key 索引       │  
+  │   2. 主线程递归释放 value      │  ← 同步释放
+  │      list/hash/set/zset 全遍历 │
+  └───────────────────────────────┘
+  大 hash/set/zset 淘汰可能阻塞主线程数十毫秒</code></pre>
+
+<div class="key-insight">
+  <strong>生产强烈推荐:</strong> <code>lazyfree-lazy-eviction yes</code> 是生产环境的强烈推荐配置。淘汰 1 GB hash 时同步释放可能阻塞主线程 <strong>100 ms+</strong>,异步释放仅占用主线程 O(1) 索引移除时间。该配置在 §24 lazyfree 章详细分析。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s23-10">23.10 源码深潜</h2>
+<!-- ============================================================ -->
+
+<h3>23.10.1 淘汰相关源码组织</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 23-10-1 · 调用链总览</div>
+  <svg viewBox="0 0 940 580" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="580" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="320" y="14" width="300" height="40" rx="6" fill="url(#d-blue)" filter="url(#d-shadow)"/>
+      <text x="470" y="32" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">src/server.c · processCommand</text>
+      <text x="470" y="48" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">所有客户端写命令的入口</text>
+
+      <line x1="470" y1="54" x2="470" y2="74" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <rect x="320" y="74" width="300" height="34" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="470" y="96" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">前置检查 maxmemory ≠ 0 &amp;&amp; !isReplica</text>
+
+      <line x1="470" y1="108" x2="470" y2="128" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <rect x="280" y="128" width="380" height="40" rx="6" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="470" y="146" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">src/evict.c · performEvictions()</text>
+      <text x="470" y="162" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">入口:循环至 used_memory ≤ maxmemory 或 EVICT_FAIL</text>
+
+      <line x1="470" y1="168" x2="470" y2="188" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <rect x="280" y="188" width="380" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="470" y="208" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">while mem_tofree &gt; 0 主循环</text>
+
+      <line x1="470" y1="220" x2="470" y2="240" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <rect x="280" y="240" width="380" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="470" y="260" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">选择候选集:db-&gt;dict / db-&gt;expires</text>
+
+      <line x1="470" y1="272" x2="470" y2="292" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <rect x="280" y="292" width="380" height="32" rx="6" fill="url(#d-orange)"/>
+      <text x="470" y="312" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="700">evictionPoolPopulate(sampledict)</text>
+
+      <line x1="280" y1="308" x2="220" y2="308" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)" stroke-dasharray="4,2"/>
+      <rect x="40" y="290" width="180" height="34" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="130" y="310" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">dictGetSomeKeys</text>
+
+      <line x1="660" y1="308" x2="720" y2="308" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)" stroke-dasharray="4,2"/>
+      <rect x="720" y="290" width="180" height="34" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="810" y="310" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">计算 idle + 插入</text>
+
+      <line x1="470" y1="324" x2="470" y2="344" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <rect x="280" y="344" width="380" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="470" y="364" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">从槽 15 取 bestkey · pool[15].key</text>
+
+      <line x1="470" y1="376" x2="470" y2="396" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <polygon points="350,396 590,396 620,424 590,452 350,452 320,424" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="1.5"/>
+      <text x="470" y="422" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="800">lazyfree-lazy-eviction ?</text>
+
+      <path d="M320,424 L 200,470" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr)"/>
+      <text x="220" y="450" fill="var(--diagram-orange-text)" font-size="9" font-weight="700">no(默认)</text>
+
+      <path d="M620,424 L 740,470" stroke="var(--diagram-green-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="700" y="450" fill="var(--diagram-green-text)" font-size="9" font-weight="700">yes</text>
+
+      <rect x="80" y="470" width="240" height="40" rx="6" fill="url(#d-orange)"/>
+      <text x="200" y="490" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">src/db.c · dbSyncDelete</text>
+      <text x="200" y="506" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">主线程释放(可能阻塞)</text>
+
+      <rect x="620" y="470" width="240" height="40" rx="6" fill="url(#d-green)"/>
+      <text x="740" y="490" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">src/lazyfree.c · dbAsyncDelete</text>
+      <text x="740" y="506" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">主线程 unlink + bio 异步释放</text>
+
+      <line x1="200" y1="510" x2="380" y2="540" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+      <line x1="740" y1="510" x2="560" y2="540" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <rect x="320" y="540" width="300" height="32" rx="6" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="470" y="562" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">server.stat_evictedkeys++ → INFO stats</text>
+    </g>
+  </svg>
+</div>
+
+<h3>23.10.2 核心源码入口</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 23-10-2 · 关键函数与职责</div>
+  <table class="data-table">
+    <thead>
+      <tr><th>文件</th><th>关键函数/结构</th><th>运行时职责</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>src/evict.c</code></td><td><code>performEvictions()</code></td><td>淘汰主循环,前置检查触发</td></tr>
+      <tr><td><code>src/evict.c</code></td><td><code>evictionPoolPopulate()</code></td><td>采样填充淘汰池</td></tr>
+      <tr><td><code>src/evict.c</code></td><td><code>EvictionPoolLRU</code></td><td>16 槽淘汰池全局变量</td></tr>
+      <tr><td><code>src/evict.c</code></td><td><code>LRU_CLOCK()</code> / <code>getLRUClock()</code></td><td>LRU 时钟读取</td></tr>
+      <tr><td><code>src/evict.c</code></td><td><code>LFULogIncr()</code> / <code>LFUDecrAndReturn()</code></td><td>LFU 概率递增与衰减</td></tr>
+      <tr><td><code>src/evict.c</code></td><td><code>estimateObjectIdleTime()</code></td><td>计算 LRU idle</td></tr>
+      <tr><td><code>src/object.c</code></td><td><code>lookupKey()</code></td><td>key 访问时更新 lru 字段</td></tr>
+      <tr><td><code>src/server.c</code></td><td><code>processCommand()</code></td><td>写命令前置淘汰检查</td></tr>
+      <tr><td><code>src/db.c</code></td><td><code>dbSyncDelete()</code> / <code>dbAsyncDelete()</code></td><td>同步/异步删除</td></tr>
+      <tr><td><code>src/lazyfree.c</code></td><td><code>lazyfreeFreeObject()</code></td><td>bio 线程异步释放</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>23.10.3 lookupKey 访问时更新元数据</h3>
+
+<pre><code class="language-c">/* src/object.c: 访问 key 时更新 LRU/LFU 元数据 */
+robj *lookupKey(redisDb *db, robj *key, int flags) {
+    dictEntry *de = dictFind(db-&gt;dict, key-&gt;ptr);
+    if (de) {
+        robj *val = dictGetVal(de);
+
+        if (server.maxmemory_policy &amp; MAXMEMORY_FLAG_LFU) {
+            updateLFU(val);
+        } else {
+            val-&gt;lru = LRU_CLOCK();
+        }
+        return val;
+    }
+    return NULL;
+}
+
+void updateLFU(robj *val) {
+    unsigned long counter = LFUDecrAndReturn(val);
+    counter = LFULogIncr(counter);
+    val-&gt;lru = (LFUGetTimeInMinutes() &lt;&lt; 8) | counter;
+}</code></pre>
+
+<h3>23.10.4 淘汰池插入</h3>
+
+<pre><code class="language-c">/* src/evict.c: 淘汰池插入 */
+void evictionPoolPopulate(int dbid, dict *sampledict, dict *keydict,
+                          struct evictionPoolEntry *pool) {
+    int j, k, count;
+    dictEntry *samples[server.maxmemory_samples];
+
+    count = dictGetSomeKeys(sampledict, samples, server.maxmemory_samples);
+
+    for (j = 0; j &lt; count; j++) {
+        unsigned long long idle;
+        sds key = dictGetKey(samples[j]);
+        robj *o = dictGetVal(samples[j]);
+
+        if (server.maxmemory_policy &amp; MAXMEMORY_FLAG_LRU) {
+            idle = estimateObjectIdleTime(o);
+        } else if (server.maxmemory_policy &amp; MAXMEMORY_FLAG_LFU) {
+            idle = 255 - LFUDecrAndReturn(o);
+        } else if (server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL) {
+            idle = ULLONG_MAX - (long)dictGetVal(samples[j]);
+        }
+
+        /* 二分查找插入位置 */
+        k = 0;
+        while (k &lt; EVPOOL_SIZE &amp;&amp; pool[k].key &amp;&amp; pool[k].idle &lt; idle) k++;
+        if (k == 0 &amp;&amp; pool[EVPOOL_SIZE - 1].key != NULL) continue;
+        else if (k &lt; EVPOOL_SIZE &amp;&amp; pool[k].key == NULL) {
+            /* 插入空槽 */
+        } else {
+            /* 移位插入 */
+        }
+        pool[k].key = sdsdup(key);
+        pool[k].idle = idle;
+        pool[k].dbid = dbid;
+    }
+}</code></pre>
+
+<h3>23.10.5 设计取舍</h3>
+
+<p>Redis 选择采样近似而非精确 LRU/LFU 的根本原因是<strong>元数据成本</strong>。精确 LRU 需要每 key 16 字节链表指针,千万级 key 累积 152 MB,且每次访问需链表移动维护。采样近似将元数据压缩到 24 bits 嵌入 robj,访问维护成本 O(1) 时间戳更新,淘汰成本 O(s) 采样,代价是命中率较精确算法低约 3-5%。在内存数据库语境下,该取舍是显著正向收益:节省的内存可多存数百万 key。</p>
+
+<p>24-bit lru 字段复用为 LRU 时钟或 LFU(ldt + logc)的设计目标是"<strong>零额外内存</strong>"。若每个 key 增加 8 字节计数器,千万级 key 累积 80 MB,与采样近似的内存收益相消。复用方案的代价是 LRU 与 LFU 不能同时启用,切换策略需要重新解读字段语义。</p>
+
+<p>淘汰池的 16 槽位是<strong>经验取舍</strong>。槽数过少则跨轮次累积效果弱,槽数过多则插入开销增加且淘汰收益边际递减。16 槽位在概率分析中已能将单轮 9.6% 命中率放大到 50 轮 99%+,继续扩容收益不显著。</p>
+
+<!-- ============================================================ -->
+<h2 id="s23-summary">23.11 本章要点</h2>
+<!-- ============================================================ -->
+
+<div class="chapter-summary">
+  <table class="data-table">
+    <thead>
+      <tr><th>#</th><th>要点</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1</td><td>淘汰由 <code>processCommand</code> 在写命令前置检查触发,<strong>同步执行</strong>直至内存压回 maxmemory 或候选集耗尽</td></tr>
+      <tr><td>2</td><td>八种策略按"<strong>范围 (allkeys/volatile) × 算法 (lru/lfu/random/ttl/none)</strong>"二维组合,noeviction 是默认</td></tr>
+      <tr><td>3</td><td><code>volatile-*</code> 候选集为 <code>db-&gt;expires</code>,所有 key 无 TTL 时<strong>退化为 noeviction</strong>,生产最常见配置错误</td></tr>
+      <tr><td>4</td><td>数据库角色实例必须配 <code>noeviction</code>,缓存角色实例推荐 <code>allkeys-lfu</code>(Zipfian)或 <code>allkeys-lru</code>(均匀)</td></tr>
+      <tr><td>5</td><td>采样 + 16 槽淘汰池实现 <strong>O(1) 元数据 + O(s) 淘汰</strong>开销,跨轮次累积使命中率逼近精确算法</td></tr>
+      <tr><td>6</td><td><code>redisObject</code> 的 24-bit <code>lru</code> 字段在 LRU 模式存时间戳,LFU 模式分裂为 <strong>16-bit ldt + 8-bit logc</strong></td></tr>
+      <tr><td>7</td><td>LRU 时钟 24 bits <strong>秒级精度,回绕周期 194 天</strong>,实际场景无影响;LFU 分钟级 ldt 回绕周期 45 天</td></tr>
+      <tr><td>8</td><td>LFU 用 <strong>Morris 概率递增</strong>使 8-bit logc 表达 6 个数量级访问频率,衰减由 <code>lfu-decay-time</code> 控制</td></tr>
+      <tr><td>9</td><td><code>volatile-ttl</code> 是<strong>预测性淘汰</strong>,优先删除即将过期的 key,与过期删除机制独立</td></tr>
+      <tr><td>10</td><td>生产配置:<code>lazyfree-lazy-eviction yes</code>(避免大 key 阻塞)、<code>maxmemory-samples 10</code>(命中率甜蜜点)、Cluster 各 master maxmemory 一致</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>最小回归测试</h3>
+
+<pre><code class="language-bash">redis-cli CONFIG SET maxmemory 10mb
+redis-cli CONFIG SET maxmemory-policy allkeys-lfu
+redis-cli CONFIG SET maxmemory-samples 10
+redis-cli CONFIG SET lazyfree-lazy-eviction yes
+
+# 写入大量 key 触发淘汰
+for i in $(seq 1 100000); do redis-cli SET "key:$i" "$(head -c 200 /dev/urandom | base64)" &gt; /dev/null; done
+
+redis-cli INFO stats | grep -E "evicted_keys|keyspace_hits|keyspace_misses"
+redis-cli INFO memory | grep -E "used_memory|maxmemory|mem_fragmentation"
+
+# 验证 LFU 工作
+redis-cli SET hot:1 "..."
+for i in $(seq 1 1000); do redis-cli GET hot:1 &gt; /dev/null; done
+redis-cli OBJECT FREQ hot:1   # 期望: 高 logc 值,如 ~40-50</code></pre>
+
+<h3>章末总结</h3>
+
+<p>第 23 章淘汰策略与第 22 章 jemalloc、第 24 章 lazyfree 共同构成 Redis 内存管理的三层基础:</p>
+
+<ul>
+  <li><strong>第 22 章</strong>(jemalloc)解决"<strong>怎么分配</strong>":size class 量化、arena 隔离、tcache 线程缓存;</li>
+  <li><strong>第 23 章</strong>(淘汰策略)解决"<strong>什么时候删</strong>":maxmemory 触发、八种策略、采样近似;</li>
+  <li><strong>第 24 章</strong>(lazyfree)解决"<strong>怎么删才不阻塞</strong>":bio 异步释放、Active Defrag、大 key 治理。</li>
+</ul>
+
+<p>三章合并起来才是完整的 Redis 内存管理画面。理解这些机制后,运维 Redis 内存就从"经验试错"变成"看 <code>INFO</code> 指标 + 知道在哪个钮上调"。</p>
+
+<h3>下一章预告</h3>
+
+<p>第 24 章深入 <strong>lazyfree</strong> 异步释放与 <strong>Active Defragmentation</strong> 在线碎片整理。本章只是介绍了 <code>lazyfree-lazy-eviction</code> 的概念,下一章会展示 <code>DEL</code> vs <code>UNLINK</code> 的内部分流、<code>bio_lazy_free</code> 后台线程的工作机制、<code>LAZYFREE_THRESHOLD=64</code> 的判定逻辑,以及 Active Defrag 的 <code>je_get_defrag_hint</code> 与 cycle CPU 控制。</p>
+
+</div>
+
+<p class="footer">&copy; 2026 图解 Redis &middot; 第 23 章 &middot; 淘汰策略</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/c.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){setTimeout(function(){document.querySelectorAll('.diagram svg').forEach(function(svg){var h=parseInt(svg.getAttribute('height')||svg.getBoundingClientRect().height);if(h>500){svg.style.maxHeight='500px';svg.style.width='auto';var p=svg.closest('.diagram');if(p)p.style.overflowX='auto';}});},1500);});</script>
+</body>
+</html>

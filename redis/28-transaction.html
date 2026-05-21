@@ -1,0 +1,1972 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.28 事务 MULTI/EXEC — 图解 Redis</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="d-purple" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="var(--diagram-purple-fill-start)"/><stop offset="100%" stop-color="var(--diagram-purple-fill-end)"/></linearGradient>
+    <linearGradient id="d-blue" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="var(--diagram-blue-fill-start)"/><stop offset="100%" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <linearGradient id="d-green" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="var(--diagram-green-fill-start)"/><stop offset="100%" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <linearGradient id="d-orange" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="var(--diagram-orange-fill-start)"/><stop offset="100%" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+    <linearGradient id="d-red" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="var(--diagram-red-fill-start)"/><stop offset="100%" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+    <filter id="d-shadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="var(--diagram-text)" flood-opacity="0.4"/></filter>
+    <marker id="d-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-orange-stroke)"/></marker>
+    <marker id="d-arr-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-green-stroke)"/></marker>
+    <marker id="d-arr-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-red-stroke)"/></marker>
+    <marker id="d-arr-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-blue-stroke)"/></marker>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Redis</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="27-cluster.html">上一章</a>
+  <a href="29-lua.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s28-0">28.0 章首速览</a>
+  <a href="#s28-1">28.1 为什么需要事务</a>
+  <a href="#s28-2">28.2 四大核心命令</a>
+  <a href="#s28-3">28.3 事务执行流程</a>
+  <a href="#s28-4">28.4 WATCH 乐观锁</a>
+  <a href="#s28-5">28.5 不回滚:工程权衡</a>
+  <a href="#s28-6">28.6 ACID 分析</a>
+  <a href="#s28-7">28.7 多部署模式</a>
+  <a href="#s28-8">28.8 性能与基线</a>
+  <a href="#s28-9">28.9 陷阱与限制</a>
+  <a href="#s28-10">28.10 源码深潜</a>
+  <a href="#s28-summary">28.11 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 28 章 · 事务 MULTI/EXEC</h1>
+<p class="subtitle">MULTI / EXEC / DISCARD / WATCH 四件套 · 单线程串行执行 · CLIENT_MULTI 与 multiState 队列 · CAS 乐观锁与 signalModifiedKey 钩子 · 不回滚的工程取舍 · ACID 满足度分析 · Cluster 单 slot 约束</p>
+
+<div class="chapter-intro">
+  <p class="lead">Redis 事务的语义边界与传统 RDBMS 事务存在<strong>显著差异</strong>。Redis 通过 <code>MULTI / EXEC / DISCARD / WATCH</code> 四个命令提供"<strong>批量提交 + 串行执行 + 乐观锁</strong>"语义,但<strong>不提供 ACID 中的回滚特性</strong>。理解 Redis 事务的关键是识别这一边界:Redis 事务的"原子性"指 EXEC 期间命令不被其他客户端命令插入,而非"全部成功或全部回滚"。</p>
+  <p>该设计选择源于<strong>单线程命令模型</strong>的内在简洁性。在单线程模型下,EXEC 阶段的所有命令在一次 <code>processCommand()</code> 调用栈内顺序完成,事件循环不返回,因此事务隔离级别天然达到 <strong>SERIALIZABLE</strong>。实现回滚则需要 undo log 或 snapshot,在单线程模型中显著增加复杂度与延迟,违背 Redis "极简高性能"的核心原则。WATCH 提供乐观锁(OCC)语义,允许客户端在 EXEC 前检测被监视 key 的修改 — 该机制利用现有写命令路径上的 <code>signalModifiedKey()</code> 钩子,无需引入额外锁结构,开销仅为单次哈希查找加链表遍历。</p>
+  <p>本章按"<strong>语义模型 → 四个命令 → WATCH 机制 → 不回滚的工程权衡 → ACID 分析 → 部署适配 → 陷阱</strong>"组织,强调事务的边界条件与生产可观测性。</p>
+  <ul class="will-learn">
+    <li>"读-计算-写"竞争条件下数据丢失的具体路径,以及 WATCH 如何用 CAS 解决</li>
+    <li><code>MULTI</code> 仅设置 <code>CLIENT_MULTI</code> flag、不创建任何数据结构的实现细节</li>
+    <li><code>multiCmd / multiState</code> 队列结构与入队期间的 robj 引用计数管理</li>
+    <li><code>EXEC</code> 在主线程 <code>processCommand</code> 调用栈内不返回事件循环的 SERIALIZABLE 证明</li>
+    <li>入队语法错误(<code>CLIENT_DIRTY_EXEC</code>)与执行类型错误的两种处理路径区别</li>
+    <li><code>DISCARD</code> 清理 multiState、解除 WATCH、清除 flag 的完整资源回收</li>
+    <li><code>watched_keys</code> 字典与 <code>signalModifiedKey</code> 钩子链的零成本设计</li>
+    <li>WATCH 的边界条件:TTL 过期、淘汰、相同 value 写回是否触发 DIRTY_CAS</li>
+    <li>Antirez 设计依据下的"不回滚"工程权衡及 Lua 替代方案</li>
+    <li>Redis 事务的 ACID 满足度逐项分析与与 PostgreSQL SSI 的对比</li>
+    <li>主从复制流中 MULTI...EXEC 整块传播、Cluster 单 slot 强制约束、hash tag 粒度选择</li>
+    <li>事务 vs Pipeline vs Lua 的吞吐基准、命令耗时分布、生产监控指标</li>
+    <li>八类典型陷阱及客户端处理模板:WATCH 重试、reply 数组逐项检查、退避策略</li>
+  </ul>
+  <p class="prereq">前置知识:第 5 章 单线程命令模型(理解 <code>processCommand</code> 与事件循环关系);第 19 章 复制(理解写命令传播链);第 21 章 Cluster(理解 slot 路由与 hash tag);第 27 章 Cluster 进阶(理解 CROSSSLOT 错误)。下一章 §29 Lua 脚本,将讨论"基于读结果决策"场景下事务的能力扩展。读者最好亲手在 redis-cli 上跑过 <code>MULTI / GET / SET / EXEC</code>,并观察过 <code>(TX)</code> 提示符的切换。</p>
+</div>
+
+<h3>本章全景图</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-0 · 本章导览 — 4 大模块 11 节</div>
+  <svg viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="460" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="370" y="20" width="200" height="50" rx="10" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="470" y="42" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="800">事务 MULTI/EXEC</text>
+      <text x="470" y="60" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">第 28 章 · 4 大模块 11 节</text>
+
+      <line x1="430" y1="70" x2="160" y2="110" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+      <line x1="450" y1="70" x2="380" y2="110" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+      <line x1="490" y1="70" x2="600" y2="110" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+      <line x1="510" y1="70" x2="820" y2="110" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="20" y="110" width="280" height="44" rx="8" fill="url(#d-blue)"/>
+      <text x="160" y="132" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">§28.1 必要性</text>
+      <text x="160" y="146" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">问题 = 读-计算-写竞争</text>
+
+      <rect x="320" y="110" width="240" height="44" rx="8" fill="url(#d-green)"/>
+      <text x="440" y="132" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">§28.2-28.3 命令与流程</text>
+      <text x="440" y="146" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">命令、入队、EXEC</text>
+
+      <rect x="580" y="110" width="160" height="44" rx="8" fill="url(#d-orange)"/>
+      <text x="660" y="132" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">§28.4-28.5 CAS</text>
+      <text x="660" y="146" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">WATCH+不回滚</text>
+
+      <rect x="760" y="110" width="160" height="44" rx="8" fill="url(#d-red)"/>
+      <text x="840" y="132" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">§28.6-28.11 工程</text>
+      <text x="840" y="146" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">ACID/部署/陷阱</text>
+
+      <line x1="160" y1="154" x2="160" y2="180" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <line x1="440" y1="154" x2="380" y2="180" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <line x1="440" y1="154" x2="500" y2="180" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <line x1="660" y1="154" x2="620" y2="180" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+      <line x1="660" y1="154" x2="700" y2="180" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="60" y="180" width="200" height="36" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="160" y="202" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">§28.1 读-计算-写竞争</text>
+
+      <rect x="300" y="180" width="170" height="36" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="385" y="202" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">§28.2 四件套命令</text>
+
+      <rect x="475" y="180" width="170" height="36" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="560" y="202" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">§28.3 状态机+(TX)</text>
+
+      <rect x="660" y="180" width="80" height="36" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="700" y="202" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">§28.4 WATCH</text>
+
+      <rect x="745" y="180" width="80" height="36" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="785" y="202" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">§28.5 不回滚</text>
+
+      <line x1="840" y1="154" x2="840" y2="240" stroke="var(--diagram-red-stroke)" marker-end="url(#d-arr-r)"/>
+
+      <rect x="40" y="240" width="880" height="200" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="60" y="266" fill="var(--diagram-red-text)" font-size="13" font-weight="800">★ §28.6-28.11 · 工程视角(细节)</text>
+      <rect x="60" y="280" width="200" height="32" rx="5" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="160" y="300" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">§28.6 ACID 满足度</text>
+      <rect x="270" y="280" width="200" height="32" rx="5" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="370" y="300" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">§28.7 主从/Sentinel/Cluster</text>
+      <rect x="480" y="280" width="200" height="32" rx="5" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="580" y="300" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">§28.8 QPS 基线+监控</text>
+      <rect x="690" y="280" width="210" height="32" rx="5" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="795" y="300" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">§28.9 八类陷阱</text>
+      <rect x="60" y="322" width="410" height="32" rx="5" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="265" y="342" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">§28.10 源码深潜:multiCmd/queue/EXEC 路径</text>
+      <rect x="480" y="322" width="420" height="32" rx="5" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="690" y="342" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">§28.11 本章要点 · 四象限速记表</text>
+      <text x="60" y="380" fill="var(--diagram-muted)" font-size="10">★ 阅读路径建议:必要性(为什么) → 命令(怎么用) → CAS(怎么避免丢更新) → 工程(生产中怎么用)</text>
+      <text x="60" y="400" fill="var(--diagram-muted)" font-size="10">★ 与其他章节关联:第 5 章单线程 / 第 19 章复制 / 第 27 章 Cluster CROSSSLOT / 第 29 章 Lua 替代方案</text>
+      <text x="60" y="420" fill="var(--diagram-muted)" font-size="10">★ 核心论点:Redis 事务 = 批量提交 + 串行执行 + 乐观锁;不等于 RDBMS 事务的"全部成功或回滚"</text>
+    </g>
+  </svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s28-0">28.0 章首速览</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">图 28-0-1 · 事务全景:三阶段 + 双分支</div>
+  <svg viewBox="0 0 940 540" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="540" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="20" y="14" width="180" height="34" rx="6" fill="url(#d-blue)"/>
+      <text x="110" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Client</text>
+      <rect x="270" y="14" width="180" height="34" rx="6" fill="url(#d-purple)"/>
+      <text x="360" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Redis 主线程</text>
+      <rect x="520" y="14" width="180" height="34" rx="6" fill="url(#d-orange)"/>
+      <text x="610" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">multiState 队列</text>
+      <rect x="750" y="14" width="170" height="34" rx="6" fill="url(#d-green)"/>
+      <text x="835" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">watched_keys</text>
+
+      <line x1="110" y1="48" x2="110" y2="520" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="360" y1="48" x2="360" y2="520" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="610" y1="48" x2="610" y2="520" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="835" y1="48" x2="835" y2="520" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+
+      <rect x="20" y="58" width="900" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="470" y="74" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">阶段 1 · WATCH(可选,启用乐观锁)</text>
+
+      <line x1="110" y1="92" x2="360" y2="92" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <text x="235" y="86" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">① WATCH balance</text>
+      <line x1="360" y1="112" x2="835" y2="112" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <text x="600" y="106" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">② 注册 client 监视 balance</text>
+      <line x1="110" y1="132" x2="360" y2="132" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <text x="235" y="126" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">③ GET balance</text>
+      <line x1="360" y1="152" x2="110" y2="152" stroke="var(--diagram-blue-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-b)"/>
+      <text x="235" y="146" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">"100"</text>
+
+      <rect x="20" y="170" width="900" height="22" rx="4" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="470" y="186" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">阶段 2 · MULTI 入队(命令仅缓存,不执行)</text>
+
+      <line x1="110" y1="204" x2="360" y2="204" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="235" y="198" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">④ MULTI</text>
+      <line x1="360" y1="224" x2="110" y2="224" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-g)"/>
+      <text x="235" y="218" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">+OK(设置 CLIENT_MULTI flag)</text>
+      <line x1="110" y1="244" x2="360" y2="244" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="235" y="238" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">⑤ DECRBY balance 10</text>
+      <line x1="360" y1="264" x2="610" y2="264" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="485" y="258" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">⑥ 入队 multiCmd</text>
+      <line x1="360" y1="284" x2="110" y2="284" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-g)"/>
+      <text x="235" y="278" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">QUEUED</text>
+
+      <rect x="20" y="302" width="900" height="22" rx="4" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="470" y="318" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">阶段 3 · EXEC 提交(双分支:CAS 通过 / DIRTY)</text>
+
+      <line x1="110" y1="336" x2="360" y2="336" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+      <text x="235" y="330" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">⑦ EXEC</text>
+      <line x1="360" y1="356" x2="835" y2="356" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+      <text x="600" y="350" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">⑧ 检查 CLIENT_DIRTY_CAS</text>
+
+      <rect x="40" y="370" width="430" height="120" rx="8" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="60" y="392" fill="var(--diagram-green-text)" font-size="12" font-weight="800">分支 A · 监视 key 未修改</text>
+      <line x1="360" y1="408" x2="610" y2="408" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="490" y="402" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">⑨ 串行执行队列</text>
+      <line x1="610" y1="428" x2="110" y2="428" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-g)"/>
+      <text x="360" y="422" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">结果数组(每命令一项)</text>
+      <text x="60" y="468" fill="var(--diagram-green-text)" font-size="10">★ EXEC 期间事件循环不返回 → SERIALIZABLE 隔离</text>
+      <text x="60" y="482" fill="var(--diagram-green-text)" font-size="10">★ 调度原子性:其他客户端命令插不进来</text>
+
+      <rect x="490" y="370" width="430" height="120" rx="8" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="510" y="392" fill="var(--diagram-red-text)" font-size="12" font-weight="800">分支 B · 监视 key 已修改</text>
+      <line x1="610" y1="408" x2="610" y2="424" stroke="var(--diagram-red-stroke)" marker-end="url(#d-arr-r)"/>
+      <text x="700" y="416" fill="var(--diagram-red-text)" font-size="10">⑨ 丢弃队列</text>
+      <line x1="610" y1="438" x2="110" y2="450" stroke="var(--diagram-red-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-r)"/>
+      <text x="700" y="446" fill="var(--diagram-red-text)" font-size="10">⑩ 返回 nil 数组(EXEC abort)</text>
+      <text x="510" y="468" fill="var(--diagram-red-text)" font-size="10">★ 客户端需重试整轮(WATCH→MULTI→EXEC)</text>
+      <text x="510" y="482" fill="var(--diagram-red-text)" font-size="10">★ 这就是乐观并发控制(OCC)/ CAS</text>
+
+      <text x="20" y="514" fill="var(--diagram-muted)" font-size="10">★ "原子性"是调度原子性(EXEC 不被插入),不是 RDBMS 的"全有全无"原子性 — 单条命令运行时错误不会回滚其他命令</text>
+    </g>
+  </svg>
+</div>
+
+<p>事务从客户端视角是三阶段:<strong>WATCH(可选注册监视) → MULTI(入队命令) → EXEC(批量提交)</strong>。EXEC 在服务端有双分支:无 dirty 标志时串行执行队列并返回结果数组;有 <code>CLIENT_DIRTY_CAS</code> 或 <code>CLIENT_DIRTY_EXEC</code> 时整体放弃,返回 <code>nil</code> 或 <code>EXECABORT</code> 错误。</p>
+
+<div class="key-insight">
+  <strong>核心洞察:</strong> Redis 事务的"原子性"是 <strong>scheduling atomicity</strong>(调度原子性) — EXEC 内部不被其他命令插入,而非 RDBMS 的 <strong>all-or-nothing atomicity</strong>(全有全无原子性)。任何把 Redis 事务等同于 RDBMS 事务的认知都会导致生产事故,常见症状是"INCR 字符串失败但前面 SET 已生效,数据出现非预期状态"。
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-0-2 · 事务的三个核心约束</div>
+  <svg viewBox="0 0 940 320" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="320" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="370" y="20" width="200" height="44" rx="8" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="470" y="42" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">Redis 事务</text>
+      <text x="470" y="58" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">三大核心约束</text>
+
+      <line x1="430" y1="64" x2="160" y2="100" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+      <line x1="470" y1="64" x2="470" y2="100" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+      <line x1="510" y1="64" x2="780" y2="100" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="20" y="100" width="280" height="50" rx="8" fill="url(#d-blue)"/>
+      <text x="160" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">约束 1 · 入队不执行</text>
+      <text x="160" y="140" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">MULTI 后命令仅缓存到队列</text>
+
+      <rect x="330" y="100" width="280" height="50" rx="8" fill="url(#d-green)"/>
+      <text x="470" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">约束 2 · EXEC 不被插入</text>
+      <text x="470" y="140" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">SERIALIZABLE 隔离级别</text>
+
+      <rect x="640" y="100" width="280" height="50" rx="8" fill="url(#d-red)"/>
+      <text x="780" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">约束 3 · 不回滚</text>
+      <text x="780" y="140" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">单命令失败不影响其他</text>
+
+      <line x1="160" y1="150" x2="160" y2="180" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <line x1="470" y1="150" x2="470" y2="180" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <line x1="780" y1="150" x2="780" y2="180" stroke="var(--diagram-red-stroke)" marker-end="url(#d-arr-r)"/>
+
+      <rect x="20" y="180" width="280" height="120" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="40" y="204" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">验证细节</text>
+      <text x="40" y="226" fill="var(--diagram-muted)" font-size="10">• MULTI 仅设置 CLIENT_MULTI</text>
+      <text x="40" y="244" fill="var(--diagram-muted)" font-size="10">• 命令在 multiState->commands 数组</text>
+      <text x="40" y="262" fill="var(--diagram-muted)" font-size="10">• 入队时只做语法/参数校验</text>
+      <text x="40" y="280" fill="var(--diagram-muted)" font-size="10">• 不分配键值,不读 keyspace</text>
+      <text x="40" y="296" fill="var(--diagram-blue-text)" font-size="10" font-weight="700">→ 入队开销 ≈ 一次哈希表 push</text>
+
+      <rect x="330" y="180" width="280" height="120" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="350" y="204" fill="var(--diagram-green-text)" font-size="11" font-weight="700">验证细节</text>
+      <text x="350" y="226" fill="var(--diagram-muted)" font-size="10">• EXEC 在 processCommand 调用栈</text>
+      <text x="350" y="244" fill="var(--diagram-muted)" font-size="10">• 整个执行不返回事件循环</text>
+      <text x="350" y="262" fill="var(--diagram-muted)" font-size="10">• 其他 client 的 read/write 全部排队</text>
+      <text x="350" y="280" fill="var(--diagram-muted)" font-size="10">• 没有锁,纯单线程语义</text>
+      <text x="350" y="296" fill="var(--diagram-green-text)" font-size="10" font-weight="700">→ 阻塞总时长 = Σ 单命令耗时</text>
+
+      <rect x="640" y="180" width="280" height="120" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="660" y="204" fill="var(--diagram-red-text)" font-size="11" font-weight="700">实战陷阱</text>
+      <text x="660" y="226" fill="var(--diagram-muted)" font-size="10">• INCR 字符串 → 单命令报错</text>
+      <text x="660" y="244" fill="var(--diagram-muted)" font-size="10">• 前面的 SET 已生效,无法 undo</text>
+      <text x="660" y="262" fill="var(--diagram-muted)" font-size="10">• reply 数组逐项检查类型</text>
+      <text x="660" y="280" fill="var(--diagram-muted)" font-size="10">• 替代:Lua 在脚本内做前置校验</text>
+      <text x="660" y="296" fill="var(--diagram-red-text)" font-size="10" font-weight="700">→ 不要把它当 RDBMS 事务</text>
+    </g>
+  </svg>
+</div>
+
+<p>三类约束的精确组合定义了 Redis 事务的能力边界,任何一项理解偏差都会导致生产事故。常见误区是将其等同于 RDBMS 事务,期待回滚保证 — 实际遇到 INCR 字符串等运行时错误时,部分命令已生效,数据出现非预期状态。把事务当作"<strong>减少网络 RTT + 防止被插入 + 检测并发冲突</strong>"三件套是正确认知,期待回滚保证是错误认知。</p>
+
+<!-- ============================================================ -->
+<h2 id="s28-1">28.1 为什么需要事务</h2>
+<!-- ============================================================ -->
+
+<h3>28.1.1 无事务下的"读-计算-写"竞争条件</h3>
+
+<pre class="ascii-art"><code>场景: 两客户端并发扣余额
+
+  时刻 t   Client A 视角             Client B 视角            balance
+  ──────  ───────────────────────  ──────────────────────  ───────
+  t = 0   GET balance → 100        -                        100
+  t = 1   计算 new = 100 - 10 = 90  GET balance → 100       100
+  t = 2   -                        计算 new = 100 - 20 = 80  100
+  t = 3   SET balance 90           -                        90
+  t = 4   -                        SET balance 80           80
+
+  最终 balance = 80
+  期望 balance = 70 (扣 10 + 扣 20)
+  少扣 10,数据丢失
+
+根因: 两客户端基于过期数据 (t=0 的 100) 各自计算并写回
+      Redis 单线程不能防止"读-计算-写"序列被其他客户端插入</code></pre>
+
+<p>Redis 单线程模型只保证<strong>每条命令的原子性</strong>,不能阻止两条命令之间被其他客户端的命令插入。<code>GET → SET</code> 之间的<strong>客户端计算时间窗口</strong>是竞争条件的根源,该问题在 <code>DECRBY balance 10</code> 单命令时不存在(原子完成),但在"读取后做业务校验再写"模式下普遍存在。</p>
+
+<h3>28.1.2 WATCH + MULTI/EXEC 的解决方案</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-1-2 · 乐观锁冲突检测时序</div>
+  <svg viewBox="0 0 940 540" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="540" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="40" y="14" width="220" height="34" rx="6" fill="url(#d-blue)"/>
+      <text x="150" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Client A(读-计算-写)</text>
+      <rect x="380" y="14" width="220" height="34" rx="6" fill="url(#d-purple)"/>
+      <text x="490" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Redis 主线程</text>
+      <rect x="700" y="14" width="220" height="34" rx="6" fill="url(#d-red)"/>
+      <text x="810" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Client B(竞争者)</text>
+
+      <line x1="150" y1="48" x2="150" y2="520" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="490" y1="48" x2="490" y2="520" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="810" y1="48" x2="810" y2="520" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+
+      <rect x="20" y="60" width="900" height="22" rx="4" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="470" y="76" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">第一轮:A 启用 WATCH 读 100,期间 B 抢先扣减,A 的 EXEC 失败</text>
+
+      <line x1="150" y1="92" x2="490" y2="92" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <text x="320" y="86" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">① WATCH balance</text>
+      <line x1="150" y1="112" x2="490" y2="112" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <text x="320" y="106" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">② GET balance → 100</text>
+      <text x="40" y="132" fill="var(--diagram-muted)" font-size="10">A 本地计算 new = 100 - 10 = 90</text>
+
+      <line x1="810" y1="148" x2="490" y2="148" stroke="var(--diagram-red-stroke)" marker-end="url(#d-arr-r)"/>
+      <text x="650" y="142" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">③ DECRBY balance 20</text>
+      <rect x="380" y="158" width="220" height="36" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="490" y="174" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="700">signalModifiedKey()</text>
+      <text x="490" y="188" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">→ A.client_flags |= DIRTY_CAS</text>
+
+      <line x1="150" y1="208" x2="490" y2="208" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="320" y="202" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">④ MULTI</text>
+      <line x1="150" y1="226" x2="490" y2="226" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="320" y="220" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">⑤ SET balance 90(QUEUED)</text>
+      <line x1="150" y1="244" x2="490" y2="244" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+      <text x="320" y="238" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">⑥ EXEC</text>
+      <rect x="380" y="252" width="220" height="36" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="490" y="268" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="700">检查 DIRTY_CAS = true</text>
+      <text x="490" y="282" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">→ 丢弃队列</text>
+      <line x1="490" y1="296" x2="150" y2="296" stroke="var(--diagram-red-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-r)"/>
+      <text x="320" y="290" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">⑦ ✗ nil 数组(EXEC abort)</text>
+
+      <rect x="20" y="312" width="900" height="22" rx="4" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="470" y="328" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">第二轮重试:A 重新 WATCH/GET,基于最新值 80 计算,EXEC 成功</text>
+
+      <line x1="150" y1="346" x2="490" y2="346" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <text x="320" y="340" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">⑧ WATCH balance(重新注册)</text>
+      <line x1="150" y1="366" x2="490" y2="366" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <text x="320" y="360" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">⑨ GET balance → 80(B 修改后)</text>
+      <text x="40" y="386" fill="var(--diagram-muted)" font-size="10">A 重新计算 new = 80 - 10 = 70</text>
+
+      <line x1="150" y1="402" x2="490" y2="402" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="320" y="396" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">⑩ MULTI / SET balance 70 / EXEC</text>
+      <line x1="490" y1="422" x2="150" y2="422" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-g)"/>
+      <text x="320" y="416" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">⑪ ✓ [+OK] · balance = 70(正确)</text>
+
+      <rect x="20" y="436" width="900" height="92" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="40" y="458" fill="var(--diagram-blue-text)" font-size="13" font-weight="800">★ CAS 重试核心要点</text>
+      <text x="40" y="478" fill="var(--diagram-green-text)" font-size="11">✓ WATCH 检测的是"是否有任何修改"(不区分 value 是否真正改变)— 同 value 重写也会触发 DIRTY_CAS</text>
+      <text x="40" y="496" fill="var(--diagram-green-text)" font-size="11">✓ 重试由<strong>客户端</strong>负责,Redis 不自动重试 — 退避策略避免活锁</text>
+      <text x="40" y="514" fill="var(--diagram-red-text)" font-size="11">✗ DIRTY_CAS 生命周期:client 级别,持续到 EXEC/DISCARD/UNWATCH;过期/淘汰也会触发</text>
+    </g>
+  </svg>
+</div>
+
+<p>WATCH 提供 <strong>CAS (Compare-And-Swap)</strong> 语义。客户端读取后到 EXEC 前,任何其他客户端对监视 key 的修改都会触发 <code>DIRTY_CAS</code> 标志,导致 EXEC 返回 <code>nil</code>。客户端必须有重试逻辑 — <strong>该重试由业务代码控制,Redis 不自动重试</strong>。</p>
+
+<div class="warning">
+  <strong>重要约束:</strong> WATCH 检测的是"<strong>是否有任何修改</strong>",不区分 value 是否真正改变。对同一 key 重复 SET 相同 value 也会触发 DIRTY_CAS。这是简化实现的取舍 — 精确比较 value 需要保存旧值,代价不值得。
+</div>
+
+<h3>28.1.3 事务解决的核心问题与边界</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-1-3 · 事务能力与限制矩阵</div>
+  <table class="data-table">
+    <thead>
+      <tr><th>问题</th><th>解决机制</th><th>边界</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>网络往返多次</td><td>MULTI 批量入队 + EXEC 一次提交</td><td>单批次原子,跨批次不保证</td></tr>
+      <tr><td>命令被其他客户端插入</td><td>单线程 + EXEC 不可中断</td><td>EXEC 内部不可中断,EXEC 之间可被插入</td></tr>
+      <tr><td>读后写竞争条件</td><td>WATCH 乐观锁</td><td>仅支持 key 级 CAS,不支持范围监视</td></tr>
+      <tr><td>部分命令失败回滚</td><td><strong>不解决</strong></td><td>不回滚,需 Lua 前置校验</td></tr>
+      <tr><td>跨节点强一致</td><td><strong>不解决</strong></td><td>Cluster 模式仅支持单 slot 内事务</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p>事务的能力边界与限制同等重要。<strong>把事务当作"减少网络 RTT + 防止被插入 + 检测并发冲突"三件套是正确认知,期待回滚保证或跨节点一致是错误认知</strong>。生产事故的根源往往是认知错位,而不是实现 bug。</p>
+
+<!-- ============================================================ -->
+<h2 id="s28-2">28.2 四大核心命令</h2>
+<!-- ============================================================ -->
+
+<h3>28.2.1 MULTI - 仅设置标志位</h3>
+
+<pre><code class="language-c">/* src/server.h */
+#define CLIENT_MULTI (1&lt;&lt;3)
+
+/* src/multi.c */
+void multiCommand(client *c) {
+    if (c-&gt;flags &amp; CLIENT_MULTI) {
+        addReplyError(c, "MULTI calls can not be nested");
+        return;
+    }
+    c-&gt;flags |= CLIENT_MULTI;
+    addReply(c, shared.ok);
+}</code></pre>
+
+<pre class="ascii-art"><code>MULTI 的实际工作:
+  仅设置一个 client flag,不创建任何数据结构
+
+  设置后的副作用:
+    后续命令进入 queueMultiCommand 而非 processCommand 主路径
+    redis-cli 提示符变为 "(TX)"
+    回复变为 "QUEUED" (除特殊命令)
+
+不可嵌套:
+  若已设置 CLIENT_MULTI 再发 MULTI → 报错
+  Redis 事务是单层的,无嵌套概念
+  代价: 客户端组合事务的工作必须在客户端完成
+
+特殊命令在事务中:
+  MULTI / EXEC / DISCARD / WATCH 不入队,直接处理
+  其他所有命令一律入队</code></pre>
+
+<div class="key-insight">
+  <strong>极简实现:</strong> MULTI 命令本身只有 6 行 C 代码 — 检查 flag 是否已设置(报错), 设置 flag, 回复 +OK。<strong>没有创建队列、没有分配内存、没有锁</strong>。所有事务复杂度都集中在 <code>queueMultiCommand</code> 与 <code>execCommand</code> 两个函数中,符合 Redis 命令"小函数 + 显式状态"的代码风格。
+</div>
+
+<h3>28.2.2 命令入队 - 仅记录不执行</h3>
+
+<pre><code class="language-c">/* src/multi.c */
+typedef struct multiCmd {
+    robj **argv;
+    int argv_len;
+    int argc;
+    struct redisCommand *cmd;
+} multiCmd;
+
+typedef struct multiState {
+    multiCmd *commands;
+    int count;
+    int cmd_flags;
+    int cmd_inv_flags;
+    size_t argv_len_sums;
+    int alloc_count;
+} multiState;
+
+void queueMultiCommand(client *c, uint64_t cmd_flags) {
+    multiCmd *mc;
+
+    if (c-&gt;flags &amp; CLIENT_DIRTY_EXEC) return;
+
+    if (c-&gt;mstate.count == 0) c-&gt;mstate.cmd_flags = 0;
+    if (c-&gt;mstate.alloc_count == c-&gt;mstate.count) {
+        c-&gt;mstate.alloc_count = (c-&gt;mstate.alloc_count + 1) * 2;
+        c-&gt;mstate.commands = zrealloc(c-&gt;mstate.commands,
+            sizeof(multiCmd) * c-&gt;mstate.alloc_count);
+    }
+    mc = c-&gt;mstate.commands + c-&gt;mstate.count;
+    mc-&gt;cmd = c-&gt;cmd;
+    mc-&gt;argc = c-&gt;argc;
+    mc-&gt;argv = zmalloc(sizeof(robj*) * c-&gt;argc);
+    memcpy(mc-&gt;argv, c-&gt;argv, sizeof(robj*) * c-&gt;argc);
+    for (int j = 0; j &lt; c-&gt;argc; j++)
+        incrRefCount(mc-&gt;argv[j]);
+    c-&gt;mstate.count++;
+    c-&gt;mstate.cmd_flags |= cmd_flags;
+}</code></pre>
+
+<pre class="ascii-art"><code>入队的内存开销:
+
+  每条入队命令:
+    multiCmd 结构: 32 bytes
+    argv 指针数组: 8 bytes × argc
+    每个 robj 引用计数 +1 (复用对象,不拷贝)
+
+  事务总开销:
+    O(commands_count × avg_argc)
+    通常远小于 1 KB
+    长事务 (1000+ 命令) 才需关注内存
+
+入队期间的语法验证:
+  命令是否存在 (cmd != NULL)
+  参数个数是否匹配 cmd-&gt;arity
+  Cluster 模式: 所有 key 是否在同一 slot
+
+任一验证失败:
+  client-&gt;flags |= CLIENT_DIRTY_EXEC
+  当前命令返回错误
+  EXEC 时整体拒绝事务</code></pre>
+
+<p>入队仅<strong>复制 argv 指针并增加引用计数</strong>,不拷贝 robj 对象本身,故内存开销远小于直接执行命令。<code>cmd_flags</code> 累积所有入队命令的标志位,EXEC 阶段可基于此判断事务是否包含写命令(<code>CMD_WRITE</code>)、是否需要复制传播等。</p>
+
+<h3>28.2.3 EXEC - 批量执行</h3>
+
+<pre><code class="language-c">/* src/multi.c (简化) */
+void execCommand(client *c) {
+    int j;
+    robj **orig_argv;
+    int orig_argc;
+    struct redisCommand *orig_cmd;
+
+    if (!(c-&gt;flags &amp; CLIENT_MULTI)) {
+        addReplyError(c, "EXEC without MULTI");
+        return;
+    }
+
+    /* 1. WATCH 冲突检测 */
+    if (c-&gt;flags &amp; (CLIENT_DIRTY_CAS | CLIENT_DIRTY_EXEC)) {
+        if (c-&gt;flags &amp; CLIENT_DIRTY_EXEC)
+            addReplyErrorFormat(c, "EXECABORT Transaction discarded "
+                                  "because of previous errors.");
+        else
+            addReply(c, shared.nullarray[c-&gt;resp]);
+        discardTransaction(c);
+        return;
+    }
+
+    /* 2. 串行执行所有入队命令 */
+    addReplyArrayLen(c, c-&gt;mstate.count);
+    for (j = 0; j &lt; c-&gt;mstate.count; j++) {
+        c-&gt;argc = c-&gt;mstate.commands[j].argc;
+        c-&gt;argv = c-&gt;mstate.commands[j].argv;
+        c-&gt;cmd = c-&gt;mstate.commands[j].cmd;
+
+        call(c, CMD_CALL_FULL);
+    }
+
+    discardTransaction(c);
+}</code></pre>
+
+<pre class="ascii-art"><code>EXEC 阶段的关键不可中断性:
+
+  for 循环在主线程的 processCommand 调用栈内完成
+  事件循环不会返回 epoll_wait
+  其他客户端的命令在该期间被排队等待
+
+  保证: EXEC 内的所有命令构成一个原子调度单元
+        任意时刻最多一个事务的 EXEC 在执行
+        多事务的 EXEC 形成全序关系 (SERIALIZABLE)
+
+非原子性: 单命令失败
+  call() 返回错误不会中断 for 循环
+  错误对象作为该命令的结果加入 reply 数组
+  下一条命令照常执行
+  最终 reply 数组中既有成功也可能有错误</code></pre>
+
+<div class="key-insight">
+  <strong>核心机制:</strong> EXEC 的 for 循环<strong>不调用 <code>aeProcessEvents()</code></strong>,事件循环不返回。这意味着 EXEC 期间整个 Redis 实例对其他客户端"<strong>暂停响应</strong>"。该机制是 SERIALIZABLE 隔离的物理基础,也是<strong>长事务严重影响其他客户端</strong>的根本原因 — 1000 命令的事务可能让其他客户端 P99 延迟从 1 ms 涨到 10 ms+。
+</div>
+
+<h3>28.2.4 DISCARD - 放弃事务</h3>
+
+<pre><code class="language-c">/* src/multi.c */
+void discardCommand(client *c) {
+    if (!(c-&gt;flags &amp; CLIENT_MULTI)) {
+        addReplyError(c, "DISCARD without MULTI");
+        return;
+    }
+    discardTransaction(c);
+    addReply(c, shared.ok);
+}
+
+void discardTransaction(client *c) {
+    freeClientMultiState(c);
+    initClientMultiState(c);
+    c-&gt;flags &amp;= ~(CLIENT_MULTI | CLIENT_DIRTY_CAS | CLIENT_DIRTY_EXEC);
+    unwatchAllKeys(c);
+}</code></pre>
+
+<pre class="ascii-art"><code>DISCARD 的清理工作:
+  释放所有已入队 multiCmd 的 argv
+  减少 robj 引用计数
+  清除 CLIENT_MULTI / DIRTY_CAS / DIRTY_EXEC flags
+  解除所有 WATCH
+
+使用场景:
+  业务代码检测到无需提交事务时主动放弃
+  入队过程中发现错误,主动清理
+  连接断开前的资源回收
+
+注意:
+  DISCARD 后客户端回到普通命令模式
+  之前 WATCH 的 key 不再有效
+  需要重新 WATCH + MULTI 开始新事务</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s28-3">28.3 事务执行流程</h2>
+<!-- ============================================================ -->
+
+<h3>28.3.1 processCommand 中的事务分支</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-3-1 · 命令分发的事务分支</div>
+  <svg viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="460" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="380" y="20" width="180" height="40" rx="8" fill="url(#d-purple)"/>
+      <text x="470" y="44" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">readQueryFromClient</text>
+
+      <line x1="470" y1="60" x2="470" y2="80" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="370" y="80" width="200" height="40" rx="8" fill="url(#d-blue)" filter="url(#d-shadow)"/>
+      <text x="470" y="104" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">processCommand</text>
+
+      <line x1="470" y1="120" x2="470" y2="140" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+
+      <rect x="380" y="140" width="180" height="36" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="470" y="162" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">权限/ACL/cluster 校验</text>
+
+      <line x1="470" y1="176" x2="470" y2="196" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+
+      <polygon points="470,196 600,236 470,276 340,236" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="2"/>
+      <text x="470" y="232" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="12" font-weight="800">CLIENT_MULTI</text>
+      <text x="470" y="248" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11">已设置?</text>
+
+      <line x1="340" y1="236" x2="160" y2="236" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="240" y="228" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">否</text>
+
+      <rect x="20" y="216" width="280" height="44" rx="8" fill="url(#d-green)"/>
+      <text x="160" y="240" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">call() · 直接执行</text>
+      <text x="160" y="254" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">普通命令路径</text>
+
+      <line x1="600" y1="236" x2="780" y2="236" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+      <text x="690" y="228" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">是</text>
+
+      <polygon points="780,196 920,236 780,276 660,236" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)" stroke-width="2"/>
+      <text x="790" y="228" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">是 MULTI/EXEC/</text>
+      <text x="790" y="244" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">DISCARD/WATCH</text>
+      <text x="790" y="260" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">/RESET?</text>
+
+      <line x1="850" y1="276" x2="850" y2="306" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="870" y="296" fill="var(--diagram-green-text)" font-size="11" font-weight="700">是 → 直接执行</text>
+
+      <line x1="780" y1="276" x2="470" y2="306" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+      <text x="600" y="296" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">否 → 普通命令</text>
+
+      <rect x="350" y="306" width="240" height="50" rx="8" fill="url(#d-orange)"/>
+      <text x="470" y="328" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">命令验证</text>
+      <text x="470" y="344" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">cmd 存在 / arity / slot 检查</text>
+
+      <line x1="400" y1="356" x2="220" y2="386" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="290" y="376" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">通过</text>
+      <line x1="540" y1="356" x2="720" y2="386" stroke="var(--diagram-red-stroke)" marker-end="url(#d-arr-r)"/>
+      <text x="650" y="376" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="700">失败</text>
+
+      <rect x="80" y="386" width="280" height="50" rx="8" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="220" y="408" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">queueMultiCommand</text>
+      <text x="220" y="424" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">入队 multiCmd · 回复 QUEUED</text>
+
+      <rect x="580" y="386" width="280" height="50" rx="8" fill="url(#d-red)" filter="url(#d-shadow)"/>
+      <text x="720" y="408" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">设 CLIENT_DIRTY_EXEC</text>
+      <text x="720" y="424" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">回复语法错误 · EXEC 时 EXECABORT</text>
+    </g>
+  </svg>
+</div>
+
+<p><code>processCommand</code> 在事务模式下分两条路径:特殊命令(<code>MULTI / EXEC / DISCARD / WATCH / RESET</code>)直接执行,其他命令进入 <code>queueMultiCommand</code>。这个分支的设计使事务命令本身不入队(否则会陷入死循环),普通命令统一入队。</p>
+
+<h3>28.3.2 client 状态转移</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-3-2 · 客户端状态机</div>
+  <svg viewBox="0 0 940 380" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="380" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <circle cx="80" cy="80" r="20" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="2"/>
+      <circle cx="80" cy="80" r="10" fill="var(--diagram-purple-fill)"/>
+      <text x="80" y="118" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">客户端连接</text>
+
+      <line x1="100" y1="80" x2="200" y2="80" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="200" y="50" width="180" height="60" rx="30" fill="url(#d-blue)" filter="url(#d-shadow)"/>
+      <text x="290" y="76" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="800">Normal</text>
+      <text x="290" y="94" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">无 flag 设置</text>
+
+      <line x1="380" y1="80" x2="480" y2="80" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="430" y="74" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">WATCH key</text>
+
+      <rect x="480" y="50" width="180" height="60" rx="30" fill="url(#d-orange)" filter="url(#d-shadow)"/>
+      <text x="570" y="76" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="800">Watching</text>
+      <text x="570" y="94" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">watched_keys 已注册</text>
+
+      <line x1="660" y1="80" x2="760" y2="110" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+      <text x="745" y="94" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">MULTI</text>
+
+      <line x1="290" y1="110" x2="290" y2="220" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+      <text x="305" y="170" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">MULTI</text>
+
+      <rect x="200" y="220" width="180" height="60" rx="30" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="290" y="248" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="800">InTx</text>
+      <text x="290" y="266" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">CLIENT_MULTI = 1</text>
+
+      <line x1="290" y1="220" x2="290" y2="220" stroke="var(--diagram-purple-stroke)"/>
+      <path d="M 200 250 Q 130 250 130 220 Q 130 190 200 200" fill="none" stroke="var(--diagram-purple-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+      <text x="100" y="220" fill="var(--diagram-purple-text)" font-size="10">普通命令</text>
+      <text x="100" y="232" fill="var(--diagram-purple-text)" font-size="10">→ QUEUED(自循环)</text>
+
+      <line x1="660" y1="110" x2="380" y2="220" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+      <text x="540" y="180" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">MULTI(从 Watching 进入)</text>
+
+      <line x1="380" y1="250" x2="480" y2="250" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="430" y="244" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">EXEC / DISCARD</text>
+      <text x="430" y="265" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">回到 Normal</text>
+
+      <rect x="480" y="220" width="180" height="60" rx="30" fill="url(#d-blue)" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3"/>
+      <text x="570" y="246" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">→ Normal(终态)</text>
+      <text x="570" y="262" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">flags 全部清零</text>
+
+      <rect x="700" y="220" width="220" height="120" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="720" y="244" fill="var(--diagram-blue-text)" font-size="12" font-weight="800">★ EXEC 三种返回</text>
+      <text x="720" y="266" fill="var(--diagram-green-text)" font-size="10">✓ 干净 → 结果数组</text>
+      <text x="720" y="284" fill="var(--diagram-orange-text)" font-size="10">⚠ DIRTY_CAS → nil 数组</text>
+      <text x="720" y="302" fill="var(--diagram-red-text)" font-size="10">✗ DIRTY_EXEC → EXECABORT</text>
+      <text x="720" y="324" fill="var(--diagram-muted)" font-size="9">优先级:DIRTY_EXEC &gt; DIRTY_CAS &gt; OK</text>
+
+      <line x1="570" y1="110" x2="290" y2="220" stroke="var(--diagram-red-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-r)"/>
+
+      <rect x="20" y="320" width="660" height="50" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="40" y="340" fill="var(--diagram-blue-text)" font-size="12" font-weight="800">三转移触发条件</text>
+      <text x="40" y="358" fill="var(--diagram-muted)" font-size="10">Watching → Normal:UNWATCH 显式取消 / 任意客户端写监视 key 后 EXEC 完成 / 客户端断开</text>
+    </g>
+  </svg>
+</div>
+
+<pre class="ascii-art"><code>client flags 与状态对应:
+
+  状态                CLIENT_MULTI  CLIENT_DIRTY_CAS  CLIENT_DIRTY_EXEC
+  ─────────────────  ────────────  ────────────────  ─────────────────
+  Normal              0             0                  0
+  Watching            0             0                  0
+  Watching (有冲突)    0             1                  0
+  InTx (干净)          1             0                  0
+  InTx (有冲突)        1             1                  0
+  InTx (有错误)        1             0                  1
+
+EXEC 决策依据:
+  DIRTY_EXEC 优先于 DIRTY_CAS
+  DIRTY_EXEC = 1 → EXECABORT (整体拒绝)
+  DIRTY_CAS = 1  → null array (WATCH 冲突)
+  全 0           → 正常执行</code></pre>
+
+<h3>28.3.3 redis-cli 交互示例</h3>
+
+<pre><code class="language-bash">127.0.0.1:6379&gt; MULTI
+OK
+
+127.0.0.1:6379(TX)&gt; SET order:O1001 PAID
+QUEUED
+
+127.0.0.1:6379(TX)&gt; INCR counter
+QUEUED
+
+127.0.0.1:6379(TX)&gt; EXEC
+1) OK
+2) (integer) 1
+
+127.0.0.1:6379&gt; MULTI
+OK
+127.0.0.1:6379(TX)&gt; SET a 1
+QUEUED
+127.0.0.1:6379(TX)&gt; SETT b 2
+(error) ERR unknown command 'SETT'
+127.0.0.1:6379(TX)&gt; EXEC
+(error) EXECABORT Transaction discarded because of previous errors.</code></pre>
+
+<p><code>(TX)</code> 提示符表示客户端处于事务模式。<code>QUEUED</code> 是命令入队成功的标准回复。EXEC 后的数组每项对应一条入队命令的执行结果。<code>EXECABORT</code> 表示入队期间检测到错误,事务整体被拒绝 — <strong>第一个 SET a 1 也不会执行</strong>。</p>
+
+<!-- ============================================================ -->
+<h2 id="s28-4">28.4 WATCH:乐观锁与 CAS 语义</h2>
+<!-- ============================================================ -->
+
+<h3>28.4.1 WATCH 的内部数据结构</h3>
+
+<pre><code class="language-c">/* src/multi.c */
+typedef struct watchedKey {
+    listNode node;
+    robj *key;
+    redisDb *db;
+    client *client;
+    unsigned expired:1;
+} watchedKey;
+
+/* src/server.h - redisDb */
+struct redisDb {
+    /* ... */
+    dict *watched_keys;  /* key -&gt; list&lt;watchedKey&gt; */
+    /* ... */
+};</code></pre>
+
+<pre class="ascii-art"><code>watched_keys 字典结构:
+
+  redisDb.watched_keys:
+    "balance" → [watchedKey{client_A}, watchedKey{client_C}]
+    "stock"   → [watchedKey{client_B}]
+    "name"    → [watchedKey{client_A}, watchedKey{client_B}]
+
+  client A 同时 WATCH 了 "balance" 与 "name"
+
+查找路径:
+  写命令执行后:
+    db.watched_keys[key] → 链表
+    遍历链表,给每个 client 设 DIRTY_CAS
+
+  EXEC 时:
+    检查当前 client 的 DIRTY_CAS flag
+    O(1)</code></pre>
+
+<p>watched_keys 是<strong>反向索引</strong>:从 key 反查"哪些 client 在监视它"。这避免了每次 WATCH 时查找全局所有 client 的低效扫描,使 <code>signalModifiedKey</code> 的开销与"该 key 的 watcher 数量"成正比,而非"全局 client 数量"。</p>
+
+<h3>28.4.2 signalModifiedKey 的触发链</h3>
+
+<pre><code class="language-c">/* src/db.c */
+void signalModifiedKey(client *c, redisDb *db, robj *key) {
+    touchWatchedKey(db, key);
+    trackingInvalidateKey(c, key, 1);
+}
+
+void touchWatchedKey(redisDb *db, robj *key) {
+    list *clients;
+    listIter li;
+    listNode *ln;
+
+    if (dictSize(db-&gt;watched_keys) == 0) return;
+
+    clients = dictFetchValue(db-&gt;watched_keys, key);
+    if (!clients) return;
+
+    listRewind(clients, &amp;li);
+    while ((ln = listNext(&amp;li))) {
+        watchedKey *wk = listNodeValue(ln);
+        wk-&gt;client-&gt;flags |= CLIENT_DIRTY_CAS;
+    }
+}</code></pre>
+
+<pre class="ascii-art"><code>signalModifiedKey 嵌入所有写命令路径:
+
+  src/t_string.c:
+    setGenericCommand → signalModifiedKey (SET 后)
+    incrCommand       → signalModifiedKey (INCR 后)
+    appendCommand     → signalModifiedKey (APPEND 后)
+
+  src/t_list.c:
+    listTypePush      → signalModifiedKey
+    listTypePop       → signalModifiedKey
+
+  src/t_hash.c:
+    hashTypeSet       → signalModifiedKey
+
+  src/db.c:
+    dbDelete          → signalModifiedKey (DEL/UNLINK)
+    expireGenericCommand → signalModifiedKey
+
+  ... (所有修改 keyspace 的命令)
+
+性能开销:
+  if (dictSize(watched_keys) == 0) return;  ← 大多数情况零开销
+  有 watcher 时:
+    一次哈希查找
+    一次链表遍历
+    每个 watcher O(1) 设 flag</code></pre>
+
+<div class="key-insight">
+  <strong>零成本设计:</strong> <code>if (dictSize(watched_keys) == 0) return;</code> 这一行是 WATCH 机制的<strong>性能基石</strong>。绝大多数生产实例不使用 WATCH,该判断使所有写命令路径上的 OCC 钩子退化为<strong>一次条件分支</strong>(几纳秒),不引入任何额外开销。该模式是 Redis"<strong>按需付费</strong>"设计哲学的典范。
+</div>
+
+<h3>28.4.3 WATCH + MULTI/EXEC 时间线</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-4-3 · CAS 窗口与冲突检测</div>
+  <svg viewBox="0 0 940 480" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="480" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="20" y="14" width="170" height="34" rx="6" fill="url(#d-blue)"/>
+      <text x="105" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Client A</text>
+      <rect x="260" y="14" width="170" height="34" rx="6" fill="url(#d-purple)"/>
+      <text x="345" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Redis</text>
+      <rect x="500" y="14" width="220" height="34" rx="6" fill="url(#d-green)"/>
+      <text x="610" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">watched_keys[balance]</text>
+      <rect x="770" y="14" width="150" height="34" rx="6" fill="url(#d-red)"/>
+      <text x="845" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Client B</text>
+
+      <line x1="105" y1="48" x2="105" y2="460" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="345" y1="48" x2="345" y2="460" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="610" y1="48" x2="610" y2="460" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="845" y1="48" x2="845" y2="460" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+
+      <line x1="105" y1="76" x2="345" y2="76" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <text x="225" y="70" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">① WATCH balance</text>
+      <line x1="345" y1="96" x2="610" y2="96" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <text x="478" y="90" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">② 注册 watchedKey{A, balance}</text>
+      <line x1="345" y1="116" x2="105" y2="116" stroke="var(--diagram-blue-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-b)"/>
+      <text x="225" y="110" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">+OK</text>
+
+      <line x1="105" y1="138" x2="345" y2="138" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <text x="225" y="132" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">③ GET balance</text>
+      <line x1="345" y1="158" x2="105" y2="158" stroke="var(--diagram-blue-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-b)"/>
+      <text x="225" y="152" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">→ 100</text>
+
+      <rect x="20" y="170" width="900" height="22" rx="4" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="470" y="186" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">⚡ CAS 窗口开启:从 GET 到 EXEC,任何对 balance 的修改都会触发 DIRTY_CAS</text>
+
+      <line x1="845" y1="208" x2="345" y2="208" stroke="var(--diagram-red-stroke)" marker-end="url(#d-arr-r)"/>
+      <text x="595" y="202" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">④ B 来抢:DECRBY balance 20</text>
+      <rect x="240" y="218" width="210" height="36" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="345" y="234" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="700">⑤ signalModifiedKey()</text>
+      <text x="345" y="248" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">遍历 watched_keys[balance] 链表</text>
+      <line x1="450" y1="236" x2="610" y2="236" stroke="var(--diagram-red-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-r)"/>
+      <text x="530" y="230" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">⑥ 链表中找到 A → A.flags |= DIRTY_CAS</text>
+      <line x1="345" y1="270" x2="845" y2="270" stroke="var(--diagram-red-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-r)"/>
+      <text x="595" y="264" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">⑦ → 80(B 收到 OK)</text>
+
+      <line x1="105" y1="296" x2="345" y2="296" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="225" y="290" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">⑧ MULTI</text>
+      <line x1="105" y1="316" x2="345" y2="316" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="225" y="310" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">⑨ DECRBY balance 10(QUEUED)</text>
+      <line x1="105" y1="336" x2="345" y2="336" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+      <text x="225" y="330" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">⑩ EXEC</text>
+
+      <rect x="240" y="346" width="210" height="36" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="345" y="362" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="700">⑪ 检查 A.flags &amp; DIRTY_CAS</text>
+      <text x="345" y="376" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">= true → 丢弃队列</text>
+      <line x1="345" y1="396" x2="105" y2="396" stroke="var(--diagram-red-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-r)"/>
+      <text x="225" y="390" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">⑫ ✗ nil(空数组,EXEC abort)</text>
+
+      <rect x="20" y="408" width="900" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="470" y="424" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">⑬ 业务层重试:重新 WATCH → GET → MULTI → EXEC</text>
+
+      <text x="20" y="450" fill="var(--diagram-muted)" font-size="10">★ DIRTY_CAS 通过 watched_keys 字典 + signalModifiedKey 钩子链实现 — 零成本检测,所有写命令路径已经调用该钩子</text>
+      <text x="20" y="468" fill="var(--diagram-muted)" font-size="10">★ TTL 过期 / maxmemory 淘汰 / 自己的非事务写也触发 DIRTY_CAS;同 value 重写也触发(不做值比较)</text>
+    </g>
+  </svg>
+</div>
+
+<h3>28.4.4 WATCH 的边界条件</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-4-4 · DIRTY_CAS 触发场景对照</div>
+  <table class="data-table">
+    <thead>
+      <tr><th>场景</th><th>DIRTY_CAS 是否设置</th><th>说明</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>其他客户端 SET/DEL/INCR 监视的 key</td><td>✅ 是</td><td>常规修改路径</td></tr>
+      <tr><td>自己的非事务命令修改监视的 key</td><td>✅ 是</td><td>自我冲突也被检测</td></tr>
+      <tr><td>监视的 key 因 TTL 过期被删除</td><td>✅ 是</td><td>activeExpireCycle 调用 dbDelete</td></tr>
+      <tr><td>监视的 key 因 maxmemory 淘汰</td><td>✅ 是</td><td>performEvictions 同样路径</td></tr>
+      <tr><td>监视的 key 不存在,新创建</td><td>✅ 是</td><td>新建 key 也触发 signalModifiedKey</td></tr>
+      <tr><td>监视的 key 内部修改但 value 相同(SET k v 已有 v)</td><td>✅ 是</td><td>不做 value 比较,简化实现</td></tr>
+      <tr><td>监视的 key 已过期但未删除(惰性删除中)</td><td>❌ 否</td><td>过期后续 expireIfNeeded 才触发</td></tr>
+      <tr><td>Cluster 模式下从 Replica 监视</td><td>—</td><td>不支持,Replica 拒绝 WATCH</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>28.4.5 典型的 WATCH 重试模式</h3>
+
+<pre><code class="language-python">def transfer(redis_cli, src, dst, amount, max_retries=5):
+    for attempt in range(max_retries):
+        try:
+            with redis_cli.pipeline() as pipe:
+                pipe.watch(src, dst)
+                src_balance = int(pipe.get(src) or 0)
+                if src_balance &lt; amount:
+                    pipe.unwatch()
+                    raise ValueError("insufficient balance")
+                pipe.multi()
+                pipe.decrby(src, amount)
+                pipe.incrby(dst, amount)
+                pipe.execute()
+                return True
+        except WatchError:
+            sleep(0.01 * (2 ** attempt))
+    raise RuntimeError("max retries exceeded")</code></pre>
+
+<pre class="ascii-art"><code>重试逻辑要点:
+
+  ✓ 限制最大重试次数,避免无限循环
+  ✓ 指数退避,避免冲突时多客户端同时重试
+  ✓ 重试时重新读取数据,不能复用旧值
+  ✓ 业务条件检查 (如余额) 必须在 WATCH 后
+
+  ✗ 不要在 EXEC 失败后立即重试,可能立即再冲突
+  ✗ 不要假设 EXEC 失败一定是 WATCH 冲突,
+    EXECABORT 也可能,需区分错误类型</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s28-5">28.5 不回滚:工程权衡</h2>
+<!-- ============================================================ -->
+
+<h3>28.5.1 执行阶段错误的处理示例</h3>
+
+<pre><code class="language-bash">127.0.0.1:6379&gt; SET name "Alice"
+OK
+
+127.0.0.1:6379&gt; MULTI
+OK
+127.0.0.1:6379(TX)&gt; SET name "Bob"
+QUEUED
+127.0.0.1:6379(TX)&gt; INCR name
+QUEUED
+127.0.0.1:6379(TX)&gt; SET age 30
+QUEUED
+127.0.0.1:6379(TX)&gt; EXEC
+1) OK
+2) (error) ERR value is not an integer or out of range
+3) OK
+
+127.0.0.1:6379&gt; MGET name age
+1) "Bob"
+2) "30"</code></pre>
+
+<pre class="ascii-art"><code>关键观察:
+  INCR name 失败,返回类型错误
+  但 SET name "Bob" 已生效 → 不回滚
+  SET age 30 在 INCR 失败后照常执行
+
+  最终 keyspace 状态: 部分提交</code></pre>
+
+<div class="warning">
+  <strong>致命误区:</strong> 客户端只检查 <code>EXEC</code> 命令本身是否返回错误,而不<strong>逐项检查 reply 数组</strong>。上例中 EXEC 没报错(返回了 3 元素数组),但中间的 INCR 失败了。仅凭 "EXEC 成功"判断业务成功是高发生产事故,务必逐项 <code>isinstance(r, Exception)</code> 检查。
+</div>
+
+<h3>28.5.2 两类错误的不同处理</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-5-2 · 入队错误 vs 执行错误</div>
+  <table class="data-table">
+    <thead>
+      <tr><th>错误类型</th><th>发生时机</th><th>检测方式</th><th>处理结果</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>入队语法错误</strong></td><td>入队阶段</td><td><code>queueMultiCommand</code> 内验证</td><td>设 <code>CLIENT_DIRTY_EXEC</code>,EXEC 整体拒绝</td></tr>
+      <tr><td><strong>执行类型错误</strong></td><td>EXEC 阶段</td><td><code>call()</code> 内运行时检查</td><td>该命令返回错,其他命令照常</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<pre class="ascii-art"><code>入队错误示例:
+  - 命令不存在:    SETT (拼写错误)
+  - 参数数量错:    SET k1 (缺 value)
+  - Cluster 跨 slot: 多 key 命令 key 在不同 slot
+  → CLIENT_DIRTY_EXEC = 1
+  → EXEC 返回 EXECABORT
+  → 整个事务无任何命令执行
+
+执行错误示例:
+  - INCR 非数字 string:  类型错误
+  - LPUSH 到 hash:       类型错误
+  - SETEX 给负 TTL:      参数错误
+  → 该命令的 reply 为错误对象
+  → 前面成功的命令已生效
+  → 后面的命令照常执行</code></pre>
+
+<h3>28.5.3 不回滚的设计依据</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-5-3 · 设计取舍的两条根因链</div>
+  <svg viewBox="0 0 940 480" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="480" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="370" y="14" width="200" height="44" rx="8" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="470" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">不回滚的根本原因</text>
+      <text x="470" y="52" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">Antirez 设计取舍</text>
+
+      <line x1="430" y1="58" x2="240" y2="90" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+      <line x1="510" y1="58" x2="700" y2="90" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="20" y="90" width="440" height="50" rx="8" fill="url(#d-blue)"/>
+      <text x="240" y="114" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">根因 1 · 错误来自代码 bug</text>
+      <text x="240" y="130" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">不应该在生产发生 / 回滚不修复 bug</text>
+
+      <rect x="480" y="90" width="440" height="50" rx="8" fill="url(#d-red)"/>
+      <text x="700" y="114" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">根因 2 · 实现复杂度违背极简原则</text>
+      <text x="700" y="130" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">undo log / snapshot 都不可行</text>
+
+      <line x1="240" y1="140" x2="240" y2="170" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <line x1="700" y1="140" x2="700" y2="170" stroke="var(--diagram-red-stroke)" marker-end="url(#d-arr-r)"/>
+
+      <rect x="20" y="170" width="440" height="240" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="40" y="194" fill="var(--diagram-blue-text)" font-size="13" font-weight="800">认知论据</text>
+
+      <rect x="40" y="210" width="400" height="48" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="60" y="232" fill="var(--diagram-blue-text)" font-size="12" font-weight="700">▸ 类型错误 = 业务代码错误</text>
+      <text x="60" y="248" fill="var(--diagram-muted)" font-size="10">EXEC 阶段唯一错误:对错误类型用错命令(如 INCR 字符串)</text>
+
+      <rect x="40" y="266" width="400" height="48" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="60" y="288" fill="var(--diagram-blue-text)" font-size="12" font-weight="700">▸ 回滚不修复 bug,仅掩盖问题</text>
+      <text x="60" y="304" fill="var(--diagram-muted)" font-size="10">下次执行还会失败,问题被推迟到下游</text>
+
+      <rect x="40" y="322" width="400" height="48" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="60" y="344" fill="var(--diagram-blue-text)" font-size="12" font-weight="700">▸ 正确做法:测试覆盖 + 类型严格</text>
+      <text x="60" y="360" fill="var(--diagram-muted)" font-size="10">类型 bug 应在测试 / Code Review 阶段拦截</text>
+
+      <text x="40" y="394" fill="var(--diagram-green-text)" font-size="11" font-weight="700">→ 把"运行时回滚"换成"开发期严格" — Redis 哲学</text>
+
+      <rect x="480" y="170" width="440" height="240" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="500" y="194" fill="var(--diagram-red-text)" font-size="13" font-weight="800">实现论据</text>
+
+      <rect x="500" y="210" width="400" height="48" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="520" y="232" fill="var(--diagram-red-text)" font-size="12" font-weight="700">▸ 选项 A:每写命令记录 undo log</text>
+      <text x="520" y="248" fill="var(--diagram-muted)" font-size="10">需保存原 value,大对象延迟翻倍;LIST/HASH 复杂度爆炸</text>
+
+      <rect x="500" y="266" width="400" height="48" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="520" y="288" fill="var(--diagram-red-text)" font-size="12" font-weight="700">▸ 选项 B:每事务 snapshot keyspace</text>
+      <text x="520" y="304" fill="var(--diagram-muted)" font-size="10">大数据集 100GB 快照不可行;COW 增加内存压力</text>
+
+      <rect x="500" y="322" width="400" height="48" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="520" y="344" fill="var(--diagram-red-text)" font-size="12" font-weight="700">▸ 选项 C:WAL + 重放</text>
+      <text x="520" y="360" fill="var(--diagram-muted)" font-size="10">需要事务日志 + 崩溃恢复,引入数据库引擎复杂度</text>
+
+      <text x="500" y="394" fill="var(--diagram-red-text)" font-size="11" font-weight="700">→ 三选项都违背 Redis 极简高性能核心原则</text>
+
+      <rect x="20" y="420" width="900" height="50" rx="10" fill="url(#d-orange)" filter="url(#d-shadow)"/>
+      <text x="40" y="442" fill="var(--diagram-text)" font-size="13" font-weight="800">★ 替代方案:需要"全有全无"语义 → 用 Lua 脚本前置校验</text>
+      <text x="40" y="460" fill="var(--diagram-orange-text)" font-size="11">Lua 在脚本内 GET → 业务校验 → 决策 → 写入,失败时根本不调用写命令(自然不需要回滚)</text>
+    </g>
+  </svg>
+</div>
+
+<p>Antirez 在官方文档中给出的设计依据:其一,Redis 命令仅在<strong>语法错误或类型不匹配</strong>时失败,这些都是开发者代码 bug,正确编写的程序不应产生此类错误;其二,实现回滚需要 undo log 或 snapshot,在单线程模型下显著增加复杂度与延迟。Redis 选择"<strong>快速失败 + 强制业务测试</strong>"模型,优于"运行时回滚"模型。</p>
+
+<h3>28.5.4 替代方案 - Lua 前置校验</h3>
+
+<pre><code class="language-lua">-- 转账场景:需要"全有全无"语义
+EVAL "
+  local src_balance = tonumber(redis.call('GET', KEYS[1]) or 0)
+  local amount = tonumber(ARGV[1])
+
+  if src_balance &lt; amount then
+    return {err = 'insufficient balance'}
+  end
+
+  redis.call('DECRBY', KEYS[1], amount)
+  redis.call('INCRBY', KEYS[2], amount)
+  return 'OK'
+" 2 account_a account_b 100</code></pre>
+
+<div class="compare-grid">
+  <div class="compare-card">
+    <h4>MULTI / EXEC 适用场景</h4>
+    <ul>
+      <li>纯写入,<strong>不需要基于读结果决策</strong></li>
+      <li>客户端组合的批量操作</li>
+      <li>需要 WATCH 提供 OCC 检测的场景</li>
+      <li>团队不熟悉 Lua 时的首选</li>
+      <li>单批次 ≤ 10 命令的轻量事务</li>
+    </ul>
+  </div>
+  <div class="compare-card">
+    <h4>Lua 脚本适用场景</h4>
+    <ul>
+      <li><strong>"全有全无"</strong>语义硬要求</li>
+      <li>需要基于读结果做条件分支</li>
+      <li>大量命令的<strong>原子打包</strong></li>
+      <li>需要多次访问同一 key 的复杂计算</li>
+      <li>性能敏感(单 RTT 比 MULTI/EXEC 少 1 次)</li>
+    </ul>
+  </div>
+</div>
+
+<div class="real-world">
+  <strong>真实事故案例:</strong> 某支付平台用 MULTI/EXEC 实现转账(<code>WATCH src; GET src; if balance&gt;=amt then MULTI/DECRBY/INCRBY/EXEC</code>),客户端在网络抖动时 GET 之后立即 MULTI,但漏了"<strong>余额检查</strong>"在 MULTI 之后才入队。WATCH 不能阻止"余额校验失败但仍执行扣款" — 因为校验是<strong>客户端逻辑</strong>,WATCH 只检测服务端 key 修改。最终上线后出现负余额,改用 Lua 一次性"读 + 校验 + 写"才彻底解决。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s28-6">28.6 ACID 分析</h2>
+<!-- ============================================================ -->
+
+<h3>28.6.1 Redis 事务的 ACID 满足度</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-6-1 · 四特性逐项打分</div>
+  <table class="data-table">
+    <thead>
+      <tr><th>特性</th><th>Redis 事务</th><th>满足度</th><th>说明</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Atomicity (原子性)</td><td>部分满足</td><td>★★★</td><td>EXEC 不被插入(执行原子);单命令失败不回滚(结果非原子);入队错误整体拒绝</td></tr>
+      <tr><td>Consistency (一致性)</td><td>满足</td><td>★★★★★</td><td>每命令独立保证类型约束;WATCH 防过期数据决策</td></tr>
+      <tr><td>Isolation (隔离性)</td><td>满足</td><td>★★★★★</td><td>单线程天然 SERIALIZABLE 级别</td></tr>
+      <tr><td>Durability (持久性)</td><td>取决于配置</td><td>★★</td><td>无持久化:不持久;AOF always:持久;AOF everysec:最多丢 1s</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>28.6.2 SERIALIZABLE 隔离级别证明</h3>
+
+<pre class="ascii-art"><code>定理: Redis 事务隔离级别等价于 SERIALIZABLE
+
+设 T_1, T_2, ..., T_n 为 n 个并发提交的事务
+
+Redis 单线程模型保证:
+  ∀ i ≠ j: time_range(EXEC(T_i)) ∩ time_range(EXEC(T_j)) = ∅
+
+  即任意两事务的 EXEC 时间区间不重叠
+
+证明:
+  EXEC 的执行在 processCommand 调用栈内完成
+  for (j = 0; j &lt; c-&gt;mstate.count; j++) call(c, ...)
+  for 循环不调用 aeProcessEvents,事件循环不返回
+
+  因此 EXEC 内的所有命令构成不可分割的执行单元
+
+  多事务的 EXEC 命令到达时间在事件循环中形成全序
+  执行顺序 = 到达顺序
+  执行结果等价于 (T_1, T_2, ..., T_n) 某种全排列的串行调度
+
+  根据 SERIALIZABLE 定义:
+    存在等价于事务集合的串行调度
+    Redis 事务总是产生这样的调度
+
+  ⊢ Redis 事务隔离级别 = SERIALIZABLE  ∎</code></pre>
+
+<h3>28.6.3 与传统数据库的对比</h3>
+
+<div class="compare-grid">
+  <div class="compare-card">
+    <h4>SQL 标准的四个隔离级别</h4>
+    <ul>
+      <li><strong>Read Uncommitted</strong> — 允许脏读</li>
+      <li><strong>Read Committed</strong> — 防脏读</li>
+      <li><strong>Repeatable Read</strong> — 防脏读 + 不可重复读</li>
+      <li><strong>Serializable</strong> — 防脏读 + 不可重复读 + 防幻读</li>
+    </ul>
+    <p>实现方式:MVCC 多版本 + 行锁 / 谓词锁 / SSI 快照隔离。</p>
+  </div>
+  <div class="compare-card">
+    <h4>Redis 事务的 Serializable</h4>
+    <ul>
+      <li>不允许任何并发访问 EXEC 内部</li>
+      <li><strong>天然达到 Serializable</strong></li>
+      <li>无 MVCC,无锁,无快照</li>
+      <li>实现成本几乎为零</li>
+    </ul>
+    <p>代价:<strong>单线程瓶颈,无法多核扩展;长事务占用主线程,影响其他客户端;生产建议事务尽可能短,避免在事务中做计算</strong>。</p>
+  </div>
+</div>
+
+<pre class="ascii-art"><code>对比 PostgreSQL Serializable Snapshot Isolation (SSI):
+  PostgreSQL 通过快照 + 提交时检测读写依赖
+  允许并发执行,提交时决定中止哪些事务
+
+  Redis 通过单线程串行,不需要快照与依赖检测
+
+  PostgreSQL: 高并发,可能中止大量事务 (吞吐受冲突影响)
+  Redis: 单线程,执行确定但吞吐受限于单核
+
+适用场景对比:
+  PG SSI:  OLTP 高并发,事务可能很长 (秒级)
+  Redis:   缓存 / 计数器 / 分布式锁,事务必须很短 (毫秒级)</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s28-7">28.7 多部署模式下的事务</h2>
+<!-- ============================================================ -->
+
+<h3>28.7.1 不同模式的事务行为</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-7-1 · 四种部署模式对照</div>
+  <table class="data-table">
+    <thead>
+      <tr><th>部署模式</th><th>MULTI/EXEC</th><th>WATCH</th><th>关键约束</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>单节点</td><td>标准 SERIALIZABLE</td><td>标准 CAS</td><td>无特殊约束</td></tr>
+      <tr><td>主从复制</td><td>仅主节点提交,复制流以 MULTI...EXEC 包装</td><td>仅主节点</td><td>从节点不能 WATCH</td></tr>
+      <tr><td>Sentinel</td><td>同主从</td><td>同主从</td><td>failover 后事务丢失</td></tr>
+      <tr><td>Cluster</td><td>所有 key 同 slot</td><td>仅本节点 key</td><td>hash tag 强制同 slot</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>28.7.2 Cluster 中的事务约束</h3>
+
+<pre><code class="language-bash"># Cluster 模式 - 跨 slot 报错
+127.0.0.1:7000&gt; MULTI
+OK
+127.0.0.1:7000(TX)&gt; SET order:O1001 paid
+QUEUED
+127.0.0.1:7000(TX)&gt; SET payment:P9001 done
+QUEUED
+127.0.0.1:7000(TX)&gt; EXEC
+(error) CROSSSLOT Keys in request don't hash to the same slot</code></pre>
+
+<pre class="ascii-art"><code>Cluster 事务约束:
+
+  EXEC 期间所有 key 必须在同一节点
+
+  解决方案: hash tag
+    SET order:{customer:C001}      paid
+    SET payment:{customer:C001}    done
+    SET shipment:{customer:C001}   pending
+
+    所有 key 用 {customer:C001} 作为 hash tag
+    都映射到同一 slot,同一节点
+    EXEC 可以正常执行
+
+副作用:
+  hash tag 设计导致负载倾斜
+  高频 customer 的所有相关数据集中在一个 slot
+  该 slot 所在节点 CPU 高,其他节点空闲
+  生产建议: hash tag 粒度选择业务自然边界,避免过粗</code></pre>
+
+<div class="warning">
+  <strong>hash tag 粒度陷阱:</strong> 若所有用户都用 <code>{global}</code> 作为 hash tag,所有 key 都路由到同一 slot,Cluster 退化为单节点!正确做法是按"<strong>业务原子单元</strong>"选择 tag — 例如订单系统按 <code>{order_id}</code>,社交系统按 <code>{user_id}</code>,确保<strong>每个 tag 对应可独立提交的事务范围</strong>,粒度过粗导致热点,过细导致跨 tag 操作无法原子化。
+</div>
+
+<h3>28.7.3 主从复制下的事务传播</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-7-3 · 复制流中的 MULTI...EXEC 整块传播</div>
+  <svg viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="460" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="40" y="14" width="200" height="34" rx="6" fill="url(#d-blue)"/>
+      <text x="140" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Client</text>
+      <rect x="380" y="14" width="200" height="34" rx="6" fill="url(#d-purple)"/>
+      <text x="480" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Master</text>
+      <rect x="700" y="14" width="200" height="34" rx="6" fill="url(#d-green)"/>
+      <text x="800" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Replica</text>
+
+      <line x1="140" y1="48" x2="140" y2="440" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="480" y1="48" x2="480" y2="440" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="800" y1="48" x2="800" y2="440" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+
+      <rect x="20" y="60" width="900" height="22" rx="4" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="470" y="76" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">阶段 1 · 客户端发送事务到 Master(命令逐条入队)</text>
+
+      <line x1="140" y1="92" x2="480" y2="92" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="310" y="86" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">① MULTI</text>
+      <line x1="140" y1="112" x2="480" y2="112" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="310" y="106" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">② SET k1 v1(QUEUED)</text>
+      <line x1="140" y1="132" x2="480" y2="132" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="310" y="126" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">③ SET k2 v2(QUEUED)</text>
+      <line x1="140" y1="152" x2="480" y2="152" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+      <text x="310" y="146" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">④ EXEC(触发提交)</text>
+
+      <rect x="380" y="160" width="200" height="38" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="480" y="178" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">⑤ Master 串行执行</text>
+      <text x="480" y="192" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">SET k1 v1 → SET k2 v2(原子)</text>
+
+      <rect x="20" y="208" width="900" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="470" y="224" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">阶段 2 · 整块复制(MULTI/EXEC 边界保留)</text>
+
+      <line x1="480" y1="240" x2="800" y2="240" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+      <text x="640" y="234" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11">⑥ 复制流:MULTI</text>
+      <line x1="480" y1="260" x2="800" y2="260" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+      <text x="640" y="254" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11">⑦ 复制流:SET k1 v1</text>
+      <line x1="480" y1="280" x2="800" y2="280" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+      <text x="640" y="274" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11">⑧ 复制流:SET k2 v2</text>
+      <line x1="480" y1="300" x2="800" y2="300" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+      <text x="640" y="294" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11">⑨ 复制流:EXEC</text>
+
+      <rect x="700" y="308" width="200" height="38" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="800" y="326" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">⑩ Replica 作为事务执行</text>
+      <text x="800" y="340" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">不会观察到中间状态</text>
+
+      <line x1="480" y1="358" x2="140" y2="358" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-g)"/>
+      <text x="310" y="352" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">⑪ Master → Client:[+OK, +OK]</text>
+
+      <rect x="20" y="376" width="900" height="74" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="40" y="398" fill="var(--diagram-blue-text)" font-size="13" font-weight="800">★ 复制语义保证</text>
+      <text x="40" y="418" fill="var(--diagram-green-text)" font-size="11">✓ 整批 MULTI...EXEC 同时进入复制流,Replica 也以事务方式应用 — 主从 keyspace 永不出现中间态</text>
+      <text x="40" y="436" fill="var(--diagram-orange-text)" font-size="11">⚠ 事务期间 Replica 不响应读请求,等待整批应用完成 — 长事务对读 QPS 有影响</text>
+    </g>
+  </svg>
+</div>
+
+<p>主节点将整个事务作为 <code>MULTI...EXEC</code> 块复制到从节点,确保从节点也以原子方式应用。这避免了从节点观察到事务的中间状态,但代价是<strong>事务期间从节点不响应读请求</strong>(等待整批应用完成)。</p>
+
+<!-- ============================================================ -->
+<h2 id="s28-8">28.8 性能与基线</h2>
+<!-- ============================================================ -->
+
+<h3>28.8.1 事务 vs Pipeline vs Lua 性能对比</h3>
+
+<pre class="ascii-art"><code>基准: Redis 7.2, 8 核 32 GB, redis-benchmark, 1000 万次操作
+每批 5 条命令
+
+  方式                   QPS (批/秒)   P99 延迟    网络往返
+  ────────────────────  ───────────  ─────────  ──────────
+  逐条命令               ~82,000      1.2 ms      5 次/批
+  Pipeline (5 条)        ~310,000     0.4 ms      1 次/批
+  MULTI/EXEC (5 条)      ~245,000     0.5 ms      7 次/批
+  Pipeline + MULTI/EXEC  ~295,000     0.4 ms      1 次/批
+  Lua 脚本 (5 条)        ~285,000     0.45 ms     1 次/批
+
+观察:
+  Pipeline 提升来自网络优化 (减少 RTT)
+  MULTI/EXEC 提升来自服务端不被插入
+  两者组合获得最佳吞吐
+  Lua 接近最佳,但有 Lua 引擎开销
+
+工程选择:
+  纯网络优化           → Pipeline
+  原子提交不依赖读     → Pipeline + MULTI/EXEC
+  基于读结果的决策     → Lua
+  长事务大量计算       → Lua</code></pre>
+
+<h3>28.8.2 事务内常见命令耗时</h3>
+
+<pre class="ascii-art"><code>单事务执行时间 = sum(每命令耗时)
+
+  典型耗时 (8 核 32 GB):
+    SET / GET            ~1-3 µs
+    INCR / DECR          ~1-3 µs
+    HSET / HGET          ~2-5 µs
+    LPUSH / RPUSH        ~2-5 µs
+    SADD                 ~3-7 µs
+    ZADD                 ~5-10 µs
+    HMGET (10 fields)    ~10-20 µs
+
+  10 条命令的事务: 通常 &lt; 100 µs
+  100 条命令的事务: ~1 ms
+
+  超过 1 ms 的事务影响其他客户端
+  超过 10 ms 的事务严重阻塞主线程
+  超过 100 ms 的事务可能触发 cluster failover
+
+生产建议:
+  事务命令数 ≤ 10
+  避免在事务中执行 O(N) 命令 (HGETALL/SMEMBERS)
+  超大事务拆分为多批</code></pre>
+
+<div class="key-insight">
+  <strong>Cluster 联动:</strong> <code>cluster-node-timeout</code> 默认 15 s,但运维通常调到 5 s 甚至 2 s。如果事务执行时间接近这个阈值,主节点会被同 shard 的 replica + 其他 master 投票判定为"<strong>不可达</strong>",触发<strong>误 failover</strong>。这是"事务必须毫秒级"的硬性工程约束 — <strong>事务时长直接决定 Cluster 稳定性</strong>。
+</div>
+
+<h3>28.8.3 核心观测指标</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-8-3 · 事务可观测性核心指标</div>
+  <table class="data-table">
+    <thead>
+      <tr><th>指标</th><th>来源</th><th>含义</th><th>异常阈值</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>cmdstat_exec</code></td><td><code>INFO commandstats</code></td><td>EXEC 命令的调用次数与平均/累计耗时</td><td>avg &gt; 1 ms 排查长事务</td></tr>
+      <tr><td><code>cmdstat_multi</code></td><td><code>INFO commandstats</code></td><td>MULTI 命令调用次数,验证事务量</td><td>—</td></tr>
+      <tr><td><code>cmdstat_watch</code></td><td><code>INFO commandstats</code></td><td>WATCH 调用,验证 OCC 使用程度</td><td>—</td></tr>
+      <tr><td><code>SLOWLOG GET</code></td><td>慢日志</td><td>慢事务的具体命令记录</td><td>定期审查</td></tr>
+      <tr><td><code>LATENCY HISTORY exec</code></td><td>延迟监控</td><td>事务相关的延迟事件</td><td>P99 突增报警</td></tr>
+      <tr><td><code>client_recent_max_output_buffer</code></td><td><code>INFO clients</code></td><td>长事务可能导致输出缓冲增长</td><td>&gt; 1 MB 关注</td></tr>
+      <tr><td><code>blocked_clients</code></td><td><code>INFO clients</code></td><td>EXEC 期间其他客户端可能被阻塞</td><td>持续 &gt; 0 调查</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>28.8.4 PromQL 监控示例</h3>
+
+<pre><code class="language-yaml"># 平均事务耗时 (毫秒)
+- record: redis:exec_avg_ms
+  expr: |
+    rate(redis_commands_total{cmd="exec"}[5m])
+    / rate(redis_commands_duration_seconds_total{cmd="exec"}[5m])
+    * 1000
+
+# 告警:事务耗时持续超过 5 ms
+- alert: RedisLongTransaction
+  expr: redis:exec_avg_ms &gt; 5
+  for: 5m
+  annotations:
+    summary: "Redis EXEC 平均耗时 &gt; 5 ms (instance={{ $labels.instance }})"
+    description: "长事务可能阻塞主线程,在 Cluster 模式下接近 cluster-node-timeout 会触发误 failover"
+
+# WATCH 冲突率(高 = OCC 重试压力大)
+- record: redis:watch_conflict_ratio
+  expr: |
+    rate(redis_commands_total{cmd="exec",result="dirty_cas"}[5m])
+    / rate(redis_commands_total{cmd="exec"}[5m])
+
+- alert: RedisHighWatchConflict
+  expr: redis:watch_conflict_ratio &gt; 0.3
+  for: 10m
+  annotations:
+    summary: "WATCH 冲突率 &gt; 30%,考虑改用 Lua 或减少争抢热点"</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s28-9">28.9 陷阱与限制</h2>
+<!-- ============================================================ -->
+
+<h3>28.9.1 陷阱分类</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-9-1 · 四类事务陷阱</div>
+  <svg viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="460" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="370" y="14" width="200" height="44" rx="8" fill="url(#d-red)" filter="url(#d-shadow)"/>
+      <text x="470" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">事务陷阱</text>
+      <text x="470" y="52" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">8 类高频生产 bug</text>
+
+      <line x1="420" y1="58" x2="160" y2="100" stroke="var(--diagram-red-stroke)" marker-end="url(#d-arr-r)"/>
+      <line x1="450" y1="58" x2="380" y2="100" stroke="var(--diagram-red-stroke)" marker-end="url(#d-arr-r)"/>
+      <line x1="490" y1="58" x2="600" y2="100" stroke="var(--diagram-red-stroke)" marker-end="url(#d-arr-r)"/>
+      <line x1="520" y1="58" x2="820" y2="100" stroke="var(--diagram-red-stroke)" marker-end="url(#d-arr-r)"/>
+
+      <rect x="20" y="100" width="280" height="50" rx="8" fill="url(#d-orange)"/>
+      <text x="160" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">A · 语义类(3)</text>
+      <text x="160" y="140" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">误解 Redis 事务定义</text>
+
+      <rect x="320" y="100" width="240" height="50" rx="8" fill="url(#d-purple)"/>
+      <text x="440" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">B · WATCH 类(3)</text>
+      <text x="440" y="140" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">乐观锁使用错误</text>
+
+      <rect x="580" y="100" width="160" height="50" rx="8" fill="url(#d-blue)"/>
+      <text x="660" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">C · Cluster(2)</text>
+      <text x="660" y="140" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">slot 路由</text>
+
+      <rect x="760" y="100" width="160" height="50" rx="8" fill="url(#d-green)"/>
+      <text x="840" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">D · 性能(2)</text>
+      <text x="840" y="140" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">阻塞主线程</text>
+
+      <line x1="160" y1="150" x2="160" y2="180" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+      <line x1="440" y1="150" x2="440" y2="180" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+      <line x1="660" y1="150" x2="660" y2="180" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <line x1="840" y1="150" x2="840" y2="180" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+
+      <rect x="20" y="180" width="280" height="200" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <rect x="40" y="200" width="240" height="48" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="60" y="222" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">A1 · 误期回滚</text>
+      <text x="60" y="238" fill="var(--diagram-muted)" font-size="10">期望"全有全无",忽略 INCR 类型错</text>
+      <rect x="40" y="252" width="240" height="48" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="60" y="274" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">A2 · Pipeline / 事务混淆</text>
+      <text x="60" y="290" fill="var(--diagram-muted)" font-size="10">SDK 默认非 transaction,跨节点丢命令</text>
+      <rect x="40" y="304" width="240" height="48" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="60" y="326" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">A3 · EXEC 错误处理遗漏</text>
+      <text x="60" y="342" fill="var(--diagram-muted)" font-size="10">不检查 reply 数组中的 Exception 项</text>
+
+      <rect x="320" y="180" width="240" height="200" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <rect x="338" y="200" width="200" height="48" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="358" y="222" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">B1 · WATCH 后不 GET</text>
+      <text x="358" y="238" fill="var(--diagram-muted)" font-size="10">监视不读取,无判断依据</text>
+      <rect x="338" y="252" width="200" height="48" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="358" y="274" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">B2 · 重试无退避</text>
+      <text x="358" y="290" fill="var(--diagram-muted)" font-size="10">活锁,争抢 CPU/网络</text>
+      <rect x="338" y="304" width="200" height="48" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="358" y="326" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">B3 · UNWATCH 时机错</text>
+      <text x="358" y="342" fill="var(--diagram-muted)" font-size="10">未取消导致后续连接残留</text>
+
+      <rect x="580" y="180" width="160" height="200" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <rect x="595" y="200" width="130" height="80" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="615" y="222" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">C1 · CROSSSLOT</text>
+      <text x="615" y="238" fill="var(--diagram-muted)" font-size="10">多 key 不同 slot</text>
+      <text x="615" y="252" fill="var(--diagram-muted)" font-size="10">EXEC 报错</text>
+      <text x="615" y="268" fill="var(--diagram-muted)" font-size="10">→ 用 hash tag</text>
+      <rect x="595" y="288" width="130" height="80" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="615" y="310" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">C2 · tag 过粗</text>
+      <text x="615" y="326" fill="var(--diagram-muted)" font-size="10">所有 key 同 tag</text>
+      <text x="615" y="340" fill="var(--diagram-muted)" font-size="10">单 slot 热点</text>
+      <text x="615" y="354" fill="var(--diagram-muted)" font-size="10">→ 拆分粒度</text>
+
+      <rect x="760" y="180" width="160" height="200" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <rect x="775" y="200" width="130" height="80" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="795" y="222" fill="var(--diagram-green-text)" font-size="11" font-weight="700">D1 · O(N) 命令</text>
+      <text x="795" y="238" fill="var(--diagram-muted)" font-size="10">HGETALL/SMEMBERS</text>
+      <text x="795" y="252" fill="var(--diagram-muted)" font-size="10">事务内阻塞</text>
+      <text x="795" y="268" fill="var(--diagram-muted)" font-size="10">→ 移到事务外</text>
+      <rect x="775" y="288" width="130" height="80" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="795" y="310" fill="var(--diagram-green-text)" font-size="11" font-weight="700">D2 · 超长事务</text>
+      <text x="795" y="326" fill="var(--diagram-muted)" font-size="10">≥ 100 命令</text>
+      <text x="795" y="340" fill="var(--diagram-muted)" font-size="10">阻塞 + 误 failover</text>
+      <text x="795" y="354" fill="var(--diagram-muted)" font-size="10">→ 拆分多批</text>
+
+      <text x="20" y="406" fill="var(--diagram-red-text)" font-size="11" font-weight="700">★ 8 大陷阱定位规则</text>
+      <text x="20" y="424" fill="var(--diagram-muted)" font-size="10">★ A 类(3)→ 业务认知偏差;B 类(3)→ 客户端代码 bug;C 类(2)→ 部署模式适配;D 类(2)→ 命令选择 + 批次大小</text>
+      <text x="20" y="442" fill="var(--diagram-muted)" font-size="10">★ 修复优先级:A &gt; D &gt; C &gt; B(语义错最隐蔽,性能问题影响面最大,Cluster 容易报错快速发现,WATCH 局限可改 Lua)</text>
+    </g>
+  </svg>
+</div>
+
+<h3>28.9.2 陷阱速查表</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-9-2 · 八类陷阱完整对照</div>
+  <table class="data-table">
+    <thead>
+      <tr><th>#</th><th>陷阱</th><th>症状</th><th>根因</th><th>修复</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1</td><td>期待回滚</td><td>部分命令失败,数据不一致</td><td>Redis 不回滚</td><td>用 Lua 前置校验</td></tr>
+      <tr><td>2</td><td>不检查 EXEC 数组</td><td>业务认为成功但 INCR 报错</td><td>仅检查 EXEC 命令成功</td><td>逐项检查 reply 数组</td></tr>
+      <tr><td>3</td><td>WATCH 冲突无重试</td><td>高并发下 EXEC 频繁 nil</td><td>客户端缺重试逻辑</td><td>加最大重试 + 退避</td></tr>
+      <tr><td>4</td><td>WATCH 后忘记 GET</td><td>EXEC 总是成功但逻辑错</td><td>WATCH 仅监视,不读取</td><td>WATCH 后立即 GET</td></tr>
+      <tr><td>5</td><td>Cluster 跨 slot</td><td>CROSSSLOT 错误</td><td>多 key 不同 slot</td><td>用 hash tag</td></tr>
+      <tr><td>6</td><td>hash tag 过粗</td><td>单 slot 热点</td><td>大量 key 同 tag</td><td>拆分 tag 粒度</td></tr>
+      <tr><td>7</td><td>事务中 HGETALL</td><td>EXEC 阻塞主线程</td><td>O(N) 命令在事务内</td><td>移到事务外</td></tr>
+      <tr><td>8</td><td>failover 时事务丢失</td><td>EXEC 返回连接断开</td><td>主节点切换</td><td>客户端重连重试</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>28.9.3 反模式与修复对比</h3>
+
+<div class="compare-grid">
+  <div class="compare-card bad">
+    <h4>❌ 反模式 · 仅检查 EXEC 是否报错</h4>
+<pre><code class="language-python">with redis_cli.pipeline(transaction=True) as pipe:
+    pipe.set("name", "Bob")
+    pipe.incr("name")           # 类型错误
+    pipe.set("age", 30)
+    results = pipe.execute()    # 不抛异常!
+
+if results:                     # results = [True, Exception, True]
+    print("transaction OK")     # 误报"成功"
+# 实际 name='Bob' 已写入,业务以为完整一致</code></pre>
+    <p>客户端只看 <code>execute()</code> 是否抛异常,忽略 <code>results</code> 数组中可能混入 Exception 对象。这是<strong>生产环境最常见的事务相关 bug</strong>。</p>
+  </div>
+  <div class="compare-card good">
+    <h4>✅ 正确做法 · 逐项检查 reply 数组</h4>
+<pre><code class="language-python">with redis_cli.pipeline(transaction=True) as pipe:
+    pipe.set("name", "Bob")
+    pipe.incr("name")
+    pipe.set("age", 30)
+    results = pipe.execute()
+
+failed = [(i, r) for i, r in enumerate(results)
+          if isinstance(r, Exception)]
+if failed:
+    log.error(f"transaction partial failure: {failed}")
+    # 触发补偿/告警逻辑
+    raise TransactionPartialFailure(results)</code></pre>
+    <p>逐项检查每个 reply 是否为 Exception,区分 <code>WatchError</code>(可重试)与 <code>PartialFailure</code>(应告警 + 补偿)。</p>
+  </div>
+</div>
+
+<h3>28.9.4 正确的客户端处理模板</h3>
+
+<pre><code class="language-python">def execute_transaction(redis_cli, watched_keys, transaction_fn,
+                        max_retries=5):
+    """
+    执行 WATCH + MULTI/EXEC 事务,带重试与错误处理
+    """
+    for attempt in range(max_retries):
+        try:
+            with redis_cli.pipeline() as pipe:
+                pipe.watch(*watched_keys)
+
+                read_results = transaction_fn.read(pipe)
+
+                if not transaction_fn.should_proceed(read_results):
+                    pipe.unwatch()
+                    return None
+
+                pipe.multi()
+                transaction_fn.write(pipe, read_results)
+
+                results = pipe.execute()
+
+                for i, r in enumerate(results):
+                    if isinstance(r, Exception):
+                        log.error(f"command {i} failed: {r}")
+                        raise TransactionPartialFailure(results)
+
+                return results
+        except WatchError:
+            sleep(0.01 * (2 ** attempt))
+            continue
+    raise TransactionRetriesExhausted()</code></pre>
+
+<pre class="ascii-art"><code>模板要点:
+
+  ✓ 限制最大重试次数
+  ✓ 指数退避避免冲突风暴
+  ✓ 业务前置校验在 MULTI 前
+  ✓ 不应执行时 unwatch
+  ✓ 检查 reply 数组每项是否为 Exception
+  ✓ 区分 WatchError (重试) 与 PartialFailure (告警)</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s28-10">28.10 源码深潜</h2>
+<!-- ============================================================ -->
+
+<h3>28.10.1 源码组织</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-10-1 · 调用链总览</div>
+  <svg viewBox="0 0 940 540" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="540" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="370" y="14" width="200" height="44" rx="8" fill="url(#d-blue)" filter="url(#d-shadow)"/>
+      <text x="470" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">processCommand()</text>
+      <text x="470" y="50" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">src/server.c</text>
+
+      <line x1="470" y1="58" x2="470" y2="80" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+
+      <polygon points="470,80 600,120 470,160 340,120" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="2"/>
+      <text x="470" y="116" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="12" font-weight="800">CLIENT_MULTI?</text>
+      <text x="470" y="132" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">已设置 / 命令特殊?</text>
+
+      <line x1="340" y1="120" x2="160" y2="120" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="240" y="112" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">否/特殊</text>
+
+      <rect x="20" y="100" width="280" height="44" rx="8" fill="url(#d-green)"/>
+      <text x="160" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">call(c) · 直接执行</text>
+      <text x="160" y="140" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">src/server.c</text>
+
+      <line x1="600" y1="120" x2="780" y2="120" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+      <text x="690" y="112" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">是/普通</text>
+
+      <rect x="660" y="100" width="260" height="44" rx="8" fill="url(#d-orange)"/>
+      <text x="790" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">queueMultiCommand()</text>
+      <text x="790" y="140" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">src/multi.c · 命令验证 + 入队</text>
+
+      <line x1="160" y1="144" x2="160" y2="170" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <line x1="790" y1="144" x2="790" y2="170" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="20" y="170" width="280" height="170" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="40" y="194" fill="var(--diagram-blue-text)" font-size="12" font-weight="800">特殊命令分支(call 路径)</text>
+      <rect x="40" y="208" width="240" height="28" rx="5" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="160" y="226" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">multiCommand · 设 CLIENT_MULTI</text>
+      <rect x="40" y="240" width="240" height="28" rx="5" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="160" y="258" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11">execCommand · 串行执行队列</text>
+      <rect x="40" y="272" width="240" height="28" rx="5" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="160" y="290" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">discardCommand · 清理 multiState</text>
+      <rect x="40" y="304" width="240" height="28" rx="5" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="160" y="322" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">watchCommand · 注册 watchedKey</text>
+
+      <rect x="660" y="170" width="260" height="170" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="680" y="194" fill="var(--diagram-blue-text)" font-size="12" font-weight="800">入队/EXEC 执行细节</text>
+      <text x="680" y="216" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">queueMultiCommand:</text>
+      <text x="680" y="232" fill="var(--diagram-muted)" font-size="10">  cmd 存在 / arity / slot 检查</text>
+      <text x="680" y="248" fill="var(--diagram-muted)" font-size="10">  失败 → 设 DIRTY_EXEC</text>
+      <text x="680" y="264" fill="var(--diagram-muted)" font-size="10">  通过 → multiState->commands[i]</text>
+      <text x="680" y="286" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">execCommand:</text>
+      <text x="680" y="302" fill="var(--diagram-muted)" font-size="10">  for i in 0..commands_count:</text>
+      <text x="680" y="316" fill="var(--diagram-muted)" font-size="10">    call() 每条 → reply 数组</text>
+      <text x="680" y="330" fill="var(--diagram-muted)" font-size="10">  EXEC 内部不返回事件循环</text>
+
+      <rect x="320" y="380" width="320" height="60" rx="10" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="480" y="404" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">signalModifiedKey() · src/db.c</text>
+      <text x="480" y="422" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">★ 所有写命令统一钩子(零成本)</text>
+
+      <line x1="480" y1="380" x2="480" y2="350" stroke="var(--diagram-green-stroke)" stroke-dasharray="4,4" marker-end="url(#d-arr-g)" marker-start="url(#d-arr-g)"/>
+      <text x="510" y="370" fill="var(--diagram-green-text)" font-size="10">↕ 写命令路径调用</text>
+
+      <line x1="480" y1="440" x2="480" y2="470" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+
+      <rect x="280" y="470" width="400" height="40" rx="8" fill="url(#d-red)"/>
+      <text x="480" y="494" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">touchWatchedKey() → client.flags |= DIRTY_CAS</text>
+
+      <text x="20" y="530" fill="var(--diagram-muted)" font-size="10">★ 调用链总览:processCommand → 分支 → call/queueMultiCommand;EXEC 时检查 DIRTY_CAS / DIRTY_EXEC,决定执行或丢弃队列</text>
+    </g>
+  </svg>
+</div>
+
+<h3>28.10.2 核心源码入口</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-10-2 · 关键函数与职责</div>
+  <table class="data-table">
+    <thead>
+      <tr><th>文件</th><th>函数 / 结构</th><th>职责</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>src/multi.c</code></td><td><code>multiCommand()</code></td><td>设置 <code>CLIENT_MULTI</code></td></tr>
+      <tr><td><code>src/multi.c</code></td><td><code>queueMultiCommand()</code></td><td>命令入队</td></tr>
+      <tr><td><code>src/multi.c</code></td><td><code>execCommand()</code></td><td>EXEC 执行队列</td></tr>
+      <tr><td><code>src/multi.c</code></td><td><code>discardCommand()</code></td><td>DISCARD 清理</td></tr>
+      <tr><td><code>src/multi.c</code></td><td><code>discardTransaction()</code></td><td>内部清理函数</td></tr>
+      <tr><td><code>src/multi.c</code></td><td><code>watchCommand()</code> / <code>watchForKey()</code></td><td>WATCH 注册</td></tr>
+      <tr><td><code>src/multi.c</code></td><td><code>unwatchAllKeys()</code></td><td>客户端解除所有监视</td></tr>
+      <tr><td><code>src/multi.c</code></td><td><code>touchWatchedKey()</code></td><td>写命令触发 DIRTY_CAS</td></tr>
+      <tr><td><code>src/db.c</code></td><td><code>signalModifiedKey()</code></td><td>写命令统一钩子</td></tr>
+      <tr><td><code>src/server.c</code></td><td><code>processCommand()</code></td><td>命令分发,事务模式分支</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>28.10.3 watchForKey 注册</h3>
+
+<pre><code class="language-c">/* src/multi.c: WATCH 注册 */
+void watchForKey(client *c, robj *key) {
+    list *clients = NULL;
+    listIter li;
+    listNode *ln;
+    watchedKey *wk;
+
+    /* 检查已监视,避免重复 */
+    listRewind(c-&gt;watched_keys, &amp;li);
+    while ((ln = listNext(&amp;li))) {
+        wk = listNodeValue(ln);
+        if (wk-&gt;db == c-&gt;db &amp;&amp; equalStringObjects(key, wk-&gt;key))
+            return;
+    }
+
+    /* 添加到 db 的 watched_keys 字典 */
+    clients = dictFetchValue(c-&gt;db-&gt;watched_keys, key);
+    if (!clients) {
+        clients = listCreate();
+        dictAdd(c-&gt;db-&gt;watched_keys, key, clients);
+        incrRefCount(key);
+    }
+    /* clients 是 watcher 链表 */
+
+    wk = zmalloc(sizeof(*wk));
+    wk-&gt;key = key;
+    wk-&gt;client = c;
+    wk-&gt;db = c-&gt;db;
+    incrRefCount(key);
+    listAddNodeTail(c-&gt;watched_keys, wk);
+    listAddNodeTail(clients, wk);
+}</code></pre>
+
+<h3>28.10.4 EXEC 主循环完整版</h3>
+
+<pre><code class="language-c">/* src/multi.c: EXEC 主循环 */
+void execCommand(client *c) {
+    if (!(c-&gt;flags &amp; CLIENT_MULTI)) { /* ... 报错 */ }
+
+    if (c-&gt;flags &amp; (CLIENT_DIRTY_CAS | CLIENT_DIRTY_EXEC)) {
+        if (c-&gt;flags &amp; CLIENT_DIRTY_EXEC)
+            addReplyErrorObject(c, shared.execaborterr);
+        else
+            addReply(c, shared.nullarray[c-&gt;resp]);
+        discardTransaction(c);
+        return;
+    }
+
+    int orig_argc = c-&gt;argc;
+    robj **orig_argv = c-&gt;argv;
+    struct redisCommand *orig_cmd = c-&gt;cmd;
+
+    addReplyArrayLen(c, c-&gt;mstate.count);
+    for (int j = 0; j &lt; c-&gt;mstate.count; j++) {
+        c-&gt;argc = c-&gt;mstate.commands[j].argc;
+        c-&gt;argv = c-&gt;mstate.commands[j].argv;
+        c-&gt;cmd = c-&gt;mstate.commands[j].cmd;
+
+        call(c, CMD_CALL_FULL);
+    }
+
+    c-&gt;argv = orig_argv;
+    c-&gt;argc = orig_argc;
+    c-&gt;cmd = orig_cmd;
+    discardTransaction(c);
+}</code></pre>
+
+<h3>28.10.5 设计取舍</h3>
+
+<p>Redis 事务选择"<strong>批量提交 + 串行执行 + 乐观锁</strong>"语义而非传统 ACID 事务的根本原因是单线程模型的<strong>内在简洁性</strong>。SERIALIZABLE 隔离级别在单线程下天然成立,无需 MVCC、锁、依赖图等复杂机制。代价是放弃回滚能力,要求业务代码在 MULTI 之前完成所有校验,运行时类型错误必须通过测试覆盖避免。</p>
+
+<p>WATCH 的设计利用了写命令路径上已存在的 <code>signalModifiedKey()</code> 钩子,无需引入额外锁结构。该机制的工程亮点是"<strong>开销与监视客户端数量成正比,不监视时近零开销</strong>"。<code>if (dictSize(watched_keys) == 0) return;</code> 使绝大多数无 WATCH 场景的写命令不承担任何 OCC 开销。</p>
+
+<p>不回滚的工程权衡有其内在一致性:Redis 命令的失败模式仅限于语法错误与类型错误,这些在严格类型系统的应用代码中应通过单元测试发现。<strong>回滚机制无法修复程序 bug,仅是事故发生后的补救手段</strong>。Redis 选择"快速失败 + 强制业务测试"模型,优于"运行时回滚"模型,这是单线程极简哲学的延续。</p>
+
+<p>Cluster 中事务限于单 slot 的根本原因是分布式事务的复杂度。跨节点事务需要<strong>两阶段提交(2PC)</strong>或类似协议,引入协调者、超时、部分失败处理,严重违背 Redis "无外部协调器"的核心设计。Redis 选择"<strong>单 slot 内强一致,跨 slot 应用层处理</strong>",将分布式事务的复杂度推给业务,保持 Cluster 的简洁。</p>
+
+<!-- ============================================================ -->
+<h2 id="s28-summary">28.11 本章要点</h2>
+<!-- ============================================================ -->
+
+<div class="chapter-summary">
+  <table class="data-table">
+    <thead>
+      <tr><th>#</th><th>要点</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1</td><td>Redis 事务的"<strong>原子性</strong>"指 EXEC 期间不被插入,而非"全部成功或全部回滚",该差异是误用根源</td></tr>
+      <tr><td>2</td><td><code>MULTI</code> 仅设置 <code>CLIENT_MULTI</code> flag;命令入队为 <code>multiCmd</code> 结构;EXEC 串行执行队列</td></tr>
+      <tr><td>3</td><td>EXEC 阶段在 <code>processCommand</code> 调用栈内完成,事件循环不返回,<strong>SERIALIZABLE 隔离</strong>天然成立</td></tr>
+      <tr><td>4</td><td>入队语法错误设 <code>CLIENT_DIRTY_EXEC</code>,EXEC 时整体拒绝(<code>EXECABORT</code>);执行类型错误不影响其他命令</td></tr>
+      <tr><td>5</td><td>WATCH 注册 client 到 <code>db.watched_keys[key]</code> 链表,<code>signalModifiedKey</code> 钩子在写命令路径触发 DIRTY_CAS</td></tr>
+      <tr><td>6</td><td>EXEC 检查 <code>DIRTY_EXEC</code> 优先于 <code>DIRTY_CAS</code>,DIRTY_EXEC → EXECABORT,DIRTY_CAS → null array</td></tr>
+      <tr><td>7</td><td>不回滚的工程权衡:类型错误是代码 bug 不是运行时竞争,实现回滚需 undo log 显著增加复杂度</td></tr>
+      <tr><td>8</td><td>需要"<strong>全有全无</strong>"语义或基于读结果决策的场景应使用 Lua 脚本而非 MULTI/EXEC</td></tr>
+      <tr><td>9</td><td>Cluster 模式事务要求所有 key 在同一 slot,通过 hash tag <code>{}</code> 强制,粒度选择需平衡热点与解耦</td></tr>
+      <tr><td>10</td><td>生产模板:<code>WATCH + GET + MULTI + 命令 + EXEC</code> + 检查每项 reply,WatchError 重试,Exception 告警</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>最小回归测试</h3>
+
+<pre><code class="language-bash"># 1. 基本 MULTI/EXEC 验证
+redis-cli MULTI
+redis-cli SET tx:k1 v1     # 应回 QUEUED
+redis-cli INCR tx:counter  # 应回 QUEUED
+redis-cli EXEC             # 应回 [+OK, (integer) 1]
+
+# 2. WATCH 冲突场景验证
+redis-cli SET balance 100
+# 终端 A:
+redis-cli WATCH balance
+redis-cli GET balance       # 100
+# 终端 B (并发):
+redis-cli DECRBY balance 20 # 80
+# 终端 A 继续:
+redis-cli MULTI
+redis-cli SET balance 90
+redis-cli EXEC              # 应回 (nil) 表示冲突
+
+# 3. 不回滚验证
+redis-cli SET name Alice
+redis-cli MULTI
+redis-cli SET name Bob
+redis-cli INCR name         # 类型错误
+redis-cli SET age 30
+redis-cli EXEC              # [+OK, (error)..., +OK]
+redis-cli GET name          # "Bob"  ← 已生效不回滚
+redis-cli GET age           # "30"
+
+# 4. EXECABORT 验证
+redis-cli MULTI
+redis-cli SET a 1
+redis-cli SETT b 2          # 命令拼写错误
+redis-cli EXEC              # (error) EXECABORT
+
+# 5. 监控指标
+redis-cli INFO commandstats | grep -E "exec|multi|watch"
+redis-cli SLOWLOG GET 10    # 检查是否有慢事务</code></pre>
+
+<h3>章末总结</h3>
+
+<p>第 28 章事务与第 27 章 Cluster、第 29 章 Lua 共同构成 Redis 多命令编排的三层基础:</p>
+
+<ul>
+  <li><strong>第 27 章</strong>(Cluster)解决"<strong>命令在哪里执行</strong>":slot 路由、hash tag、节点拓扑;</li>
+  <li><strong>第 28 章</strong>(事务)解决"<strong>多命令如何打包</strong>":MULTI/EXEC 队列、SERIALIZABLE 隔离、WATCH 乐观锁;</li>
+  <li><strong>第 29 章</strong>(Lua / Functions)解决"<strong>如何在服务端做决策</strong>":条件分支、读后写原子、持久化业务逻辑。</li>
+</ul>
+
+<p>三章合并起来才是完整的 Redis 命令编排画面。理解这些机制后,选择"用 Pipeline 还是 MULTI/EXEC 还是 Lua"就从"凭直觉"变成"<strong>看场景需求 → 看语义匹配 → 看性能目标</strong>"的工程决策。事务不是万能锁,而是<strong>调度原子性 + 乐观锁</strong>的精确组合工具。</p>
+
+<h3>下一章预告</h3>
+
+<p>第 29 章深入 <strong>Lua 脚本与 Redis 7 Functions</strong>。本章看到 MULTI/EXEC 在"<strong>需要基于读结果决策</strong>"场景下的根本无力 — Lua 是这个问题的标准答案。下一章会展示 <code>EVAL / EVALSHA</code> 的脚本缓存机制、<code>redis.call / redis.pcall</code> 的错误语义差异、<code>Lua 5.1 沙箱</code>的能力边界,以及 Redis 7 引入的 <code>Functions</code> 如何把临时脚本提升为<strong>持久化的一等公民</strong>(随 RDB/AOF 持久化、随复制传播)。Lua 在原子性、条件分支、复制模式三个维度都是事务的能力扩展,但<strong>长脚本阻塞</strong>与 <code>cluster-node-timeout</code> 联动是必须正确处理的生产硬约束。</p>
+
+</div>
+
+<p class="footer">&copy; 2026 图解 Redis &middot; 第 28 章 &middot; 事务 MULTI/EXEC</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/c.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/lua.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){setTimeout(function(){document.querySelectorAll('.diagram svg').forEach(function(svg){var h=parseInt(svg.getAttribute('height')||svg.getBoundingClientRect().height);if(h>500){svg.style.maxHeight='500px';svg.style.width='auto';var p=svg.closest('.diagram');if(p)p.style.overflowX='auto';}});},1500);});</script>
+</body>
+</html>

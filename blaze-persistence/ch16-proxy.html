@@ -1,0 +1,1014 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 16 章 · Entity View 代理生成 — 图解 Blaze-Persistence</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Blaze-Persistence</span>
+  <span class="sep">|</span>
+  <a href="index.html">目录</a>
+  <a href="ch15-provider.html">← 第 15 章</a>
+  <a href="ch17-graphql.html">第 17 章 →</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s16-1">16.1 Entity View 实现策略</a>
+  <a href="#s16-2">16.2 运行时代理生成</a>
+  <a href="#s16-3">16.3 不可变视图的代理</a>
+  <a href="#s16-4">16.4 可变视图的脏检查</a>
+  <a href="#s16-5">16.5 级联与集合代理</a>
+  <a href="#s16-6">16.6 注解处理器与静态元模型</a>
+  <a href="#s16-7">16.7 陷阱与限制</a>
+  <a href="#summary">本章小结</a>
+</aside>
+
+<article class="article">
+
+<h1>第 16 章 · Entity View 代理生成</h1>
+<p class="subtitle">运行时代理 · 字节码生成 · 脏检查实现 · 不可变 vs 可变 · 静态元模型</p>
+
+<div class="chapter-intro">
+  <p class="lead">Entity View 以接口或抽象类定义 — 但运行时谁来实例化它们？本章深入 Blaze-Persistence 最核心的黑魔法：代理类的字节码生成机制。我们将逐层剥开代理的内存布局、脏检查位图、集合录制器，以及编译期静态元模型的替代方案。</p>
+  <ul class="will-learn">
+    <li>理解 Entity View 从接口到可执行对象的三种实现策略</li>
+    <li>掌握运行时字节码生成的完整流程（ProxyFactory → ByteBuddy/ASM → Class）</li>
+    <li>区分不可变视图与可变视图在代理层面的差异</li>
+    <li>深入脏检查位图（dirty bits）的工作原理与部分更新机制</li>
+    <li>理解集合代理（RecordingList / RecordingSet / RecordingMap）的变更追踪策略</li>
+    <li>使用注解处理器生成静态实现，加速启动并兼容 GraalVM</li>
+    <li>识别代理生成的常见陷阱与模块化 Java 限制</li>
+  </ul>
+  <p class="prereq">前置知识：建议先完成 <a href="ch04-entityview.html">第 4 章 · Entity View 基础</a> 和 <a href="ch06-updatable.html">第 6 章 · 可更新 Entity View</a> 的学习。</p>
+</div>
+
+
+<!-- ================================================================== -->
+<h2 id="s16-1">16.1 Entity View 实现策略</h2>
+<!-- ================================================================== -->
+
+<p>当你定义一个 <code>@EntityView</code> 接口时，其中没有任何实现代码 — 只有 getter 方法签名。Blaze-Persistence 必须在运行时生成真正的类来实现这些接口，才能将查询结果映射为类型安全的对象。</p>
+
+<div class="diagram">
+<div class="diagram-title">从 @EntityView 接口到可执行实例的完整流程</div>
+<div class="mermaid">
+flowchart TD
+    DEF["@EntityView(Cat.class)<br/>interface CatView &#123;<br/>&nbsp;&nbsp;Long getId();<br/>&nbsp;&nbsp;String getName();<br/>&#125;"] --> SCAN["EntityViewManager 启动扫描"]
+    SCAN --> ANALYZE["解析注解元数据<br/>字段映射 · 关联路径 · 抓取策略"]
+    ANALYZE --> STRATEGY{"实现策略？"}
+
+    STRATEGY -->|"默认"| RUNTIME["运行时代理生成<br/>ByteBuddy / ASM 字节码"]
+    STRATEGY -->|"编译期"| STATIC["APT 注解处理器<br/>生成 *_Impl.java"]
+    STRATEGY -->|"Builder"| BUILDER["Builder 模式<br/>EntityViewManager.create()"]
+
+    RUNTIME --> CLASS["生成 CatView$$Proxy 类<br/>实现 CatView + 内部接口"]
+    STATIC --> CLASS2["编译期 CatView_Impl 类<br/>纯 Java 实现"]
+    BUILDER --> CLASS3["通过 Builder 逐字段<br/>设置后构建实例"]
+
+    CLASS --> INSTANCE["查询时实例化<br/>new CatView$$Proxy(tuple)"]
+    CLASS2 --> INSTANCE
+    CLASS3 --> INSTANCE
+
+    INSTANCE --> RESULT["返回类型安全的<br/>CatView 实例"]
+
+    style DEF fill:#1e3a5f,stroke:#58a6ff
+    style RUNTIME fill:#2d1f4e,stroke:#bc8cff
+    style STATIC fill:#1a3a2a,stroke:#3fb950
+    style BUILDER fill:#3a2a1a,stroke:#d29922
+    style RESULT fill:#1a3a1a,stroke:#3fb950
+</div>
+</div>
+
+<h3>三种策略对比</h3>
+
+<table>
+<thead>
+<tr><th>策略</th><th>实现时机</th><th>适用场景</th><th>启动开销</th><th>GraalVM 兼容</th></tr>
+</thead>
+<tbody>
+<tr><td>运行时代理</td><td>应用启动时</td><td>标准 JVM 环境</td><td style="color:var(--orange)">中等</td><td style="color:var(--red)">❌ 不兼容</td></tr>
+<tr><td>静态实现 (APT)</td><td>编译期</td><td>GraalVM / 快速启动</td><td style="color:var(--green)">极低</td><td style="color:var(--green)">✅ 兼容</td></tr>
+<tr><td>Builder 模式</td><td>调用时</td><td>编程式创建实例</td><td style="color:var(--green)">无</td><td style="color:var(--green)">✅ 兼容</td></tr>
+</tbody>
+</table>
+
+<div class="diagram">
+<div class="diagram-title">为什么选择代理而非直接代码生成</div>
+<svg viewBox="0 0 900 310" xmlns="http://www.w3.org/2000/svg" style="width:100%;max-width:900px;margin:0 auto;display:block" font-family="Inter,'Microsoft YaHei',system-ui,sans-serif">
+  <rect width="900" height="310" rx="12" fill="#0d1117"/>
+  <!-- Left: proxy -->
+  <rect x="20" y="16" width="390" height="278" rx="10" fill="none" stroke="#3fb950" stroke-width="1.5"/>
+  <rect x="20" y="16" width="390" height="36" rx="10" fill="#3fb95020"/>
+  <text x="215" y="40" text-anchor="middle" font-size="15" font-weight="700" fill="#3fb950">✅ 运行时代理</text>
+  <rect x="44" y="66" width="342" height="32" rx="6" fill="#0b1c0b" stroke="#3fb950" stroke-width="1"/><text x="56" y="87" font-size="13" fill="#4ade80">✓</text><text x="76" y="87" font-size="13" fill="#e6edf3">用户只写接口</text>
+  <rect x="44" y="108" width="342" height="32" rx="6" fill="#0b1c0b" stroke="#3fb950" stroke-width="1"/><text x="56" y="129" font-size="13" fill="#4ade80">✓</text><text x="76" y="129" font-size="13" fill="#e6edf3">零样板代码</text>
+  <rect x="44" y="150" width="342" height="32" rx="6" fill="#0b1c0b" stroke="#3fb950" stroke-width="1"/><text x="56" y="171" font-size="13" fill="#4ade80">✓</text><text x="76" y="171" font-size="13" fill="#e6edf3">框架控制内部结构</text>
+  <rect x="44" y="192" width="342" height="32" rx="6" fill="#0b1c0b" stroke="#3fb950" stroke-width="1"/><text x="56" y="213" font-size="13" fill="#4ade80">✓</text><text x="76" y="213" font-size="13" fill="#e6edf3">可注入追踪逻辑 (DirtyTracker)</text>
+  <rect x="60" y="240" width="310" height="32" rx="6" fill="#0b2b0b" stroke="#3fb950" stroke-width="1"/>
+  <text x="215" y="261" text-anchor="middle" font-size="13" font-weight="600" fill="#4ade80">开发效率 ×5 — 默认选择</text>
+  <!-- VS -->
+  <circle cx="450" cy="155" r="24" fill="#161b22" stroke="#e6edf3" stroke-width="2"/>
+  <text x="450" y="161" text-anchor="middle" font-size="14" font-weight="800" fill="#e6edf3">VS</text>
+  <!-- Right: manual -->
+  <rect x="490" y="16" width="390" height="278" rx="10" fill="none" stroke="#f85149" stroke-width="1.5"/>
+  <rect x="490" y="16" width="390" height="36" rx="10" fill="#f8514920"/>
+  <text x="685" y="40" text-anchor="middle" font-size="15" font-weight="700" fill="#f85149">❌ 手动实现类</text>
+  <rect x="514" y="66" width="342" height="32" rx="6" fill="#3a1a1a" stroke="#f85149" stroke-width="1"/><text x="526" y="87" font-size="13" fill="#f87171">✗</text><text x="546" y="87" font-size="13" fill="#e6edf3">每个 View 写一个类</text>
+  <rect x="514" y="108" width="342" height="32" rx="6" fill="#3a1a1a" stroke="#f85149" stroke-width="1"/><text x="526" y="129" font-size="13" fill="#f87171">✗</text><text x="546" y="129" font-size="13" fill="#e6edf3">构造器 / setter 样板代码</text>
+  <rect x="514" y="150" width="342" height="32" rx="6" fill="#3a1a1a" stroke="#f85149" stroke-width="1"/><text x="526" y="171" font-size="13" fill="#f87171">✗</text><text x="546" y="171" font-size="13" fill="#e6edf3">脏检查需手动实现</text>
+  <rect x="514" y="192" width="342" height="32" rx="6" fill="#3a1a1a" stroke="#f85149" stroke-width="1"/><text x="526" y="213" font-size="13" fill="#f87171">✗</text><text x="546" y="213" font-size="13" fill="#e6edf3">接口变更需同步修改</text>
+  <rect x="530" y="240" width="310" height="32" rx="6" fill="#3d0f0f" stroke="#f85149" stroke-width="1"/>
+  <text x="685" y="261" text-anchor="middle" font-size="13" font-weight="600" fill="#f87171">维护成本高 · 易出错</text>
+</svg>
+</div>
+
+<div class="key-insight">
+  <strong>💡 设计哲学：</strong>Blaze-Persistence 选择运行时代理的核心原因是<strong>零侵入</strong> — 用户只需定义接口，框架在内部生成包含字段存储、脏检查、序列化支持的完整实现类。这与 Hibernate 对 Entity 使用代理的思路一脉相承。
+</div>
+
+
+<!-- ================================================================== -->
+<h2 id="s16-2">16.2 运行时代理生成</h2>
+<!-- ================================================================== -->
+
+<p>运行时代理生成是 Entity View 的默认实现策略。当 <code>EntityViewManager</code> 初始化时，它会为每个已注册的 View 接口生成一个代理类，然后在查询执行时通过代理类的构造器将结果元组映射为 View 实例。</p>
+
+<div class="diagram">
+<div class="diagram-title">代理类生成时序 — 从接口到实例</div>
+<div class="mermaid">
+sequenceDiagram
+    participant App as 应用启动
+    participant EVM as EntityViewManager
+    participant PF as ProxyFactory
+    participant BB as ByteBuddy / ASM
+    participant CL as ClassLoader
+
+    App->>EVM: EntityViews.createDefaultConfiguration()<br/>.addEntityView(CatView.class)
+    EVM->>EVM: 解析 @EntityView 注解元数据
+    EVM->>PF: generateProxyClass(CatView.class, metadata)
+
+    PF->>BB: 定义新类: CatView$$_blazeproxy
+    BB->>BB: 添加字段存储数组 Object[]
+    BB->>BB: 实现 getter → 从数组读取
+    BB->>BB: 实现内部接口 (EntityViewProxy)
+    BB-->>PF: 返回字节码 byte[]
+
+    PF->>CL: defineClass(byte[])
+    CL-->>PF: 返回 Class&lt;CatView$$_blazeproxy&gt;
+    PF-->>EVM: 缓存代理 Class 对象
+
+    Note over EVM: 代理类在启动时一次性生成，后续查询直接复用
+
+    App->>EVM: 执行查询: applySetting(CatView.class, cb)
+    EVM->>EVM: 从缓存取出代理 Class
+    EVM->>CL: newInstance(tupleData)
+    CL-->>App: 返回 CatView 代理实例
+</div>
+</div>
+
+<h3>生成的代理类结构</h3>
+
+<p>代理类不仅实现了用户定义的 View 接口，还实现了框架内部的追踪接口。其字段存储采用 <code>Object[]</code> 数组而非独立字段，这样可以统一处理不同类型的属性。</p>
+
+<div class="diagram">
+<div class="diagram-title">代理类的类层次结构</div>
+<div class="mermaid">
+classDiagram
+    class CatView {
+        <<interface>>
+        +getId() Long
+        +getName() String
+        +getAge() int
+    }
+
+    class EntityViewProxy {
+        <<interface>>
+        +$$_getId() Object
+        +$$_getEntityViewClass() Class
+        +$$_isNew() boolean
+        +$$_toReference() EntityViewProxy
+    }
+
+    class DirtyTracker {
+        <<interface>>
+        +$$_isDirty() boolean
+        +$$_getDirtyProperties() String[]
+        +$$_unmarkDirty()
+        +$$_setParent(parent, index)
+    }
+
+    class CatView$$_blazeproxy {
+        -Object[] $$_tuple
+        -long $$_dirtyBits
+        -DirtyTracker $$_parent
+        -int $$_parentIndex
+        +getId() Long
+        +getName() String
+        +getAge() int
+        +$$_isDirty() boolean
+        +$$_getDirtyProperties() String[]
+    }
+
+    CatView <|.. CatView$$_blazeproxy : implements
+    EntityViewProxy <|.. CatView$$_blazeproxy : implements
+    DirtyTracker <|.. CatView$$_blazeproxy : implements
+
+    note for CatView$$_blazeproxy "由 ByteBuddy 在运行时生成\n字段存储在 Object[] 数组中\n脏位存储在 long 位图中"
+</div>
+</div>
+
+<h3>代理实例的内存布局</h3>
+
+<p>每个代理实例的核心是一个 <code>Object[]</code> 数组，数组的每个槽位对应 View 接口中的一个属性。脏检查通过一个 <code>long</code> 类型的位图实现，每个 bit 对应一个字段的修改状态。</p>
+
+<div class="diagram">
+<div class="diagram-title">代理实例内存布局 — Object[] 元组存储 + 脏位图</div>
+<div style="max-width:660px;margin:0 auto;padding:16px 0;">
+      <div style="background:rgba(30,58,95,.15);border:1px solid #58a6ff;border-radius:8px 8px 0 0;padding:10px 16px;text-align:center;font-weight:bold;color:#58a6ff;font-size:14px;">CatView$$_blazeproxy 实例内存布局</div>
+      <div style="background:rgba(45,31,78,.15);border:1px solid #bc8cff;border-top:none;padding:8px 16px;text-align:center;font-weight:bold;color:#bc8cff;font-size:13px;">$$_tuple: Object[]</div>
+      <div style="display:flex;border:1px solid #30363d;border-top:none;">
+        <div style="flex:1;padding:10px 6px;text-align:center;background:#161b22;border-right:1px solid #30363d;">
+          <div style="color:#8b949e;font-size:11px;">[0] id</div>
+          <div style="color:#e6edf3;font-size:13px;font-weight:bold;margin-top:4px;">= 42L</div>
+        </div>
+        <div style="flex:1;padding:10px 6px;text-align:center;background:#161b22;border-right:1px solid #30363d;">
+          <div style="color:#8b949e;font-size:11px;">[1] name</div>
+          <div style="color:#e6edf3;font-size:13px;font-weight:bold;margin-top:4px;">= 'Tom'</div>
+        </div>
+        <div style="flex:1;padding:10px 6px;text-align:center;background:#161b22;border-right:1px solid #30363d;">
+          <div style="color:#8b949e;font-size:11px;">[2] age</div>
+          <div style="color:#e6edf3;font-size:13px;font-weight:bold;margin-top:4px;">= 3</div>
+        </div>
+        <div style="flex:1;padding:10px 6px;text-align:center;background:#161b22;border-right:1px solid #30363d;">
+          <div style="color:#8b949e;font-size:11px;">[3] owner</div>
+          <div style="color:#e6edf3;font-size:13px;font-weight:bold;margin-top:4px;">OwnerView</div>
+        </div>
+        <div style="flex:1;padding:10px 6px;text-align:center;background:#161b22;">
+          <div style="color:#8b949e;font-size:11px;">[4] breed</div>
+          <div style="color:#e6edf3;font-size:13px;font-weight:bold;margin-top:4px;">= 'Persian'</div>
+        </div>
+      </div>
+      <div style="background:rgba(26,58,42,.15);border:1px solid #3fb950;border-top:none;padding:8px 16px;text-align:center;font-weight:bold;color:#3fb950;font-size:13px;">$$_dirtyBits: long = 0b00000</div>
+      <div style="display:flex;border:1px solid #3fb950;border-top:none;border-radius:0 0 8px 8px;overflow:hidden;">
+        <div style="flex:1;padding:8px 6px;text-align:center;background:rgba(26,58,26,.15);border-right:1px solid rgba(63,185,80,.3);">
+          <div style="color:#8b949e;font-size:11px;">bit 0 · id</div>
+          <div style="color:#3fb950;font-size:12px;margin-top:3px;">✅ clean</div>
+        </div>
+        <div style="flex:1;padding:8px 6px;text-align:center;background:rgba(26,58,26,.15);border-right:1px solid rgba(63,185,80,.3);">
+          <div style="color:#8b949e;font-size:11px;">bit 1 · name</div>
+          <div style="color:#3fb950;font-size:12px;margin-top:3px;">✅ clean</div>
+        </div>
+        <div style="flex:1;padding:8px 6px;text-align:center;background:rgba(26,58,26,.15);border-right:1px solid rgba(63,185,80,.3);">
+          <div style="color:#8b949e;font-size:11px;">bit 2 · age</div>
+          <div style="color:#3fb950;font-size:12px;margin-top:3px;">✅ clean</div>
+        </div>
+        <div style="flex:1;padding:8px 6px;text-align:center;background:rgba(26,58,26,.15);border-right:1px solid rgba(63,185,80,.3);">
+          <div style="color:#8b949e;font-size:11px;">bit 3 · owner</div>
+          <div style="color:#3fb950;font-size:12px;margin-top:3px;">✅ clean</div>
+        </div>
+        <div style="flex:1;padding:8px 6px;text-align:center;background:rgba(26,58,26,.15);">
+          <div style="color:#8b949e;font-size:11px;">bit 4 · breed</div>
+          <div style="color:#3fb950;font-size:12px;margin-top:3px;">✅ clean</div>
+        </div>
+      </div>
+    </div>
+</div>
+
+<pre><code>// 生成的代理类伪代码（简化）
+public class CatView$$_blazeproxy implements CatView, EntityViewProxy, DirtyTracker {
+
+    private Object[] $$_tuple;
+    private long $$_dirtyBits;
+
+    // 元组构造器 — 查询结果直接传入
+    public CatView$$_blazeproxy(Object[] tuple) {
+        this.$$_tuple = tuple;
+    }
+
+    @Override
+    public Long getId() {
+        return (Long) $$_tuple[0];
+    }
+
+    @Override
+    public String getName() {
+        return (String) $$_tuple[1];
+    }
+
+    // ... 其余 getter 同理
+}</code></pre>
+
+
+<!-- ================================================================== -->
+<h2 id="s16-3">16.3 不可变视图的代理</h2>
+<!-- ================================================================== -->
+
+<p>只读的 Entity View（未标注 <code>@UpdatableEntityView</code>）获得的是精简版代理：只有 getter 方法，没有 setter，不追踪脏状态。这类代理的内存开销最小、生成逻辑最简单。</p>
+
+<div class="diagram">
+<div class="diagram-title">只读代理 vs 可更新代理的结构差异</div>
+<div class="mermaid">
+classDiagram
+    class CatReadView {
+        <<interface · 只读>>
+        +getId() Long
+        +getName() String
+        +getAge() int
+    }
+
+    class CatReadView$$proxy {
+        <<只读代理>>
+        -Object[] $$_tuple
+        +getId() Long
+        +getName() String
+        +getAge() int
+        +$$_getEntityViewClass() Class
+    }
+
+    class CatEditView {
+        <<interface · 可更新>>
+        +getId() Long
+        +getName() String
+        +setName(name)
+        +getAge() int
+        +setAge(age)
+    }
+
+    class CatEditView$$proxy {
+        <<可更新代理>>
+        -Object[] $$_tuple
+        -Object[] $$_initialState
+        -long $$_dirtyBits
+        -DirtyTracker $$_parent
+        +getId() Long
+        +getName() String
+        +setName(name)
+        +getAge() int
+        +setAge(age)
+        +$$_isDirty() boolean
+        +$$_getDirtyProperties() String[]
+        +$$_unmarkDirty()
+    }
+
+    CatReadView <|.. CatReadView$$proxy
+    CatEditView <|.. CatEditView$$proxy
+
+    note for CatReadView$$proxy "无 setter\n无脏位图\n无初始状态快照\n内存更紧凑"
+    note for CatEditView$$proxy "包含 setter\n脏位图追踪\n初始状态快照\n支持部分更新"
+</div>
+</div>
+
+<h3>TupleConstructor：查询结果到代理的映射</h3>
+
+<p>Blaze-Persistence 的 <code>ObjectBuilder</code> 系统负责将 SELECT 元组转换为代理实例。核心流程：先确定元组中每个位置对应 View 的哪个属性，再调用代理构造器完成映射。</p>
+
+<div class="diagram">
+<div class="diagram-title">SELECT 元组 → 代理实例的映射流程</div>
+<div class="mermaid">
+sequenceDiagram
+    participant QB as QueryBuilder
+    participant OB as ObjectBuilder
+    participant TC as TupleConstructor
+    participant PX as Proxy Class
+
+    QB->>QB: SELECT c.id, c.name, c.age FROM Cat c
+    QB->>OB: 返回 ResultStream
+
+    loop 每行结果
+        OB->>OB: 读取一行: Object[] row = {42L, "Tom", 3}
+        OB->>TC: build(row)
+        TC->>TC: 重排列: 将 SQL 列顺序<br/>映射到 View 属性顺序
+        TC->>PX: new CatView$$proxy(mappedTuple)
+        PX-->>TC: 返回代理实例
+        TC-->>OB: 返回 CatView 实例
+    end
+
+    OB-->>QB: 返回 List&lt;CatView&gt;
+
+    Note over TC,PX: TupleConstructor 处理列顺序差异<br/>确保 tuple[i] 对应正确的 getter
+</div>
+</div>
+
+<div class="key-insight">
+  <strong>💡 性能优势：</strong>只读代理的实例化路径非常短 — 仅一次数组赋值，无任何拷贝或快照。在 <code>getResultList()</code> 返回 10,000 条记录时，只读代理比可更新代理节约约 40% 的内存分配。
+</div>
+
+<pre><code>// 只读视图定义 — 生成最精简的代理
+@EntityView(Cat.class)
+public interface CatSummaryView {
+    @IdMapping
+    Long getId();
+    String getName();
+
+    @Mapping("UPPER(breed)")
+    String getBreedUpper();
+
+    @Mapping("SIZE(kittens)")
+    long getKittenCount();
+}</code></pre>
+
+
+<!-- ================================================================== -->
+<h2 id="s16-4">16.4 可变视图的脏检查</h2>
+<!-- ================================================================== -->
+
+<p>标注了 <code>@UpdatableEntityView</code> 的视图代理拥有完整的变更追踪能力。每次调用 setter 时，代理会自动在位图中标记对应字段为"脏"。最终 flush 时，只有脏字段才会被写入 UPDATE 语句。</p>
+
+<div class="diagram">
+<div class="diagram-title">脏检查完整流程 — setter → dirty bit → partial UPDATE</div>
+<div class="mermaid">
+flowchart TD
+    LOAD["加载 CatEditView 实例<br/>dirtyBits = 0b0000"] --> SET1["调用 setName('Jerry')"]
+    SET1 --> MARK1["$$_tuple[1] = 'Jerry'<br/>dirtyBits |= (1 &lt;&lt; 1)<br/>→ 0b0010"]
+    MARK1 --> SET2["调用 setAge(5)"]
+    SET2 --> MARK2["$$_tuple[2] = 5<br/>dirtyBits |= (1 &lt;&lt; 2)<br/>→ 0b0110"]
+    MARK2 --> FLUSH["调用 evm.save(em, view)"]
+    FLUSH --> CHECK{"$$_isDirty() ?<br/>dirtyBits != 0"}
+
+    CHECK -->|"是 ✅"| DIRTY["获取脏属性列表<br/>$$_getDirtyProperties()<br/>→ ['name', 'age']"]
+    CHECK -->|"否"| SKIP["跳过 — 无需更新"]
+
+    DIRTY --> SQL["生成部分 UPDATE<br/>UPDATE cat<br/>SET name='Jerry', age=5<br/>WHERE id=42"]
+    SQL --> RESET["$$_unmarkDirty()<br/>dirtyBits = 0b0000"]
+    RESET --> DONE["✅ 更新完成"]
+
+    style LOAD fill:#1e3a5f,stroke:#58a6ff
+    style MARK1 fill:#3a2a1a,stroke:#d29922
+    style MARK2 fill:#3a2a1a,stroke:#d29922
+    style SQL fill:#2d1f4e,stroke:#bc8cff
+    style DONE fill:#1a3a1a,stroke:#3fb950
+    style SKIP fill:#161b22,stroke:#30363d
+</div>
+</div>
+
+<h3>DirtyTracker 接口实现</h3>
+
+<pre><code>// 可更新代理生成的 setter 伪代码
+@Override
+public void setName(String name) {
+    if (!Objects.equals(this.$$_tuple[1], name)) {
+        this.$$_tuple[1] = name;
+        this.$$_dirtyBits |= (1L << 1);  // 标记 bit 1 为脏
+        if (this.$$_parent != null) {
+            this.$$_parent.$$_markDirty(this.$$_parentIndex);
+        }
+    }
+}
+
+@Override
+public boolean $$_isDirty() {
+    return this.$$_dirtyBits != 0L;
+}
+
+@Override
+public String[] $$_getDirtyProperties() {
+    List&lt;String&gt; dirty = new ArrayList&lt;&gt;();
+    if (($$_dirtyBits &amp; (1L &lt;&lt; 1)) != 0) dirty.add("name");
+    if (($$_dirtyBits &amp; (1L &lt;&lt; 2)) != 0) dirty.add("age");
+    // ...
+    return dirty.toArray(new String[0]);
+}</code></pre>
+
+<h3>JPA 全量更新 vs Entity View 部分更新</h3>
+
+<div class="diagram">
+<div class="diagram-title">对比：JPA merge() vs Entity View 脏检查的 SQL 差异</div>
+<svg viewBox="0 0 900 380" xmlns="http://www.w3.org/2000/svg" style="width:100%;max-width:900px;margin:0 auto;display:block" font-family="Inter,'Microsoft YaHei',system-ui,sans-serif">
+  <rect width="900" height="380" rx="12" fill="#0d1117"/>
+  <!-- Left: JPA merge -->
+  <rect x="20" y="16" width="390" height="348" rx="10" fill="none" stroke="#f85149" stroke-width="1.5"/>
+  <rect x="20" y="16" width="390" height="36" rx="10" fill="#f8514920"/>
+  <text x="215" y="40" text-anchor="middle" font-size="15" font-weight="700" fill="#f85149">❌ JPA em.merge() — 全量更新</text>
+  <rect x="80" y="66" width="240" height="28" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/><text x="200" y="85" text-anchor="middle" font-size="13" fill="#e6edf3">加载 Cat 实体</text>
+  <line x1="200" y1="94" x2="200" y2="106" stroke="#f85149" stroke-width="1.5" marker-end="url(#a16r)"/>
+  <rect x="80" y="106" width="240" height="28" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/><text x="200" y="125" text-anchor="middle" font-size="13" fill="#e6edf3">cat.setName("Jerry")</text>
+  <line x1="200" y1="134" x2="200" y2="146" stroke="#f85149" stroke-width="1.5" marker-end="url(#a16r)"/>
+  <rect x="44" y="146" width="342" height="118" rx="6" fill="#3a1a1a" stroke="#f85149" stroke-width="1"/>
+  <text x="215" y="166" text-anchor="middle" font-size="13" fill="#e6edf3">UPDATE cat SET</text>
+  <text x="215" y="184" text-anchor="middle" font-size="13" fill="#f87171">id=42, name='Jerry', age=3,</text>
+  <text x="215" y="202" text-anchor="middle" font-size="13" fill="#f87171">breed='Persian', owner_id=7,</text>
+  <text x="215" y="220" text-anchor="middle" font-size="13" fill="#f87171">color='gray', weight=4.2</text>
+  <text x="215" y="250" text-anchor="middle" font-size="13" fill="#8b949e">WHERE id=42</text>
+  <rect x="56" y="280" width="288" height="32" rx="6" fill="#3d0f0f" stroke="#f85149" stroke-width="1"/>
+  <text x="200" y="301" text-anchor="middle" font-size="13" font-weight="600" fill="#f87171">⚠️ 全部 7 列写入 · 只改了 name</text>
+  <!-- VS -->
+  <circle cx="450" cy="190" r="24" fill="#161b22" stroke="#e6edf3" stroke-width="2"/>
+  <text x="450" y="196" text-anchor="middle" font-size="14" font-weight="800" fill="#e6edf3">VS</text>
+  <!-- Right: Entity View -->
+  <rect x="490" y="16" width="390" height="348" rx="10" fill="none" stroke="#3fb950" stroke-width="1.5"/>
+  <rect x="490" y="16" width="390" height="36" rx="10" fill="#3fb95020"/>
+  <text x="685" y="40" text-anchor="middle" font-size="15" font-weight="700" fill="#3fb950">✅ Entity View — 部分更新</text>
+  <rect x="550" y="66" width="270" height="28" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/><text x="685" y="85" text-anchor="middle" font-size="13" fill="#e6edf3">加载 CatEditView</text>
+  <line x1="685" y1="94" x2="685" y2="106" stroke="#3fb950" stroke-width="1.5" marker-end="url(#a16g)"/>
+  <rect x="550" y="106" width="270" height="28" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/><text x="685" y="125" text-anchor="middle" font-size="13" fill="#e6edf3">view.setName("Jerry")</text>
+  <line x1="685" y1="134" x2="685" y2="146" stroke="#3fb950" stroke-width="1.5" marker-end="url(#a16g)"/>
+  <rect x="530" y="146" width="310" height="64" rx="6" fill="#0b1c0b" stroke="#3fb950" stroke-width="1"/>
+  <text x="685" y="170" text-anchor="middle" font-size="13" fill="#e6edf3">UPDATE cat SET</text>
+  <text x="685" y="190" text-anchor="middle" font-size="13" fill="#4ade80">name='Jerry'</text>
+  <text x="685" y="204" text-anchor="middle" font-size="13" fill="#8b949e">WHERE id=42</text>
+  <rect x="530" y="228" width="310" height="32" rx="6" fill="#0b2b0b" stroke="#3fb950" stroke-width="1"/>
+  <text x="685" y="249" text-anchor="middle" font-size="13" font-weight="600" fill="#4ade80">✅ 仅 1 列 · 减少 I/O 和锁竞争</text>
+  <defs>
+    <marker id="a16r" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#f85149"/></marker>
+    <marker id="a16g" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#3fb950"/></marker>
+  </defs>
+</svg>
+</div>
+
+<h3>初始状态快照与重置</h3>
+
+<p>可更新代理在加载时会拍摄一份初始状态快照 <code>$$_initialState</code>。当调用 <code>$$_unmarkDirty()</code> 时，快照同步更新为当前值。这确保了二次修改能被正确追踪。</p>
+
+<div class="diagram">
+<div class="diagram-title">初始快照的生命周期</div>
+<div class="mermaid">
+stateDiagram-v2
+    [*] --> 加载态: 查询返回元组
+    加载态 --> 修改态: setter 调用
+    修改态 --> 修改态: 更多 setter 调用
+    修改态 --> 持久化: evm.save() 成功
+    持久化 --> 加载态: 快照更新为当前值\ndirtyBits 重置为 0
+    修改态 --> 回滚态: evm.save() 失败
+    回滚态 --> 修改态: 修正后重试
+
+    note right of 加载态
+        $$_initialState = copy($$_tuple)
+        $$_dirtyBits = 0
+    end note
+
+    note right of 修改态
+        $$_tuple 已变更
+        $$_dirtyBits ≠ 0
+        $$_initialState 保持不变
+    end note
+</div>
+</div>
+
+<div class="warning">
+  <strong>⚠️ 位图容量限制：</strong><code>long</code> 类型的脏位图最多追踪 64 个字段。当 View 的属性超过 64 个时，框架会自动切换到 <code>long[]</code> 数组。不过，拥有 64+ 属性的 View 本身就是反模式（参见第 13 章 God View 反模式）。
+</div>
+
+
+<!-- ================================================================== -->
+<h2 id="s16-5">16.5 级联与集合代理</h2>
+<!-- ================================================================== -->
+
+<p>可更新视图中的集合字段（<code>List</code>、<code>Set</code>、<code>Map</code>）不使用标准 JDK 集合 — 它们被替换为特殊的<strong>录制集合</strong>（Recording Collection），能够精确记录每一次增删操作。</p>
+
+<div class="diagram">
+<div class="diagram-title">集合代理的类型层次与操作追踪</div>
+<div class="mermaid">
+classDiagram
+    class List~E~ {
+        <<JDK interface>>
+    }
+    class Set~E~ {
+        <<JDK interface>>
+    }
+    class Map~K,V~ {
+        <<JDK interface>>
+    }
+
+    class RecordingList~E~ {
+        -List~E~ delegate
+        -List~E~ addedElements
+        -List~E~ removedElements
+        -boolean dirty
+        +add(E element)
+        +remove(Object o)
+        +clear()
+        +$$_getAddedElements() List
+        +$$_getRemovedElements() List
+        +$$_isDirty() boolean
+    }
+
+    class RecordingSet~E~ {
+        -Set~E~ delegate
+        -Set~E~ addedElements
+        -Set~E~ removedElements
+        -boolean dirty
+        +add(E element)
+        +remove(Object o)
+        +$$_getAddedElements() Set
+        +$$_getRemovedElements() Set
+    }
+
+    class RecordingMap~K,V~ {
+        -Map~K,V~ delegate
+        -Map~K,V~ addedEntries
+        -Set~K~ removedKeys
+        -boolean dirty
+        +put(K key, V value)
+        +remove(Object key)
+        +$$_getAddedEntries() Map
+        +$$_getRemovedKeys() Set
+    }
+
+    List <|.. RecordingList
+    Set <|.. RecordingSet
+    Map <|.. RecordingMap
+
+    note for RecordingList "记录每次 add/remove\n flush 时生成精确的 INSERT/DELETE"
+</div>
+</div>
+
+<div class="diagram">
+<div class="diagram-title">集合变更 flush 策略 — Diff-based vs Replace-based</div>
+<div class="mermaid">
+flowchart TD
+    CHANGE["集合发生变更"] --> STRATEGY{"flush 策略？"}
+
+    STRATEGY -->|"DIFF (默认)"| DIFF_CHECK["计算 added / removed 集合"]
+    STRATEGY -->|"REPLACE"| REPLACE_ALL["删除全部旧元素<br/>插入全部新元素"]
+
+    DIFF_CHECK --> HAS_ADD{"有新增？"}
+    HAS_ADD -->|"是"| INSERT["INSERT INTO join_table<br/>VALUES (新增元素)"]
+    HAS_ADD -->|"否"| HAS_REM
+
+    INSERT --> HAS_REM{"有删除？"}
+    HAS_REM -->|"是"| DELETE["DELETE FROM join_table<br/>WHERE id IN (删除元素)"]
+    HAS_REM -->|"否"| DONE
+
+    DELETE --> DONE["✅ 集合同步完成"]
+
+    REPLACE_ALL --> DEL_ALL["DELETE FROM join_table<br/>WHERE parent_id = ?"]
+    DEL_ALL --> INS_ALL["INSERT INTO join_table<br/>VALUES (全部当前元素)"]
+    INS_ALL --> DONE
+
+    style DIFF_CHECK fill:#1a3a1a,stroke:#3fb950
+    style REPLACE_ALL fill:#3a2a1a,stroke:#d29922
+    style DONE fill:#1a3a1a,stroke:#3fb950
+</div>
+</div>
+
+<pre><code>// 集合代理的操作录制示例
+@UpdatableEntityView
+@EntityView(Cat.class)
+public interface CatEditView {
+    @IdMapping
+    Long getId();
+
+    // 返回 RecordingList 而非 ArrayList
+    List&lt;KittenView&gt; getKittens();
+}
+
+// 使用时
+CatEditView cat = evm.find(em, CatEditView.class, 42L);
+cat.getKittens().add(newKitten);     // RecordingList 记录 add
+cat.getKittens().remove(oldKitten);  // RecordingList 记录 remove
+
+// flush 时只执行增量 SQL
+evm.save(em, cat);
+// → INSERT INTO cat_kittens ... (newKitten)
+// → DELETE FROM cat_kittens WHERE ... (oldKitten)</code></pre>
+
+<h3>孤儿移除</h3>
+
+<div class="diagram">
+<div class="diagram-title">orphanRemoval 在集合代理中的实现</div>
+<div class="mermaid">
+sequenceDiagram
+    participant App as 应用代码
+    participant RL as RecordingList
+    participant EVM as EntityViewManager
+    participant EM as EntityManager
+
+    App->>RL: kittens.remove(kittenView)
+    RL->>RL: removedElements.add(kittenView)
+    RL->>RL: dirty = true
+    RL-->>App: 返回 true
+
+    App->>EVM: save(em, catView)
+    EVM->>EVM: 检查 @MappingInverse(removeStrategy=REMOVE)
+
+    alt orphanRemoval = true
+        EVM->>EM: DELETE FROM kitten WHERE id = ?
+        Note over EM: 删除子实体本身
+    else orphanRemoval = false
+        EVM->>EM: UPDATE kitten SET cat_id = NULL WHERE id = ?
+        Note over EM: 仅断开关联
+    end
+
+    EVM->>RL: $$_unmarkDirty()
+    RL-->>EVM: 集合状态重置
+</div>
+</div>
+
+<div class="os-note">
+  <strong>📦 集合策略选择：</strong>Diff-based（默认）适合绝大多数场景，只传输变更部分。Replace-based 在集合被完全重写（如上传 CSV 覆盖全部明细行）时更高效，省去了逐条 diff 的开销。通过 <code>@MappingInverse(removeStrategy = ...)</code> 配置。
+</div>
+
+
+<!-- ================================================================== -->
+<h2 id="s16-6">16.6 注解处理器与静态元模型</h2>
+<!-- ================================================================== -->
+
+<p>运行时代理虽然方便，但存在启动开销和 GraalVM 兼容性问题。Blaze-Persistence 提供了编译期替代方案 — 通过 APT（Annotation Processing Tool）在编译阶段直接生成实现类。</p>
+
+<div class="diagram">
+<div class="diagram-title">APT 注解处理器工作流 — 编译期生成实现类</div>
+<div class="mermaid">
+flowchart TD
+    SRC["@EntityView(Cat.class)<br/>interface CatView &#123; ... &#125;<br/><i>源代码</i>"] --> JAVAC["javac 编译器"]
+    JAVAC --> APT["blaze-persistence-<br/>entity-view-processor<br/><i>APT 注解处理器</i>"]
+
+    APT --> SCAN["扫描 @EntityView 注解"]
+    SCAN --> META["提取元数据<br/>属性名 · 类型 · 映射路径"]
+    META --> GEN["生成 CatView_Impl.java"]
+
+    GEN --> IMPL["纯 Java 实现类<br/>无需字节码操纵<br/>无需反射"]
+    IMPL --> COMPILE["javac 编译 Impl 类"]
+    COMPILE --> CLASS["CatView_Impl.class<br/>加入 classpath"]
+
+    CLASS --> RUNTIME["运行时 EntityViewManager<br/>检测到 Impl → 跳过代理生成"]
+
+    subgraph 同时生成 ["静态元模型"]
+        APT --> METAMODEL["生成 CatView_.java<br/>静态元模型类"]
+        METAMODEL --> MM_CLASS["CatView_.class"]
+    end
+
+    style SRC fill:#1e3a5f,stroke:#58a6ff
+    style APT fill:#2d1f4e,stroke:#bc8cff
+    style GEN fill:#3a2a1a,stroke:#d29922
+    style CLASS fill:#1a3a1a,stroke:#3fb950
+    style RUNTIME fill:#1a3a1a,stroke:#3fb950
+    style MM_CLASS fill:#1a3a2a,stroke:#3fb950
+</div>
+</div>
+
+<h3>静态元模型 API</h3>
+
+<p>APT 同时生成静态元模型类 <code>CatView_</code>，提供编译期类型安全的属性引用，类似 JPA 的 <code>CriteriaMetamodel</code>。</p>
+
+<pre><code>// APT 生成的静态元模型（简化）
+@StaticMetamodel(CatView.class)
+public class CatView_ {
+    public static volatile MethodSingularAttribute&lt;CatView, Long&gt; id;
+    public static volatile MethodSingularAttribute&lt;CatView, String&gt; name;
+    public static volatile MethodSingularAttribute&lt;CatView, Integer&gt; age;
+    public static volatile MethodPluralAttribute&lt;CatView, List&lt;KittenView&gt;, KittenView&gt; kittens;
+}
+
+// 使用元模型进行类型安全的排序和过滤
+EntityViewSetting&lt;CatView, CriteriaBuilder&lt;CatView&gt;&gt; setting =
+    EntityViewSetting.create(CatView.class);
+setting.addAttributeSorter(CatView_.name, Sorters.ascending());
+setting.addAttributeFilter(CatView_.age, "3");</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">运行时代理 vs 静态实现：启动时间与内存对比</div>
+<div class="mermaid">
+flowchart LR
+    subgraph PROXY ["运行时代理"]
+        direction TB
+        P_STEP1["解析注解元数据"]
+        P_STEP2["ByteBuddy 生成字节码"]
+        P_STEP3["ClassLoader 加载代理类"]
+        P_STEP4["缓存 Class 对象"]
+        P_TIME["⏱️ 启动: +200~800ms<br/>📦 Metaspace: +2~8MB"]
+
+        P_STEP1 --> P_STEP2 --> P_STEP3 --> P_STEP4 --> P_TIME
+    end
+
+    subgraph STATIC ["静态实现 (APT)"]
+        direction TB
+        S_STEP1["编译期已生成 Impl 类"]
+        S_STEP2["ClassLoader 直接加载"]
+        S_STEP3["无需字节码生成"]
+        S_TIME["⏱️ 启动: +0ms<br/>📦 Metaspace: +0.5~1MB"]
+
+        S_STEP1 --> S_STEP2 --> S_STEP3 --> S_TIME
+    end
+
+    style P_TIME fill:#3a2a1a,stroke:#d29922
+    style S_TIME fill:#1a3a1a,stroke:#3fb950
+</div>
+</div>
+
+<h3>Maven 配置</h3>
+
+<pre><code>&lt;!-- pom.xml — 启用 Entity View APT --&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;com.blazebit&lt;/groupId&gt;
+    &lt;artifactId&gt;blaze-persistence-entity-view-processor&lt;/artifactId&gt;
+    &lt;version&gt;${blaze-persistence.version}&lt;/version&gt;
+    &lt;scope&gt;provided&lt;/scope&gt;
+&lt;/dependency&gt;
+
+&lt;!-- 编译后检查 target/generated-sources/annotations/ 目录 --&gt;
+&lt;!-- 应包含 CatView_Impl.java 和 CatView_.java --&gt;</code></pre>
+
+<div class="key-insight">
+  <strong>💡 GraalVM 必需：</strong>GraalVM Native Image 不支持运行时字节码生成。如果目标是 AOT 编译（如 Spring Native / Quarkus Native），必须启用 APT 静态实现。确保所有 View 的 <code>*_Impl.class</code> 在构建产物中存在。
+</div>
+
+
+<!-- ================================================================== -->
+<h2 id="s16-7">16.7 陷阱与限制</h2>
+<!-- ================================================================== -->
+
+<p>代理生成是 Blaze-Persistence 最强大也最脆弱的部分。以下问题在生产环境中反复出现，需提前识别和预防。</p>
+
+<div class="diagram">
+<div class="diagram-title">代理生成六大陷阱及应对策略</div>
+<div style="display:flex;flex-wrap:wrap;gap:12px;justify-content:center;padding:16px 0;">
+  <div style="border:1px solid #f85149;border-radius:8px;padding:12px 14px;min-width:170px;max-width:220px;background:rgba(58,26,26,.10);">
+    <div style="font-weight:bold;color:#f85149;margin-bottom:4px;font-size:13px;">① 启动时间膨胀</div>
+    <div style="color:#3fb950;font-size:12px;">✅ 使用 APT 静态实现或延迟初始化</div>
+  </div>
+  <div style="border:1px solid #f85149;border-radius:8px;padding:12px 14px;min-width:170px;max-width:220px;background:rgba(58,26,26,.10);">
+    <div style="font-weight:bold;color:#f85149;margin-bottom:4px;font-size:13px;">② 模块化 Java 限制</div>
+    <div style="color:#3fb950;font-size:12px;">✅ 添加 --add-opens java.base/java.lang</div>
+  </div>
+  <div style="border:1px solid #f85149;border-radius:8px;padding:12px 14px;min-width:170px;max-width:220px;background:rgba(58,26,26,.10);">
+    <div style="font-weight:bold;color:#f85149;margin-bottom:4px;font-size:13px;">③ GraalVM 不兼容</div>
+    <div style="color:#3fb950;font-size:12px;">✅ 必须使用 APT + 注册 reflect-config.json</div>
+  </div>
+  <div style="border:1px solid #d29922;border-radius:8px;padding:12px 14px;min-width:170px;max-width:220px;background:rgba(58,42,26,.10);">
+    <div style="font-weight:bold;color:#d29922;margin-bottom:4px;font-size:13px;">④ 深层视图层次</div>
+    <div style="color:#3fb950;font-size:12px;">✅ 扁平化视图层次，避免 &gt;3 层嵌套</div>
+  </div>
+  <div style="border:1px solid #d29922;border-radius:8px;padding:12px 14px;min-width:170px;max-width:220px;background:rgba(58,42,26,.10);">
+    <div style="font-weight:bold;color:#d29922;margin-bottom:4px;font-size:13px;">⑤ 序列化问题</div>
+    <div style="color:#3fb950;font-size:12px;">✅ 配置 Jackson Mixin 或 @JsonIgnoreProperties</div>
+  </div>
+  <div style="border:1px solid #d29922;border-radius:8px;padding:12px 14px;min-width:170px;max-width:220px;background:rgba(58,42,26,.10);">
+    <div style="font-weight:bold;color:#d29922;margin-bottom:4px;font-size:13px;">⑥ ClassLoader 冲突</div>
+    <div style="color:#3fb950;font-size:12px;">✅ 确保 View 和代理在同一 ClassLoader</div>
+  </div>
+</div>
+</div>
+
+<h3>陷阱 1：启动时间膨胀</h3>
+
+<p>每个 Entity View 的代理生成需要 5–15ms。当项目中有 100+ 个 View 时，累计启动时间可达数秒。</p>
+
+<pre><code>// 测量代理生成耗时
+long start = System.nanoTime();
+EntityViewConfiguration config = EntityViews.createDefaultConfiguration();
+config.addEntityView(CatView.class);
+config.addEntityView(DogView.class);
+// ... 100+ Views
+EntityViewManager evm = config.createEntityViewManager(cbf);
+long elapsed = (System.nanoTime() - start) / 1_000_000;
+System.out.println("EVM init: " + elapsed + "ms");
+// 典型输出: EVM init: 850ms  (100 Views)</code></pre>
+
+<h3>陷阱 2：模块化 Java (JPMS) 限制</h3>
+
+<p>Java 9+ 的模块系统默认禁止跨模块反射访问。代理生成需要访问 <code>java.lang</code> 包的内部 API。</p>
+
+<pre><code># JVM 启动参数 — 为代理生成开放必要的模块
+--add-opens java.base/java.lang=ALL-UNNAMED
+--add-opens java.base/java.lang.reflect=ALL-UNNAMED
+--add-opens java.base/java.util=ALL-UNNAMED</code></pre>
+
+<div class="warning">
+  <strong>⚠️ 忘记 add-opens：</strong>如果缺少上述 JVM 参数，启动时会抛出 <code>InaccessibleObjectException</code>，错误信息中包含 "module java.base does not 'opens' ... to unnamed module"。这是 Java 17+ 环境中最常见的代理生成失败原因。
+</div>
+
+<h3>陷阱 3：GraalVM Native Image</h3>
+
+<div class="diagram">
+<div class="diagram-title">GraalVM 兼容方案决策树</div>
+<div class="mermaid">
+flowchart TD
+    START["目标: GraalVM Native Image"] --> Q1{"已启用 APT？"}
+
+    Q1 -->|"是 ✅"| Q2{"所有 View 都有 Impl？"}
+    Q1 -->|"否 ❌"| ADD_APT["添加 entity-view-processor<br/>到 Maven 依赖"]
+
+    ADD_APT --> Q2
+
+    Q2 -->|"是 ✅"| Q3{"reflect-config.json<br/>已注册？"}
+    Q2 -->|"否 ❌"| CHECK["检查编译输出<br/>缺失的 View 未被 APT 扫描到"]
+
+    CHECK --> FIX_SCAN["确保 View 类在<br/>APT 的扫描路径中"]
+    FIX_SCAN --> Q2
+
+    Q3 -->|"是 ✅"| BUILD["native-image 构建<br/>✅ 预期成功"]
+    Q3 -->|"否 ❌"| ADD_REFLECT["注册 View + Impl 类<br/>到 reflect-config.json"]
+
+    ADD_REFLECT --> BUILD
+
+    style START fill:#1e3a5f,stroke:#58a6ff
+    style BUILD fill:#1a3a1a,stroke:#3fb950
+    style ADD_APT fill:#3a2a1a,stroke:#d29922
+    style CHECK fill:#3a1a1a,stroke:#f85149
+</div>
+</div>
+
+<h3>陷阱 4：深层视图嵌套</h3>
+
+<p>视图中引用另一个视图，再引用下一层 — 每一层都需要独立的代理类。超过 3 层嵌套时，代理生成的复杂度和内存占用显著上升。</p>
+
+<div class="diagram">
+<div class="diagram-title">深层嵌套的代理膨胀效应</div>
+<div class="mermaid">
+flowchart LR
+    L1["OrderView<br/>代理 #1"] --> L2["CustomerView<br/>代理 #2"]
+    L2 --> L3["AddressView<br/>代理 #3"]
+    L3 --> L4["CityView<br/>代理 #4"]
+    L4 --> L5["CountryView<br/>代理 #5"]
+
+    L1 -.->|"每层 +1 代理类<br/>+1 ObjectBuilder<br/>+1 TupleConstructor"| COST["5 层 = 5 个代理类<br/>查询 JOIN 深度 +4<br/>内存: ×5 元组嵌套"]
+
+    style COST fill:#3a1a1a,stroke:#f85149
+    style L1 fill:#1e3a5f,stroke:#58a6ff
+    style L2 fill:#2d1f4e,stroke:#bc8cff
+    style L3 fill:#3a2a1a,stroke:#d29922
+    style L4 fill:#3a2a1a,stroke:#d29922
+    style L5 fill:#3a1a1a,stroke:#f85149
+</div>
+</div>
+
+<h3>陷阱 5：代理实例的 Jackson 序列化</h3>
+
+<p>代理类包含框架内部字段（<code>$$_tuple</code>, <code>$$_dirtyBits</code> 等），直接序列化会泄漏内部状态。需要配置 Jackson 过滤。</p>
+
+<pre><code>// 方案 1: 全局配置 Jackson ObjectMapper
+ObjectMapper mapper = new ObjectMapper();
+mapper.addMixIn(EntityViewProxy.class, EntityViewProxyMixin.class);
+
+@JsonIgnoreProperties({"$$_tuple", "$$_dirtyBits", "$$_parent",
+    "$$_parentIndex", "$$_initialState", "$$_kind"})
+abstract class EntityViewProxyMixin {}
+
+// 方案 2: 使用 blaze-persistence-integration-jackson
+// 自动处理代理序列化，推荐方案
+&lt;dependency&gt;
+    &lt;groupId&gt;com.blazebit&lt;/groupId&gt;
+    &lt;artifactId&gt;blaze-persistence-integration-jackson&lt;/artifactId&gt;
+    &lt;version&gt;${blaze-persistence.version}&lt;/version&gt;
+&lt;/dependency&gt;</code></pre>
+
+<h3>陷阱 6：应用服务器中的 ClassLoader 问题</h3>
+
+<div class="real-world">
+  <h5>WildFly / JBoss 部署注意事项</h5>
+  <p>在 EAR 部署中，如果 Entity View 接口定义在一个 EJB 模块、而 <code>EntityViewManager</code> 在另一个 Web 模块中初始化，代理类可能由错误的 ClassLoader 加载。解决方案：将 View 接口和 EVM 配置放在共享的 <code>lib/</code> 目录下，确保同一 ClassLoader 可见。在 Spring Boot Fat JAR 部署中不存在此问题。</p>
+</div>
+
+<table>
+<thead>
+<tr><th>陷阱</th><th>出现频率</th><th>影响</th><th>修复难度</th></tr>
+</thead>
+<tbody>
+<tr><td>启动时间膨胀</td><td style="color:var(--orange)">中</td><td style="color:var(--orange)">中</td><td style="color:var(--green)">低 — 启用 APT</td></tr>
+<tr><td>JPMS add-opens</td><td style="color:var(--red)">高</td><td style="color:var(--red)">启动失败</td><td style="color:var(--green)">低 — 加 JVM 参数</td></tr>
+<tr><td>GraalVM 不兼容</td><td style="color:var(--orange)">中</td><td style="color:var(--red)">构建失败</td><td style="color:var(--orange)">中 — APT + 配置</td></tr>
+<tr><td>深层嵌套</td><td style="color:var(--orange)">中</td><td style="color:var(--orange)">性能退化</td><td style="color:var(--orange)">中 — 重构 View</td></tr>
+<tr><td>Jackson 序列化</td><td style="color:var(--red)">高</td><td style="color:var(--orange)">数据泄漏</td><td style="color:var(--green)">低 — 加集成包</td></tr>
+<tr><td>ClassLoader 冲突</td><td style="color:var(--accent)">低</td><td style="color:var(--red)">运行时异常</td><td style="color:var(--orange)">中 — 调整部署结构</td></tr>
+</tbody>
+</table>
+
+
+<!-- ================================================================== -->
+<!-- CHAPTER SUMMARY -->
+<!-- ================================================================== -->
+
+<div class="chapter-summary" id="summary">
+  <h2>📝 本章小结</h2>
+  <ul>
+    <li>Entity View 接口通过<strong>运行时代理</strong>（ByteBuddy/ASM）、<strong>编译期静态实现</strong>（APT）或 <strong>Builder 模式</strong>三种策略实例化。</li>
+    <li>代理类实现用户定义接口 + 内部接口（<code>EntityViewProxy</code>、<code>DirtyTracker</code>），字段存储于 <code>Object[]</code> 元组数组中。</li>
+    <li><strong>只读代理</strong>只有 getter、无脏追踪，内存开销最小；<strong>可更新代理</strong>包含 setter、脏位图和初始状态快照。</li>
+    <li>脏检查通过 <code>long</code> 位图的<strong>位操作</strong>实现：setter 写入时 OR 标记对应 bit，flush 时只更新脏字段，生成<strong>部分 UPDATE SQL</strong>。</li>
+    <li>集合字段被替换为<strong>录制集合</strong>（RecordingList/Set/Map），精确记录增删操作，支持 Diff-based 和 Replace-based 两种 flush 策略。</li>
+    <li>APT 注解处理器在编译期生成 <code>*_Impl.java</code> 和 <code>*_.java</code> 静态元模型，<strong>消除启动开销</strong>并兼容 GraalVM Native Image。</li>
+    <li>代理生成的主要陷阱包括 JPMS <code>add-opens</code>、Jackson 序列化泄漏、深层嵌套膨胀和 ClassLoader 冲突。</li>
+  </ul>
+  <p class="next-hint">下一章 → <a href="ch17-graphql.html">第 17 章 · GraphQL 集成</a>，我们将看到代理实例如何与 GraphQL DataFetcher 配合，实现按需字段解析与自动 N+1 消除。</p>
+</div>
+
+<div class="chapter-nav">
+  <a href="ch15-provider.html">← 第 15 章 · JPA Provider 深度集成</a>
+  <a href="ch17-graphql.html">第 17 章 · GraphQL 集成 →</a>
+</div>
+
+<p class="footer">&copy; 2026 图解 Blaze-Persistence &middot; 第 16 章 · Entity View 代理生成</p>
+
+</article>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+mermaid.initialize({
+  theme: 'dark',
+  themeVariables: {
+    primaryColor: '#58a6ff', primaryTextColor: '#e6edf3', primaryBorderColor: '#30363d',
+    lineColor: '#8b949e', secondaryColor: '#161b22', tertiaryColor: '#0d1117',
+    background: '#161b22', mainBkg: '#161b22', nodeBorder: '#30363d',
+    clusterBkg: 'rgba(22,27,34,.5)', clusterBorder: '#30363d', titleColor: '#e6edf3',
+    edgeLabelBackground: '#161b22',
+  },
+  flowchart: { curve: 'basis', padding: 15 },
+  sequence: { actorMargin: 50, messageMargin: 30 },
+});
+</script>
+</body>
+</html>

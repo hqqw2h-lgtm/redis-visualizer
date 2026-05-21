@@ -1,0 +1,809 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 15 章 · JPA Provider 深度集成 — 图解 Blaze-Persistence</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Blaze-Persistence</span>
+  <span class="sep">|</span>
+  <a href="index.html">目录</a>
+  <a href="ch14-rendering.html">← 第 14 章</a>
+  <a href="ch16-proxy.html">第 16 章 →</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s15-1">15.1 集成架构总览</a>
+  <a href="#s15-2">15.2 Hibernate 集成深度解析</a>
+  <a href="#s15-3">15.3 自定义 SQL 函数注册机制</a>
+  <a href="#s15-4">15.4 JPA Provider Bug 变通方案</a>
+  <a href="#s15-5">15.5 EclipseLink 与 DataNucleus 集成</a>
+  <a href="#s15-6">15.6 DbmsDialect 数据库方言层</a>
+  <a href="#s15-7">15.7 陷阱与限制</a>
+  <a href="#summary">本章小结</a>
+</aside>
+
+<article class="article">
+
+<h1>第 15 章 · JPA Provider 深度集成</h1>
+<p class="subtitle">Hibernate 钩子 · ServiceLoader · 自定义函数注册 · Bug 变通 · EclipseLink/DataNucleus</p>
+
+<div class="chapter-intro">
+  <p class="lead">JPQL 标准只覆盖了 SQL 能力的冰山一角。Blaze-Persistence 要支持 CTE、窗口函数、集合操作等高级特性，就必须深入每个 JPA Provider 的内部 — 不是 fork 源码，而是通过精心设计的钩子与 SPI 接口"寄生"其中。本章带你看清这层看不见的集成层到底做了什么。</p>
+  <ul class="will-learn">
+    <li>理解 Blaze-Persistence 与 JPA Provider 的多层集成架构</li>
+    <li>掌握 Hibernate 集成的核心实现：<code>JpaProvider</code> / <code>FunctionContributor</code></li>
+    <li>了解数十个自定义 SQL 函数的注册与渲染流程</li>
+    <li>识别 JPA Provider 已知 Bug 及 Blaze-Persistence 的变通策略</li>
+    <li>对比 EclipseLink / DataNucleus 集成深度与功能差异</li>
+    <li>理解 DbmsDialect 数据库方言层如何控制最终 SQL 输出</li>
+  </ul>
+  <p class="prereq">前置知识：<a href="ch14-rendering.html">第 14 章 · JPQL 渲染管线</a>（理解查询如何从 AST 变为 SQL 字符串）。</p>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="s15-1">15.1 集成架构总览</h2>
+<!-- ================================================================== -->
+
+<p>Blaze-Persistence 不修改任何 JPA Provider 的源码。它定义了一组 SPI 接口，由各 Provider 对应的集成模块实现，再通过 Java 标准的 <code>ServiceLoader</code> 机制在运行时自动发现和加载。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 15-1 集成架构分层 — SPI 驱动的 Provider 适配</div>
+<div style="display:flex;flex-wrap:wrap;gap:12px;justify-content:center;padding:16px 0;">
+  <div style="border:1px solid #58a6ff;border-radius:8px;padding:14px 18px;min-width:200px;max-width:260px;background:rgba(88,166,255,.06);">
+    <div style="font-weight:bold;color:#58a6ff;margin-bottom:8px;text-align:center;">应用层</div>
+    <div style="color:#e6edf3;font-size:13px;text-align:center;">CriteriaBuilder<br/>EntityViewManager</div>
+  </div>
+  <span style="color:#8b949e;font-size:18px;align-self:center;">↓</span>
+  <div style="border:1px solid #58a6ff;border-radius:8px;padding:14px 18px;min-width:200px;max-width:260px;background:rgba(88,166,255,.06);">
+    <div style="font-weight:bold;color:#58a6ff;margin-bottom:8px;text-align:center;">blaze-persistence-core</div>
+    <div style="color:#e6edf3;font-size:13px;text-align:center;">JpaProvider SPI<br/>DbmsDialect SPI<br/>FunctionRenderer SPI</div>
+  </div>
+  <span style="color:#8b949e;font-size:18px;align-self:center;">↓</span>
+  <div style="border:1px solid #bc8cff;border-radius:8px;padding:14px 18px;min-width:260px;max-width:340px;background:rgba(188,140,255,.06);">
+    <div style="font-weight:bold;color:#bc8cff;margin-bottom:8px;text-align:center;">集成模块 (ServiceLoader 发现)</div>
+    <div style="color:#e6edf3;font-size:13px;text-align:center;">hibernate-5 集成 · hibernate-6 集成<br/>eclipselink 集成 · datanucleus 集成</div>
+  </div>
+  <span style="color:#8b949e;font-size:18px;align-self:center;">↓</span>
+  <div style="border:1px solid #d29922;border-radius:8px;padding:14px 18px;min-width:260px;max-width:340px;background:rgba(210,153,34,.06);">
+    <div style="font-weight:bold;color:#d29922;margin-bottom:8px;text-align:center;">JPA Provider 内部</div>
+    <div style="color:#e6edf3;font-size:13px;text-align:center;">Hibernate SessionFactory<br/>EclipseLink ServerSession<br/>DataNucleus NucleusContext</div>
+  </div>
+</div>
+</div>
+
+<p>这种架构的核心优势是<strong>解耦</strong>：blaze-persistence-core 本身不依赖任何 Provider — 全部依赖关系反转到集成模块中。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 15-2 ServiceLoader 发现流程</div>
+<div class="mermaid">
+sequenceDiagram
+    participant App as 应用启动
+    participant SL as ServiceLoader
+    participant CP as Classpath
+    participant HI as HibernateIntegration
+
+    App->>SL: ServiceLoader.load(JpaProviderFactory.class)
+    SL->>CP: 扫描 META-INF/services/<br/>com.blazebit.persistence.spi.JpaProviderFactory
+    CP-->>SL: 发现 HibernateJpaProviderFactory
+    SL->>HI: newInstance()
+    HI->>HI: 探测 Hibernate 版本
+    HI-->>App: 返回 JpaProvider 实例
+
+    Note over App,HI: 完全自动 — 用户只需引入正确的 Maven 依赖
+</div>
+</div>
+
+<h3>为什么需要深度集成？</h3>
+
+<p>标准 JPQL 规范无法表达以下 SQL 能力：</p>
+
+<table>
+<thead>
+<tr><th>SQL 特性</th><th>JPQL 支持？</th><th>Blaze-Persistence 方案</th></tr>
+</thead>
+<tbody>
+<tr><td>CTE (WITH 子句)</td><td>❌ 不支持</td><td>通过自定义函数 + Provider 钩子注入</td></tr>
+<tr><td>窗口函数 (ROW_NUMBER, RANK)</td><td>❌ 不支持</td><td>注册为 HQL 自定义函数</td></tr>
+<tr><td>集合操作 (UNION, INTERSECT)</td><td>❌ 不支持</td><td>拼接多条 JPQL + SQL 级联</td></tr>
+<tr><td>LATERAL JOIN</td><td>❌ 不支持</td><td>DbmsDialect 方言渲染</td></tr>
+<tr><td>VALUES 子句</td><td>❌ 不支持</td><td>Provider 特定 API 注入</td></tr>
+<tr><td>RETURNING 子句</td><td>❌ 不支持</td><td>DbmsDialect + DML 扩展</td></tr>
+</tbody>
+</table>
+
+<p>要实现这些特性，必须深入 Provider 的函数注册、查询解析和 SQL 生成层 — 这正是集成模块的职责。</p>
+
+<!-- ================================================================== -->
+<h2 id="s15-2">15.2 Hibernate 集成深度解析</h2>
+<!-- ================================================================== -->
+
+<p>Hibernate 是 Blaze-Persistence 支持最深、使用最广的 Provider。集成模块提供了 <code>JpaProvider</code> 接口的完整实现，涵盖函数注册、类型适配、查询改写等多个维度。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 15-3 JpaProvider 接口与 Hibernate 实现类关系</div>
+<div class="mermaid">
+classDiagram
+    class JpaProvider {
+        <<interface>>
+        +isForeignJoinColumn(metamodel, ownerType, attrName) boolean
+        +getCustomFunctionContributor() FunctionContributor
+        +supportsAdvancedSql() boolean
+        +needsBracketsForListParameter() boolean
+        +supportsCountStar() boolean
+        +supportsCustomFunctions() boolean
+        +getOnClause() String
+        +getCollectionValueFunction() String
+    }
+
+    class HibernateJpaProvider {
+        -majorVersion : int
+        -minorVersion : int
+        -sessionFactory : SessionFactory
+        +isForeignJoinColumn() boolean
+        +getCustomFunctionContributor() FunctionContributor
+        +supportsAdvancedSql() boolean
+        +detectBugs() List~BugWorkaround~
+        -extractDialect() Dialect
+    }
+
+    class EclipseLinkJpaProvider {
+        -serverSession : ServerSession
+        +isForeignJoinColumn() boolean
+        +supportsAdvancedSql() boolean
+    }
+
+    class DataNucleusJpaProvider {
+        -nucleusContext : NucleusContext
+        +isForeignJoinColumn() boolean
+        +supportsAdvancedSql() boolean
+    }
+
+    JpaProvider <|.. HibernateJpaProvider
+    JpaProvider <|.. EclipseLinkJpaProvider
+    JpaProvider <|.. DataNucleusJpaProvider
+
+    class FunctionContributor {
+        <<interface>>
+        +contributeFunctions(registry) void
+    }
+
+    class HibernateFunctionContributor {
+        +contributeFunctions(registry) void
+        -registerWindowFunctions() void
+        -registerSetFunctions() void
+        -registerStringFunctions() void
+    }
+
+    FunctionContributor <|.. HibernateFunctionContributor
+    HibernateJpaProvider --> HibernateFunctionContributor : creates
+</div>
+</div>
+
+<h3>版本探测机制</h3>
+
+<p><code>HibernateJpaProvider</code> 在初始化时通过反射探测 Hibernate 版本号，因为不同版本的内部 API 差异巨大：</p>
+
+<pre><code>// 简化的版本探测逻辑
+String version = org.hibernate.Version.getVersionString();  // "5.6.14.Final"
+String[] parts = version.split("\\.");
+int major = Integer.parseInt(parts[0]);  // 5
+int minor = Integer.parseInt(parts[1]);  // 6
+
+// 根据版本选择不同的函数注册策略
+if (major >= 6) {
+    // Hibernate 6: 使用 FunctionContributions API
+    registerViaFunctionContributions(registry);
+} else if (major == 5 && minor >= 3) {
+    // Hibernate 5.3+: 使用 MetadataContributor SPI
+    registerViaMetadataContributor(registry);
+} else {
+    // Hibernate 5.0–5.2: 直接操作 Dialect
+    registerViaDialect(sessionFactory);
+}</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">Fig 15-4 Hibernate 版本 → 函数注册策略映射</div>
+<div class="mermaid">
+flowchart LR
+    V["Hibernate 版本探测"] --> V5["5.0 – 5.2"]
+    V --> V53["5.3 – 5.6"]
+    V --> V6["6.x+"]
+
+    V5 --> S1["Dialect.registerFunction()<br/>直接修改方言对象"]
+    V53 --> S2["MetadataContributor SPI<br/>通过 SPI 注册"]
+    V6 --> S3["FunctionContributions API<br/>官方推荐方式"]
+
+    S1 --> W1["⚠️ 反射 hack<br/>兼容性风险高"]
+    S2 --> W2["✅ 标准 SPI<br/>相对稳定"]
+    S3 --> W3["✅ 官方 API<br/>最安全"]
+
+    style V fill:#1e3a5f,stroke:#58a6ff
+    style W1 fill:#3a1a1a,stroke:#f85149
+    style W2 fill:#1a3a2a,stroke:#3fb950
+    style W3 fill:#1a3a2a,stroke:#3fb950
+</div>
+</div>
+
+<h3>SessionFactory 钩子</h3>
+
+<p>Hibernate 集成模块在 <code>SessionFactory</code> 构建时介入，注册所有自定义函数并配置方言扩展。核心切入点包括：</p>
+
+<table>
+<thead>
+<tr><th>钩子点</th><th>Hibernate API</th><th>用途</th></tr>
+</thead>
+<tbody>
+<tr><td>函数注册</td><td><code>FunctionContributions</code></td><td>注册 SET_UNION、WINDOW_ROW_NUMBER 等</td></tr>
+<tr><td>类型注册</td><td><code>TypeContributions</code></td><td>注册 Blaze 专用类型映射</td></tr>
+<tr><td>方言获取</td><td><code>Dialect</code></td><td>探测底层数据库类型</td></tr>
+<tr><td>元模型访问</td><td><code>Metamodel</code></td><td>获取实体关联关系元数据</td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================== -->
+<h2 id="s15-3">15.3 自定义 SQL 函数注册机制</h2>
+<!-- ================================================================== -->
+
+<p>Blaze-Persistence 注册了数十个自定义函数来弥补 JPQL 的能力缺口。这些函数在 HQL 层面以"普通函数调用"的形式存在，但在 SQL 渲染阶段会被替换为原生 SQL 语法。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 15-5 自定义函数分类全景</div>
+<div style="display:flex;flex-wrap:wrap;gap:12px;justify-content:center;padding:16px 0;">
+  <div style="border:1px solid #bc8cff;border-radius:8px;padding:12px 14px;min-width:150px;max-width:200px;background:rgba(45,31,78,.12);">
+    <div style="font-weight:bold;color:#bc8cff;margin-bottom:6px;text-align:center;">集合操作</div>
+    <div style="color:#e6edf3;font-size:12px;line-height:1.7;font-family:monospace;">SET_UNION<br/>SET_INTERSECT<br/>SET_EXCEPT<br/>SET_UNION_ALL</div>
+  </div>
+  <div style="border:1px solid #3fb950;border-radius:8px;padding:12px 14px;min-width:150px;max-width:200px;background:rgba(26,58,42,.12);">
+    <div style="font-weight:bold;color:#3fb950;margin-bottom:6px;text-align:center;">窗口函数</div>
+    <div style="color:#e6edf3;font-size:12px;line-height:1.7;font-family:monospace;">WINDOW_ROW_NUMBER<br/>WINDOW_RANK<br/>WINDOW_DENSE_RANK<br/>WINDOW_NTILE<br/>WINDOW_LEAD / LAG<br/>WINDOW_SUM / AVG / COUNT</div>
+  </div>
+  <div style="border:1px solid #d29922;border-radius:8px;padding:12px 14px;min-width:150px;max-width:200px;background:rgba(58,42,26,.12);">
+    <div style="font-weight:bold;color:#d29922;margin-bottom:6px;text-align:center;">聚合增强</div>
+    <div style="color:#e6edf3;font-size:12px;line-height:1.7;font-family:monospace;">COUNT_TUPLE<br/>GROUP_CONCAT<br/>AGGREGATE_NULL_SUBQUERY</div>
+  </div>
+  <div style="border:1px solid #f778ba;border-radius:8px;padding:12px 14px;min-width:150px;max-width:200px;background:rgba(58,26,42,.12);">
+    <div style="font-weight:bold;color:#f778ba;margin-bottom:6px;text-align:center;">字符串处理</div>
+    <div style="color:#e6edf3;font-size:12px;line-height:1.7;font-family:monospace;">REPLACE<br/>REPEAT<br/>REVERSE</div>
+  </div>
+  <div style="border:1px solid #79c0ff;border-radius:8px;padding:12px 14px;min-width:150px;max-width:200px;background:rgba(26,42,58,.12);">
+    <div style="font-weight:bold;color:#79c0ff;margin-bottom:6px;text-align:center;">条件与类型</div>
+    <div style="color:#e6edf3;font-size:12px;line-height:1.7;font-family:monospace;">TREAT_*<br/>PARAM_*<br/>ENTITY_FUNCTION</div>
+  </div>
+  <div style="border:1px solid #f85149;border-radius:8px;padding:12px 14px;min-width:150px;max-width:200px;background:rgba(58,26,26,.12);">
+    <div style="font-weight:bold;color:#f85149;margin-bottom:6px;text-align:center;">DML 辅助</div>
+    <div style="color:#e6edf3;font-size:12px;line-height:1.7;font-family:monospace;">RETURNING_*<br/>VALUES</div>
+  </div>
+</div>
+</div>
+
+<h3>函数注册流程</h3>
+
+<div class="diagram">
+<div class="diagram-title">Fig 15-6 函数从注册到执行的完整生命周期</div>
+<div class="mermaid">
+sequenceDiagram
+    participant Boot as 应用启动
+    participant FC as FunctionContributor
+    participant Reg as Hibernate FunctionRegistry
+    participant QP as HQL Parser
+    participant Render as SqlAstTranslator
+
+    Boot->>FC: contributeFunctions(registry)
+    FC->>Reg: registerFunction("WINDOW_ROW_NUMBER", impl)
+    FC->>Reg: registerFunction("SET_UNION", impl)
+    FC->>Reg: registerFunction("COUNT_TUPLE", impl)
+    Note over Reg: 函数存入 Hibernate 内部注册表
+
+    QP->>Reg: 解析 HQL: WINDOW_ROW_NUMBER(...)
+    Reg-->>QP: 查找到已注册函数定义
+
+    QP->>Render: AST 节点 → SQL 渲染
+    Render->>Render: 调用 FunctionRenderingSupport
+    Render-->>Render: 输出: ROW_NUMBER() OVER (...)
+    Note over Render: HQL 函数 → 原生 SQL 语法
+</div>
+</div>
+
+<h3>WINDOW_ROW_NUMBER 渲染示例</h3>
+
+<p>以 <code>WINDOW_ROW_NUMBER</code> 为例，展示从用户 API 到最终 SQL 的完整转换链：</p>
+
+<pre><code>// 用户代码 — CriteriaBuilder API
+cb.select("e.name")
+  .select("WINDOW_ROW_NUMBER(ORDER BY e.createdAt DESC)")
+  .from(Entity.class, "e");
+
+// → Blaze-Persistence 生成 HQL
+//   SELECT e.name, WINDOW_ROW_NUMBER(ORDER BY e.createdAt DESC) FROM Entity e
+
+// → Hibernate 渲染为 SQL (PostgreSQL)
+//   SELECT e.name, ROW_NUMBER() OVER (ORDER BY e.created_at DESC) FROM entity e
+
+// → Hibernate 渲染为 SQL (MySQL 8+)
+//   SELECT e.name, ROW_NUMBER() OVER (ORDER BY e.created_at DESC) FROM entity e
+
+// → Hibernate 渲染为 SQL (Oracle)
+//   SELECT e.name, ROW_NUMBER() OVER (ORDER BY e.created_at DESC) FROM entity e</code></pre>
+
+<h3>DbmsDialect 与方言特定渲染</h3>
+
+<p>并非所有函数都能用统一 SQL 表达。<code>DbmsDialect</code> 负责处理数据库间的差异：</p>
+
+<pre><code>// GROUP_CONCAT 在不同数据库上的渲染差异
+// PostgreSQL:  STRING_AGG(col, ',' ORDER BY col)
+// MySQL:       GROUP_CONCAT(col ORDER BY col SEPARATOR ',')
+// Oracle:      LISTAGG(col, ',') WITHIN GROUP (ORDER BY col)
+// SQL Server:  STRING_AGG(col, ',') WITHIN GROUP (ORDER BY col)</code></pre>
+
+<!-- ================================================================== -->
+<h2 id="s15-4">15.4 JPA Provider Bug 变通方案</h2>
+<!-- ================================================================== -->
+
+<p>每个 JPA Provider 都有已知 Bug，Blaze-Persistence 的集成模块包含一套<strong>Bug 检测 + 自动变通</strong>系统，让开发者无需感知底层缺陷。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 15-7 Bug 变通决策引擎</div>
+<div class="mermaid">
+flowchart TD
+    START["JpaProvider 初始化"] --> DETECT["检测 Provider 版本"]
+    DETECT --> LOOKUP["查询已知 Bug 数据库"]
+    LOOKUP --> MATCH{"命中已知 Bug？"}
+
+    MATCH -->|"是"| STRATEGY["选择变通策略"]
+    MATCH -->|"否"| NORMAL["使用标准代码路径"]
+
+    STRATEGY --> S1["查询改写<br/>避开触发条件"]
+    STRATEGY --> S2["SQL 后处理<br/>修补生成的 SQL"]
+    STRATEGY --> S3["降级功能<br/>使用替代实现"]
+    STRATEGY --> S4["版本检查<br/>已修复版本跳过"]
+
+    S1 --> APPLY["应用变通"]
+    S2 --> APPLY
+    S3 --> APPLY
+    S4 --> APPLY
+    NORMAL --> EXEC["正常执行"]
+    APPLY --> EXEC
+
+    style START fill:#1e3a5f,stroke:#58a6ff
+    style MATCH fill:#3a2a1a,stroke:#d29922
+    style S1 fill:#2d1f4e,stroke:#bc8cff
+    style S2 fill:#2d1f4e,stroke:#bc8cff
+    style S3 fill:#2d1f4e,stroke:#bc8cff
+    style S4 fill:#1a3a2a,stroke:#3fb950
+    style EXEC fill:#1a3a2a,stroke:#3fb950
+</div>
+</div>
+
+<h3>典型 Bug 与变通策略</h3>
+
+<table>
+<thead>
+<tr><th>Provider</th><th>Bug 描述</th><th>影响版本</th><th>变通策略</th></tr>
+</thead>
+<tbody>
+<tr>
+  <td>Hibernate</td>
+  <td><strong>隐式 JOIN 去重失败</strong> — 当同一关联路径在 SELECT 和 WHERE 中出现时，Hibernate 可能生成重复的隐式 JOIN</td>
+  <td>5.x 全系列</td>
+  <td>Blaze-Persistence 自行追踪已生成的 JOIN 路径，重复时复用别名</td>
+</tr>
+<tr>
+  <td>Hibernate</td>
+  <td><strong>子查询关联丢失</strong> — 在某些嵌套子查询中，外层关联实体的引用被错误地解析</td>
+  <td>5.0 – 5.4</td>
+  <td>将关联引用改为显式参数传递到子查询内部</td>
+</tr>
+<tr>
+  <td>Hibernate</td>
+  <td><strong>COUNT(DISTINCT tuple) 语法错误</strong> — 部分方言无法正确渲染多列 COUNT DISTINCT</td>
+  <td>5.x</td>
+  <td>使用 COUNT_TUPLE 自定义函数替代，由 Blaze 控制渲染</td>
+</tr>
+<tr>
+  <td>EclipseLink</td>
+  <td><strong>子查询 Correlation 失效</strong> — 相关子查询中外层实体无法正确关联</td>
+  <td>2.6 – 2.7</td>
+  <td>改用 JOIN 重写等价查询</td>
+</tr>
+<tr>
+  <td>EclipseLink</td>
+  <td><strong>TREAT 操作符忽略</strong> — 类型转换在某些继承策略下被静默丢弃</td>
+  <td>2.7.x</td>
+  <td>在集成层手动添加类型鉴别条件</td>
+</tr>
+<tr>
+  <td>DataNucleus</td>
+  <td><strong>分页 + ORDER BY 冲突</strong> — 分页查询中 ORDER BY 列不在 SELECT 中时报错</td>
+  <td>5.x</td>
+  <td>自动将 ORDER BY 列添加到 SELECT 子句</td>
+</tr>
+</tbody>
+</table>
+
+<div class="diagram">
+<div class="diagram-title">Fig 15-8 Hibernate 隐式 JOIN 去重 Bug 变通示例</div>
+<svg viewBox="0 0 900 360" xmlns="http://www.w3.org/2000/svg" style="width:100%;max-width:900px;margin:0 auto;display:block" font-family="Inter,'Microsoft YaHei',system-ui,sans-serif">
+  <rect width="900" height="360" rx="12" fill="#0d1117"/>
+  <!-- Left: Hibernate -->
+  <rect x="20" y="16" width="390" height="328" rx="10" fill="none" stroke="#f85149" stroke-width="1.5"/>
+  <rect x="20" y="16" width="390" height="36" rx="10" fill="#f8514920"/>
+  <text x="215" y="40" text-anchor="middle" font-size="15" font-weight="700" fill="#f85149">Hibernate 原始行为 ❌</text>
+  <rect x="44" y="64" width="342" height="50" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+  <text x="215" y="84" text-anchor="middle" font-size="13" fill="#e6edf3">SELECT o.customer.name FROM Order o</text>
+  <text x="215" y="102" text-anchor="middle" font-size="13" fill="#e6edf3">WHERE o.customer.age > 18</text>
+  <line x1="215" y1="114" x2="215" y2="128" stroke="#f85149" stroke-width="1.5" marker-end="url(#a15r)"/>
+  <rect x="44" y="128" width="342" height="80" rx="6" fill="#3a1a1a" stroke="#f85149" stroke-width="1"/>
+  <text x="215" y="148" text-anchor="middle" font-size="13" fill="#e6edf3">SELECT c1.name FROM orders o</text>
+  <text x="215" y="166" text-anchor="middle" font-size="13" fill="#f87171">JOIN customers c1 ON o.cust_id = c1.id</text>
+  <text x="215" y="184" text-anchor="middle" font-size="13" fill="#f87171">JOIN customers c2 ON o.cust_id = c2.id</text>
+  <text x="215" y="200" text-anchor="middle" font-size="13" fill="#e6edf3">WHERE c2.age > 18</text>
+  <rect x="60" y="222" width="300" height="32" rx="6" fill="#3d0f0f" stroke="#f85149" stroke-width="1"/>
+  <text x="210" y="243" text-anchor="middle" font-size="13" font-weight="600" fill="#f87171">⚠️ 重复 JOIN — c1 c2 同表</text>
+  <!-- VS -->
+  <circle cx="450" cy="180" r="24" fill="#161b22" stroke="#e6edf3" stroke-width="2"/>
+  <text x="450" y="186" text-anchor="middle" font-size="14" font-weight="800" fill="#e6edf3">VS</text>
+  <!-- Right: Blaze -->
+  <rect x="490" y="16" width="390" height="328" rx="10" fill="none" stroke="#3fb950" stroke-width="1.5"/>
+  <rect x="490" y="16" width="390" height="36" rx="10" fill="#3fb95020"/>
+  <text x="685" y="40" text-anchor="middle" font-size="15" font-weight="700" fill="#3fb950">Blaze-Persistence 变通 ✅</text>
+  <rect x="514" y="64" width="342" height="50" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+  <text x="685" y="84" text-anchor="middle" font-size="13" fill="#e6edf3">SELECT o.customer.name FROM Order o</text>
+  <text x="685" y="102" text-anchor="middle" font-size="13" fill="#e6edf3">WHERE o.customer.age > 18</text>
+  <line x1="685" y1="114" x2="685" y2="128" stroke="#3fb950" stroke-width="1.5" marker-end="url(#a15g)"/>
+  <rect x="514" y="128" width="342" height="64" rx="6" fill="#0b1c0b" stroke="#3fb950" stroke-width="1"/>
+  <text x="685" y="148" text-anchor="middle" font-size="13" fill="#e6edf3">SELECT c1.name FROM orders o</text>
+  <text x="685" y="166" text-anchor="middle" font-size="13" fill="#4ade80">JOIN customers c1 ON o.cust_id = c1.id</text>
+  <text x="685" y="184" text-anchor="middle" font-size="13" fill="#e6edf3">WHERE c1.age > 18</text>
+  <rect x="530" y="210" width="310" height="32" rx="6" fill="#0b2b0b" stroke="#3fb950" stroke-width="1"/>
+  <text x="685" y="231" text-anchor="middle" font-size="13" font-weight="600" fill="#4ade80">✅ 复用别名 c1 · 路径追踪去重</text>
+  <defs>
+    <marker id="a15r" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#f85149"/></marker>
+    <marker id="a15g" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#3fb950"/></marker>
+  </defs>
+</svg>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="s15-5">15.5 EclipseLink 与 DataNucleus 集成</h2>
+<!-- ================================================================== -->
+
+<p>Hibernate 之外，Blaze-Persistence 还支持 EclipseLink 和 DataNucleus — 但集成深度和功能覆盖度存在显著差异。这是由各 Provider 的架构开放程度决定的。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 15-9 三大 Provider 集成深度对比</div>
+<div style="display:flex;flex-wrap:wrap;gap:14px;justify-content:center;padding:16px 0;">
+  <div style="border:1px solid #3fb950;border-radius:8px;padding:14px 18px;min-width:200px;max-width:260px;background:rgba(26,58,42,.12);">
+    <div style="font-weight:bold;color:#3fb950;margin-bottom:8px;text-align:center;">Hibernate 集成</div>
+    <div style="color:#e6edf3;font-size:12px;line-height:1.8;">✅ 自定义函数注册<br/>✅ 窗口函数<br/>✅ CTE 支持<br/>✅ 集合操作<br/>✅ LATERAL JOIN<br/>✅ RETURNING 子句<br/>✅ VALUES 子句<br/>✅ Bug 自动变通</div>
+  </div>
+  <div style="border:1px solid #d29922;border-radius:8px;padding:14px 18px;min-width:200px;max-width:260px;background:rgba(58,42,26,.12);">
+    <div style="font-weight:bold;color:#d29922;margin-bottom:8px;text-align:center;">EclipseLink 集成</div>
+    <div style="color:#e6edf3;font-size:12px;line-height:1.8;">⚠️ 有限函数注册<br/>❌ 窗口函数<br/>❌ CTE 支持<br/>⚠️ 基础集合操作<br/>❌ LATERAL JOIN<br/>❌ RETURNING 子句<br/>❌ VALUES 子句<br/>⚠️ 部分 Bug 变通</div>
+  </div>
+  <div style="border:1px solid #f85149;border-radius:8px;padding:14px 18px;min-width:200px;max-width:260px;background:rgba(58,26,26,.12);">
+    <div style="font-weight:bold;color:#f85149;margin-bottom:8px;text-align:center;">DataNucleus 集成</div>
+    <div style="color:#e6edf3;font-size:12px;line-height:1.8;">⚠️ 有限函数注册<br/>❌ 窗口函数<br/>❌ CTE 支持<br/>❌ 集合操作<br/>❌ LATERAL JOIN<br/>❌ RETURNING 子句<br/>❌ VALUES 子句<br/>⚠️ 基础 Bug 变通</div>
+  </div>
+</div>
+</div>
+
+<h3>集成策略差异根源</h3>
+
+<p>为什么非 Hibernate Provider 的集成深度有限？根本原因在于<strong>内部扩展机制的开放程度</strong>不同：</p>
+
+<table>
+<thead>
+<tr><th>维度</th><th>Hibernate</th><th>EclipseLink</th><th>DataNucleus</th></tr>
+</thead>
+<tbody>
+<tr><td>函数注册 API</td><td>FunctionContributions — 公开且稳定</td><td>需直接操作 ExpressionOperator — 不稳定</td><td>需修改 SQLExpressionFactory — 受限</td></tr>
+<tr><td>查询 AST 暴露程度</td><td>HQL AST 可介入</td><td>JPQL → SQL 全封闭</td><td>JPQL → SQL 全封闭</td></tr>
+<tr><td>方言扩展</td><td>Dialect 可继承</td><td>DatabasePlatform 有限暴露</td><td>需插件机制</td></tr>
+<tr><td>SPI 生态</td><td>丰富（Integrator, Contributor, etc.）</td><td>有限</td><td>有限</td></tr>
+<tr><td>社区与维护</td><td>活跃，Bug 响应快</td><td>Oracle 主导，节奏慢</td><td>小众社区</td></tr>
+</tbody>
+</table>
+
+<div class="diagram">
+<div class="diagram-title">Fig 15-10 EclipseLink 集成路径 — 功能降级策略</div>
+<div class="mermaid">
+flowchart TD
+    REQ["用户请求: 使用 CTE 查询"] --> CHECK{"当前 Provider？"}
+
+    CHECK -->|"Hibernate"| HIB_CTE["使用 CTE 自定义函数<br/>注册到 HQL 层"]
+    CHECK -->|"EclipseLink"| ECL_CHECK{"功能受支持？"}
+    CHECK -->|"DataNucleus"| DN_CHECK{"功能受支持？"}
+
+    ECL_CHECK -->|"否"| ECL_FALLBACK["抛出 UnsupportedOperationException<br/>提示: CTE 不被当前 Provider 支持"]
+    ECL_CHECK -->|"是 (基础功能)"| ECL_EXEC["使用 EclipseLink<br/>原生查询降级"]
+
+    DN_CHECK -->|"否"| DN_FALLBACK["抛出 UnsupportedOperationException"]
+    DN_CHECK -->|"是 (基础功能)"| DN_EXEC["使用 DataNucleus<br/>原生查询降级"]
+
+    HIB_CTE --> SUCCESS["✅ 正常执行"]
+    ECL_EXEC --> SUCCESS
+    DN_EXEC --> SUCCESS
+
+    style REQ fill:#1e3a5f,stroke:#58a6ff
+    style SUCCESS fill:#1a3a2a,stroke:#3fb950
+    style ECL_FALLBACK fill:#3a1a1a,stroke:#f85149
+    style DN_FALLBACK fill:#3a1a1a,stroke:#f85149
+</div>
+</div>
+
+<!-- ================================================================== -->
+<h2 id="s15-6">15.6 DbmsDialect 数据库方言层</h2>
+<!-- ================================================================== -->
+
+<p><code>DbmsDialect</code> 是 Blaze-Persistence <strong>自己的</strong>数据库方言抽象层，独立于 JPA Provider 的方言（如 Hibernate 的 <code>Dialect</code>）。它控制着最终 SQL 输出中与数据库相关的所有语法细节。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 15-11 DbmsDialect 继承体系</div>
+<div class="mermaid">
+classDiagram
+    class DbmsDialect {
+        <<interface>>
+        +supportsWithClause() boolean
+        +supportsWithClauseInModificationQuery() boolean
+        +supportsWindowFunctions() boolean
+        +supportsLateralJoin() boolean
+        +supportsSetOperations() boolean
+        +supportsReturningColumns() boolean
+        +supportsIntersect() boolean
+        +supportsExcept() boolean
+        +renderCte(sql, cteEntries) void
+        +renderSetOperation(sql, op) void
+        +renderLateralJoin(sql, subquery) void
+        +renderLimit(sql, limit, offset) void
+    }
+
+    class DefaultDbmsDialect {
+        #dbmsName : String
+        +supportsWithClause() boolean
+        +renderLimit(sql, limit, offset) void
+    }
+
+    class PostgreSQLDbmsDialect {
+        +supportsWithClause() true
+        +supportsLateralJoin() true
+        +supportsReturningColumns() true
+        +renderCte() PostgreSQL语法
+        +renderLimit() LIMIT...OFFSET
+    }
+
+    class MySQLDbmsDialect {
+        +supportsWithClause() 8.0+
+        +supportsLateralJoin() 8.0.14+
+        +supportsReturningColumns() false
+        +renderLimit() LIMIT...OFFSET
+    }
+
+    class OracleDbmsDialect {
+        +supportsWithClause() true
+        +supportsLateralJoin() true
+        +supportsReturningColumns() true
+        +renderCte() Oracle语法
+        +renderLimit() FETCH FIRST...ROWS ONLY
+    }
+
+    class SQLServerDbmsDialect {
+        +supportsWithClause() true
+        +supportsLateralJoin() CROSS APPLY
+        +supportsReturningColumns() OUTPUT
+        +renderLimit() OFFSET...FETCH NEXT
+    }
+
+    class H2DbmsDialect {
+        +supportsWithClause() true
+        +supportsLateralJoin() false
+        +supportsReturningColumns() false
+        +renderLimit() LIMIT...OFFSET
+    }
+
+    DbmsDialect <|.. DefaultDbmsDialect
+    DefaultDbmsDialect <|-- PostgreSQLDbmsDialect
+    DefaultDbmsDialect <|-- MySQLDbmsDialect
+    DefaultDbmsDialect <|-- OracleDbmsDialect
+    DefaultDbmsDialect <|-- SQLServerDbmsDialect
+    DefaultDbmsDialect <|-- H2DbmsDialect
+</div>
+</div>
+
+<h3>特性支持矩阵</h3>
+
+<table>
+<thead>
+<tr><th>SQL 特性</th><th>PostgreSQL</th><th>MySQL 8+</th><th>Oracle</th><th>SQL Server</th><th>H2</th></tr>
+</thead>
+<tbody>
+<tr><td>WITH (CTE)</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td></tr>
+<tr><td>递归 CTE</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td></tr>
+<tr><td>CTE in DML</td><td>✅</td><td>❌</td><td>✅</td><td>✅</td><td>❌</td></tr>
+<tr><td>窗口函数</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td></tr>
+<tr><td>LATERAL JOIN</td><td>✅ LATERAL</td><td>✅ LATERAL</td><td>✅ LATERAL</td><td>✅ CROSS APPLY</td><td>❌</td></tr>
+<tr><td>UNION / INTERSECT / EXCEPT</td><td>✅ 全部</td><td>✅ 全部</td><td>✅ MINUS 代替 EXCEPT</td><td>✅ 全部</td><td>✅ 全部</td></tr>
+<tr><td>RETURNING</td><td>✅</td><td>❌</td><td>✅ RETURNING INTO</td><td>✅ OUTPUT</td><td>❌</td></tr>
+<tr><td>LIMIT / OFFSET</td><td>LIMIT…OFFSET</td><td>LIMIT…OFFSET</td><td>FETCH FIRST</td><td>OFFSET…FETCH</td><td>LIMIT…OFFSET</td></tr>
+</tbody>
+</table>
+
+<div class="diagram">
+<div class="diagram-title">Fig 15-12 同一 CTE 查询在不同数据库的 SQL 渲染差异</div>
+<div class="mermaid">
+flowchart TD
+    CTE_AST["Blaze-Persistence CTE AST<br/>WITH cte AS (SELECT ...) SELECT ..."] --> PG_RENDER["PostgreSQL 渲染"]
+    CTE_AST --> ORA_RENDER["Oracle 渲染"]
+    CTE_AST --> SS_RENDER["SQL Server 渲染"]
+    CTE_AST --> MY_RENDER["MySQL 渲染"]
+
+    PG_RENDER --> PG_SQL["WITH cte AS (<br/>  SELECT ...<br/>)<br/>SELECT * FROM cte"]
+
+    ORA_RENDER --> ORA_SQL["WITH cte AS (<br/>  SELECT ...<br/>)<br/>SELECT * FROM cte"]
+
+    SS_RENDER --> SS_SQL["WITH cte AS (<br/>  SELECT ...<br/>)<br/>SELECT * FROM cte<br/>/* 必须加分号前缀 */"]
+
+    MY_RENDER --> MY_SQL["WITH cte AS (<br/>  SELECT ...<br/>)<br/>SELECT * FROM cte<br/>/* 仅 MySQL 8.0+ */"]
+
+    style CTE_AST fill:#1e3a5f,stroke:#58a6ff
+    style PG_SQL fill:#1a3a2a,stroke:#3fb950
+    style ORA_SQL fill:#3a2a1a,stroke:#d29922
+    style SS_SQL fill:#2d1f4e,stroke:#bc8cff
+    style MY_SQL fill:#3a1a2a,stroke:#f778ba
+</div>
+</div>
+
+<h3>DbmsDialect 自动发现</h3>
+
+<p><code>DbmsDialect</code> 不需要用户手动配置。Blaze-Persistence 在初始化时通过 JDBC <code>DatabaseMetaData</code> 自动探测数据库类型和版本，然后选择对应的方言实现：</p>
+
+<pre><code>// 自动探测逻辑 (简化)
+Connection conn = dataSource.getConnection();
+DatabaseMetaData meta = conn.getMetaData();
+String productName = meta.getDatabaseProductName();   // "PostgreSQL"
+int majorVersion = meta.getDatabaseMajorVersion();     // 15
+
+DbmsDialect dialect = switch (productName.toLowerCase()) {
+    case "postgresql"  -> new PostgreSQLDbmsDialect();
+    case "mysql"       -> majorVersion >= 8
+                            ? new MySQL8DbmsDialect()
+                            : new MySQLDbmsDialect();
+    case "oracle"      -> new OracleDbmsDialect();
+    case "microsoft sql server" -> new SQLServerDbmsDialect();
+    case "h2"          -> new H2DbmsDialect();
+    default            -> new DefaultDbmsDialect(productName);
+};</code></pre>
+
+<!-- ================================================================== -->
+<h2 id="s15-7">15.7 陷阱与限制</h2>
+<!-- ================================================================== -->
+
+<p>JPA Provider 集成是 Blaze-Persistence 最脆弱的一层 — 紧密耦合第三方内部 API 意味着每次升级都是风险。以下是实践中最常踩的坑。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 15-13 集成层常见陷阱决策树</div>
+<div class="mermaid">
+flowchart TD
+    ISSUE["集成问题！"] --> T1{"类型？"}
+
+    T1 -->|"版本不匹配"| P1["集成模块版本 ≠ Provider 版本"]
+    T1 -->|"函数冲突"| P2["自定义函数名冲突"]
+    T1 -->|"功能缺失"| P3["非 Hibernate Provider 功能限制"]
+    T1 -->|"升级故障"| P4["Provider 升级破坏集成"]
+
+    P1 --> FIX1["检查 Maven BOM 版本<br/>确保 blaze-persistence-integration-hibernate-X<br/>与 hibernate-core X 完全匹配"]
+    P2 --> FIX2["使用 Blaze 前缀命名空间<br/>避免与用户自定义函数冲突<br/>或检查 Hibernate Dialect 已注册函数"]
+    P3 --> FIX3["迁移到 Hibernate<br/>或降级为 JPQL 子集<br/>参考 Fig 15-9 支持矩阵"]
+    P4 --> FIX4["锁定 Provider 版本<br/>等待 Blaze 发布兼容更新<br/>关注 GitHub Release Notes"]
+
+    style ISSUE fill:#3a1a1a,stroke:#f85149
+    style FIX1 fill:#1a3a2a,stroke:#3fb950
+    style FIX2 fill:#1a3a2a,stroke:#3fb950
+    style FIX3 fill:#3a2a1a,stroke:#d29922
+    style FIX4 fill:#3a2a1a,stroke:#d29922
+</div>
+</div>
+
+<h3>陷阱一：集成模块版本必须精确匹配</h3>
+
+<p>这是最常见的问题。<code>blaze-persistence-integration-hibernate-5.6</code> 只能搭配 Hibernate 5.6.x 使用 — 用 5.4 的集成模块连 5.6 的 Hibernate 会在启动时抛出 <code>NoSuchMethodError</code> 或 <code>ClassNotFoundException</code>。</p>
+
+<pre><code>&lt;!-- ✅ 正确：版本精确匹配 --&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;com.blazebit&lt;/groupId&gt;
+    &lt;artifactId&gt;blaze-persistence-integration-hibernate-5.6&lt;/artifactId&gt;
+    &lt;version&gt;${blaze.version}&lt;/version&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.hibernate&lt;/groupId&gt;
+    &lt;artifactId&gt;hibernate-core&lt;/artifactId&gt;
+    &lt;version&gt;5.6.14.Final&lt;/version&gt;
+&lt;/dependency&gt;
+
+&lt;!-- ❌ 错误：集成模块版本不匹配 --&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;com.blazebit&lt;/groupId&gt;
+    &lt;artifactId&gt;blaze-persistence-integration-hibernate-5.4&lt;/artifactId&gt;  &lt;!-- 5.4 集成 --&gt;
+    &lt;version&gt;${blaze.version}&lt;/version&gt;
+&lt;/dependency&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.hibernate&lt;/groupId&gt;
+    &lt;artifactId&gt;hibernate-core&lt;/artifactId&gt;
+    &lt;version&gt;5.6.14.Final&lt;/version&gt;  &lt;!-- 但 Hibernate 是 5.6！ --&gt;
+&lt;/dependency&gt;</code></pre>
+
+<h3>陷阱二：自定义函数名冲突</h3>
+
+<p>如果用户在 Hibernate <code>Dialect</code> 中也注册了同名函数（如 <code>GROUP_CONCAT</code>），Blaze-Persistence 的注册可能覆盖用户定义，或反过来被用户定义覆盖 — 取决于注册顺序。建议检查冲突并使用独立命名空间。</p>
+
+<h3>陷阱三：并非所有 Hibernate 特性都可通过集成暴露</h3>
+
+<p>Blaze-Persistence 仅集成了它需要的 Hibernate 特性。以下 Hibernate 原生能力<strong>不在</strong>集成范围内：</p>
+
+<ul>
+  <li>Hibernate Envers（审计日志） — Blaze 不感知审计实体</li>
+  <li>Hibernate Search（全文索引） — 需要直接使用 Hibernate Search API</li>
+  <li>Hibernate Reactive — 异步 Session 的集成尚未实现</li>
+  <li>StatelessSession — 仅支持标准 Session / EntityManager</li>
+</ul>
+
+<h3>陷阱四：EclipseLink / DataNucleus 功能大幅受限</h3>
+
+<p>在非 Hibernate Provider 上，大量 Blaze-Persistence 核心特性不可用（参见 Fig 15-9）。如果项目依赖 CTE、窗口函数或集合操作，<strong>必须使用 Hibernate</strong>。</p>
+
+<h3>陷阱五：Provider 升级可能破坏集成</h3>
+
+<p>JPA Provider 的小版本升级通常安全，但大版本升级（如 Hibernate 5 → 6）几乎一定需要同步更换 Blaze-Persistence 集成模块。升级前务必：</p>
+
+<ol>
+  <li>阅读 Blaze-Persistence Release Notes 中的兼容性矩阵</li>
+  <li>在隔离环境运行全量集成测试</li>
+  <li>检查已弃用 API 是否被集成模块依赖</li>
+  <li>验证自定义函数注册是否正常</li>
+</ol>
+
+<!-- ================================================================== -->
+<div class="chapter-summary" id="summary">
+  <h2>本章小结</h2>
+  <ul>
+    <li><strong>SPI + ServiceLoader</strong> 架构实现了 Core 与 Provider 的完全解耦 — 引入正确的 Maven 依赖即可自动激活集成。</li>
+    <li><strong>Hibernate 集成</strong>是最深的一层，通过 <code>FunctionContributor</code> / <code>MetadataContributor</code> 注册数十个自定义 HQL 函数。</li>
+    <li><strong>自定义函数</strong>涵盖窗口函数、集合操作、聚合增强等 6 大类，在 HQL 层作为普通函数调用，SQL 层渲染为原生语法。</li>
+    <li><strong>Bug 变通系统</strong>自动检测 Provider 版本，命中已知缺陷时透明应用查询改写或 SQL 后处理。</li>
+    <li><strong>EclipseLink / DataNucleus</strong> 由于内部扩展机制受限，仅支持基础功能；高级特性必须搭配 Hibernate。</li>
+    <li><strong>DbmsDialect</strong> 是 Blaze-Persistence 自己的数据库方言层，独立于 Provider 方言，控制 CTE / LATERAL / RETURNING 等语法渲染。</li>
+    <li>最大陷阱是<strong>版本匹配</strong> — 集成模块版本必须精确匹配 Provider 版本，大版本升级需要同步更新。</li>
+  </ul>
+  <p class="next-hint">下一章 <a href="ch16-proxy.html">第 16 章 · Entity View 代理生成</a> 将深入 Entity View 运行时代理机制 — 了解 Blaze-Persistence 如何在运行时生成接口实现类，以及代理缓存、字节码增强与性能优化策略。</p>
+</div>
+
+<div class="chapter-nav">
+  <a href="ch14-rendering.html">← 第 14 章 · JPQL 渲染管线</a>
+  <a href="ch16-proxy.html">第 16 章 · Entity View 代理生成 →</a>
+</div>
+
+<p class="footer">&copy; 2026 图解 Blaze-Persistence &middot; 第 15 章 · JPA Provider 深度集成</p>
+
+</article>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+mermaid.initialize({
+  theme: 'dark',
+  themeVariables: {
+    primaryColor: '#58a6ff', primaryTextColor: '#e6edf3', primaryBorderColor: '#30363d',
+    lineColor: '#8b949e', secondaryColor: '#161b22', tertiaryColor: '#0d1117',
+    background: '#161b22', mainBkg: '#161b22', nodeBorder: '#30363d',
+    clusterBkg: 'rgba(22,27,34,.5)', clusterBorder: '#30363d', titleColor: '#e6edf3',
+    edgeLabelBackground: '#161b22',
+  },
+  flowchart: { curve: 'basis', padding: 15 },
+  sequence: { actorMargin: 50, messageMargin: 30 },
+});
+</script>
+</body>
+</html>

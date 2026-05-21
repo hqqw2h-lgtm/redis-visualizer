@@ -1,0 +1,1539 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 20 章 · 异步处理与任务调度 — 图解 Spring Boot</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="g-blue" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1e3a8a"/><stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="g-green" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#14532d"/><stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="g-orange" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7c2d12"/><stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="g-red" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7f1d1d"/><stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="g-purple" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4c1d95"/><stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8b949e"/>
+    </marker>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Spring Boot</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="ch19-cache.html">上一章 ch19-cache</a>
+  <a href="ch21-messaging.html">下一章 ch21-messaging</a>
+</nav>
+
+<aside class="toc">
+<a href="#20.1-@async-异步方法执行">20.1 @Async 异步方法执行</a>
+<a href="#20.2-taskexecutor-体系">20.2 TaskExecutor 体系</a>
+<a href="#20.3-@scheduled-定时任务">20.3 @Scheduled 定时任务</a>
+<a href="#20.4-virtual-thread-集成-java-21-加">20.4 Virtual Thread 集成 Java 21 加</a>
+<a href="#20.5-异步编排模式">20.5 异步编排模式</a>
+<a href="#20.6-陷阱与限制">20.6 陷阱与限制</a>
+<a href="#20.7-本章小结">20.7 本章小结</a>
+</aside>
+
+<div class="article">
+
+<h1>第 20 章 · 异步处理与任务调度</h1>
+<p class="subtitle">v7 图解版 · 自动从 v6 markdown 生成 · Mermaid 图原样保留</p>
+<div class="chapter-intro"><p>异步处理是高性能系统的基石——它将耗时操作从主线程剥离,让请求快速返回,同时在后台完成繁重工作。Spring 提供了从简单的 <code>@Async</code> 注解到完整的线程池管理与定时调度的全套方案。</p>
+<p>但异步并非银弹——它引入了线程安全、事务边界、上下文传播、资源管理等全新维度的复杂性。一个配置不当的 <code>SimpleAsyncTaskExecutor</code> 可以在几分钟内创建数万个线程导致 OOM;一个 <code>@Scheduled</code> 任务默认只有一个线程,一个慢任务会阻塞所有后续调度。Java 21 的 Virtual Thread 彻底改变了"一请求一线程"的成本模型,Spring Boot 3.2 加 对此提供了一等公民支持。</p>
+<p>本章按"@Async 代理机制 → TaskExecutor 体系 → @Scheduled 调度 → Virtual Thread 集成 → CompletableFuture 编排 → 陷阱与限制"的顺序,系统讲解 Spring 异步编程的全景。前置知识:第 3 章 IoC 容器的 Bean 生命周期与 BeanPostProcessor 机制,第 5 章 AOP 代理原理。了解 <code>java.util.concurrent</code> 基础有助于理解执行器模型。</p>
+</div>
+<h2 id="20.1-@async-异步方法执行">20.1 <code>@Async</code> 异步方法执行</h2>
+<p>Spring 的 <code>@Async</code> 是最简单的异步编程入口:只需一个注解,方法调用就从同步变为异步。但"简单"的背后隐藏着一整套代理机制——理解它,才能在生产中避开各种诡异问题。</p>
+<h3>20.1.1 <code>@EnableAsync</code> 激活异步支持</h3>
+<p>一切的起点是 <code>@EnableAsync</code>。这个注解通过 <code>@Import(AsyncConfigurationSelector.class)</code> 导入异步配置,激活 <code>AsyncAnnotationBeanPostProcessor</code>——后者负责扫描所有标注了 <code>@Async</code> 的 Bean,为它们创建代理。</p>
+<pre><code class="language-java">@Configuration
+@EnableAsync
+public class AsyncConfig {
+}
+</code></pre>
+<p>把 <code>org.springframework.aop</code> 与 <code>org.springframework.scheduling</code> 日志调到 DEBUG 后,启动时能看到异步代理被装配:</p>
+<pre><code class="language-text">INFO  o.s.s.a.AsyncAnnotationBeanPostProcessor : Found @Async annotation on bean 'emailService'
+DEBUG o.s.a.f.autoproxy.AbstractAutoProxyCreator : Creating implicit proxy for bean 'emailService'
+INFO  c.example.AsyncConfig : @EnableAsync is active, async proxy mode=PROXY
+</code></pre>
+<p>Spring Boot 不会自动启用 <code>@Async</code>——与 <code>@EnableScheduling</code> 类似,必须显式在配置类上添加 <code>@EnableAsync</code>。这是一个有意的设计决策:异步执行改变了方法调用的线程模型,不应在开发者不知情的情况下隐式激活。</p>
+<h3>20.1.2 <code>@Async</code> 代理创建与调用链路</h3>
+<p><code>AsyncAnnotationBeanPostProcessor</code> 继承自 <code>AbstractAdvisingBeanPostProcessor</code>,在 Bean 初始化完成后(<code>postProcessAfterInitialization</code> 阶段)介入。它检查 Bean 的方法上是否存在 <code>@Async</code> 注解,如存在则通过 AOP 为该 Bean 创建代理。代理的核心拦截器是 <code>AsyncExecutionInterceptor</code>,负责将方法调用提交到 <code>TaskExecutor</code> 线程池。</p>
+<div class="diagram">
+<div class="diagram-title">图 20-1 · @Async 代理调用时序(Caller → Proxy → Executor → Target,立即返回 Future)</div>
+<svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="24" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">@Async 关键 — 调用方立即返回,目标方法在异步线程执行</text>
+
+  <text x="120" y="60" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">调用方</text>
+  <text x="380" y="60" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">★ AOP Proxy</text>
+  <text x="640" y="60" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">TaskExecutor</text>
+  <text x="860" y="60" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">目标方法</text>
+
+  <line x1="120" y1="80" x2="120" y2="430" stroke="#bc8cff" stroke-dasharray="3,2"/>
+  <line x1="380" y1="80" x2="380" y2="430" stroke="#58a6ff" stroke-dasharray="3,2"/>
+  <line x1="640" y1="80" x2="640" y2="430" stroke="#3fb950" stroke-dasharray="3,2"/>
+  <line x1="860" y1="80" x2="860" y2="430" stroke="#d29922" stroke-dasharray="3,2"/>
+
+  <path d="M120,110 L380,110" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="250" y="103" text-anchor="middle" fill="#fee2e2" font-size="9">emailService.sendOrderConfirmation(order)</text>
+
+  <rect x="370" y="125" width="20" height="40" fill="url(#g-blue)" stroke="#58a6ff"/>
+
+  <rect x="200" y="170" width="360" height="22" rx="3" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="380" y="185" text-anchor="middle" fill="#dbeafe" font-size="9" font-weight="bold">★ 解析 @Async value 选择 Executor</text>
+
+  <path d="M380,200 L640,200" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="510" y="193" text-anchor="middle" fill="#dbeafe" font-size="9">executor.submit(Callable)</text>
+
+  <rect x="630" y="215" width="20" height="180" fill="url(#g-green)" stroke="#3fb950"/>
+
+  <path d="M380,235 L120,235" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr)" fill="none"/>
+  <text x="250" y="225" text-anchor="middle" fill="#bc8cff" font-size="10" font-weight="bold">★ 立即返回 Future / void</text>
+
+  <path d="M640,290 L860,290" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="750" y="283" text-anchor="middle" fill="#bbf7d0" font-size="10" font-weight="bold">★ 异步线程执行目标方法</text>
+
+  <rect x="850" y="305" width="20" height="60" fill="url(#g-orange)" stroke="#d29922"/>
+
+  <path d="M860,355 L640,355" stroke="#d29922" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr)" fill="none"/>
+  <text x="750" y="345" text-anchor="middle" fill="#d29922" font-size="9">↩ 返回结果或异常</text>
+
+  <rect x="540" y="380" width="200" height="22" rx="3" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="640" y="395" text-anchor="middle" fill="#bbf7d0" font-size="9" font-weight="bold">填充 Future 结果</text>
+
+  <text x="20" y="445" fill="#fed7aa" font-size="10">★ 关键:调用方收到 Future 时,目标方法可能还没开始执行</text>
+</svg>
+</div>
+<h3>20.1.3 源码入口:<code>@Async</code> 从注解到线程切换</h3>
+<p><code>@Async</code> 的核心不是"新开线程"四个字,而是 Spring AOP、执行器选择与返回值适配三者的组合。源码阅读可从 <code>@EnableAsync</code> 的导入链开始,最后落到 <code>AsyncExecutionInterceptor.invoke()</code>。</p>
+<table>
+<thead>
+<tr>
+<th>源码入口</th>
+<th>关键方法</th>
+<th>运行期职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>@EnableAsync</code></td>
+<td><code>@Import(AsyncConfigurationSelector.class)</code></td>
+<td>选择 <code>ProxyAsyncConfiguration</code> 或 AspectJ 配置</td>
+</tr>
+<tr>
+<td><code>ProxyAsyncConfiguration</code></td>
+<td><code>asyncAdvisor()</code></td>
+<td>注册 <code>AsyncAnnotationBeanPostProcessor</code></td>
+</tr>
+<tr>
+<td><code>AsyncAnnotationBeanPostProcessor</code></td>
+<td><code>postProcessAfterInitialization()</code></td>
+<td>创建 <code>AsyncAnnotationAdvisor</code>,为含 <code>@Async</code> 的 Bean 加代理</td>
+</tr>
+<tr>
+<td><code>AsyncAnnotationAdvisor</code></td>
+<td><code>buildAdvice()</code></td>
+<td>绑定 <code>AnnotationAsyncExecutionInterceptor</code></td>
+</tr>
+<tr>
+<td><code>AnnotationAsyncExecutionInterceptor</code></td>
+<td><code>invoke()</code></td>
+<td>拦截方法调用,提交 <code>Callable</code> 到执行器</td>
+</tr>
+<tr>
+<td><code>AsyncExecutionAspectSupport</code></td>
+<td><code>determineAsyncExecutor()</code></td>
+<td>按 <code>@Async("beanName")</code>、<code>AsyncConfigurer</code>、默认 executor 顺序选择</td>
+</tr>
+<tr>
+<td><code>AsyncExecutionAspectSupport</code></td>
+<td><code>doSubmit()</code></td>
+<td>按返回类型适配 <code>void</code>、<code>Future</code>、<code>CompletableFuture</code></td>
+</tr>
+<tr>
+<td><code>TaskExecutionAutoConfiguration</code></td>
+<td><code>applicationTaskExecutor</code></td>
+<td>Boot 默认创建可配置的 <code>ThreadPoolTaskExecutor</code> 或虚拟线程执行器</td>
+</tr>
+</tbody>
+</table>
+<div class="diagram">
+<div class="diagram-title">图 20-2 · Spring Async 源码到运行时线程模型(@EnableAsync → BPP → Advisor → Interceptor → Executor)</div>
+<svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="24" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">两条独立链路:启动期装配代理 + 运行期拦截方法调用</text>
+
+  <text x="200" y="50" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">启动期装配链</text>
+  <text x="700" y="50" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">运行期调用链</text>
+
+  <rect x="80" y="70" width="240" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="200" y="94" text-anchor="middle" fill="#dbeafe" font-size="10" font-weight="bold">★ @EnableAsync</text>
+
+  <path d="M200,110 L200,140" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="80" y="140" width="240" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="200" y="164" text-anchor="middle" fill="#dbeafe" font-size="10" font-weight="bold">AsyncConfigurationSelector</text>
+
+  <path d="M200,180 L200,210" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="80" y="210" width="240" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="200" y="234" text-anchor="middle" fill="#dbeafe" font-size="10" font-weight="bold">ProxyAsyncConfiguration</text>
+
+  <path d="M200,250 L200,280" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="80" y="280" width="240" height="40" rx="6" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+  <text x="200" y="304" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">★ AsyncAnnotationBPP</text>
+
+  <path d="M200,320 L200,350" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="80" y="350" width="240" height="40" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="200" y="374" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">AsyncAnnotationAdvisor</text>
+
+  <rect x="600" y="70" width="240" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="720" y="94" text-anchor="middle" fill="#bbf7d0" font-size="10" font-weight="bold">★ 业务代码 emailService.send</text>
+
+  <path d="M720,110 L720,140" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="600" y="140" width="240" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="720" y="164" text-anchor="middle" fill="#bbf7d0" font-size="10" font-weight="bold">AOP Proxy 拦截</text>
+
+  <path d="M720,180 L720,210" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="600" y="210" width="240" height="40" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="720" y="234" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">★ AsyncExecInterceptor.invoke</text>
+
+  <path d="M720,250 L720,280" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="600" y="280" width="240" height="40" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="720" y="304" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">determineAsyncExecutor</text>
+
+  <path d="M720,320 L720,350" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="600" y="350" width="240" height="40" rx="6" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+  <text x="720" y="374" text-anchor="middle" fill="#fecaca" font-size="10" font-weight="bold">★ TaskExecutor 执行</text>
+
+  <path d="M320,370 L600,370" stroke="#bc8cff" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#arr)" fill="none"/>
+  <text x="460" y="360" text-anchor="middle" fill="#bc8cff" font-size="9" font-weight="bold">注入 Interceptor</text>
+
+  <rect x="20" y="410" width="880" height="40" rx="8" fill="#0d1117" stroke="#bc8cff"/>
+  <text x="460" y="432" text-anchor="middle" fill="#bc8cff" font-size="10" font-weight="bold">★ 边界:代理只包"从代理对象进入的方法调用" — this.method() / private / 构造器都不切线程</text>
+</svg>
+</div>
+<p>这里有一个关键边界:<code>@Async</code> 代理只包住"从代理对象进入的方法调用"。目标方法内部的 <code>this.sendEmail()</code>、<code>private</code> 方法、构造器逻辑、同类内部调用都不会经过 <code>AnnotationAsyncExecutionInterceptor</code>,因此不会切线程。</p>
+<h3>20.1.4 默认 <code>SimpleAsyncTaskExecutor</code> 的危险</h3>
+<p>在纯 Spring Framework 中,如找不到可用的 <code>Executor</code> 或 <code>TaskExecutor</code>,<code>@Async</code> 会回退到 <code>SimpleAsyncTaskExecutor</code>。它的行为非常简单粗暴:每次调用都创建一个新线程,没有线程复用,没有队列缓冲,没有最大线程数限制。Spring Boot 应用通常会自动提供 <code>applicationTaskExecutor</code>,但显式覆盖异步配置时仍要确认最终使用的是哪个执行器。</p>
+<p><code>SimpleAsyncTaskExecutor</code> 在高并发场景下极其危险。假设每秒有 1000 个 <code>@Async</code> 调用,它会在 1 秒内创建 1000 个线程。每个线程默认占用约 1 MB 栈空间,10 秒后就是 10 GB 级别的栈空间压力,加上操作系统对线程数的限制,系统很快会抛出 <code>OutOfMemoryError unable to create native thread</code> 或被 OOM Killer 杀死。生产环境必须显式确认异步执行器有边界。</p>
+<pre><code class="language-java">public class SimpleAsyncTaskExecutor implements AsyncTaskExecutor {
+    @Override
+    public void execute(Runnable task) {
+        Thread t = new Thread(task);
+        t.setDaemon(false);
+        t.start();
+    }
+}
+</code></pre>
+<h3>20.1.5 配置自定义 TaskExecutor</h3>
+<p>生产环境必须配置 <code>ThreadPoolTaskExecutor</code>,控制线程数量、队列容量与拒绝策略:</p>
+<pre><code class="language-java">@Configuration
+@EnableAsync
+public class AsyncConfig implements AsyncConfigurer {
+
+    @Override
+    public Executor getAsyncExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(10);
+        executor.setMaxPoolSize(50);
+        executor.setQueueCapacity(200);
+        executor.setThreadNamePrefix(&quot;async-&quot;);
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(60);
+        executor.initialize();
+        return executor;
+    }
+
+    @Override
+    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+        return (ex, method, params) -&gt;
+            log.error(&quot;Async method {} threw exception&quot;, method.getName(), ex);
+    }
+}
+</code></pre>
+<p>调用方线程会立即返回,真正的业务日志出现在 <code>async-</code> 线程中;这也是排查 <code>@Async</code> 是否生效的第一眼证据:</p>
+<pre><code class="language-text">INFO  [http-nio-8080-exec-7] c.example.OrderController : accepted orderId=O1001 elapsed=4ms
+INFO  [async-1] c.example.EmailService : start sending welcome mail orderId=O1001
+INFO  [async-1] c.example.EmailService : mail sent orderId=O1001 elapsed=476ms
+</code></pre>
+<h3>20.1.6 <code>@Async</code> 的四种返回类型</h3>
+<p><code>@Async</code> 方法支持四种返回类型,选择取决于调用方是否需要获取异步结果。</p>
+<p><code>void</code> 适合发射即忘场景。调用方不关心结果,异常只能通过 <code>AsyncUncaughtExceptionHandler</code> 捕获:</p>
+<pre><code class="language-java">@Async
+public void sendEmail(String to) {
+    mailSender.send(to, &quot;Welcome&quot;);
+}
+</code></pre>
+<p><code>Future&lt;T&gt;</code> 是传统阻塞获取方式。调用方使用 <code>future.get()</code> 阻塞等待:</p>
+<pre><code class="language-java">@Async
+public Future&lt;Report&gt; generateReport(Long id) {
+    Report report = doHeavyWork(id);
+    return new AsyncResult&lt;&gt;(report);
+}
+</code></pre>
+<p><code>CompletableFuture&lt;T&gt;</code> 是推荐方式。从 Spring 4.2 起,<code>@Async</code> 方法返回的 <code>CompletableFuture</code> 由框架自动适配,无需 <code>AsyncResult</code> 包装。<code>CompletableFuture</code> 支持函数式编排(<code>thenApply</code>、<code>thenCompose</code>、<code>allOf</code>),远比传统 <code>Future.get()</code> 阻塞获取灵活:</p>
+<pre><code class="language-java">@Async
+public CompletableFuture&lt;Report&gt; generateReport(Long id) {
+    Report report = doHeavyWork(id);
+    return CompletableFuture.completedFuture(report);
+}
+</code></pre>
+<p><code>ListenableFuture&lt;T&gt;</code> 已废弃。Spring 6.0 将其标记为 <code>@Deprecated</code>,迁移到 <code>CompletableFuture</code> 即可。</p>
+<h3>20.1.7 上下文传播案例:Spring Cloud Sleuth 与 Micrometer Tracing</h3>
+<p>在分布式追踪系统中,每个请求会携带 traceId 与 spanId。当使用 <code>@Async</code> 切换线程时,这些追踪信息默认会丢失。Spring Cloud Sleuth 通过 <code>LazyTraceExecutor</code>、<code>TraceableExecutorService</code> 包装 TaskExecutor,在任务提交时捕获当前 Span,在异步线程启动时恢复。Spring Boot 3.x 迁移到 Micrometer Tracing 后,通常需要配合 Micrometer Context Propagation 或框架提供的 executor 包装能力,不能假设任意自定义线程池都会自动传播 traceId。</p>
+<h3>20.1.8 设计取舍:为什么选择代理而非改写字节码</h3>
+<p><code>@Async</code> 复用了 Spring AOP 代理体系,这让它和事务、缓存、安全等注解保持一致,但也继承了代理模型的限制。Spring 同时提供 AspectJ 模式,但默认仍是 proxy mode。</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>优点</th>
+<th>代价或被拒绝原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Proxy mode 默认</td>
+<td>零额外工具链;与 <code>@Transactional</code> 一致;启动时创建代理即可</td>
+<td>自调用不生效;<code>final</code> 与 <code>private</code> 方法受限;只拦截 Spring Bean</td>
+</tr>
+<tr>
+<td>AspectJ compile-time weaving</td>
+<td>可拦截自调用与非 public 方法;语义彻底</td>
+<td>需要 AJ 编译器或织入插件,构建复杂</td>
+</tr>
+<tr>
+<td>Load-time weaving</td>
+<td>不改编译流程,运行期织入更强</td>
+<td>类加载期复杂,容器与 Agent 兼容成本高</td>
+</tr>
+<tr>
+<td>显式 <code>CompletableFuture.supplyAsync</code></td>
+<td>行为透明,调用点可见</td>
+<td>样板多,执行器与上下文传播容易散落各处</td>
+</tr>
+</tbody>
+</table>
+<p>生产项目通常选择 proxy mode 加 明确线程池 加 清晰服务边界。如果一个类里大量需要异步自调用,往往说明边界划分错了:把异步职责拆到独立 Bean,比引入 AspectJ 更易维护。</p>
+<h2 id="20.2-taskexecutor-体系">20.2 TaskExecutor 体系</h2>
+<p>Spring 的 <code>TaskExecutor</code> 是 JDK <code>java.util.concurrent.Executor</code> 的语义子接口,为 Spring 生态提供统一的任务执行抽象。从"每次新建线程"的 <code>SimpleAsyncTaskExecutor</code> 到"虚拟线程"的 <code>VirtualThreadTaskExecutor</code>,Spring 提供了丰富的实现。</p>
+<h3>20.2.1 TaskExecutor 继承体系</h3>
+<div class="diagram">
+<div class="diagram-title">图 20-3 · TaskExecutor 类继承关系(JDK Executor → TaskExecutor → AsyncTaskExecutor → 4 实现)</div>
+<svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="24" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">JDK Executor → Spring TaskExecutor → AsyncTaskExecutor → 4 个实现</text>
+
+  <rect x="380" y="50" width="160" height="50" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="460" y="74" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">★ Executor</text>
+  <text x="460" y="90" text-anchor="middle" fill="#dbeafe" font-size="9">JDK interface</text>
+
+  <path d="M460,100 L460,130" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="490" y="118" fill="#58a6ff" font-size="9">extends</text>
+
+  <rect x="380" y="130" width="160" height="50" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="460" y="154" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">TaskExecutor</text>
+  <text x="460" y="170" text-anchor="middle" fill="#dbeafe" font-size="9">Spring interface</text>
+
+  <path d="M460,180 L460,210" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="380" y="210" width="160" height="50" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+  <text x="460" y="234" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">★ AsyncTaskExecutor</text>
+  <text x="460" y="250" text-anchor="middle" fill="#fee2e2" font-size="9">+submit / +Future</text>
+
+  <path d="M380,235 L120,310" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M380,255 L320,310" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M540,255 L600,310" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M540,235 L800,310" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="20" y="310" width="200" height="80" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="120" y="334" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">★ ThreadPoolTaskExec</text>
+  <text x="120" y="352" text-anchor="middle" fill="#bbf7d0" font-size="9">corePoolSize</text>
+  <text x="120" y="366" text-anchor="middle" fill="#bbf7d0" font-size="9">maxPoolSize</text>
+  <text x="120" y="380" text-anchor="middle" fill="#bbf7d0" font-size="9">queueCapacity</text>
+
+  <rect x="240" y="310" width="200" height="80" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+  <text x="340" y="334" text-anchor="middle" fill="#fecaca" font-size="11" font-weight="bold">★ SimpleAsync</text>
+  <text x="340" y="352" text-anchor="middle" fill="#fecaca" font-size="9">每次新线程</text>
+  <text x="340" y="366" text-anchor="middle" fill="#fecaca" font-size="9">(无队列无上限!)</text>
+  <text x="340" y="380" text-anchor="middle" fill="#fecaca" font-size="9">★ 高并发 OOM</text>
+
+  <rect x="500" y="310" width="200" height="80" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="600" y="334" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">★ VirtualThreadTaskExec</text>
+  <text x="600" y="352" text-anchor="middle" fill="#fee2e2" font-size="9">Java 21+</text>
+  <text x="600" y="366" text-anchor="middle" fill="#fee2e2" font-size="9">每任务虚拟线程</text>
+  <text x="600" y="380" text-anchor="middle" fill="#fee2e2" font-size="9">极高并发</text>
+
+  <rect x="720" y="310" width="180" height="80" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="810" y="334" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">ConcurrentTaskExec</text>
+  <text x="810" y="352" text-anchor="middle" fill="#dbeafe" font-size="9">target Executor</text>
+  <text x="810" y="366" text-anchor="middle" fill="#dbeafe" font-size="9">适配器模式</text>
+
+  <text x="20" y="425" fill="#fed7aa" font-size="10">★ 生产强烈推荐 ThreadPoolTaskExecutor — 容量有边界,Actuator 暴露指标</text>
+  <text x="20" y="445" fill="#fed7aa" font-size="10">★ 高并发 I/O 场景可考虑 VirtualThreadTaskExecutor(Java 21+)</text>
+</svg>
+</div>
+<h3>20.2.2 ThreadPoolTaskExecutor 核心参数</h3>
+<p><code>ThreadPoolTaskExecutor</code> 是生产环境最常用的实现。它内部包装了 JDK 的 <code>ThreadPoolExecutor</code>,但提供了 Spring 风格的配置(支持属性注入、生命周期管理、优雅关闭)。理解其参数之间的关系是调优的关键。</p>
+<div class="diagram">
+<div class="diagram-title">图 20-4 · 线程池任务提交执行流程(core → queue → max → reject 4 阶段决策)</div>
+<svg viewBox="0 0 920 540" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="24" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">扩容顺序:先填核心 → 再堆队列 → 才创建非核心 → 最后拒绝</text>
+
+  <rect x="320" y="50" width="280" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+  <text x="460" y="74" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">★ 新任务 execute(Runnable)</text>
+
+  <path d="M460,90 L460,110" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <polygon points="380,110 540,110 580,140 540,170 380,170 340,140" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="460" y="135" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">线程数 &lt; corePoolSize?</text>
+  <text x="460" y="155" text-anchor="middle" fill="#fee2e2" font-size="9">① 第一阶段</text>
+
+  <path d="M340,140 L160,210" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="220" y="180" fill="#3fb950" font-size="10" font-weight="bold">是</text>
+
+  <rect x="20" y="210" width="280" height="40" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="160" y="234" text-anchor="middle" fill="#bbf7d0" font-size="10" font-weight="bold">★ 创建核心线程执行</text>
+
+  <path d="M580,140 L580,200" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="610" y="170" fill="#d29922" font-size="10">否</text>
+
+  <polygon points="500,200 660,200 700,230 660,260 500,260 460,230" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="580" y="225" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">任务队列未满?</text>
+  <text x="580" y="245" text-anchor="middle" fill="#fee2e2" font-size="9">② 第二阶段</text>
+
+  <path d="M460,230 L300,290" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="370" y="265" fill="#3fb950" font-size="10">是</text>
+
+  <rect x="160" y="290" width="280" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="300" y="314" text-anchor="middle" fill="#dbeafe" font-size="10" font-weight="bold">★ 进入队列等待</text>
+
+  <path d="M700,230 L700,290" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="730" y="265" fill="#d29922" font-size="10">否</text>
+
+  <polygon points="620,290 780,290 820,320 780,350 620,350 580,320" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="700" y="315" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">线程数 &lt; maxPoolSize?</text>
+  <text x="700" y="335" text-anchor="middle" fill="#fee2e2" font-size="9">③ 第三阶段</text>
+
+  <path d="M580,320 L460,380" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="510" y="355" fill="#3fb950" font-size="10">是</text>
+
+  <rect x="320" y="380" width="280" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="460" y="404" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">★ 创建非核心线程</text>
+
+  <path d="M820,320 L820,380" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="850" y="355" fill="#f85149" font-size="10">否</text>
+
+  <rect x="640" y="380" width="240" height="40" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+  <text x="760" y="404" text-anchor="middle" fill="#fecaca" font-size="10" font-weight="bold">★ ④ RejectedExecution</text>
+
+  <rect x="20" y="450" width="880" height="80" rx="10" fill="#0d1117" stroke="#f85149"/>
+  <text x="460" y="472" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">★ 4 种 RejectedExecutionHandler</text>
+  <text x="40"  y="494" fill="#fecaca" font-size="10">① AbortPolicy 抛 RejectedExecutionException ② CallerRunsPolicy 调用方执行,形成回压</text>
+  <text x="40"  y="514" fill="#fecaca" font-size="10">③ DiscardPolicy 静默丢弃(危险!)④ DiscardOldestPolicy 丢弃最老排队任务后重试</text>
+</svg>
+</div>
+<pre><code class="language-java">@Bean(&quot;orderExecutor&quot;)
+public ThreadPoolTaskExecutor orderExecutor() {
+    ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+    executor.setCorePoolSize(10);
+    executor.setMaxPoolSize(50);
+    executor.setQueueCapacity(200);
+    executor.setKeepAliveSeconds(60);
+    executor.setThreadNamePrefix(&quot;order-async-&quot;);
+    executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+    return executor;
+}
+</code></pre>
+<p>启用 Actuator 后,<code>ThreadPoolTaskExecutor</code> 会暴露活跃线程、队列与完成任务数:</p>
+<pre><code class="language-text">executor_active_threads{name=&quot;orderExecutor&quot;} 10.0
+executor_queued_tasks{name=&quot;orderExecutor&quot;} 37.0
+executor_pool_size_threads{name=&quot;orderExecutor&quot;} 10.0
+executor_completed_tasks_total{name=&quot;orderExecutor&quot;} 1842.0
+</code></pre>
+<p><code>ThreadPoolExecutor</code> 的扩容逻辑常让人意外:它先填满核心线程,然后把任务堆到队列里,只有队列满了才开始创建非核心线程。这意味着如 <code>queueCapacity = Integer.MAX_VALUE</code>(<code>LinkedBlockingQueue</code> 默认值),<code>maxPoolSize</code> 永远不会生效。Spring 的 <code>ThreadPoolTaskExecutor</code> 默认 <code>queueCapacity = Integer.MAX_VALUE</code>,必须显式设置合理值。</p>
+<h3>20.2.3 三种执行器的对比</h3>
+<table>
+<thead>
+<tr>
+<th>执行器</th>
+<th>调度模型</th>
+<th>适用场景</th>
+<th>Spring 集成度</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ThreadPoolTaskExecutor</code></td>
+<td>固定大小线程池加 任务队列</td>
+<td>I/O 密集型异步任务</td>
+<td>最完善,Actuator 暴露指标</td>
+</tr>
+<tr>
+<td><code>ForkJoinPool</code></td>
+<td>工作窃取算法</td>
+<td>CPU 密集型递归或分治计算</td>
+<td><code>CompletableFuture</code> 默认 commonPool</td>
+</tr>
+<tr>
+<td><code>VirtualThreadTaskExecutor</code></td>
+<td>Java 21 加 虚拟线程</td>
+<td>极高并发 I/O 阻塞代码</td>
+<td>Spring Boot 3.2 加 内置支持</td>
+</tr>
+</tbody>
+</table>
+<p><code>ForkJoinPool</code> 默认线程数等于 CPU 核心数减 1,不适合包含阻塞 I/O 的任务;<code>VirtualThreadTaskExecutor</code> 极低开销可达百万级并发,但 <code>synchronized</code> 会导致 pinning。</p>
+<h3>20.2.4 <code>@Async("specificExecutor")</code> 指定执行器</h3>
+<p>当系统中有多个 <code>TaskExecutor</code> Bean 时,可以通过 <code>@Async("beanName")</code> 指定使用哪个执行器,实现任务隔离:</p>
+<pre><code class="language-java">@Service
+public class NotificationService {
+
+    @Async(&quot;emailExecutor&quot;)
+    public CompletableFuture&lt;Void&gt; sendEmail(String to, String body) {
+        mailSender.send(to, body);
+        return CompletableFuture.completedFuture(null);
+    }
+
+    @Async(&quot;smsExecutor&quot;)
+    public CompletableFuture&lt;Void&gt; sendSms(String phone, String text) {
+        smsGateway.send(phone, text);
+        return CompletableFuture.completedFuture(null);
+    }
+}
+</code></pre>
+<p>两个下游通道使用不同线程名前缀,说明邮件与短信任务被隔离到不同执行器:</p>
+<pre><code class="language-text">INFO  [email-1] c.example.NotificationService : send email to alice@example.com
+INFO  [sms-1] c.example.NotificationService : send sms to +86138 0000 0000
+INFO  [sms-1] c.example.NotificationService : sms accepted messageId=sms-7788
+INFO  [email-1] c.example.NotificationService : email accepted messageId=mail-9911
+</code></pre>
+<h3>20.2.5 优雅关闭</h3>
+<p>应用关闭时,正在执行的异步任务可能被粗暴中断。通过配置优雅关闭,可让已提交的任务执行完毕后再关闭线程池:</p>
+<pre><code class="language-java">@Bean
+public ThreadPoolTaskExecutor taskExecutor() {
+    ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+    executor.setCorePoolSize(10);
+    executor.setMaxPoolSize(50);
+    executor.setQueueCapacity(200);
+    executor.setWaitForTasksToCompleteOnShutdown(true);
+    executor.setAwaitTerminationSeconds(60);
+    return executor;
+}
+</code></pre>
+<p>收到关闭信号后,线程池先停止接收新任务,再等待已提交任务完成;超时才会强制中断:</p>
+<pre><code class="language-text">INFO  [SpringApplicationShutdownHook] o.s.s.c.ThreadPoolTaskExecutor : Shutting down ExecutorService 'taskExecutor'
+INFO  [SpringApplicationShutdownHook] c.example.AsyncConfig : waiting up to 60s for async tasks to finish
+INFO  [order-async-8] c.example.PaymentReceiptJob : payment receipt generated orderId=O1001
+INFO  [SpringApplicationShutdownHook] o.s.s.c.ThreadPoolTaskExecutor : ExecutorService 'taskExecutor' shut down successfully
+</code></pre>
+<h3>20.2.6 Spring Kafka 并发消费模型案例</h3>
+<p>Spring Kafka 的 <code>ConcurrentMessageListenerContainer</code> 通过 <code>concurrency</code> 参数控制消费者线程数。每个消费线程对应一个 Kafka 分区(或多个)。底层并不使用 <code>ThreadPoolTaskExecutor</code>,而是直接管理 <code>KafkaMessageListenerContainer</code> 实例数组。每个容器内部使用 <code>SimpleAsyncTaskExecutor</code> 创建一个长期运行的轮询线程。设置 <code>spring.kafka.listener.concurrency=3</code> 就会启动 3 个消费线程。优雅关闭同样重要:<code>ContainerProperties.setShutdownTimeout()</code> 控制消费者关闭前最长等待时间。</p>
+<h3>20.2.7 扩展边界:执行器、装饰器与上下文传播</h3>
+<p>异步扩展最容易出错的地方,是把"执行任务"、"传播上下文"、"限流隔离"混在一个自定义 executor 里。Spring 已经给出了分层扩展点。</p>
+<table>
+<thead>
+<tr>
+<th>扩展点</th>
+<th>适合做什么</th>
+<th>边界</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>AsyncConfigurer.getAsyncExecutor()</code></td>
+<td>定义全局默认 <code>@Async</code> 执行器</td>
+<td>不要写业务路由,多业务池用 <code>@Async("beanName")</code></td>
+</tr>
+<tr>
+<td><code>@Async("executorName")</code></td>
+<td>按任务类型隔离线程池</td>
+<td>名称是运行期契约,重命名 Bean 要同步测试</td>
+</tr>
+<tr>
+<td><code>TaskDecorator</code></td>
+<td>捕获并恢复 MDC、traceId、租户 ID</td>
+<td>不要传播事务连接、EntityManager、Request 对象本体</td>
+</tr>
+<tr>
+<td><code>DelegatingSecurityContextAsyncTaskExecutor</code></td>
+<td>传播 Spring Security <code>SecurityContext</code></td>
+<td>线程池复用场景不要用 <code>MODE_INHERITABLETHREADLOCAL</code> 替代</td>
+</tr>
+<tr>
+<td><code>RejectedExecutionHandler</code></td>
+<td>定义满载行为:抛错、调用方执行、丢弃</td>
+<td><code>DiscardPolicy</code> 极少适合业务任务,会隐藏数据丢失</td>
+</tr>
+<tr>
+<td>Micrometer executor metrics</td>
+<td>观察活跃线程、队列、完成任务、拒绝数</td>
+<td>没有指标的线程池无法调优</td>
+</tr>
+</tbody>
+</table>
+<p>上下文传播的核心原则:只传播"值",不要传播"资源句柄"。TraceId、用户 ID、租户 ID 可以复制;数据库事务、Hibernate Session、Servlet request 输入流都不能跨线程复用。</p>
+<h2 id="20.3-@scheduled-定时任务">20.3 <code>@Scheduled</code> 定时任务</h2>
+<p>定时任务是后端系统的"心跳"——定期清理过期数据、生成日报、同步第三方状态、推送指标。Spring 的 <code>@Scheduled</code> 提供了声明式定时任务,但默认的单线程调度器是一个隐藏的地雷。</p>
+<h3>20.3.1 <code>@EnableScheduling</code> 激活调度</h3>
+<pre><code class="language-java">@Configuration
+@EnableScheduling
+public class SchedulingConfig {
+}
+</code></pre>
+<h3>20.3.2 源码入口:<code>@Scheduled</code> 如何注册成定时任务</h3>
+<p><code>@Scheduled</code> 不是每次请求触发,而是在容器启动阶段扫描 Bean 方法并注册任务。核心处理器是 <code>ScheduledAnnotationBeanPostProcessor</code>,它在单例 Bean 初始化之后解析注解,再把任务交给 <code>ScheduledTaskRegistrar</code>。</p>
+<table>
+<thead>
+<tr>
+<th>源码入口</th>
+<th>关键方法</th>
+<th>运行期职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>@EnableScheduling</code></td>
+<td><code>@Import(SchedulingConfiguration.class)</code></td>
+<td>注册 <code>ScheduledAnnotationBeanPostProcessor</code></td>
+</tr>
+<tr>
+<td><code>ScheduledAnnotationBeanPostProcessor</code></td>
+<td><code>postProcessAfterInitialization()</code></td>
+<td>扫描 Bean 方法上的 <code>@Scheduled</code> 与 <code>@Schedules</code></td>
+</tr>
+<tr>
+<td><code>ScheduledAnnotationBeanPostProcessor</code></td>
+<td><code>processScheduled()</code></td>
+<td>解析 fixedRate、fixedDelay、cron、initialDelay</td>
+</tr>
+<tr>
+<td><code>ScheduledTaskRegistrar</code></td>
+<td><code>scheduleTasks()</code></td>
+<td>把任务注册到 <code>TaskScheduler</code> 或 <code>ScheduledExecutorService</code></td>
+</tr>
+<tr>
+<td><code>ThreadPoolTaskScheduler</code></td>
+<td><code>scheduleAtFixedRate()</code></td>
+<td>管理调度线程池、错误处理与优雅关闭</td>
+</tr>
+<tr>
+<td><code>SimpleAsyncTaskScheduler</code></td>
+<td><code>setVirtualThreads(true)</code></td>
+<td>Boot 虚拟线程场景下,用调度线程触发、虚拟线程执行任务</td>
+</tr>
+</tbody>
+</table>
+<div class="diagram">
+<div class="diagram-title">图 20-5 · Scheduled 源码到运行期触发链路(@EnableScheduling → BPP → 扫描 → Registrar → Scheduler)</div>
+<svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="24" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">启动期一次注册 + 运行期周期触发</text>
+
+  <rect x="20" y="60" width="160" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="100" y="84" text-anchor="middle" fill="#dbeafe" font-size="10" font-weight="bold">★ @EnableScheduling</text>
+
+  <path d="M180,80 L200,80" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="200" y="60" width="180" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="290" y="84" text-anchor="middle" fill="#dbeafe" font-size="10" font-weight="bold">SchedulingConfig</text>
+
+  <path d="M380,80 L400,80" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="400" y="60" width="220" height="40" rx="6" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+  <text x="510" y="84" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">★ ScheduledAnnotationBPP</text>
+
+  <path d="M510,100 L510,130" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="20" y="60" width="160" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="100" y="84" text-anchor="middle" fill="#dbeafe" font-size="10" font-weight="bold">★ @EnableScheduling</text>
+
+  <rect x="640" y="60" width="240" height="40" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="760" y="84" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">★ 业务 Bean 初始化完成</text>
+
+  <path d="M760,100 L760,130" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <path d="M760,150 L510,150" stroke="#d29922" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="400" y="130" width="220" height="40" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="510" y="154" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">扫描 @Scheduled 方法</text>
+
+  <rect x="660" y="130" width="200" height="40" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="760" y="154" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">反射调用目标</text>
+
+  <path d="M510,170 L510,200" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="400" y="200" width="220" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="510" y="224" text-anchor="middle" fill="#bbf7d0" font-size="10" font-weight="bold">★ ScheduledTaskRegistrar</text>
+
+  <path d="M510,240 L510,270" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="400" y="270" width="220" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="510" y="294" text-anchor="middle" fill="#bbf7d0" font-size="10" font-weight="bold">★ TaskScheduler</text>
+
+  <path d="M620,290 L660,290" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="660" y="270" width="220" height="40" rx="6" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+  <text x="770" y="294" text-anchor="middle" fill="#fecaca" font-size="10" font-weight="bold">★ 时间命中 → 调度线程调用</text>
+
+  <text x="20" y="350" fill="#fed7aa" font-size="10">★ 关键:ErrorHandler 必须配置 — 调度任务异常会让调度链路静默死亡!</text>
+</svg>
+</div>
+<h3>20.3.3 三种调度模式</h3>
+<pre><code class="language-java">@Component
+public class DataCleanupTask {
+
+    @Scheduled(fixedRate = 5000)
+    public void heartbeat() {
+        healthChecker.ping();
+    }
+
+    @Scheduled(fixedDelay = 5000)
+    public void cleanExpiredSessions() {
+        sessionRepo.deleteExpired();
+    }
+
+    @Scheduled(cron = &quot;0 30 2 * * ?&quot;)
+    public void generateDailyReport() {
+        reportService.generateDaily(LocalDate.now().minusDays(1));
+    }
+
+    @Scheduled(cron = &quot;${app.cleanup.cron:0 0 3 * * ?}&quot;)
+    public void configurableTask() {
+    }
+}
+</code></pre>
+<p><code>fixedRate</code> 按计划时间触发,<code>fixedDelay</code> 按"上次结束后再延迟"触发,cron 则按表达式命中:</p>
+<pre><code class="language-text">INFO  [scheduling-1] c.example.DataCleanupTask : heartbeat tick mode=fixedRate
+INFO  [scheduling-1] c.example.DataCleanupTask : heartbeat tick mode=fixedRate
+INFO  [scheduling-1] c.example.DataCleanupTask : cleanExpiredSessions finished mode=fixedDelay
+INFO  [scheduling-1] c.example.DataCleanupTask : cleanExpiredSessions started after previous completion + 5s
+INFO  [scheduling-1] c.example.DataCleanupTask : generateDailyReport date=2026-05-01 mode=cron
+</code></pre>
+<h3>20.3.4 Cron 表达式语法</h3>
+<p>Spring Cron 表达式由 6 个字段组成(注意:不同于 Quartz 的 7 个字段,Spring 没有"年"字段)。</p>
+<pre><code class="language-text">秒 0-59
+分 0-59
+时 0-23
+日 1-31
+月 1-12 或 JAN-DEC
+周几 0-7 或 SUN-SAT, 0 和 7 都是周日
+
+示例:
+0 0 9 * * MON-FRI    工作日每天 9 时
+0 */15 * * * *       每 15 分钟
+0 0 0 1 * *          每月 1 日 0 时
+0 0 22 * * 1-5       周一至周五 22 时
+0 0 6,18 * * *       每天 6 时与 18 时
+</code></pre>
+<h3>20.3.5 fixedRate 与 fixedDelay 的执行模式</h3>
+<div class="diagram">
+<div class="diagram-title">图 20-6 · fixedRate=5s(任务执行 7s 会迟到 — 立即补下一轮挤占调度线程)</div>
+<svg viewBox="0 0 920 240" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="24" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">fixedRate 按计划时间触发 — 慢任务导致下一轮迟到立即补</text>
+
+  <rect x="20" y="60" width="200" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="120" y="84" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">★ T0 = 0s</text>
+  <text x="120" y="102" text-anchor="middle" fill="#dbeafe" font-size="9">任务1 开始</text>
+
+  <path d="M220,90 L260,90" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="260" y="60" width="200" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="360" y="84" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">★ T7 = 7s</text>
+  <text x="360" y="102" text-anchor="middle" fill="#fee2e2" font-size="9">任务1 结束(应 5s 触发已迟到)</text>
+
+  <path d="M460,90 L500,90" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="500" y="60" width="200" height="60" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+  <text x="600" y="84" text-anchor="middle" fill="#fecaca" font-size="11" font-weight="bold">★ 立即补下一轮</text>
+  <text x="600" y="102" text-anchor="middle" fill="#fecaca" font-size="9">挤占调度线程</text>
+
+  <path d="M700,90 L740,90" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="740" y="60" width="160" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="820" y="84" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">T14 = 14s</text>
+  <text x="820" y="102" text-anchor="middle" fill="#fee2e2" font-size="9">任务2 结束</text>
+
+  <text x="20" y="160" fill="#fed7aa" font-size="10">★ 关键:同一 @Scheduled 方法不会并发重入 — 但慢任务会让下一轮立即补</text>
+  <text x="20" y="180" fill="#fed7aa" font-size="10">★ 单线程调度器场景 — 慢任务会阻塞所有其他 @Scheduled 任务</text>
+  <text x="20" y="200" fill="#fed7aa" font-size="10">★ 适合:心跳检测、指标推送(关心"按时触发"而不是"间隔均匀")</text>
+</svg>
+</div>
+<div class="diagram">
+<div class="diagram-title">图 20-7 · fixedDelay=5s(节奏不追赶 — 上次结束 + 5s 才开始下一轮)</div>
+<svg viewBox="0 0 920 240" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="24" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">fixedDelay 按"上次结束后再延迟" — 节奏稳定,不会追赶</text>
+
+  <rect x="20" y="60" width="100" height="50" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="70" y="80" text-anchor="middle" fill="#dbeafe" font-size="10" font-weight="bold">★ 0s</text>
+  <text x="70" y="98" text-anchor="middle" fill="#dbeafe" font-size="9">任务1 开始</text>
+
+  <path d="M120,85 L140,85" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="140" y="60" width="100" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="190" y="80" text-anchor="middle" fill="#bbf7d0" font-size="10" font-weight="bold">3s</text>
+  <text x="190" y="98" text-anchor="middle" fill="#bbf7d0" font-size="9">任务1 结束</text>
+
+  <path d="M240,85 L260,85" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="260" y="60" width="120" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="320" y="80" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">★ 等待 5s</text>
+  <text x="320" y="98" text-anchor="middle" fill="#fee2e2" font-size="9">8s 开始任务2</text>
+
+  <path d="M380,85 L400,85" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="400" y="60" width="100" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="450" y="80" text-anchor="middle" fill="#bbf7d0" font-size="10" font-weight="bold">11s</text>
+  <text x="450" y="98" text-anchor="middle" fill="#bbf7d0" font-size="9">任务2 结束</text>
+
+  <path d="M500,85 L520,85" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="520" y="60" width="120" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="580" y="80" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">★ 等待 5s</text>
+  <text x="580" y="98" text-anchor="middle" fill="#fee2e2" font-size="9">16s 开始任务3</text>
+
+  <path d="M640,85 L660,85" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="660" y="60" width="100" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="710" y="80" text-anchor="middle" fill="#bbf7d0" font-size="10" font-weight="bold">23s</text>
+  <text x="710" y="98" text-anchor="middle" fill="#bbf7d0" font-size="9">任务3 结束</text>
+
+  <text x="20" y="160" fill="#fed7aa" font-size="10">★ 关键:每次执行结束后至少等待 N 毫秒 — 不会因为慢任务而追赶</text>
+  <text x="20" y="180" fill="#fed7aa" font-size="10">★ 适合:数据同步、清理任务(避免负载过高时雪崩堆积)</text>
+  <text x="20" y="200" fill="#fed7aa" font-size="10">★ 推荐生产场景默认选 fixedDelay,只在心跳类任务用 fixedRate</text>
+</svg>
+</div>
+<p>当 fixedRate 等于 5000 但任务执行用了 7 秒时,下一次执行会在上一轮结束后尽快开始(因为已经迟到 2 秒),而非再等待 5 秒。同一个 <code>@Scheduled</code> 方法的周期性执行通常不会并发重入,也不会把每个错过的时间点都补跑一遍;它只是让下一次已到期执行尽快开始,并挤占调度线程。使用 <code>fixedDelay</code> 可以避免这种节奏问题——它保证每次执行结束后至少等待 N 毫秒。</p>
+<h3>20.3.6 单线程默认调度器的陷阱</h3>
+<p><code>@EnableScheduling</code> 默认只创建一个单线程的 <code>TaskScheduler</code>(底层是 <code>ScheduledExecutorService</code> with poolSize 等于 1)。这意味着如有 5 个 <code>@Scheduled</code> 任务,它们共享同一个线程——一个慢任务会阻塞所有其他任务的调度。</p>
+<p>假设有 3 个 <code>@Scheduled</code> 任务,都设置 fixedRate 等于 1000(每秒执行一次)。如任务 A 意外耗时 10 秒,任务 B 与 C 在这 10 秒内完全不会被调度。任务 A 完成后,B 与 C 已经到期的下一轮执行会在同一个线程中串行启动。这种行为在生产环境中极为隐蔽——因为每个任务单独测试都正常,但合在一起就出问题。</p>
+<pre><code class="language-java">@Configuration
+@EnableScheduling
+public class SchedulerConfig implements SchedulingConfigurer {
+
+    @Override
+    public void configureTasks(ScheduledTaskRegistrar taskRegistrar) {
+        ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
+        scheduler.setPoolSize(5);
+        scheduler.setThreadNamePrefix(&quot;sched-&quot;);
+        scheduler.setErrorHandler(t -&gt; log.error(&quot;Scheduled task error&quot;, t));
+        scheduler.setWaitForTasksToCompleteOnShutdown(true);
+        scheduler.setAwaitTerminationSeconds(30);
+        scheduler.initialize();
+        taskRegistrar.setTaskScheduler(scheduler);
+    }
+}
+</code></pre>
+<p>多线程调度器让慢任务与快任务分到不同 <code>sched-</code> 线程;异常会进入统一 <code>ErrorHandler</code>,不会静默杀死调度链路:</p>
+<pre><code class="language-text">INFO  [sched-1] c.example.SyncTask : supplier sync started expected=30s
+INFO  [sched-2] c.example.HeartbeatTask : heartbeat ok
+INFO  [sched-2] c.example.HeartbeatTask : heartbeat ok
+ERROR [sched-3] c.example.SchedulerConfig : Scheduled task error
+java.net.SocketTimeoutException: metrics push timeout
+INFO  [sched-1] c.example.SyncTask : supplier sync finished rows=1840
+</code></pre>
+<h3>20.3.7 Spring Boot Actuator MetricsExporter 案例</h3>
+<p>Spring Boot Actuator 的指标导出(如 Prometheus PushGateway、DataDog、InfluxDB)使用 <code>@Scheduled</code> 机制定期推送指标数据。<code>PushGatewayManager</code> 内部通过 <code>ScheduledFuture</code> 注册一个 fixedRate 任务,默认每分钟推送一次。如推送目标响应慢或网络超时,这个推送任务会阻塞调度线程,影响其他 <code>@Scheduled</code> 任务。这就是为什么 Actuator 建议为指标推送配置独立的 <code>TaskScheduler</code>。</p>
+<p>调度线程池也可通过 Actuator 验证是否被慢任务堵住,重点看 active 是否长期等于 pool size、队列是否持续增长:</p>
+<pre><code class="language-text">executor_active_threads{name=&quot;taskScheduler&quot;} 5.0
+executor_pool_size_threads{name=&quot;taskScheduler&quot;} 5.0
+executor_queued_tasks{name=&quot;taskScheduler&quot;} 18.0
+spring_scheduled_tasks_seconds_count{name=&quot;supplierSync&quot;,exception=&quot;none&quot;} 12.0
+spring_scheduled_tasks_seconds_max{name=&quot;supplierSync&quot;,exception=&quot;none&quot;} 30.117
+</code></pre>
+<h3>20.3.8 验证实验</h3>
+<p>异步代码的验收标准不是"方法返回得很快",而是能证明它走了正确执行器、容量有边界、异常有归宿。下面的测试用 <code>Awaitility</code> 验证 <code>@Async("emailExecutor")</code> 确实切到预期线程池。</p>
+<pre><code class="language-java">@SpringBootTest
+class AsyncExecutorSmokeTests {
+
+    @Autowired NotificationService notifications;
+
+    @Test
+    void asyncMethodRunsOnNamedExecutor() {
+        CompletableFuture&lt;String&gt; threadName =
+            notifications.sendEmail(&quot;alice@example.com&quot;, &quot;hello&quot;)
+                .thenApply(v -&gt; notifications.lastThreadName());
+
+        await().atMost(2, SECONDS).untilAsserted(() -&gt;
+            assertThat(threadName.join()).startsWith(&quot;email-&quot;));
+    }
+}
+</code></pre>
+<p>生产侧至少保留三类输出:线程名、Micrometer 指标与拒绝策略日志:</p>
+<pre><code class="language-text">INFO  [email-3] c.example.NotificationService : sendEmail customerId=C1001 elapsed=118ms
+executor_active_threads{name=&quot;emailExecutor&quot;} 3.0
+executor_queued_tasks{name=&quot;emailExecutor&quot;} 12.0
+executor_completed_tasks_total{name=&quot;emailExecutor&quot;} 8841.0
+executor_rejected_tasks_total{name=&quot;emailExecutor&quot;,exception=&quot;RejectedExecutionException&quot;} 0.0
+</code></pre>
+<h2 id="20.4-virtual-thread-集成-java-21-加">20.4 Virtual Thread 集成 Java 21 加</h2>
+<p>Java 21 正式发布的 Virtual Thread(虚拟线程,Project Loom)是 Java 并发模型的一次革命。传统平台线程由操作系统管理,每个线程约 1 MB 栈空间,创建与上下文切换成本高昂。虚拟线程由 JVM 管理,一个 JVM 可以轻松运行数百万个虚拟线程——而 Spring Boot 3.2 加 只需一行配置就能启用。</p>
+<h3>20.4.1 平台线程与虚拟线程对比</h3>
+<div class="diagram">
+<div class="diagram-title">图 20-8 · 平台线程与虚拟线程架构对比(1:1 OS 线程 vs M:N 虚拟线程在载体线程上多路复用)</div>
+<svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="24" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">平台线程 1:1 OS 线程 vs 虚拟线程 M:N 复用载体线程</text>
+
+  <rect x="20" y="60" width="420" height="380" rx="12" fill="#0d1117" stroke="#f85149" stroke-width="2"/>
+  <text x="230" y="84" text-anchor="middle" fill="#f85149" font-size="13" font-weight="bold">★ 平台线程模型(传统)</text>
+
+  <rect x="40" y="110" width="100" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="90" y="134" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">请求 1</text>
+
+  <path d="M140,135 L180,135" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="180" y="110" width="240" height="50" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+  <text x="300" y="130" text-anchor="middle" fill="#fecaca" font-size="10" font-weight="bold">★ OS Thread 1</text>
+  <text x="300" y="148" text-anchor="middle" fill="#fecaca" font-size="9">~1 MB 栈空间</text>
+
+  <rect x="40" y="180" width="100" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="90" y="204" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">请求 2</text>
+
+  <path d="M140,205 L180,205" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="180" y="180" width="240" height="50" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+  <text x="300" y="200" text-anchor="middle" fill="#fecaca" font-size="10" font-weight="bold">★ OS Thread 2</text>
+  <text x="300" y="218" text-anchor="middle" fill="#fecaca" font-size="9">创建+切换成本高</text>
+
+  <rect x="40" y="250" width="100" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="90" y="274" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">请求 N</text>
+
+  <path d="M140,275 L180,275" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="180" y="250" width="240" height="50" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+  <text x="300" y="270" text-anchor="middle" fill="#fecaca" font-size="10" font-weight="bold">★ OS Thread N</text>
+  <text x="300" y="288" text-anchor="middle" fill="#fecaca" font-size="9">数量受 OS 限制</text>
+
+  <text x="40"  y="345" fill="#fecaca" font-size="10">★ 1 请求 = 1 OS 线程</text>
+  <text x="40"  y="363" fill="#fecaca" font-size="10">阻塞 I/O 时线程闲着但占着</text>
+  <text x="40"  y="381" fill="#fecaca" font-size="10">默认 Tomcat 200 线程上限</text>
+  <text x="40"  y="399" fill="#fecaca" font-size="10">每线程 ~1MB 栈 → 1000 线程 ~1GB</text>
+  <text x="40"  y="417" fill="#fecaca" font-size="10">无法支撑高并发慢 I/O</text>
+
+  <rect x="480" y="60" width="420" height="380" rx="12" fill="#0d1117" stroke="#3fb950" stroke-width="2"/>
+  <text x="690" y="84" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">★ 虚拟线程模型(Java 21+)</text>
+
+  <rect x="500" y="110" width="100" height="40" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="550" y="134" text-anchor="middle" fill="#fee2e2" font-size="9" font-weight="bold">VT 1</text>
+
+  <rect x="500" y="155" width="100" height="40" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="550" y="179" text-anchor="middle" fill="#fee2e2" font-size="9" font-weight="bold">VT 2</text>
+
+  <rect x="500" y="200" width="100" height="40" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="550" y="224" text-anchor="middle" fill="#fee2e2" font-size="9" font-weight="bold">VT 3</text>
+
+  <rect x="500" y="245" width="100" height="40" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="550" y="269" text-anchor="middle" fill="#fee2e2" font-size="9" font-weight="bold">VT N</text>
+
+  <path d="M600,135 L640,200" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M600,180 L640,200" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M600,225 L640,200" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M600,265 L640,200" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="640" y="160" width="240" height="80" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="760" y="184" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">★ Carrier Thread Pool</text>
+  <text x="760" y="202" text-anchor="middle" fill="#bbf7d0" font-size="9">ForkJoinPool</text>
+  <text x="760" y="218" text-anchor="middle" fill="#bbf7d0" font-size="9">N = CPU 核数</text>
+
+  <path d="M760,240 L760,290" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="600" y="290" width="280" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="740" y="312" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">★ 阻塞 I/O 时 unmount</text>
+  <text x="740" y="330" text-anchor="middle" fill="#fee2e2" font-size="9">载体线程释放</text>
+  <text x="740" y="344" text-anchor="middle" fill="#fee2e2" font-size="9">运行其他 VT</text>
+
+  <text x="500" y="380" fill="#bbf7d0" font-size="10">★ M:N 多路复用</text>
+  <text x="500" y="398" fill="#bbf7d0" font-size="10">百万级并发可达</text>
+  <text x="500" y="416" fill="#bbf7d0" font-size="10">每 VT ~256 字节(对比 1MB)</text>
+</svg>
+</div>
+<h3>20.4.2 Spring Boot 一键启用</h3>
+<pre><code class="language-yaml">spring:
+  threads:
+    virtual:
+      enabled: true
+</code></pre>
+<p>设置 <code>spring.threads.virtual.enabled=true</code> 后,Spring Boot 会在支持的组件上优先使用虚拟线程。下面是概念化的自动配置结果,真实 bean 类型会随 Boot 版本与 classpath 略有差异:</p>
+<pre><code class="language-java">@Bean
+@ConditionalOnMissingBean(TaskExecutor.class)
+public TaskExecutor applicationTaskExecutor() {
+    return new VirtualThreadTaskExecutor(&quot;async-vt-&quot;);
+}
+
+@Bean
+@ConditionalOnMissingBean(TaskScheduler.class)
+public TaskScheduler taskScheduler() {
+    SimpleAsyncTaskScheduler scheduler = new SimpleAsyncTaskScheduler();
+    scheduler.setVirtualThreads(true);
+    scheduler.setThreadNamePrefix(&quot;sched-vt-&quot;);
+    return scheduler;
+}
+
+@Bean
+public TomcatProtocolHandlerCustomizer&lt;?&gt; virtualThreadCustomizer() {
+    return handler -&gt; handler.setExecutor(
+        Executors.newVirtualThreadPerTaskExecutor()
+    );
+}
+</code></pre>
+<p>启用虚拟线程后,<code>@Async</code>、调度任务与 Tomcat 请求线程名都会暴露出 <code>VirtualThread</code> 或自定义前缀:</p>
+<pre><code class="language-text">INFO  [VirtualThread #93 runnable@ForkJoinPool-1-worker-4] c.example.OrderController : handle request
+INFO  [async-vt-95] c.example.EmailService : sending async email orderId=O1001
+INFO  [sched-vt-101] c.example.CleanupTask : cleanup started with virtual thread
+</code></pre>
+<h3>20.4.3 虚拟线程调度机制</h3>
+<div class="diagram">
+<div class="diagram-title">图 20-9 · 虚拟线程在载体线程上的调度(mount → I/O → unmount → 复用 → re-mount)</div>
+<svg viewBox="0 0 920 480" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="24" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">虚拟线程的核心:阻塞 I/O 时自动卸载,载体线程不被占用</text>
+
+  <text x="120" y="60" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">Virtual Thread</text>
+  <text x="460" y="60" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">★ Carrier Thread (ForkJoinPool)</text>
+  <text x="800" y="60" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">阻塞 I/O</text>
+
+  <line x1="120" y1="80" x2="120" y2="450" stroke="#bc8cff" stroke-dasharray="3,2"/>
+  <line x1="460" y1="80" x2="460" y2="450" stroke="#3fb950" stroke-dasharray="3,2"/>
+  <line x1="800" y1="80" x2="800" y2="450" stroke="#d29922" stroke-dasharray="3,2"/>
+
+  <path d="M120,110 L460,110" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="290" y="103" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">★ mount 挂载</text>
+
+  <rect x="450" y="125" width="20" height="80" fill="url(#g-green)" stroke="#3fb950"/>
+
+  <path d="M460,160 L800,160" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="630" y="153" text-anchor="middle" fill="#bbf7d0" font-size="10">数据库查询(阻塞)</text>
+
+  <path d="M460,200 L120,200" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr)" fill="none"/>
+  <text x="290" y="190" text-anchor="middle" fill="#bc8cff" font-size="10" font-weight="bold">★ unmount 卸载</text>
+  <text x="290" y="210" text-anchor="middle" fill="#bc8cff" font-size="9">VT 让出载体线程</text>
+
+  <rect x="350" y="225" width="220" height="80" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="460" y="249" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">★ 载体线程释放</text>
+  <text x="460" y="267" text-anchor="middle" fill="#fee2e2" font-size="9">运行其他 VT</text>
+  <text x="460" y="281" text-anchor="middle" fill="#fee2e2" font-size="9">M:N 多路复用</text>
+  <text x="460" y="295" text-anchor="middle" fill="#fee2e2" font-size="9">关键性能优势</text>
+
+  <path d="M800,330 L120,330" stroke="#d29922" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr)" fill="none"/>
+  <text x="460" y="320" text-anchor="middle" fill="#d29922" font-size="10">↩ I/O 完成</text>
+
+  <path d="M120,360 L460,360" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="290" y="353" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">★ re-mount 重新挂载</text>
+
+  <rect x="450" y="375" width="20" height="40" fill="url(#g-green)" stroke="#3fb950"/>
+
+  <path d="M460,415 L120,415" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr)" fill="none"/>
+  <text x="290" y="405" text-anchor="middle" fill="#3fb950" font-size="10">↩ 方法返回结果</text>
+</svg>
+</div>
+<h3>20.4.4 Pinning 问题:<code>synchronized</code> 是虚拟线程的天敌</h3>
+<p>虚拟线程的核心优势在于遇到阻塞 I/O 时自动从载体线程"卸载"(unmount),让载体线程去执行其他虚拟线程。但当虚拟线程进入 <code>synchronized</code> 块时,它会被"钉住"(pinned)在载体线程上,阻塞 I/O 不再触发卸载——导致载体线程被占用,本质上退化为平台线程模型。</p>
+<p>许多 JDBC 驱动内部大量使用 <code>synchronized</code>。在 Spring Boot 3.2 发布初期,MySQL Connector/J 的 <code>synchronized</code> 块导致虚拟线程在数据库操作时被钉住,严重时载体线程全部被占用,吞吐量反而低于平台线程。MySQL Connector/J 8.2.0 加 已将关键路径改为 <code>ReentrantLock</code>。启用虚拟线程前,务必检查所有依赖的 synchronized 使用情况。</p>
+<pre><code class="language-java">public class LegacyConnectionPool {
+    private final Object lock = new Object();
+    public Connection getConnection() {
+        synchronized (lock) {
+            return pool.borrowObject();
+        }
+    }
+}
+
+public class ModernConnectionPool {
+    private final ReentrantLock lock = new ReentrantLock();
+    public Connection getConnection() {
+        lock.lock();
+        try {
+            return pool.borrowObject();
+        } finally {
+            lock.unlock();
+        }
+    }
+}
+</code></pre>
+<p>开启 <code>-Djdk.tracePinnedThreads=short</code> 后,真正的 pinning 会由 JVM 打印出来:</p>
+<pre><code class="language-text">java -Djdk.tracePinnedThreads=short -jar target/app.jar
+
+Thread[#42,ForkJoinPool-1-worker-3,5,CarrierThreads]
+    java.base/java.lang.VirtualThread$VThreadContinuation.onPinned VirtualThread.java:180
+    java.base/java.lang.VirtualThread.parkOnCarrierThread VirtualThread.java:642
+    com.example.LegacyConnectionPool.getConnection LegacyConnectionPool.java:716
+</code></pre>
+<h3>20.4.5 Spring Boot 3.2 加 虚拟线程基准解读</h3>
+<p>虚拟线程常见收益来自"让阻塞 I/O 不再长期占住昂贵的平台线程"。在包含 JDBC 与 HTTP 调用的 REST API 中,平台线程模型通常会受限于 Tomcat 工作线程与下游连接池;启用虚拟线程后,请求线程本身不再是主要瓶颈,但吞吐仍会被数据库连接池、下游限流、CPU 与 pinning 限制。结论不是"并发一定提升到 10000",而是:I/O 密集型阻塞代码更容易扩展,CPU 密集型计算几乎不会因此变快。</p>
+<h2 id="20.5-异步编排模式">20.5 异步编排模式</h2>
+<p>单个 <code>@Async</code> 调用只是起点。在真实的微服务架构中,一个业务操作往往需要调用多个下游服务,并将结果汇总——这就是 fan-out/fan-in(扇出与扇入)模式。<code>CompletableFuture</code> 提供了强大的异步编排能力。</p>
+<h3>20.5.1 CompletableFuture 核心组合操作</h3>
+<pre><code class="language-java">@Service
+public class ProductAggregationService {
+
+    @Autowired private ProductService productService;
+    @Autowired private PriceService priceService;
+    @Autowired private ReviewService reviewService;
+    @Autowired private InventoryService inventoryService;
+
+    public CompletableFuture&lt;ProductDetail&gt; getProductDetail(Long productId) {
+        CompletableFuture&lt;Product&gt; productFuture =
+            productService.findById(productId);
+        CompletableFuture&lt;Price&gt; priceFuture =
+            priceService.getPrice(productId);
+        CompletableFuture&lt;List&lt;Review&gt;&gt; reviewsFuture =
+            reviewService.getReviews(productId);
+        CompletableFuture&lt;Inventory&gt; inventoryFuture =
+            inventoryService.checkStock(productId);
+
+        return CompletableFuture.allOf(
+                productFuture, priceFuture, reviewsFuture, inventoryFuture)
+            .thenApply(v -&gt; ProductDetail.builder()
+                .product(productFuture.join())
+                .price(priceFuture.join())
+                .reviews(reviewsFuture.join())
+                .inventory(inventoryFuture.join())
+                .build());
+    }
+}
+</code></pre>
+<p>fan-out/fan-in 后,总耗时接近最慢的下游,而非四个下游耗时相加:</p>
+<pre><code class="language-text">INFO  [product-async-1] c.example.ProductService : product=42 done in 42ms
+INFO  [price-async-2] c.example.PriceService : price=42 done in 59ms
+INFO  [review-async-3] c.example.ReviewService : reviews=42 done in 83ms
+INFO  [inventory-async-4] c.example.InventoryService : inventory=42 done in 70ms
+INFO  [http-nio-8080-exec-9] c.example.ProductAggregationService : product detail aggregated id=42 elapsed=86ms
+</code></pre>
+<div class="diagram">
+<div class="diagram-title">图 20-10 · Fan-out 与 Fan-in 异步编排模式(并行 4 路下游 + allOf 聚合)</div>
+<svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="24" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">Fan-out 并行调用 4 个下游 + Fan-in 用 allOf 汇总 — 总耗时 ≈ 最慢下游</text>
+
+  <rect x="20" y="60" width="200" height="50" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+  <text x="120" y="84" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">★ API 请求</text>
+  <text x="120" y="100" text-anchor="middle" fill="#fee2e2" font-size="9">/api/product/42</text>
+
+  <path d="M220,85 L260,85" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="260" y="60" width="200" height="50" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="360" y="84" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">★ 聚合服务</text>
+  <text x="360" y="100" text-anchor="middle" fill="#dbeafe" font-size="9">ProductAggregationService</text>
+
+  <path d="M360,110 L80,180" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M360,110 L280,180" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M360,110 L480,180" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M360,110 L680,180" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="170" y="155" fill="#58a6ff" font-size="10" font-weight="bold">★ Fan-out 并行</text>
+
+  <rect x="20" y="180" width="160" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="100" y="204" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">productService</text>
+  <text x="100" y="220" text-anchor="middle" fill="#fee2e2" font-size="9">.findById()</text>
+  <text x="100" y="234" text-anchor="middle" fill="#fee2e2" font-size="9">42ms</text>
+
+  <rect x="200" y="180" width="160" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="280" y="204" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">priceService</text>
+  <text x="280" y="220" text-anchor="middle" fill="#fee2e2" font-size="9">.getPrice()</text>
+  <text x="280" y="234" text-anchor="middle" fill="#fee2e2" font-size="9">59ms</text>
+
+  <rect x="400" y="180" width="160" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="480" y="204" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">★ reviewService</text>
+  <text x="480" y="220" text-anchor="middle" fill="#fee2e2" font-size="9">.getReviews()</text>
+  <text x="480" y="234" text-anchor="middle" fill="#fee2e2" font-size="9">83ms (最慢)</text>
+
+  <rect x="600" y="180" width="160" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="680" y="204" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">inventoryService</text>
+  <text x="680" y="220" text-anchor="middle" fill="#fee2e2" font-size="9">.checkStock()</text>
+  <text x="680" y="234" text-anchor="middle" fill="#fee2e2" font-size="9">70ms</text>
+
+  <path d="M100,240 L380,310" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M280,240 L420,310" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M480,240 L460,310" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M680,240 L500,310" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="320" y="310" width="280" height="50" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="460" y="334" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">★ CompletableFuture.allOf</text>
+  <text x="460" y="350" text-anchor="middle" fill="#bbf7d0" font-size="9">Fan-in 等待全部完成</text>
+
+  <path d="M460,360 L460,390" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="320" y="390" width="280" height="50" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+  <text x="460" y="414" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">★ thenApply 聚合</text>
+  <text x="460" y="430" text-anchor="middle" fill="#fee2e2" font-size="9">总耗时 ~86ms ≈ 最慢下游(83ms)</text>
+</svg>
+</div>
+<h3>20.5.2 CompletableFuture 链式操作速查</h3>
+<p>转换操作:</p>
+<pre><code class="language-java">future.thenApply(order -&gt; order.getId())
+
+future.thenCompose(order -&gt;
+    shipmentService.createShipment(order.getId()))
+
+customerFuture.thenCombine(orderFuture,
+    (customer, order) -&gt; new CustomerOrder(customer, order))
+</code></pre>
+<p>聚合操作:</p>
+<pre><code class="language-java">CompletableFuture.allOf(f1, f2, f3)
+    .thenApply(v -&gt; List.of(f1.join(), f2.join(), f3.join()))
+
+CompletableFuture.anyOf(primary, fallback)
+    .thenApply(result -&gt; (Response) result)
+</code></pre>
+<p>异常处理:</p>
+<pre><code class="language-java">future.exceptionally(ex -&gt; {
+    log.warn(&quot;Fallback {}&quot;, ex.getMessage());
+    return DEFAULT_VALUE;
+})
+
+future.handle((result, ex) -&gt; {
+    if (ex != null) return fallback;
+    return result;
+})
+
+future.whenComplete((r, ex) -&gt; metrics.record(ex == null))
+</code></pre>
+<p>异常链路应同时有降级日志与指标,避免 <code>CompletableFuture</code> 的失败被调用方误认为成功:</p>
+<pre><code class="language-text">WARN  [product-async-7] c.example.PriceService : Fallback java.util.concurrent.TimeoutException
+INFO  [product-async-7] c.example.ProductAggregationService : price fallback applied productId=42
+
+async_downstream_calls_total{service=&quot;price&quot;,result=&quot;fallback&quot;} 1.0
+async_downstream_calls_total{service=&quot;review&quot;,result=&quot;success&quot;} 1.0
+async_downstream_latency_seconds_max{service=&quot;price&quot;} 2.001
+</code></pre>
+<h3>20.5.3 超时控制</h3>
+<pre><code class="language-java">CompletableFuture&lt;Response&gt; result = callRemoteService()
+    .orTimeout(3, TimeUnit.SECONDS);
+
+CompletableFuture&lt;Response&gt; result2 = callRemoteService()
+    .completeOnTimeout(Response.empty(), 3, TimeUnit.SECONDS);
+
+public CompletableFuture&lt;SearchResult&gt; search(String query) {
+    CompletableFuture&lt;List&lt;Product&gt;&gt; dbSearch =
+        productRepo.searchAsync(query)
+            .completeOnTimeout(List.of(), 2, TimeUnit.SECONDS);
+
+    CompletableFuture&lt;List&lt;Product&gt;&gt; esSearch =
+        elasticService.searchAsync(query)
+            .completeOnTimeout(List.of(), 2, TimeUnit.SECONDS);
+
+    return dbSearch.thenCombine(esSearch, (db, es) -&gt; {
+        List&lt;Product&gt; merged = new ArrayList&lt;&gt;(db);
+        merged.addAll(es);
+        return new SearchResult(merged);
+    });
+}
+</code></pre>
+<p><code>completeOnTimeout</code> 会把慢服务替换成默认值;<code>orTimeout</code> 则会让 Future 以异常完成:</p>
+<pre><code class="language-text">INFO  [search-async-1] c.example.SearchService : db search done query=&quot;boot&quot; rows=12 elapsed=118ms
+WARN  [CompletableFutureDelayScheduler] c.example.SearchService : elastic search timed out query=&quot;boot&quot; fallback=[]
+INFO  [http-nio-8080-exec-4] c.example.SearchController : merged search result query=&quot;boot&quot; rows=12 elapsed=2004ms
+</code></pre>
+<h3>20.5.4 电商商品详情页聚合服务案例</h3>
+<p>在一个典型的电商平台中,商品详情页需要聚合来自 5 至 8 个微服务的数据:商品基本信息、价格(可能有动态促销价)、库存、评论摘要、推荐商品、优惠券、配送信息等。如串行调用,每个服务 50 毫秒,总耗时 400 毫秒;使用 <code>CompletableFuture.allOf()</code> 并行调用后,总耗时约等于最慢的那个服务(约 80 毫秒)。</p>
+<p>注意两点:使用自定义 <code>ThreadPoolTaskExecutor</code> 而非 <code>ForkJoinPool.commonPool()</code>,避免 CPU 密集型任务饿死 I/O 任务;对每个下游调用设置 <code>completeOnTimeout()</code>,防止一个慢服务拖垮整个页面。</p>
+<h2 id="20.6-陷阱与限制">20.6 陷阱与限制</h2>
+<p>异步编程的每一个便利背后,都有一个等着踩的坑。以下是 Spring 异步与调度中最常见的七个陷阱。</p>
+<h3>20.6.1 陷阱一:<code>@Async</code> 加 <code>@Transactional</code> 同一方法导致事务丢失</h3>
+<p><code>@Async</code> 将方法执行切换到新线程,而 Spring 事务绑定在 <code>ThreadLocal</code> 上。新线程没有原始线程的事务上下文,因此 <code>@Transactional</code> 在 <code>@Async</code> 方法中会开启一个全新的事务(而非参与调用方的事务)。如调用方回滚,异步方法的事务不会受影响——数据不一致。</p>
+<div class="diagram">
+<div class="diagram-title">图 20-11 · @Async + @Transactional 事务隔离问题(主线程 TX-A 回滚 / 异步线程 TX-B 提交 → 数据不一致!)</div>
+<svg viewBox="0 0 920 540" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="24" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">@Async 切线程后事务上下文丢失 — TX-A 回滚 ≠ TX-B 回滚</text>
+
+  <text x="100" y="60" text-anchor="middle" fill="#bc8cff" font-size="10" font-weight="bold">主线程</text>
+  <text x="320" y="60" text-anchor="middle" fill="#58a6ff" font-size="10" font-weight="bold">@Async Proxy</text>
+  <text x="540" y="60" text-anchor="middle" fill="#3fb950" font-size="10" font-weight="bold">异步线程</text>
+  <text x="800" y="60" text-anchor="middle" fill="#d29922" font-size="10" font-weight="bold">Database</text>
+
+  <line x1="100" y1="80" x2="100" y2="510" stroke="#bc8cff" stroke-dasharray="3,2"/>
+  <line x1="320" y1="80" x2="320" y2="510" stroke="#58a6ff" stroke-dasharray="3,2"/>
+  <line x1="540" y1="80" x2="540" y2="510" stroke="#3fb950" stroke-dasharray="3,2"/>
+  <line x1="800" y1="80" x2="800" y2="510" stroke="#d29922" stroke-dasharray="3,2"/>
+
+  <rect x="40" y="100" width="120" height="22" rx="3" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="100" y="115" text-anchor="middle" fill="#dbeafe" font-size="9" font-weight="bold">@Transactional TX-A</text>
+
+  <path d="M100,140 L800,140" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="450" y="133" text-anchor="middle" fill="#fee2e2" font-size="9">INSERT order(TX-A)</text>
+
+  <path d="M100,170 L320,170" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="210" y="163" text-anchor="middle" fill="#fee2e2" font-size="9">orderService.asyncNotify(orderId)</text>
+
+  <path d="M320,200 L540,200" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="430" y="193" text-anchor="middle" fill="#dbeafe" font-size="9">submit to executor</text>
+
+  <path d="M100,230 L800,230" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="450" y="223" text-anchor="middle" fill="#f85149" font-size="10" font-weight="bold">★ 后续操作出错 → TX-A ROLLBACK</text>
+
+  <rect x="40" y="245" width="120" height="22" rx="3" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+  <text x="100" y="260" text-anchor="middle" fill="#fecaca" font-size="9" font-weight="bold">★ TX-A 回滚</text>
+
+  <rect x="480" y="285" width="120" height="22" rx="3" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="540" y="300" text-anchor="middle" fill="#fee2e2" font-size="9" font-weight="bold">★ @Tx TX-B 新事务</text>
+
+  <path d="M540,325 L800,325" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="660" y="318" text-anchor="middle" fill="#bbf7d0" font-size="9">INSERT notification(TX-B)</text>
+
+  <path d="M540,355 L800,355" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="660" y="348" text-anchor="middle" fill="#3fb950" font-size="10" font-weight="bold">★ TX-B COMMIT(独立事务!)</text>
+
+  <rect x="20" y="400" width="880" height="100" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+  <text x="460" y="425" text-anchor="middle" fill="#fecaca" font-size="13" font-weight="bold">★ 数据不一致!</text>
+  <text x="460" y="447" text-anchor="middle" fill="#fecaca" font-size="11">order 表:被回滚(TX-A 失败)</text>
+  <text x="460" y="467" text-anchor="middle" fill="#fecaca" font-size="11">notification 表:已提交(TX-B 独立)</text>
+  <text x="460" y="487" text-anchor="middle" fill="#fed7aa" font-size="10">★ 修复:把 @Async 与 @Transactional 拆到不同 Bean — 或用事件 + @TransactionalEventListener</text>
+</svg>
+</div>
+<p>正确做法是分离关注点:</p>
+<pre><code class="language-java">@Async
+public void processOrderAsync(Long orderId) {
+    orderTransactionService.processInTransaction(orderId);
+}
+
+@Service
+public class OrderTransactionService {
+    @Transactional
+    public void processInTransaction(Long orderId) {
+    }
+}
+</code></pre>
+<h3>20.6.2 陷阱二:<code>@Async</code> 自调用不走代理</h3>
+<p>与所有基于 AOP 代理的注解一样(<code>@Transactional</code>、<code>@Cacheable</code>),同一个类内部的方法调用(<code>this.asyncMethod()</code>)不会经过代理,<code>@Async</code> 注解被完全忽略——方法在调用方线程同步执行。</p>
+<pre><code class="language-java">@Service
+public class OrderService {
+    public void createOrder(Order order) {
+        orderRepo.save(order);
+        this.sendNotification(order);
+    }
+
+    @Async
+    public void sendNotification(Order order) {
+        notificationClient.send(order);
+    }
+}
+</code></pre>
+<p>修复方案一:注入自身代理(用 <code>@Lazy</code> 避免循环):</p>
+<pre><code class="language-java">@Service
+public class OrderService {
+    @Autowired @Lazy
+    private OrderService self;
+
+    public void createOrder(Order order) {
+        orderRepo.save(order);
+        self.sendNotification(order);
+    }
+
+    @Async
+    public void sendNotification(Order order) {
+    }
+}
+</code></pre>
+<p>修复方案二(推荐):拆分到独立 Bean:</p>
+<pre><code class="language-java">@Service
+public class OrderService {
+    @Autowired
+    private NotificationService notificationService;
+
+    public void createOrder(Order order) {
+        orderRepo.save(order);
+        notificationService.sendAsync(order);
+    }
+}
+
+@Service
+public class NotificationService {
+    @Async
+    public void sendAsync(Order order) {
+    }
+}
+</code></pre>
+<h3>20.6.3 陷阱三:默认 <code>SimpleAsyncTaskExecutor</code> 导致 OOM</h3>
+<p>在纯 Spring Framework 中,或 Spring Boot 的 <code>applicationTaskExecutor</code> 自动配置被禁用、绕开或无法被唯一解析时,<code>@Async</code> 才可能回退到 <code>SimpleAsyncTaskExecutor</code>。它为每个任务创建新线程,无上限,高并发下分分钟 OOM。</p>
+<pre><code class="language-yaml">spring:
+  task:
+    execution:
+      pool:
+        core-size: 10
+        max-size: 50
+        queue-capacity: 200
+      thread-name-prefix: &quot;app-async-&quot;
+      shutdown:
+        await-termination: true
+        await-termination-period: 60s
+</code></pre>
+<p>从 Spring Boot 2.1 起,如没有自定义 <code>TaskExecutor</code> Bean,Spring Boot 会自动创建一个 <code>ThreadPoolTaskExecutor</code>,可通过 <code>spring.task.execution.*</code> 属性配置。只有当没有可解析的 <code>Executor</code> 或 <code>TaskExecutor</code>(例如禁用了相关自动配置、定义了多个候选但没有指定 <code>@Async</code> value、或自定义异步配置没有暴露执行器)时,才会走框架级回退路径。</p>
+<h3>20.6.4 陷阱四:<code>@Scheduled</code> 单线程默认,一个慢任务阻塞全部</h3>
+<p><code>@EnableScheduling</code> 默认创建 poolSize 等于 1 的 <code>TaskScheduler</code>。一个执行 30 秒的 <code>@Scheduled</code> 方法会阻塞所有其他定时任务 30 秒。</p>
+<pre><code class="language-yaml">spring:
+  task:
+    scheduling:
+      pool:
+        size: 5
+      thread-name-prefix: &quot;sched-&quot;
+      shutdown:
+        await-termination: true
+        await-termination-period: 30s
+</code></pre>
+<h3>20.6.5 陷阱五:<code>SecurityContext</code> 不传播到 <code>@Async</code> 线程</h3>
+<p>Spring Security 的 <code>SecurityContext</code> 默认存储在 <code>ThreadLocal</code> 中。<code>@Async</code> 切换线程后,异步方法中 <code>SecurityContextHolder.getContext().getAuthentication()</code> 返回 <code>null</code>——所有基于权限的检查(<code>@PreAuthorize</code>)都会失败。</p>
+<p>推荐方案:使用 <code>DelegatingSecurityContextExecutor</code> 包装线程池:</p>
+<pre><code class="language-java">@Bean(&quot;secureExecutor&quot;)
+public Executor secureExecutor() {
+    ThreadPoolTaskExecutor delegate = new ThreadPoolTaskExecutor();
+    delegate.setCorePoolSize(10);
+    delegate.setMaxPoolSize(50);
+    delegate.initialize();
+    return new DelegatingSecurityContextAsyncTaskExecutor(delegate);
+}
+
+@Async(&quot;secureExecutor&quot;)
+public void auditAction(String action) {
+    Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+    auditLog.record(auth.getName(), action);
+}
+</code></pre>
+<p>避免使用 <code>SecurityContextHolder.MODE_INHERITABLETHREADLOCAL</code>——这种方式对线程池不安全:线程被复用时会携带上一个请求的 <code>SecurityContext</code>。</p>
+<h3>20.6.6 陷阱六:Virtual Thread 与 <code>synchronized</code> 的 Pinning 性能退化</h3>
+<p>虚拟线程在 <code>synchronized</code> 块中执行阻塞操作时会被钉住在载体线程上,失去虚拟线程的核心优势。ForkJoinPool 默认载体线程数等于 CPU 核心数——如所有载体线程都被 pinned,系统吞吐量骤降。</p>
+<pre><code class="language-text">java -Djdk.tracePinnedThreads=short -jar target/app.jar
+java -Djdk.tracePinnedThreads=full -jar target/app.jar
+
+Thread[#42,ForkJoinPool-1-worker-3,5,main]
+    java.base/java.lang.VirtualThread$VThreadContinuation.onPinned VirtualThread.java:180
+    com.example.LegacyPool.getConnection LegacyPool.java:55
+</code></pre>
+<h3>20.6.7 陷阱七:<code>CompletableFuture.get()</code> 阻塞事件循环线程</h3>
+<p>在 WebFlux(Reactive)或 Netty EventLoop 线程中调用 <code>CompletableFuture.get()</code> 或 <code>.join()</code> 会阻塞事件循环线程,导致所有请求处理停滞——这是经典的 Reactive 死锁。</p>
+<pre><code class="language-java">@GetMapping(&quot;/product/{id}&quot;)
+public Mono&lt;ProductDetail&gt; getProduct(@PathVariable Long id) {
+    CompletableFuture&lt;ProductDetail&gt; future = aggregationService.getDetail(id);
+    return Mono.fromFuture(future);
+}
+</code></pre>
+<h3>20.6.8 异步陷阱速查表</h3>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>高频陷阱</th>
+<th>一句话修复</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>代理相关</td>
+<td>自调用不走代理;<code>private</code> 方法注解无效;<code>final</code> 类无法代理</td>
+<td>通过外部代理调用,或拆到独立 Bean</td>
+</tr>
+<tr>
+<td>线程上下文</td>
+<td><code>@Transactional</code> 事务边界变化;<code>SecurityContext</code>、MDC、TraceId 丢失</td>
+<td>用事件、事务后回调或 executor wrapper 显式传播</td>
+</tr>
+<tr>
+<td>线程池</td>
+<td>无界线程、无界队列、<code>ForkJoinPool.commonPool</code> 被阻塞任务占满</td>
+<td>配置有界 <code>ThreadPoolTaskExecutor</code>,按任务隔离</td>
+</tr>
+<tr>
+<td>调度器</td>
+<td>默认单线程,慢任务拖慢所有 <code>@Scheduled</code></td>
+<td>配置 <code>spring.task.scheduling.pool.size</code> 或独立 <code>TaskScheduler</code></td>
+</tr>
+<tr>
+<td>Virtual Thread</td>
+<td><code>synchronized</code> pinning、连接池仍是瓶颈、CPU 任务无收益</td>
+<td>开启 pinning 诊断,压测真实下游容量</td>
+</tr>
+<tr>
+<td>CompletableFuture</td>
+<td><code>get()</code> 与 <code>join()</code> 阻塞 EventLoop;异常链缺失;<code>allOf</code> 部分失败难定位</td>
+<td>用 <code>Mono.fromFuture</code>、<code>exceptionally</code>、超时与指标闭环</td>
+</tr>
+</tbody>
+</table>
+<div class="chapter-summary">
+<h2>20.7 本章小结</h2>
+
+<table>
+<thead>
+<tr>
+<th>关注点</th>
+<th>核心 API</th>
+<th>关键建议</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>@Async</code> 代理机制</td>
+<td>AsyncExecutionInterceptor 加 TaskExecutor</td>
+<td>返回 CompletableFuture,勿用 void</td>
+</tr>
+<tr>
+<td>线程池配置</td>
+<td>ThreadPoolTaskExecutor</td>
+<td>生产禁用 SimpleAsyncTaskExecutor;配置 core 加 max 加 queue 加 reject</td>
+</tr>
+<tr>
+<td>扩容策略</td>
+<td>core 转 queue 转 max 转 reject</td>
+<td>CallerRunsPolicy 最安全(调用方限流)</td>
+</tr>
+<tr>
+<td><code>@Scheduled</code> 调度</td>
+<td>TaskScheduler 加 SchedulingConfigurer</td>
+<td>默认单线程会阻塞,需配置 pool.size</td>
+</tr>
+<tr>
+<td>Virtual Thread</td>
+<td>spring.threads.virtual.enabled=true</td>
+<td>避免 synchronized,用 ReentrantLock</td>
+</tr>
+<tr>
+<td>异步编排</td>
+<td>CompletableFuture allOf 加 completeOnTimeout</td>
+<td>勿在 EventLoop 线程调 get 或 join</td>
+</tr>
+<tr>
+<td>上下文传播</td>
+<td>DelegatingSecurityContextAsyncTaskExecutor</td>
+<td>手动传递事务 加 SecurityContext 加 MDC 加 TraceId</td>
+</tr>
+</tbody>
+</table>
+<p>下一章 第 21 章 · 消息驱动架构 将深入 Spring 的消息中间件集成——JMS、AMQP(RabbitMQ)、Kafka 的统一抽象,以及消息监听器容器的线程模型(它依赖本章的 TaskExecutor 体系)。</p>
+</div>
+
+
+<div class="chapter-nav">
+  <a href="ch19-cache.html">&larr; ch19-cache · 第 19 章 · 缓存策略与 W-TinyLFU</a>
+  <a href="ch21-messaging.html">ch21-messaging · 第 21 章 · 消息驱动架构 &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 Spring Boot &middot; 第 20 章 · 异步处理与任务调度</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+</body>
+</html>

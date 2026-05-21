@@ -1,0 +1,1925 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 18 章 · QueryPart 表达式树与渲染管线 — 图解 jOOQ</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 jOOQ</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="ch17-bestpractice.html">上一章 ch17-bestpractice</a>
+  <a href="ch19-qom.html">下一章 ch19-qom</a>
+</nav>
+
+<aside class="toc">
+<a href="#18.0-章首速览">18.0 章首速览</a>
+<a href="#18.1-一切皆-querypart">18.1 一切皆 QueryPart</a>
+<a href="#18.2-表达式树的构造">18.2 表达式树的构造</a>
+<a href="#18.3-双-context-渲染">18.3 双 Context 渲染</a>
+<a href="#18.4-深度优先渲染算法">18.4 深度优先渲染算法</a>
+<a href="#18.5-方言感知渲染">18.5 方言感知渲染</a>
+<a href="#18.6-内联-vs-绑定变量">18.6 内联 vs 绑定变量</a>
+<a href="#18.7-子查询与嵌套渲染">18.7 子查询与嵌套渲染</a>
+<a href="#18.8-陷阱与调试">18.8 陷阱与调试</a>
+<a href="#18.9-生产守卫">18.9 生产守卫</a>
+<a href="#18.10-测试护栏">18.10 测试护栏</a>
+<a href="#18.11-源码深潜与本章要点">18.11 源码深潜与本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 18 章 · QueryPart 表达式树与渲染管线</h1>
+<p class="subtitle">v7 图解版 · 自动从 v6 markdown 生成 · Mermaid 图原样保留</p>
+<div class="chapter-intro"><p>前 17 章讲"如何使用",本章讲"如何工作"。当一行 <code>dsl.select(ORDERS.ID).from(ORDERS).where(ORDERS.ID.eq(1))</code> 被写下时,实际产物是一棵表达式树;调用 <code>.fetch()</code> 时,jOOQ 对树做深度优先遍历,通过 <code>RenderContext</code> 生成 SQL 字符串、通过 <code>BindContext</code> 绑定参数。这就是 jOOQ 引擎的全部秘密。</p>
+<p>核心设计:<code>QueryPart</code> 是万物之祖。所有 SQL 元素(语句、表、列、条件、常量)都实现该接口,通过统一的 <code>accept(Context)</code> visitor 方法驱动渲染。</p>
+</div>
+<h2 id="18.0-章首速览">18.0 章首速览</h2>
+<h3>图 18-0:本章地图</h3>
+<div class="diagram">
+  <div class="diagram-title">图 18-0 · 本章地图 — 9 大主题</div>
+  <svg viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="320" y="20" width="280" height="55" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="46" text-anchor="middle" fill="#c9d1d9" font-size="14" font-weight="bold">QueryPart 与渲染管线</text>
+    <text x="460" y="65" text-anchor="middle" fill="#8b949e" font-size="11">表达式树 + 双 Context</text>
+
+    <rect x="20"  y="130" width="200" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="120" y="155" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">§18.1</text>
+    <text x="120" y="175" text-anchor="middle" fill="#8b949e" font-size="11">一切皆 QueryPart</text>
+
+    <rect x="240" y="130" width="200" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="340" y="155" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">§18.2</text>
+    <text x="340" y="175" text-anchor="middle" fill="#8b949e" font-size="11">表达式树构造</text>
+
+    <rect x="460" y="130" width="200" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="560" y="155" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">§18.3</text>
+    <text x="560" y="175" text-anchor="middle" fill="#8b949e" font-size="11">双 Context</text>
+
+    <rect x="680" y="130" width="200" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="780" y="155" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">§18.4</text>
+    <text x="780" y="175" text-anchor="middle" fill="#8b949e" font-size="11">深度优先渲染</text>
+
+    <rect x="20"  y="210" width="200" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="120" y="235" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">§18.5</text>
+    <text x="120" y="255" text-anchor="middle" fill="#8b949e" font-size="11">方言感知</text>
+
+    <rect x="240" y="210" width="200" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="340" y="235" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">§18.6</text>
+    <text x="340" y="255" text-anchor="middle" fill="#8b949e" font-size="11">内联 vs 绑定</text>
+
+    <rect x="460" y="210" width="200" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="560" y="235" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">§18.7</text>
+    <text x="560" y="255" text-anchor="middle" fill="#8b949e" font-size="11">子查询嵌套</text>
+
+    <rect x="680" y="210" width="200" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="780" y="235" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">§18.8</text>
+    <text x="780" y="255" text-anchor="middle" fill="#8b949e" font-size="11">陷阱与调试</text>
+
+    <rect x="240" y="290" width="440" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="460" y="315" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">§18.9-18.11</text>
+    <text x="460" y="335" text-anchor="middle" fill="#8b949e" font-size="11">生产守卫 / 测试护栏 / 源码深潜</text>
+
+    <path d="M 460 75  L 120 130" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 75  L 340 130" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 75  L 560 130" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 75  L 780 130" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+<h3>图 18-0a:渲染管线主线</h3>
+<div class="diagram">
+  <div class="diagram-title">图 18-0a · 渲染管线主线 — DSL → 树 → 双 Context → JDBC</div>
+  <svg viewBox="0 0 920 320" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20"  y="135" width="160" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="100" y="160" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">DSL 链式调用</text>
+    <text x="100" y="180" text-anchor="middle" fill="#8b949e" font-size="11">.select().from()</text>
+
+    <rect x="220" y="135" width="160" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="300" y="160" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">QueryPart 树</text>
+    <text x="300" y="180" text-anchor="middle" fill="#8b949e" font-size="11">SelectQueryImpl ...</text>
+
+    <rect x="420" y="50"  width="200" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="520" y="75"  text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">第 1 趟</text>
+    <text x="520" y="95"  text-anchor="middle" fill="#8b949e" font-size="11">RenderContext · 拼 SQL</text>
+
+    <rect x="420" y="220" width="200" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="520" y="245" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">第 2 趟</text>
+    <text x="520" y="265" text-anchor="middle" fill="#8b949e" font-size="11">BindContext · 绑参数</text>
+
+    <rect x="660" y="50"  width="160" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="740" y="75"  text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">SQL 字符串</text>
+    <text x="740" y="95"  text-anchor="middle" fill="#8b949e" font-size="11">含 ? 占位</text>
+
+    <rect x="660" y="220" width="160" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="740" y="245" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">参数列表</text>
+    <text x="740" y="265" text-anchor="middle" fill="#8b949e" font-size="11">List&lt;Val&gt;</text>
+
+    <rect x="820" y="135" width="80" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="860" y="160" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">PS</text>
+    <text x="860" y="178" text-anchor="middle" fill="#8b949e" font-size="10">→ DB</text>
+
+    <path d="M 180 165 L 220 165" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 380 150 L 420 80"  stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 380 180 L 420 250" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 620 80  L 660 80"  stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 620 250 L 660 250" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 820 80  L 860 135" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 820 250 L 860 195" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+<h2 id="18.1-一切皆-querypart">18.1 一切皆 QueryPart</h2>
+<h3>图 18-1:QueryPart 类型层次</h3>
+<div class="diagram">
+  <div class="diagram-title">图 18-1 · QueryPart 类型层次 — 公共基类型 + 四大子类型 + 具体实现</div>
+  <svg viewBox="0 0 920 480" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="350" y="20" width="220" height="55" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="45" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">QueryPart</text>
+    <text x="460" y="63" text-anchor="middle" fill="#8b949e" font-size="11">公共基类型</text>
+
+    <rect x="20"  y="130" width="170" height="55" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="105" y="155" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">TableLike</text>
+    <text x="105" y="173" text-anchor="middle" fill="#8b949e" font-size="11">表 / 子查询</text>
+
+    <rect x="210" y="130" width="170" height="55" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="295" y="155" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">FieldLike</text>
+    <text x="295" y="173" text-anchor="middle" fill="#8b949e" font-size="11">列 / 表达式</text>
+
+    <rect x="400" y="130" width="170" height="55" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="485" y="155" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">ConditionLike</text>
+    <text x="485" y="173" text-anchor="middle" fill="#8b949e" font-size="11">谓词 / 组合</text>
+
+    <rect x="590" y="130" width="170" height="55" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="675" y="155" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Query</text>
+    <text x="675" y="173" text-anchor="middle" fill="#8b949e" font-size="11">顶层 DML</text>
+
+    <rect x="770" y="130" width="130" height="55" rx="10" fill="#161b22" stroke="#8b949e" stroke-width="1.5" stroke-dasharray="3 2"/>
+    <text x="835" y="155" text-anchor="middle" fill="#c9d1d9" font-size="11">AbstractQueryPart</text>
+    <text x="835" y="173" text-anchor="middle" fill="#8b949e" font-size="10">accept(Context)</text>
+
+    <path d="M 400 75 L 105 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 430 75 L 295 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 490 75 L 485 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 520 75 L 675 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 570 50 L 770 145" stroke="#58a6ff" stroke-width="1.5" fill="none" stroke-dasharray="4 3"/>
+
+    <rect x="20"  y="230" width="170" height="42" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.2"/>
+    <text x="105" y="256" text-anchor="middle" fill="#c9d1d9" font-size="11">Table · 表引用</text>
+    <rect x="20"  y="280" width="170" height="42" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.2"/>
+    <text x="105" y="306" text-anchor="middle" fill="#c9d1d9" font-size="11">Select · 子查询</text>
+
+    <rect x="210" y="230" width="170" height="42" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.2"/>
+    <text x="295" y="256" text-anchor="middle" fill="#c9d1d9" font-size="11">Field · 列</text>
+    <rect x="210" y="280" width="170" height="42" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.2"/>
+    <text x="295" y="306" text-anchor="middle" fill="#c9d1d9" font-size="11">AggregateFunction</text>
+
+    <rect x="400" y="230" width="170" height="42" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.2"/>
+    <text x="485" y="256" text-anchor="middle" fill="#c9d1d9" font-size="11">Condition</text>
+    <rect x="400" y="280" width="170" height="42" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.2"/>
+    <text x="485" y="306" text-anchor="middle" fill="#c9d1d9" font-size="11">CompareCondition</text>
+
+    <rect x="590" y="230" width="170" height="42" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.2"/>
+    <text x="675" y="256" text-anchor="middle" fill="#c9d1d9" font-size="11">SelectQuery</text>
+    <rect x="590" y="280" width="170" height="42" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.2"/>
+    <text x="675" y="306" text-anchor="middle" fill="#c9d1d9" font-size="11">Insert/Update/Delete</text>
+
+    <path d="M 105 185 L 105 230" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 295 185 L 295 230" stroke="#3fb950" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 485 185 L 485 230" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 675 185 L 675 230" stroke="#bc8cff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="60"  y="370" width="200" height="60" rx="10" fill="#161b22" stroke="#58a6ff" stroke-width="1"/>
+    <text x="160" y="395" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">TableImpl</text>
+    <text x="160" y="412" text-anchor="middle" fill="#8b949e" font-size="11">e.g. OrdersTable(codegen)</text>
+
+    <rect x="280" y="370" width="200" height="60" rx="10" fill="#161b22" stroke="#3fb950" stroke-width="1"/>
+    <text x="380" y="395" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">TableField</text>
+    <text x="380" y="412" text-anchor="middle" fill="#8b949e" font-size="11">ORDERS.ID</text>
+
+    <rect x="500" y="370" width="240" height="60" rx="10" fill="#161b22" stroke="#d29922" stroke-width="1"/>
+    <text x="620" y="395" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">CombinedCondition</text>
+    <text x="620" y="412" text-anchor="middle" fill="#8b949e" font-size="11">AND / OR 二叉组合</text>
+
+    <path d="M 105 322 L 160 370" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 295 322 L 380 370" stroke="#3fb950" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 485 322 L 620 370" stroke="#d29922" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+<h3>18.1.1 接口定义</h3>
+<p><code>QueryPart</code> 是公共组合基类型;真正驱动渲染的 <code>accept(Context)</code> 位于内部 visitor / SPI 层。业务代码通常不直接实现裸 <code>QueryPart</code>,而应使用 DSL、<code>CustomField</code>、<code>CustomCondition</code> 或 <code>Binding</code> / <code>Converter</code>。</p>
+<pre><code class="language-java">public interface QueryPart extends Serializable {
+    String toString();
+
+    QueryPart $replace(Replacer replacer);
+    &lt;R&gt; R $traverse(Supplier&lt;R&gt; supplier, BiFunction&lt;R, QueryPart, R&gt; before);
+}
+
+abstract class AbstractQueryPart implements QueryPart {
+    public abstract void accept(Context&lt;?&gt; ctx);
+}
+</code></pre>
+<h3>18.1.2 最小验证</h3>
+<pre><code class="language-java">QueryPart root = dsl.select(ORDERS.ID).from(ORDERS).where(ORDERS.ID.eq(42));
+
+System.out.println(root.getClass().getSimpleName());
+System.out.println(((Query) root).getSQL());
+System.out.println(((Query) root).getBindValues());
+</code></pre>
+<pre><code class="language-text">SelectImpl
+select &quot;orders&quot;.&quot;id&quot; from &quot;orders&quot; where &quot;orders&quot;.&quot;id&quot; = ?
+[42]
+</code></pre>
+<h3>图 18-1a:accept 双重身份</h3>
+<div class="diagram">
+  <div class="diagram-title">图 18-1a · accept 双重身份 — 同一棵树根据 Context 类型生成 SQL 或绑定值</div>
+  <svg viewBox="0 0 920 280" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20"  y="100" width="220" height="80" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="130" y="135" text-anchor="middle" fill="#c9d1d9" font-size="14" font-weight="bold">QueryPart 节点</text>
+    <text x="130" y="158" text-anchor="middle" fill="#8b949e" font-size="12">.accept(ctx)</text>
+
+    <rect x="380" y="20"  width="280" height="70" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="520" y="48"  text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">生成 SQL 文本</text>
+    <text x="520" y="70"  text-anchor="middle" fill="#8b949e" font-size="11">'SELECT ... WHERE x = ?'</text>
+
+    <rect x="380" y="190" width="280" height="70" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="520" y="218" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">绑定参数值</text>
+    <text x="520" y="240" text-anchor="middle" fill="#8b949e" font-size="11">stmt.setInt(1, 42)</text>
+
+    <rect x="710" y="20"  width="190" height="70" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="805" y="48"  text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">String sql</text>
+    <text x="805" y="70"  text-anchor="middle" fill="#8b949e" font-size="11">conn.prepareStatement</text>
+
+    <rect x="710" y="190" width="190" height="70" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="805" y="218" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">PreparedStatement</text>
+    <text x="805" y="240" text-anchor="middle" fill="#8b949e" font-size="11">.executeQuery()</text>
+
+    <path d="M 240 130 L 380 55"  stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="290" y="80" fill="#3fb950" font-size="11">ctx 是 RenderContext</text>
+
+    <path d="M 240 150 L 380 225" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="290" y="220" fill="#d29922" font-size="11">ctx 是 BindContext</text>
+
+    <path d="M 660 55  L 710 55"  stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 660 225 L 710 225" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+<h3>18.1.3 Configuration 通过 Context 传播</h3>
+<p><code>Attachable</code> 不是 <code>QueryPart</code> 的语义子类型,而是常见实现类的生命周期能力:<code>attach(Configuration)</code> / <code>detach()</code>。渲染时,<code>Context</code> 携带当前 <code>Configuration</code> 穿过整棵树,节点据此决定方言与设置。</p>
+<div class="diagram">
+  <div class="diagram-title">图 18-1b · Configuration 通过 Context 在树间传播</div>
+  <svg viewBox="0 0 920 420" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20"  y="20" width="160" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="100" y="45" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">用户代码</text>
+
+    <rect x="200" y="20" width="160" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="280" y="45" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">DSLContext</text>
+
+    <rect x="380" y="20" width="160" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="45" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">SelectQueryImpl</text>
+
+    <rect x="560" y="20" width="160" height="40" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="640" y="45" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Table ORDERS</text>
+
+    <rect x="740" y="20" width="160" height="40" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="820" y="45" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Condition ID.eq(1)</text>
+
+    <line x1="100" y1="60" x2="100" y2="380" stroke="#58a6ff" stroke-width="1.2" stroke-dasharray="4 3"/>
+    <line x1="280" y1="60" x2="280" y2="380" stroke="#bc8cff" stroke-width="1.2" stroke-dasharray="4 3"/>
+    <line x1="460" y1="60" x2="460" y2="380" stroke="#bc8cff" stroke-width="1.2" stroke-dasharray="4 3"/>
+    <line x1="640" y1="60" x2="640" y2="380" stroke="#3fb950" stroke-width="1.2" stroke-dasharray="4 3"/>
+    <line x1="820" y1="60" x2="820" y2="380" stroke="#3fb950" stroke-width="1.2" stroke-dasharray="4 3"/>
+
+    <path d="M 100 90  L 280 90"  stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="190" y="83" text-anchor="middle" fill="#58a6ff" font-size="11">1. select(ORDERS.ID)</text>
+
+    <path d="M 280 120 L 460 120" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="370" y="113" text-anchor="middle" fill="#bc8cff" font-size="11">2. new SelectQueryImpl(config)</text>
+
+    <path d="M 280 150 L 460 150" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="370" y="143" text-anchor="middle" fill="#bc8cff" font-size="11">3. addSelect(ORDERS.ID)</text>
+
+    <path d="M 100 180 L 460 180" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="280" y="173" text-anchor="middle" fill="#58a6ff" font-size="11">4. from(ORDERS)</text>
+
+    <path d="M 460 210 L 640 210" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="550" y="203" text-anchor="middle" fill="#bc8cff" font-size="11">5. render: ctx.visit(ORDERS)</text>
+
+    <path d="M 100 240 L 460 240" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="280" y="233" text-anchor="middle" fill="#58a6ff" font-size="11">6. where(ORDERS.ID.eq(1))</text>
+
+    <path d="M 460 270 L 820 270" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="640" y="263" text-anchor="middle" fill="#bc8cff" font-size="11">7. render: ctx.visit(condition)</text>
+
+    <rect x="400" y="320" width="500" height="50" rx="10" fill="#161b22" stroke="#d29922" stroke-width="1.5" stroke-dasharray="3 2"/>
+    <text x="650" y="345" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">Context 携带同一 Configuration 穿过整棵树</text>
+    <text x="650" y="362" text-anchor="middle" fill="#8b949e" font-size="11">方言、Settings、ExecuteListeners 全程一致</text>
+  </svg>
+</div>
+<h3>18.1.4 Visitor 模式</h3>
+<div class="diagram">
+  <div class="diagram-title">图 18-1c · Visitor 模式 — Context(访问者) ↔ QueryPart(元素)</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20"  y="20" width="280" height="320" rx="12" fill="#0d1117" stroke="#bc8cff" stroke-width="2"/>
+    <text x="160" y="48" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">Context · 访问者</text>
+
+    <rect x="60"  y="80"  width="200" height="55" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="160" y="105" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">RenderContext</text>
+    <text x="160" y="123" text-anchor="middle" fill="#8b949e" font-size="11">拼 SQL 字符串</text>
+
+    <rect x="60"  y="155" width="200" height="55" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="160" y="180" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">BindContext</text>
+    <text x="160" y="198" text-anchor="middle" fill="#8b949e" font-size="11">绑参数到 PreparedStatement</text>
+
+    <text x="160" y="260" text-anchor="middle" fill="#8b949e" font-size="11">两类访问者共享接口 visit()</text>
+    <text x="160" y="280" text-anchor="middle" fill="#8b949e" font-size="11">→ 元素无需关心是哪种 Context</text>
+    <text x="160" y="300" text-anchor="middle" fill="#8b949e" font-size="11">→ 切换 Context 即换行为</text>
+
+    <rect x="460" y="20"  width="440" height="320" rx="12" fill="#0d1117" stroke="#58a6ff" stroke-width="2"/>
+    <text x="680" y="48"  text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">QueryPart · 被访问元素</text>
+
+    <rect x="500" y="80"  width="360" height="42" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="680" y="106" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">SelectQueryImpl (根节点)</text>
+
+    <rect x="500" y="140" width="170" height="42" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="585" y="166" text-anchor="middle" fill="#c9d1d9" font-size="11">TableImpl</text>
+    <rect x="690" y="140" width="170" height="42" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="775" y="166" text-anchor="middle" fill="#c9d1d9" font-size="11">TableField</text>
+
+    <rect x="500" y="200" width="360" height="42" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="680" y="226" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">CompareCondition (子节点)</text>
+
+    <rect x="500" y="260" width="360" height="42" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="680" y="286" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Val&lt;T&gt; · 常量叶节点</text>
+
+    <path d="M 300 110 L 500 100" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="390" y="92" text-anchor="middle" fill="#3fb950" font-size="11">visit(part)</text>
+
+    <path d="M 680 122 L 585 140" stroke="#bc8cff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 680 122 L 775 140" stroke="#bc8cff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 680 122 L 680 200" stroke="#bc8cff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <text x="555" y="138" fill="#bc8cff" font-size="10">visit(table)</text>
+    <text x="800" y="138" fill="#bc8cff" font-size="10">visit(field)</text>
+
+    <path d="M 680 242 L 680 260" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <text x="700" y="256" fill="#d29922" font-size="10">visit(val)</text>
+  </svg>
+</div>
+<div class="key-insight"><p>设计精髓:统一为 <code>QueryPart</code> + 统一通过 <code>accept(Context)</code> 驱动 = 仅切换 Context 类型即可改变渲染行为。开闭原则的教科书级实现。</p></div>
+<h2 id="18.2-表达式树的构造">18.2 表达式树的构造</h2>
+<h3>图 18-2:三步构建</h3>
+<div class="diagram">
+  <div class="diagram-title">图 18-2 · 三步构建表达式树 — 链式调用累积内部结构</div>
+  <svg viewBox="0 0 920 220" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20"  y="40" width="270" height="140" rx="12" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="155" y="68" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">Step 1 · dsl.select(ID, AMOUNT)</text>
+    <text x="155" y="98" text-anchor="middle" fill="#8b949e" font-size="11">→ SelectQueryImpl 实例化</text>
+    <text x="155" y="120" text-anchor="middle" fill="#8b949e" font-size="11">→ SelectFieldList</text>
+    <text x="155" y="142" text-anchor="middle" fill="#8b949e" font-size="11">[ID, AMOUNT]</text>
+
+    <rect x="325" y="40" width="270" height="140" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="460" y="68" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">Step 2 · .from(ORDERS)</text>
+    <text x="460" y="98" text-anchor="middle" fill="#8b949e" font-size="11">→ 添加 FromClause</text>
+    <text x="460" y="120" text-anchor="middle" fill="#8b949e" font-size="11">FromClause[ORDERS]</text>
+    <text x="460" y="142" text-anchor="middle" fill="#8b949e" font-size="11">(可继续 join)</text>
+
+    <rect x="630" y="40" width="270" height="140" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="765" y="68" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">Step 3 · .where(ID.eq(1))</text>
+    <text x="765" y="92" text-anchor="middle" fill="#8b949e" font-size="11">→ ConditionProvider</text>
+    <text x="765" y="112" text-anchor="middle" fill="#8b949e" font-size="11">→ CompareCondition</text>
+    <text x="765" y="132" text-anchor="middle" fill="#8b949e" font-size="11">(EQ, ID, Val(1))</text>
+
+    <path d="M 290 110 L 325 110" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 595 110 L 630 110" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+<h3>18.2.1 完整树示例</h3>
+<pre><code class="language-java">dsl.select(ORDERS.ID, count())
+   .from(ORDERS)
+   .join(CUSTOMERS).on(ORDERS.CUSTOMER_ID.eq(CUSTOMERS.ID))
+   .where(CUSTOMERS.COUNTRY.eq(&quot;CN&quot;))
+   .groupBy(ORDERS.ID)
+   .orderBy(count().desc())
+   .limit(10);
+</code></pre>
+<pre><code class="language-sql">select &quot;orders&quot;.&quot;id&quot;, count(*)
+from &quot;orders&quot;
+join &quot;customers&quot; on &quot;orders&quot;.&quot;customer_id&quot; = &quot;customers&quot;.&quot;id&quot;
+where &quot;customers&quot;.&quot;country&quot; = ?
+group by &quot;orders&quot;.&quot;id&quot;
+order by count(*) desc
+limit ?
+</code></pre>
+<pre><code class="language-text">bind values: [CN, 10]
+</code></pre>
+<h3>图 18-2a:JOIN + GROUP BY + LIMIT 树</h3>
+<div class="diagram">
+  <div class="diagram-title">图 18-2a · 完整 JOIN + GROUP BY + LIMIT 表达式树</div>
+  <svg viewBox="0 0 920 480" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><polygon points="0,0 9,5 0,10" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="350" y="20"  width="220" height="50" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="48"  text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">SelectQueryImpl</text>
+
+    <rect x="20"  y="120" width="130" height="42" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="85"  y="146" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">SelectFieldList</text>
+
+    <rect x="165" y="120" width="130" height="42" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="230" y="146" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">FromClause</text>
+
+    <rect x="310" y="120" width="170" height="42" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="395" y="146" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">ConditionProvider</text>
+
+    <rect x="495" y="120" width="130" height="42" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="560" y="146" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">GroupFieldList</text>
+
+    <rect x="640" y="120" width="130" height="42" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="705" y="146" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">SortFieldList</text>
+
+    <rect x="785" y="120" width="100" height="42" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="835" y="146" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">Limit</text>
+
+    <path d="M 410 70 L 85  120" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 430 70 L 230 120" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 450 70 L 395 120" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 470 70 L 560 120" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 490 70 L 705 120" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 510 70 L 835 120" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="20"  y="210" width="130" height="34" rx="6" fill="#161b22" stroke="#58a6ff" stroke-width="1"/>
+    <text x="85"  y="232" text-anchor="middle" fill="#c9d1d9" font-size="10">ORDERS.ID</text>
+    <rect x="20"  y="250" width="130" height="34" rx="6" fill="#161b22" stroke="#58a6ff" stroke-width="1"/>
+    <text x="85"  y="272" text-anchor="middle" fill="#c9d1d9" font-size="10">count()</text>
+
+    <rect x="165" y="210" width="130" height="34" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="1"/>
+    <text x="230" y="232" text-anchor="middle" fill="#c9d1d9" font-size="10">JoinTable</text>
+    <rect x="165" y="250" width="62"  height="34" rx="6" fill="#161b22" stroke="#3fb950" stroke-width="1"/>
+    <text x="196" y="272" text-anchor="middle" fill="#c9d1d9" font-size="10">ORDERS</text>
+    <rect x="233" y="250" width="62"  height="34" rx="6" fill="#161b22" stroke="#3fb950" stroke-width="1"/>
+    <text x="264" y="272" text-anchor="middle" fill="#c9d1d9" font-size="10">CUSTOMERS</text>
+    <rect x="165" y="290" width="130" height="34" rx="6" fill="#161b22" stroke="#3fb950" stroke-width="1"/>
+    <text x="230" y="312" text-anchor="middle" fill="#c9d1d9" font-size="10">ON cust_id = id</text>
+
+    <rect x="310" y="210" width="170" height="34" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="1"/>
+    <text x="395" y="232" text-anchor="middle" fill="#c9d1d9" font-size="10">CompareCondition</text>
+    <rect x="310" y="250" width="80"  height="34" rx="6" fill="#161b22" stroke="#d29922" stroke-width="1"/>
+    <text x="350" y="272" text-anchor="middle" fill="#c9d1d9" font-size="10">COUNTRY</text>
+    <rect x="395" y="250" width="85"  height="34" rx="6" fill="#161b22" stroke="#d29922" stroke-width="1"/>
+    <text x="438" y="272" text-anchor="middle" fill="#c9d1d9" font-size="10">Val('CN')</text>
+
+    <rect x="495" y="210" width="130" height="34" rx="6" fill="#161b22" stroke="#58a6ff" stroke-width="1"/>
+    <text x="560" y="232" text-anchor="middle" fill="#c9d1d9" font-size="10">ORDERS.ID</text>
+
+    <rect x="640" y="210" width="130" height="34" rx="6" fill="#161b22" stroke="#58a6ff" stroke-width="1"/>
+    <text x="705" y="232" text-anchor="middle" fill="#c9d1d9" font-size="10">count() DESC</text>
+
+    <rect x="785" y="210" width="100" height="34" rx="6" fill="#161b22" stroke="#58a6ff" stroke-width="1"/>
+    <text x="835" y="232" text-anchor="middle" fill="#c9d1d9" font-size="10">Val(10)</text>
+
+    <path d="M 85  162 L 85  210" stroke="#58a6ff" stroke-width="1" fill="none"/>
+    <path d="M 85  162 L 85  250" stroke="#58a6ff" stroke-width="1" fill="none"/>
+    <path d="M 230 162 L 230 210" stroke="#3fb950" stroke-width="1" fill="none"/>
+    <path d="M 230 244 L 196 250" stroke="#3fb950" stroke-width="1" fill="none"/>
+    <path d="M 230 244 L 264 250" stroke="#3fb950" stroke-width="1" fill="none"/>
+    <path d="M 230 244 L 230 290" stroke="#3fb950" stroke-width="1" fill="none"/>
+    <path d="M 395 162 L 395 210" stroke="#d29922" stroke-width="1" fill="none"/>
+    <path d="M 395 244 L 350 250" stroke="#d29922" stroke-width="1" fill="none"/>
+    <path d="M 395 244 L 438 250" stroke="#d29922" stroke-width="1" fill="none"/>
+    <path d="M 560 162 L 560 210" stroke="#58a6ff" stroke-width="1" fill="none"/>
+    <path d="M 705 162 L 705 210" stroke="#58a6ff" stroke-width="1" fill="none"/>
+    <path d="M 835 162 L 835 210" stroke="#58a6ff" stroke-width="1" fill="none"/>
+
+    <text x="460" y="390" text-anchor="middle" fill="#8b949e" font-size="12">渲染时 DFS 顺序:SelectFieldList → FromClause → ConditionProvider → GroupFieldList → SortFieldList → Limit</text>
+    <text x="460" y="412" text-anchor="middle" fill="#8b949e" font-size="11">每个子树叶到 Val 时,RenderContext 输出 ?,BindContext 在第 2 趟绑定值</text>
+  </svg>
+</div>
+<h3>18.2.2 可变 vs 不可变</h3>
+<div class="diagram">
+  <div class="diagram-title">图 18-2b · 不可变 DSL vs 可变 SelectQuery — 两种构建路径</div>
+  <svg viewBox="0 0 920 320" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20"  y="20" width="430" height="280" rx="12" fill="#0d1117" stroke="#3fb950" stroke-width="2"/>
+    <text x="235" y="48" text-anchor="middle" fill="#3fb950" font-size="14" font-weight="bold">DSL 链式 · 近似不可变</text>
+
+    <rect x="60"  y="75"  width="350" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="235" y="105" text-anchor="middle" fill="#c9d1d9" font-size="12">ORDERS.ID(Field 实例 · 可共享)</text>
+
+    <rect x="60"  y="145" width="350" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="235" y="175" text-anchor="middle" fill="#c9d1d9" font-size="12">ORDERS.ID.eq('x')(新 Condition)</text>
+
+    <rect x="60"  y="215" width="350" height="60" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="235" y="240" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">原 Field 可复用</text>
+    <text x="235" y="260" text-anchor="middle" fill="#8b949e" font-size="11">线程安全 / 适合共享常量</text>
+
+    <path d="M 235 125 L 235 145" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 235 195 L 235 215" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="470" y="20" width="430" height="280" rx="12" fill="#0d1117" stroke="#d29922" stroke-width="2"/>
+    <text x="685" y="48" text-anchor="middle" fill="#d29922" font-size="14" font-weight="bold">SelectQuery · 显式可变 API</text>
+
+    <rect x="510" y="75"  width="350" height="42" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="685" y="101" text-anchor="middle" fill="#c9d1d9" font-size="12">dsl.selectQuery()</text>
+
+    <rect x="510" y="125" width="350" height="42" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="685" y="151" text-anchor="middle" fill="#c9d1d9" font-size="12">.addSelect(ORDERS.ID)</text>
+
+    <rect x="510" y="175" width="350" height="42" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="685" y="201" text-anchor="middle" fill="#c9d1d9" font-size="12">.addFrom(ORDERS) / .addConditions(...)</text>
+
+    <rect x="510" y="225" width="350" height="55" rx="8" fill="#5c1f1f" stroke="#f85149" stroke-width="1.5"/>
+    <text x="685" y="248" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">同一实例被修改 ✗</text>
+    <text x="685" y="268" text-anchor="middle" fill="#8b949e" font-size="11">线程不安全 · 禁跨请求复用</text>
+
+    <path d="M 685 117 L 685 125" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 685 167 L 685 175" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 685 217 L 685 225" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+<div class="warning"><p>陷阱:<code>SelectQuery</code> 是少数可变的 QueryPart。<code>addConditions()</code> 修改当前对象,不返回新对象。需要独立查询时必须用 <code>dsl.selectQuery()</code> 创建新实例。</p></div>
+<h2 id="18.3-双-context-渲染">18.3 双 Context 渲染</h2>
+<h3>图 18-3:Context 类型层次</h3>
+<div class="diagram">
+  <div class="diagram-title">图 18-3 · Context 类型层次 — 抽象 Context → Render/Bind → 具体实现</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="320" y="20" width="280" height="80" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="45" text-anchor="middle" fill="#c9d1d9" font-size="14" font-weight="bold">Context&lt;C&gt; · 抽象接口</text>
+    <text x="460" y="65" text-anchor="middle" fill="#8b949e" font-size="11">visit(QueryPart) · sql(String)</text>
+    <text x="460" y="83" text-anchor="middle" fill="#8b949e" font-size="11">keyword(Keyword) · formatIndent</text>
+
+    <rect x="100" y="150" width="280" height="70" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="240" y="178" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">RenderContext</text>
+    <text x="240" y="200" text-anchor="middle" fill="#8b949e" font-size="11">StringBuilder · ParamType · qualify</text>
+
+    <rect x="540" y="150" width="280" height="70" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="680" y="178" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">BindContext</text>
+    <text x="680" y="200" text-anchor="middle" fill="#8b949e" font-size="11">PreparedStatement · nextIndex</text>
+
+    <path d="M 400 100 L 240 150" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 520 100 L 680 150" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="100" y="260" width="280" height="50" rx="10" fill="#161b22" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="240" y="290" text-anchor="middle" fill="#c9d1d9" font-size="12">DefaultRenderContext</text>
+
+    <rect x="540" y="260" width="280" height="50" rx="10" fill="#161b22" stroke="#d29922" stroke-width="1.5"/>
+    <text x="680" y="290" text-anchor="middle" fill="#c9d1d9" font-size="12">DefaultBindContext</text>
+
+    <path d="M 240 220 L 240 260" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 680 220 L 680 260" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="100" y="335" width="280" height="35" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1"/>
+    <text x="240" y="358" text-anchor="middle" fill="#c9d1d9" font-size="11" font-style="italic">→ 输出:SQL 字符串</text>
+
+    <rect x="540" y="335" width="280" height="35" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1"/>
+    <text x="680" y="358" text-anchor="middle" fill="#c9d1d9" font-size="11" font-style="italic">→ 输出:stmt.setInt(1, 42)</text>
+  </svg>
+</div>
+<h3>18.3.1 RenderContext 内部状态</h3>
+<table>
+<thead>
+<tr>
+<th>状态</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>StringBuilder sql</code></td>
+<td>当前 SQL 缓冲区</td>
+</tr>
+<tr>
+<td><code>ParamType paramType</code></td>
+<td>INDEXED / INLINED / NAMED</td>
+</tr>
+<tr>
+<td><code>boolean qualify</code></td>
+<td>是否加表名前缀</td>
+</tr>
+<tr>
+<td><code>CastMode castMode</code></td>
+<td>是否需要类型转换</td>
+</tr>
+<tr>
+<td><code>boolean format</code></td>
+<td>是否格式化输出</td>
+</tr>
+<tr>
+<td><code>int indent</code></td>
+<td>当前缩进层级</td>
+</tr>
+<tr>
+<td><code>SQLDialect dialect</code></td>
+<td>目标方言</td>
+</tr>
+</tbody>
+</table>
+<h3>18.3.2 渲染示例</h3>
+<pre><code class="language-java">Condition condition = ORDERS.ID.like(&quot;jOOQ%&quot;)
+    .and(ORDERS.AMOUNT.lt(new BigDecimal(&quot;80.00&quot;)));
+
+System.out.println(dsl.render(condition));
+System.out.println(dsl.renderInlined(condition));
+</code></pre>
+<pre><code class="language-sql">(&quot;orders&quot;.&quot;id&quot; like ? and &quot;orders&quot;.&quot;amount&quot; &lt; ?)
+(&quot;orders&quot;.&quot;id&quot; like 'jOOQ%' and &quot;orders&quot;.&quot;amount&quot; &lt; 80.00)
+</code></pre>
+<h3>18.3.3 BindContext 简化逻辑</h3>
+<pre><code class="language-java">class DefaultBindContext extends AbstractContext&lt;BindContext&gt; {
+    private final PreparedStatement stmt;
+    private int nextIndex = 1;
+
+    @Override
+    public void visit(Val&lt;?&gt; val) {
+        val.bind(stmt, nextIndex++);
+    }
+
+    @Override
+    public void visit(QueryPart part) {
+        part.accept(this);
+    }
+}
+</code></pre>
+<h3>图 18-3a:两趟渲染时序</h3>
+<div class="diagram">
+  <div class="diagram-title">图 18-3a · 两趟渲染时序 — 第 1 趟拼 SQL,第 2 趟绑参数</div>
+  <svg viewBox="0 0 920 540" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20"  y="20" width="120" height="40" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="2"/>
+    <text x="80"  y="45" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">用户代码</text>
+    <rect x="170" y="20" width="120" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="230" y="45" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">表达式树</text>
+    <rect x="320" y="20" width="130" height="40" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="2"/>
+    <text x="385" y="45" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">RenderContext</text>
+    <rect x="480" y="20" width="130" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="545" y="45" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">BindContext</text>
+    <rect x="640" y="20" width="130" height="40" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="2"/>
+    <text x="705" y="45" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">PreparedStmt</text>
+    <rect x="800" y="20" width="100" height="40" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="2"/>
+    <text x="850" y="45" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">数据库</text>
+
+    <line x1="80"  y1="60" x2="80"  y2="500" stroke="#58a6ff" stroke-width="1.2" stroke-dasharray="4 3"/>
+    <line x1="230" y1="60" x2="230" y2="500" stroke="#bc8cff" stroke-width="1.2" stroke-dasharray="4 3"/>
+    <line x1="385" y1="60" x2="385" y2="500" stroke="#3fb950" stroke-width="1.2" stroke-dasharray="4 3"/>
+    <line x1="545" y1="60" x2="545" y2="500" stroke="#d29922" stroke-width="1.2" stroke-dasharray="4 3"/>
+    <line x1="705" y1="60" x2="705" y2="500" stroke="#58a6ff" stroke-width="1.2" stroke-dasharray="4 3"/>
+    <line x1="850" y1="60" x2="850" y2="500" stroke="#58a6ff" stroke-width="1.2" stroke-dasharray="4 3"/>
+
+    <path d="M 80 90  L 230 90"  stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="155" y="83" text-anchor="middle" fill="#58a6ff" font-size="11">1. dsl.select().from().where()</text>
+
+    <path d="M 80 125 L 230 125" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="155" y="118" text-anchor="middle" fill="#58a6ff" font-size="11">2. .fetch()</text>
+
+    <path d="M 230 165 L 385 165" stroke="#3fb950" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+    <text x="307" y="158" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">3. 第 1 趟 tree.accept(renderCtx)</text>
+
+    <rect x="295" y="180" width="180" height="34" rx="6" fill="#0d1117" stroke="#3fb950" stroke-width="1" stroke-dasharray="3 2"/>
+    <text x="385" y="202" text-anchor="middle" fill="#3fb950" font-size="11">DFS · 拼 SQL 字符串</text>
+
+    <path d="M 385 240 L 705 240" stroke="#58a6ff" stroke-width="1.5" fill="none" stroke-dasharray="3 2" marker-end="url(#arr)"/>
+    <text x="545" y="233" text-anchor="middle" fill="#58a6ff" font-size="11">4. conn.prepareStatement(sql)</text>
+
+    <path d="M 230 285 L 545 285" stroke="#d29922" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+    <text x="387" y="278" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">5. 第 2 趟 tree.accept(bindCtx)</text>
+
+    <rect x="455" y="300" width="180" height="34" rx="6" fill="#0d1117" stroke="#d29922" stroke-width="1" stroke-dasharray="3 2"/>
+    <text x="545" y="322" text-anchor="middle" fill="#d29922" font-size="11">DFS · 仅处理 Val</text>
+
+    <path d="M 545 360 L 705 360" stroke="#58a6ff" stroke-width="1.5" fill="none" stroke-dasharray="3 2" marker-end="url(#arr)"/>
+    <text x="625" y="353" text-anchor="middle" fill="#58a6ff" font-size="11">6. stmt.setInt(1, 42)</text>
+
+    <path d="M 705 400 L 850 400" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="777" y="393" text-anchor="middle" fill="#58a6ff" font-size="11">7. executeQuery</text>
+
+    <path d="M 850 435 L 705 435" stroke="#58a6ff" stroke-width="1.5" fill="none" stroke-dasharray="3 2" marker-end="url(#arr)"/>
+    <text x="777" y="428" text-anchor="middle" fill="#58a6ff" font-size="11">8. ResultSet</text>
+
+    <path d="M 705 470 L 80 470"  stroke="#58a6ff" stroke-width="1.5" fill="none" stroke-dasharray="3 2" marker-end="url(#arr)"/>
+    <text x="390" y="463" text-anchor="middle" fill="#58a6ff" font-size="11">9. Result&lt;Record&gt;</text>
+  </svg>
+</div>
+<div class="warning"><p>JDBC 协议要求先 SQL 后参数。两趟遍历精确匹配:第 1 趟遇到 <code>Val&lt;T&gt;</code> 输出 <code>?</code>,第 2 趟调用 <code>setXxx()</code>。两趟顺序必须严格一致。</p></div>
+<h2 id="18.4-深度优先渲染算法">18.4 深度优先渲染算法</h2>
+<h3>图 18-4:遍历顺序</h3>
+<div class="diagram">
+  <div class="diagram-title">图 18-4 · 深度优先遍历顺序 — 11 步生成完整 SQL</div>
+  <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><polygon points="0,0 9,5 0,10" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="320" y="20" width="280" height="55" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="45" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">[1] SelectQueryImpl</text>
+    <text x="460" y="63" text-anchor="middle" fill="#8b949e" font-size="11">输出 "SELECT"</text>
+
+    <rect x="60"  y="120" width="220" height="55" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="170" y="145" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">[2] SelectFieldList</text>
+    <rect x="40"  y="200" width="120" height="45" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1"/>
+    <text x="100" y="220" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">[3] ORDERS.ID</text>
+    <text x="100" y="237" text-anchor="middle" fill="#8b949e" font-size="10">→ orders.id</text>
+    <rect x="180" y="200" width="160" height="45" rx="8" fill="#161b22" stroke="#58a6ff" stroke-width="1"/>
+    <text x="260" y="220" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">[4] ORDERS.AMOUNT</text>
+    <text x="260" y="237" text-anchor="middle" fill="#8b949e" font-size="10">→ , orders.amount</text>
+    <path d="M 170 175 L 100 200" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 170 175 L 260 200" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="350" y="120" width="220" height="55" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="460" y="145" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">[5] FromClause</text>
+    <text x="460" y="162" text-anchor="middle" fill="#8b949e" font-size="10">输出 "FROM"</text>
+    <rect x="370" y="200" width="180" height="45" rx="8" fill="#161b22" stroke="#3fb950" stroke-width="1"/>
+    <text x="460" y="220" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">[6] ORDERS</text>
+    <text x="460" y="237" text-anchor="middle" fill="#8b949e" font-size="10">→ orders</text>
+    <path d="M 460 175 L 460 200" stroke="#3fb950" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="640" y="120" width="240" height="55" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="760" y="145" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">[7] ConditionProvider</text>
+    <text x="760" y="162" text-anchor="middle" fill="#8b949e" font-size="10">输出 "WHERE"</text>
+
+    <path d="M 380 75 L 170 120" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 75 L 460 120" stroke="#3fb950" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 540 75 L 760 120" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="610" y="220" width="290" height="55" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="755" y="245" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">[8] CompareCondition</text>
+    <text x="755" y="262" text-anchor="middle" fill="#8b949e" font-size="10">渲染左 op 右三部分</text>
+
+    <path d="M 760 175 L 755 220" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="610" y="295" width="80"  height="45" rx="8" fill="#161b22" stroke="#d29922" stroke-width="1"/>
+    <text x="650" y="313" text-anchor="middle" fill="#c9d1d9" font-size="10" font-weight="bold">[9]</text>
+    <text x="650" y="330" text-anchor="middle" fill="#8b949e" font-size="9">ORDERS.ID</text>
+
+    <rect x="700" y="295" width="100" height="45" rx="8" fill="#161b22" stroke="#d29922" stroke-width="1"/>
+    <text x="750" y="313" text-anchor="middle" fill="#c9d1d9" font-size="10" font-weight="bold">[10] EQ</text>
+    <text x="750" y="330" text-anchor="middle" fill="#8b949e" font-size="9">→ "="</text>
+
+    <rect x="810" y="295" width="90"  height="45" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1"/>
+    <text x="855" y="313" text-anchor="middle" fill="#c9d1d9" font-size="10" font-weight="bold">[11] Val(42)</text>
+    <text x="855" y="330" text-anchor="middle" fill="#8b949e" font-size="9">→ "?"</text>
+
+    <path d="M 720 275 L 650 295" stroke="#d29922" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 755 275 L 750 295" stroke="#d29922" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 790 275 L 855 295" stroke="#d29922" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="60" y="390" width="800" height="50" rx="10" fill="#0d1117" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="460" y="412" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">最终拼出: SELECT orders.id, orders.amount FROM orders WHERE orders.id = ?</text>
+    <text x="460" y="430" text-anchor="middle" fill="#8b949e" font-size="11">数字 = DFS 访问顺序 · 第 2 趟 BindContext 同序绑定 Val(42)</text>
+  </svg>
+</div>
+<h3>图 18-4a:SelectQueryImpl.accept 流程</h3>
+<div class="diagram">
+  <div class="diagram-title">图 18-4a · SelectQueryImpl.accept 主流程 — 关键字 → 子句 → 可选分支</div>
+  <svg viewBox="0 0 920 580" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><polygon points="0,0 9,5 0,10" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="370" y="20" width="180" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="45" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">accept(ctx)</text>
+
+    <rect x="350" y="85"  width="220" height="36" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="460" y="108" text-anchor="middle" fill="#c9d1d9" font-size="11">ctx.keyword(SELECT)</text>
+    <rect x="350" y="130" width="220" height="36" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="460" y="153" text-anchor="middle" fill="#c9d1d9" font-size="11">visit(selectFieldList)</text>
+    <rect x="350" y="175" width="220" height="36" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="460" y="198" text-anchor="middle" fill="#c9d1d9" font-size="11">ctx.keyword(FROM)</text>
+    <rect x="350" y="220" width="220" height="36" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="460" y="243" text-anchor="middle" fill="#c9d1d9" font-size="11">visit(fromClause)</text>
+
+    <path d="M 460 60  L 460 85"  stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 121 L 460 130" stroke="#58a6ff" stroke-width="1" fill="none"/>
+    <path d="M 460 166 L 460 175" stroke="#58a6ff" stroke-width="1" fill="none"/>
+    <path d="M 460 211 L 460 220" stroke="#58a6ff" stroke-width="1" fill="none"/>
+
+    <polygon points="370,275 550,275 570,300 550,325 370,325 350,300" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="460" y="305" text-anchor="middle" fill="#c9d1d9" font-size="11">有 JOIN ?</text>
+    <path d="M 460 256 L 460 275" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="60"  y="285" width="220" height="36" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="170" y="308" text-anchor="middle" fill="#c9d1d9" font-size="11">visit(joinClause)</text>
+    <path d="M 350 300 L 280 303" stroke="#3fb950" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <text x="320" y="290" fill="#3fb950" font-size="10">是</text>
+
+    <polygon points="370,345 550,345 570,370 550,395 370,395 350,370" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="460" y="375" text-anchor="middle" fill="#c9d1d9" font-size="11">有 WHERE ?</text>
+    <path d="M 460 325 L 460 345" stroke="#d29922" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <text x="475" y="338" fill="#d29922" font-size="10">否</text>
+    <path d="M 170 321 L 460 345" stroke="#3fb950" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="610" y="355" width="280" height="36" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="750" y="378" text-anchor="middle" fill="#c9d1d9" font-size="11">keyword(WHERE) → visit(condition)</text>
+    <path d="M 570 370 L 610 373" stroke="#3fb950" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <text x="585" y="365" fill="#3fb950" font-size="10">是</text>
+
+    <polygon points="370,415 550,415 570,440 550,465 370,465 350,440" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="460" y="445" text-anchor="middle" fill="#c9d1d9" font-size="11">有 GROUP BY ?</text>
+    <path d="M 460 395 L 460 415" stroke="#d29922" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 750 391 L 460 415" stroke="#3fb950" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="610" y="425" width="280" height="36" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="750" y="448" text-anchor="middle" fill="#c9d1d9" font-size="11">keyword(GROUP BY) → visit(groupBy)</text>
+    <path d="M 570 440 L 610 443" stroke="#3fb950" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <polygon points="370,485 550,485 570,510 550,535 370,535 350,510" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="460" y="515" text-anchor="middle" fill="#c9d1d9" font-size="11">有 ORDER BY / LIMIT ?</text>
+    <path d="M 460 465 L 460 485" stroke="#d29922" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 750 461 L 460 485" stroke="#3fb950" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="610" y="495" width="280" height="36" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="750" y="518" text-anchor="middle" fill="#c9d1d9" font-size="11">visit(orderBy / limit)</text>
+    <path d="M 570 510 L 610 513" stroke="#3fb950" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="20"  y="495" width="200" height="40" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="120" y="520" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">完成 · SQL 拼好</text>
+    <path d="M 350 510 L 220 515" stroke="#bc8cff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+<h3>18.4.1 缩进与格式化</h3>
+<pre><code class="language-java">DSLContext fmt = DSL.using(config.derive(
+    new Settings().withRenderFormatted(true)));
+
+System.out.println(fmt.select(ORDERS.ID, ORDERS.AMOUNT)
+    .from(ORDERS)
+    .where(ORDERS.ID.eq(42))
+    .getSQL());
+</code></pre>
+<pre><code class="language-sql">select
+  &quot;orders&quot;.&quot;id&quot;,
+  &quot;orders&quot;.&quot;amount&quot;
+from
+  &quot;orders&quot;
+where
+  &quot;orders&quot;.&quot;id&quot; = ?
+</code></pre>
+<h2 id="18.5-方言感知渲染">18.5 方言感知渲染</h2>
+<h3>图 18-5:同一棵树多种 SQL</h3>
+<div class="diagram">
+  <div class="diagram-title">图 18-5 · 同一棵树多种 SQL — LIMIT/OFFSET 的四方言分发</div>
+  <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0d0d"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="280" y="20" width="360" height="70" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="48" text-anchor="middle" fill="#c9d1d9" font-size="14" font-weight="bold">表达式树(同一棵)</text>
+    <text x="460" y="70" text-anchor="middle" fill="#8b949e" font-size="11">SELECT id FROM orders LIMIT 10 OFFSET 20</text>
+
+    <rect x="20"  y="160" width="200" height="55" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="120" y="185" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">PostgreSQL / MySQL</text>
+    <text x="120" y="203" text-anchor="middle" fill="#8b949e" font-size="11">SQL 标准 LIMIT</text>
+
+    <rect x="240" y="160" width="200" height="55" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="340" y="185" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Oracle 12c+</text>
+    <text x="340" y="203" text-anchor="middle" fill="#8b949e" font-size="11">SQL:2008 标准</text>
+
+    <rect x="460" y="160" width="200" height="55" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="560" y="185" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">SQL Server</text>
+    <text x="560" y="203" text-anchor="middle" fill="#8b949e" font-size="11">需 ORDER BY</text>
+
+    <rect x="680" y="160" width="220" height="55" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="790" y="185" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Oracle 11g(legacy)</text>
+    <text x="790" y="203" text-anchor="middle" fill="#8b949e" font-size="11">无 OFFSET 关键字</text>
+
+    <path d="M 380 90 L 120 160" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 430 90 L 340 160" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 490 90 L 560 160" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 540 90 L 790 160" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="20"  y="260" width="200" height="80" rx="10" fill="#0d1117" stroke="#3fb950" stroke-width="1"/>
+    <text x="120" y="285" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">渲染输出</text>
+    <text x="120" y="305" text-anchor="middle" fill="#c9d1d9" font-size="10">LIMIT 10</text>
+    <text x="120" y="325" text-anchor="middle" fill="#c9d1d9" font-size="10">OFFSET 20</text>
+
+    <rect x="240" y="260" width="200" height="80" rx="10" fill="#0d1117" stroke="#58a6ff" stroke-width="1"/>
+    <text x="340" y="285" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">渲染输出</text>
+    <text x="340" y="305" text-anchor="middle" fill="#c9d1d9" font-size="10">OFFSET 20 ROWS</text>
+    <text x="340" y="325" text-anchor="middle" fill="#c9d1d9" font-size="10">FETCH NEXT 10 ROWS ONLY</text>
+
+    <rect x="460" y="260" width="200" height="80" rx="10" fill="#0d1117" stroke="#d29922" stroke-width="1"/>
+    <text x="560" y="285" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">渲染输出</text>
+    <text x="560" y="305" text-anchor="middle" fill="#c9d1d9" font-size="10">ORDER BY (SELECT 0)</text>
+    <text x="560" y="325" text-anchor="middle" fill="#c9d1d9" font-size="10">OFFSET 20 / FETCH NEXT 10</text>
+
+    <rect x="680" y="260" width="220" height="80" rx="10" fill="#0d1117" stroke="#f85149" stroke-width="1"/>
+    <text x="790" y="285" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">渲染输出</text>
+    <text x="790" y="305" text-anchor="middle" fill="#c9d1d9" font-size="10">嵌套 ROWNUM 子查询</text>
+    <text x="790" y="325" text-anchor="middle" fill="#8b949e" font-size="10">SELECT * FROM (SELECT ROWNUM ...)</text>
+
+    <path d="M 120 215 L 120 260" stroke="#3fb950" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 340 215 L 340 260" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 560 215 L 560 260" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 790 215 L 790 260" stroke="#f85149" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="160" y="390" width="600" height="50" rx="10" fill="#0d1117" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="3 2"/>
+    <text x="460" y="412" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">关键点 · 树不变,渲染分支由 ctx.family() 切换</text>
+    <text x="460" y="430" text-anchor="middle" fill="#8b949e" font-size="11">Limit.accept(ctx) 内部 switch(family) → 输出对应方言 SQL</text>
+  </svg>
+</div>
+<h3>18.5.1 Limit 节点伪代码</h3>
+<pre><code class="language-java">class Limit extends AbstractQueryPart {
+    @Override
+    public void accept(Context&lt;?&gt; ctx) {
+        switch (ctx.family()) {
+            case POSTGRES:
+            case MYSQL:
+                ctx.keyword(LIMIT).sql(' ').visit(numberOfRows)
+                   .sql(' ').keyword(OFFSET).sql(' ').visit(offset);
+                break;
+
+            case ORACLE:
+                ctx.keyword(OFFSET).sql(' ').visit(offset)
+                   .sql(' ').keyword(ROWS)
+                   .sql(' ').keyword(FETCH_NEXT).sql(' ').visit(numberOfRows)
+                   .sql(' ').keyword(ROWS_ONLY);
+                break;
+
+            case SQLSERVER:
+                ctx.keyword(OFFSET).sql(' ').visit(offset)
+                   .sql(' ').keyword(ROWS)
+                   .sql(' ').keyword(FETCH_NEXT).sql(' ').visit(numberOfRows)
+                   .sql(' ').keyword(ROWS_ONLY);
+                break;
+        }
+    }
+}
+</code></pre>
+<h3>18.5.2 三方言对比</h3>
+<pre><code class="language-java">var page = select(ORDERS.ID).from(ORDERS).orderBy(ORDERS.ID).limit(10).offset(20);
+
+System.out.println(DSL.using(SQLDialect.POSTGRES).renderInlined(page));
+System.out.println(DSL.using(SQLDialect.ORACLE).renderInlined(page));
+System.out.println(DSL.using(SQLDialect.SQLSERVER).renderInlined(page));
+</code></pre>
+<pre><code class="language-sql">-- PostgreSQL
+select &quot;orders&quot;.&quot;id&quot; from &quot;orders&quot; order by &quot;orders&quot;.&quot;id&quot; limit 10 offset 20
+
+-- Oracle 12c+
+select &quot;orders&quot;.&quot;id&quot; from &quot;orders&quot; order by &quot;orders&quot;.&quot;id&quot;
+offset 20 rows fetch next 10 rows only
+
+-- SQL Server
+select [orders].[id] from [orders] order by [orders].[id]
+offset 20 rows fetch next 10 rows only
+</code></pre>
+<h3>表 18-5:函数翻译</h3>
+<table>
+<thead>
+<tr>
+<th>jOOQ DSL</th>
+<th>PostgreSQL</th>
+<th>Oracle</th>
+<th>MySQL</th>
+<th>SQL Server</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DSL.substring()</code></td>
+<td><code>SUBSTRING</code></td>
+<td><code>SUBSTR</code></td>
+<td><code>SUBSTRING</code></td>
+<td><code>SUBSTRING</code></td>
+</tr>
+<tr>
+<td><code>DSL.length()</code></td>
+<td><code>LENGTH</code></td>
+<td><code>LENGTH</code></td>
+<td><code>CHAR_LENGTH</code></td>
+<td><code>LEN</code></td>
+</tr>
+<tr>
+<td><code>DSL.coalesce()</code></td>
+<td><code>COALESCE</code></td>
+<td><code>COALESCE / NVL</code></td>
+<td><code>COALESCE / IFNULL</code></td>
+<td><code>COALESCE / ISNULL</code></td>
+</tr>
+<tr>
+<td><code>DSL.currentTimestamp()</code></td>
+<td><code>CURRENT_TIMESTAMP</code></td>
+<td><code>SYSTIMESTAMP</code></td>
+<td><code>CURRENT_TIMESTAMP</code></td>
+<td><code>CURRENT_TIMESTAMP</code></td>
+</tr>
+<tr>
+<td><code>DSL.concat()</code></td>
+<td><code>a \|\| b</code></td>
+<td><code>a \|\| b</code></td>
+<td><code>CONCAT(a,b)</code></td>
+<td><code>a + b</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="18.6-内联-vs-绑定变量">18.6 内联 vs 绑定变量</h2>
+<h3>图 18-6:三种 ParamType</h3>
+<div class="diagram">
+  <div class="diagram-title">图 18-6 · 三种 ParamType — INDEXED / INLINED / NAMED 对比</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="370" y="20" width="180" height="50" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="50" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">Val&lt;Integer&gt;(42)</text>
+
+    <polygon points="380,100 540,100 560,130 540,160 380,160 360,130" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="460" y="135" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">ParamType ?</text>
+    <path d="M 460 70 L 460 100" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="20"  y="200" width="260" height="70" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="150" y="225" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">INDEXED(默认)</text>
+    <text x="150" y="245" text-anchor="middle" fill="#8b949e" font-size="11">输出 "?"</text>
+    <text x="150" y="262" text-anchor="middle" fill="#8b949e" font-size="11">BindContext.setInt(1, 42)</text>
+
+    <rect x="320" y="200" width="260" height="70" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="450" y="225" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">INLINED</text>
+    <text x="450" y="245" text-anchor="middle" fill="#8b949e" font-size="11">输出 "42"</text>
+    <text x="450" y="262" text-anchor="middle" fill="#8b949e" font-size="11">直接写入 SQL 文本</text>
+
+    <rect x="620" y="200" width="280" height="70" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="760" y="225" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">NAMED</text>
+    <text x="760" y="245" text-anchor="middle" fill="#8b949e" font-size="11">输出 ":param1"</text>
+    <text x="760" y="262" text-anchor="middle" fill="#8b949e" font-size="11">日志 / 调试场景</text>
+
+    <path d="M 400 160 L 200 200" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="280" y="190" text-anchor="middle" fill="#3fb950" font-size="11">默认</text>
+    <path d="M 460 160 L 450 200" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="490" y="190" fill="#d29922" font-size="11">显式</text>
+    <path d="M 520 160 L 720 200" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="640" y="190" fill="#58a6ff" font-size="11">显式</text>
+
+    <rect x="20"  y="295" width="260" height="60" rx="8" fill="#0d1117" stroke="#3fb950" stroke-width="1"/>
+    <text x="150" y="318" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">✓ 安全(防注入)</text>
+    <text x="150" y="336" text-anchor="middle" fill="#8b949e" font-size="10">✓ 数据库计划缓存命中</text>
+    <text x="150" y="350" text-anchor="middle" fill="#8b949e" font-size="10">✓ 生产首选</text>
+
+    <rect x="320" y="295" width="260" height="60" rx="8" fill="#0d1117" stroke="#d29922" stroke-width="1"/>
+    <text x="450" y="318" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">⚠ DDL / 日志专用</text>
+    <text x="450" y="336" text-anchor="middle" fill="#8b949e" font-size="10">✗ 缓存未命中</text>
+    <text x="450" y="350" text-anchor="middle" fill="#8b949e" font-size="10">✗ 脱敏风险</text>
+
+    <rect x="620" y="295" width="280" height="60" rx="8" fill="#0d1117" stroke="#58a6ff" stroke-width="1"/>
+    <text x="760" y="318" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">调试友好</text>
+    <text x="760" y="336" text-anchor="middle" fill="#8b949e" font-size="10">→ 不实际执行</text>
+    <text x="760" y="350" text-anchor="middle" fill="#8b949e" font-size="10">→ Oracle 实际支持 named bind</text>
+
+    <path d="M 150 270 L 150 295" stroke="#3fb950" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 450 270 L 450 295" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 760 270 L 760 295" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+<h3>图 18-6a:渲染决策树</h3>
+<div class="diagram">
+  <div class="diagram-title">图 18-6a · 渲染决策树 — 遇到 Val 节点的多层判定</div>
+  <svg viewBox="0 0 920 600" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><polygon points="0,0 9,5 0,10" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="370" y="20" width="180" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="45" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">遇到 Val 节点</text>
+
+    <polygon points="370,85 550,85 570,110 550,135 370,135 350,110" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="460" y="115" text-anchor="middle" fill="#c9d1d9" font-size="12">DDL 语句 ?</text>
+    <path d="M 460 60 L 460 85" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <polygon points="370,165 550,165 570,190 550,215 370,215 350,190" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="460" y="195" text-anchor="middle" fill="#c9d1d9" font-size="12">DSL.inline(val) ?</text>
+    <path d="M 460 135 L 460 165" stroke="#d29922" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <text x="475" y="158" fill="#d29922" font-size="11">否</text>
+
+    <polygon points="350,245 570,245 590,270 570,295 350,295 330,270" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="460" y="275" text-anchor="middle" fill="#c9d1d9" font-size="12">Settings.statementType ?</text>
+    <path d="M 460 215 L 460 245" stroke="#d29922" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <text x="475" y="238" fill="#d29922" font-size="11">否</text>
+
+    <polygon points="370,325 550,325 570,350 550,375 370,375 350,350" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="460" y="355" text-anchor="middle" fill="#c9d1d9" font-size="12">ParamType ?</text>
+    <path d="M 460 295 L 460 325" stroke="#d29922" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <text x="475" y="318" fill="#d29922" font-size="11">PREPARED</text>
+
+    <rect x="700" y="95" width="200" height="50" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="800" y="120" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">内联为 literal</text>
+    <text x="800" y="138" text-anchor="middle" fill="#8b949e" font-size="11">→ Inlined</text>
+    <path d="M 570 110 L 700 120" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <text x="610" y="105" fill="#58a6ff" font-size="11">是</text>
+    <path d="M 570 190 L 700 145" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <text x="620" y="170" fill="#58a6ff" font-size="11">是</text>
+    <path d="M 590 270 L 700 145" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <text x="630" y="245" fill="#58a6ff" font-size="11">STATIC</text>
+
+    <rect x="20"  y="425" width="240" height="55" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="140" y="450" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">INDEXED · 输出 ?</text>
+    <text x="140" y="468" text-anchor="middle" fill="#8b949e" font-size="11">加入绑定列表</text>
+
+    <polygon points="370,420 550,420 570,445 550,470 370,470 350,445" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="460" y="450" text-anchor="middle" fill="#c9d1d9" font-size="11">值是 String ?</text>
+
+    <rect x="660" y="425" width="240" height="55" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="780" y="450" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">NAMED · 输出 :paramN</text>
+
+    <path d="M 370 360 L 140 425" stroke="#3fb950" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <text x="250" y="395" fill="#3fb950" font-size="11">INDEXED</text>
+    <path d="M 460 375 L 460 420" stroke="#d29922" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <text x="475" y="400" fill="#d29922" font-size="11">INLINED</text>
+    <path d="M 550 360 L 780 425" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <text x="650" y="385" fill="#58a6ff" font-size="11">NAMED</text>
+
+    <rect x="240" y="510" width="220" height="55" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="350" y="535" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">转义单引号 'value'</text>
+    <text x="350" y="553" text-anchor="middle" fill="#8b949e" font-size="10">防止字符串闭合</text>
+
+    <rect x="500" y="510" width="220" height="55" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="610" y="535" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">literal 42 / TRUE / NULL</text>
+    <text x="610" y="553" text-anchor="middle" fill="#8b949e" font-size="10">原样输出</text>
+
+    <path d="M 410 470 L 350 510" stroke="#d29922" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <text x="365" y="495" fill="#d29922" font-size="10">是</text>
+    <path d="M 510 470 L 610 510" stroke="#d29922" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <text x="555" y="495" fill="#d29922" font-size="10">否</text>
+  </svg>
+</div>
+<h3>18.6.1 三种 ParamType 输出</h3>
+<pre><code class="language-java">var indexed = dsl.select(ORDERS.ID).from(ORDERS).where(ORDERS.ID.eq(42));
+var inlined = dsl.select(ORDERS.ID).from(ORDERS).where(ORDERS.ID.eq(DSL.inline(42)));
+var named   = dsl.select(ORDERS.ID).from(ORDERS).where(ORDERS.ID.eq(DSL.param(&quot;orderId&quot;, 42)));
+
+System.out.println(indexed.getSQL());
+System.out.println(indexed.getBindValues());
+System.out.println(inlined.getSQL());
+System.out.println(named.getSQL(ParamType.NAMED));
+</code></pre>
+<pre><code class="language-sql">-- INDEXED
+select &quot;orders&quot;.&quot;id&quot; from &quot;orders&quot; where &quot;orders&quot;.&quot;id&quot; = ?
+[42]
+
+-- INLINED
+select &quot;orders&quot;.&quot;id&quot; from &quot;orders&quot; where &quot;orders&quot;.&quot;id&quot; = 42
+
+-- NAMED
+select &quot;orders&quot;.&quot;id&quot; from &quot;orders&quot; where &quot;orders&quot;.&quot;id&quot; = :orderId
+</code></pre>
+<h3>18.6.2 安全性对比</h3>
+<div class="diagram">
+  <div class="diagram-title">图 18-6b · 安全性对比 — INDEXED 安全 · INLINED 谨慎 · Plain SQL 危险</div>
+  <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0d0d"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><polygon points="0,0 9,5 0,10" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20"  y="20" width="290" height="420" rx="12" fill="#0d1117" stroke="#3fb950" stroke-width="2"/>
+    <text x="165" y="48" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">INDEXED(默认 · 安全 ✓)</text>
+
+    <rect x="40"  y="75"  width="250" height="65" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.2"/>
+    <text x="165" y="98"  text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">用户输入</text>
+    <text x="165" y="116" text-anchor="middle" fill="#8b949e" font-size="10">Robert'; DROP TABLE...</text>
+
+    <rect x="40"  y="155" width="250" height="55" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.2"/>
+    <text x="165" y="180" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">SQL · WHERE name = ?</text>
+    <text x="165" y="198" text-anchor="middle" fill="#8b949e" font-size="10">输入与 SQL 完全分离</text>
+
+    <rect x="40"  y="225" width="250" height="55" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.2"/>
+    <text x="165" y="250" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">stmt.setString(1, input)</text>
+    <text x="165" y="268" text-anchor="middle" fill="#8b949e" font-size="10">驱动层处理转义</text>
+
+    <rect x="40"  y="295" width="250" height="70" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.2"/>
+    <text x="165" y="318" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">DB 作字符串值处理</text>
+    <text x="165" y="338" text-anchor="middle" fill="#8b949e" font-size="10">不执行 DROP</text>
+    <text x="165" y="355" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">✓ 注入失效</text>
+
+    <path d="M 165 140 L 165 155" stroke="#3fb950" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 165 210 L 165 225" stroke="#3fb950" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 165 280 L 165 295" stroke="#3fb950" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="320" y="20" width="290" height="420" rx="12" fill="#0d1117" stroke="#d29922" stroke-width="2"/>
+    <text x="465" y="48" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">INLINED literal(谨慎 ⚠)</text>
+
+    <rect x="340" y="75"  width="250" height="65" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.2"/>
+    <text x="465" y="98"  text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">DSL.inline(input)</text>
+    <text x="465" y="116" text-anchor="middle" fill="#8b949e" font-size="10">显式将值内联到 SQL</text>
+
+    <rect x="340" y="155" width="250" height="80" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.2"/>
+    <text x="465" y="180" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">渲染后</text>
+    <text x="465" y="198" text-anchor="middle" fill="#8b949e" font-size="10">WHERE name = 'Robert''; ...'</text>
+    <text x="465" y="218" text-anchor="middle" fill="#8b949e" font-size="10">jOOQ 转义单引号</text>
+
+    <rect x="340" y="250" width="250" height="100" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.2"/>
+    <text x="465" y="275" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">转义后 literal 安全</text>
+    <text x="465" y="295" text-anchor="middle" fill="#8b949e" font-size="10">但 SQL 形状随值变化</text>
+    <text x="465" y="315" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">⚠ 计划缓存失效</text>
+    <text x="465" y="335" text-anchor="middle" fill="#8b949e" font-size="10">仅 DDL / 调试用</text>
+
+    <path d="M 465 140 L 465 155" stroke="#d29922" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 465 235 L 465 250" stroke="#d29922" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="620" y="20" width="290" height="420" rx="12" fill="#0d1117" stroke="#f85149" stroke-width="2"/>
+    <text x="765" y="48" text-anchor="middle" fill="#f85149" font-size="13" font-weight="bold">Plain SQL 拼接(危险 ✗)</text>
+
+    <rect x="640" y="75"  width="250" height="65" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="1.2"/>
+    <text x="765" y="98"  text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">DSL.condition(</text>
+    <text x="765" y="116" text-anchor="middle" fill="#8b949e" font-size="10">"name=" + input)</text>
+
+    <rect x="640" y="155" width="250" height="80" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="1.2"/>
+    <text x="765" y="180" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">渲染后</text>
+    <text x="765" y="198" text-anchor="middle" fill="#8b949e" font-size="10">WHERE name = 'Robert';</text>
+    <text x="765" y="218" text-anchor="middle" fill="#8b949e" font-size="10">DROP TABLE users;...</text>
+
+    <rect x="640" y="250" width="250" height="100" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="1.2"/>
+    <text x="765" y="275" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">✗ 真正注入发生</text>
+    <text x="765" y="295" text-anchor="middle" fill="#8b949e" font-size="10">DB 执行额外语句</text>
+    <text x="765" y="315" text-anchor="middle" fill="#8b949e" font-size="10">数据被删 / 信息泄露</text>
+    <text x="765" y="335" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">绝对禁止</text>
+
+    <path d="M 765 140 L 765 155" stroke="#f85149" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 765 235 L 765 250" stroke="#f85149" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+<div class="warning"><p>安全红线:永远不要把用户输入拼进 <code>DSL.field(String)</code> / <code>DSL.condition(String)</code> / <code>plainSQL(...)</code>。<code>DSL.inline()</code> 按方言转义为 literal,但生产 SELECT/DML 默认仍应用绑定变量。</p></div>
+<h2 id="18.7-子查询与嵌套渲染">18.7 子查询与嵌套渲染</h2>
+<h3>图 18-7:嵌套树</h3>
+<div class="diagram">
+  <div class="diagram-title">图 18-7 · 子查询嵌套树 — 外层 SELECT 嵌套内层 SELECT</div>
+  <svg viewBox="0 0 920 560" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><polygon points="0,0 9,5 0,10" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20" y="20" width="880" height="240" rx="12" fill="#0d1117" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="48" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">外层查询 (Outer Scope)</text>
+
+    <rect x="320" y="70" width="280" height="50" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="100" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">SelectQueryImpl(外层)</text>
+
+    <rect x="40"  y="160" width="220" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="150" y="185" text-anchor="middle" fill="#c9d1d9" font-size="11">SelectFieldList[ORDERS.ID]</text>
+
+    <rect x="290" y="160" width="220" height="40" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="400" y="185" text-anchor="middle" fill="#c9d1d9" font-size="11">FromClause[ORDERS]</text>
+
+    <rect x="540" y="160" width="220" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="650" y="185" text-anchor="middle" fill="#c9d1d9" font-size="11">ConditionProvider</text>
+
+    <rect x="540" y="210" width="220" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="650" y="235" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">InCondition · CUSTOMER_ID IN</text>
+
+    <path d="M 400 120 L 150 160" stroke="#bc8cff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 120 L 400 160" stroke="#bc8cff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 520 120 L 650 160" stroke="#bc8cff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 650 200 L 650 210" stroke="#d29922" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="20" y="290" width="880" height="240" rx="12" fill="#0d1117" stroke="#8b949e" stroke-width="2" stroke-dasharray="6 4"/>
+    <text x="460" y="318" text-anchor="middle" fill="#8b949e" font-size="13" font-weight="bold">内层子查询 (Subquery Scope · 缩进 +1)</text>
+
+    <rect x="320" y="340" width="280" height="50" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="370" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">SelectQueryImpl(子查询)</text>
+
+    <rect x="40"  y="420" width="220" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="150" y="445" text-anchor="middle" fill="#c9d1d9" font-size="11">SelectFieldList[CUSTOMERS.ID]</text>
+
+    <rect x="290" y="420" width="220" height="40" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="400" y="445" text-anchor="middle" fill="#c9d1d9" font-size="11">FromClause[CUSTOMERS]</text>
+
+    <rect x="540" y="420" width="220" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="650" y="445" text-anchor="middle" fill="#c9d1d9" font-size="11">ConditionProvider</text>
+
+    <rect x="430" y="470" width="180" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="520" y="495" text-anchor="middle" fill="#c9d1d9" font-size="11">CompareCondition · COUNTRY = ?</text>
+
+    <rect x="630" y="470" width="120" height="40" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="690" y="495" text-anchor="middle" fill="#c9d1d9" font-size="11">Val('CN')</text>
+
+    <path d="M 650 250 L 460 340" stroke="#bc8cff" stroke-width="1.5" fill="none" stroke-dasharray="3 2" marker-end="url(#arr)"/>
+    <text x="600" y="295" fill="#bc8cff" font-size="11">嵌入子查询</text>
+
+    <path d="M 400 390 L 150 420" stroke="#bc8cff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 390 L 400 420" stroke="#bc8cff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 520 390 L 650 420" stroke="#bc8cff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 650 460 L 520 470" stroke="#d29922" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 610 490 L 630 490" stroke="#d29922" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+<h3>18.7.1 IN 子查询示例</h3>
+<pre><code class="language-java">var query = dsl.select(ORDERS.ID).from(ORDERS)
+   .where(ORDERS.CUSTOMER_ID.in(
+       select(CUSTOMERS.ID).from(CUSTOMERS).where(CUSTOMERS.COUNTRY.eq(&quot;CN&quot;))));
+
+System.out.println(query.getSQL());
+System.out.println(query.getBindValues());
+</code></pre>
+<pre><code class="language-sql">select &quot;orders&quot;.&quot;id&quot;
+from &quot;orders&quot;
+where &quot;orders&quot;.&quot;customer_id&quot; in (
+  select &quot;customers&quot;.&quot;id&quot;
+  from &quot;customers&quot;
+  where &quot;customers&quot;.&quot;country&quot; = ?
+)
+[CN]
+</code></pre>
+<h3>图 18-7a:嵌套作用域</h3>
+<div class="diagram">
+  <div class="diagram-title">图 18-7a · 嵌套作用域 — 进入子查询 缩进+1,离开缩进-1</div>
+  <svg viewBox="0 0 920 500" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="40"  y="20" width="160" height="40" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="2"/>
+    <text x="120" y="45" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">RenderContext</text>
+    <rect x="260" y="20" width="160" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="340" y="45" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">外层 SELECT</text>
+    <rect x="480" y="20" width="160" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="560" y="45" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">IN 条件</text>
+    <rect x="700" y="20" width="160" height="40" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="2"/>
+    <text x="780" y="45" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">子查询</text>
+
+    <line x1="120" y1="60" x2="120" y2="470" stroke="#3fb950" stroke-width="1.2" stroke-dasharray="4 3"/>
+    <line x1="340" y1="60" x2="340" y2="470" stroke="#bc8cff" stroke-width="1.2" stroke-dasharray="4 3"/>
+    <line x1="560" y1="60" x2="560" y2="470" stroke="#d29922" stroke-width="1.2" stroke-dasharray="4 3"/>
+    <line x1="780" y1="60" x2="780" y2="470" stroke="#58a6ff" stroke-width="1.2" stroke-dasharray="4 3"/>
+
+    <path d="M 120 90 L 340 90" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="230" y="83" text-anchor="middle" fill="#3fb950" font-size="11">visit(outerSelect)</text>
+
+    <path d="M 340 120 L 120 120" stroke="#bc8cff" stroke-width="1.5" fill="none" stroke-dasharray="3 2" marker-end="url(#arr)"/>
+    <text x="230" y="113" text-anchor="middle" fill="#bc8cff" font-size="11">sql("SELECT id ")</text>
+
+    <path d="M 340 150 L 120 150" stroke="#bc8cff" stroke-width="1.5" fill="none" stroke-dasharray="3 2" marker-end="url(#arr)"/>
+    <text x="230" y="143" text-anchor="middle" fill="#bc8cff" font-size="11">sql("FROM orders")</text>
+
+    <path d="M 340 180 L 120 180" stroke="#bc8cff" stroke-width="1.5" fill="none" stroke-dasharray="3 2" marker-end="url(#arr)"/>
+    <text x="230" y="173" text-anchor="middle" fill="#bc8cff" font-size="11">sql("WHERE customer_id IN")</text>
+
+    <path d="M 340 215 L 560 215" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="450" y="208" text-anchor="middle" fill="#bc8cff" font-size="11">visit(inCondition)</text>
+
+    <path d="M 560 245 L 120 245" stroke="#d29922" stroke-width="1.5" fill="none" stroke-dasharray="3 2" marker-end="url(#arr)"/>
+    <text x="340" y="238" text-anchor="middle" fill="#d29922" font-size="11">sql("(")</text>
+
+    <rect x="40"  y="265" width="800" height="35" rx="8" fill="#161b22" stroke="#bc8cff" stroke-width="1" stroke-dasharray="3 2"/>
+    <text x="440" y="287" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">→ 进入子查询作用域 · 缩进 +1</text>
+
+    <path d="M 560 325 L 780 325" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="670" y="318" text-anchor="middle" fill="#d29922" font-size="11">visit(subSelect)</text>
+
+    <path d="M 780 355 L 120 355" stroke="#58a6ff" stroke-width="1.5" fill="none" stroke-dasharray="3 2" marker-end="url(#arr)"/>
+    <text x="440" y="348" text-anchor="middle" fill="#58a6ff" font-size="11">sql("SELECT customers.id FROM customers WHERE ...")</text>
+
+    <rect x="40"  y="375" width="800" height="35" rx="8" fill="#161b22" stroke="#bc8cff" stroke-width="1" stroke-dasharray="3 2"/>
+    <text x="440" y="397" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">← 离开子查询作用域 · 缩进 −1</text>
+
+    <path d="M 560 435 L 120 435" stroke="#d29922" stroke-width="1.5" fill="none" stroke-dasharray="3 2" marker-end="url(#arr)"/>
+    <text x="340" y="428" text-anchor="middle" fill="#d29922" font-size="11">sql(")")</text>
+  </svg>
+</div>
+<h3>表 18-7:三种子查询</h3>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>jOOQ 写法</th>
+<th>渲染 SQL</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>标量子查询</td>
+<td><code>field(select(count()).from(...).where(...))</code></td>
+<td><code>(SELECT COUNT(*) FROM ... WHERE ...)</code></td>
+</tr>
+<tr>
+<td>谓词子查询</td>
+<td><code>where(col.in(select(...).from(...)))</code></td>
+<td><code>WHERE col IN (SELECT ...)</code></td>
+</tr>
+<tr>
+<td>派生表</td>
+<td><code>from(select(...).from(...).asTable("t"))</code></td>
+<td><code>FROM (SELECT ...) AS t</code></td>
+</tr>
+</tbody>
+</table>
+<h3>18.7.2 EXISTS 相关子查询</h3>
+<pre><code class="language-java">var query = dsl.select(ORDERS.ID).from(ORDERS)
+   .where(exists(
+       selectOne().from(ORDER_ITEMS)
+                  .where(ORDER_ITEMS.ORDER_ID.eq(ORDERS.ID))));
+
+System.out.println(query.getSQL());
+</code></pre>
+<pre><code class="language-sql">select &quot;orders&quot;.&quot;id&quot;
+from &quot;orders&quot;
+where exists (
+  select 1
+  from &quot;order_items&quot;
+  where &quot;order_items&quot;.&quot;order_id&quot; = &quot;orders&quot;.&quot;id&quot;
+)
+</code></pre>
+<h2 id="18.8-陷阱与调试">18.8 陷阱与调试</h2>
+<h3>表 18-8:四大陷阱</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">#</th>
+<th>陷阱</th>
+<th>现象</th>
+<th>根因</th>
+<th>修复</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">1</td>
+<td>自定义 QueryPart 漏方言</td>
+<td>PG 通过 / MySQL 失败</td>
+<td><code>accept</code> 只处理一个 family</td>
+<td>覆盖目标方言,默认抛 <code>SQLDialectNotSupportedException</code></td>
+</tr>
+<tr>
+<td style="text-align: right;">2</td>
+<td>RenderContext 状态污染</td>
+<td>后续字段无表名前缀 / 缩进错乱</td>
+<td>改 qualify / castMode 后未恢复</td>
+<td>try-finally 恢复或作用域 data API</td>
+</tr>
+<tr>
+<td style="text-align: right;">3</td>
+<td>线程不安全树共享</td>
+<td>请求条件串到另一请求</td>
+<td>共享可变 <code>SelectQuery</code></td>
+<td>每请求新建 query,只共享 Table / Field 常量</td>
+</tr>
+<tr>
+<td style="text-align: right;">4</td>
+<td>深表达式树栈溢出</td>
+<td>大量 <code>.or()</code> 触发 SOE</td>
+<td>极深二叉树</td>
+<td><code>DSL.or(Collection)</code> / <code>field.in(Collection)</code> 扁平化</td>
+</tr>
+</tbody>
+</table>
+<h3>18.8.1 自定义 QueryPart 示例</h3>
+<pre><code class="language-java">final class JsonText extends AbstractField&lt;String&gt; {
+    private final Field&lt;?&gt; json;
+    private final String key;
+
+    JsonText(Field&lt;?&gt; json, String key) {
+        super(name(&quot;json_text&quot;), SQLDataType.VARCHAR);
+        this.json = json;
+        this.key = key;
+    }
+
+    @Override
+    public void accept(Context&lt;?&gt; ctx) {
+        switch (ctx.family()) {
+            case POSTGRES:
+                ctx.sql('(').visit(json).sql(&quot; -&gt;&gt; &quot;).visit(val(key)).sql(')');
+                break;
+            case MYSQL:
+                ctx.sql(&quot;json_unquote(json_extract(&quot;)
+                   .visit(json)
+                   .sql(&quot;, concat('$.', &quot;).visit(val(key)).sql(&quot;)))&quot;);
+                break;
+            default:
+                throw new SQLDialectNotSupportedException(&quot;JSON text path&quot;);
+        }
+    }
+}
+</code></pre>
+<pre><code class="language-java">Field&lt;String&gt; title = new JsonText(ORDERS.META, &quot;title&quot;);
+var query = dsl.select(title).from(ORDERS).where(ORDERS.ID.eq(42));
+
+System.out.println(query.getSQL());
+System.out.println(query.getSQL(ParamType.INLINED));
+System.out.println(query.getBindValues());
+</code></pre>
+<pre><code class="language-sql">select (&quot;orders&quot;.&quot;meta&quot; -&gt;&gt; ?) from &quot;orders&quot; where &quot;orders&quot;.&quot;id&quot; = ?
+select (&quot;orders&quot;.&quot;meta&quot; -&gt;&gt; 'title') from &quot;orders&quot; where &quot;orders&quot;.&quot;id&quot; = 42
+[title, 42]
+</code></pre>
+<p>不变量(visitor invariant):</p>
+<pre><code class="language-text">RenderContext: visit(JsonText) -&gt; sql + ?
+BindContext  : same Val visited in same order -&gt; setString
+violation = SQL placeholder count != bind values count
+</code></pre>
+<h3>18.8.2 调试工具箱</h3>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>query.getSQL()</code></td>
+<td>渲染后的 SQL(默认 INDEXED)</td>
+</tr>
+<tr>
+<td><code>query.getSQL(ParamType.INLINED)</code></td>
+<td>参数内联,可贴入数据库工具执行</td>
+</tr>
+<tr>
+<td><code>Settings.withRenderFormatted(true)</code></td>
+<td>缩进 / 换行的可读 SQL</td>
+</tr>
+<tr>
+<td><code>ExecuteListener.renderEnd</code></td>
+<td>拦截最终 SQL 注入日志</td>
+</tr>
+<tr>
+<td><code>query.getBindValues()</code></td>
+<td>绑定参数列表</td>
+</tr>
+<tr>
+<td><code>condition.toString()</code></td>
+<td>任意 QueryPart 的快速预览</td>
+</tr>
+</tbody>
+</table>
+<pre><code class="language-java">var query = dsl.select(ORDERS.ID).from(ORDERS).where(ORDERS.ID.eq(42));
+
+System.out.println(query.getSQL());
+System.out.println(query.getSQL(ParamType.INLINED));
+
+DSLContext debug = dsl.configuration()
+    .derive(new Settings().withRenderFormatted(true)).dsl();
+System.out.println(debug.render(query));
+
+System.out.println(query.getBindValues());
+
+Condition cond = ORDERS.ID.eq(42).and(ORDERS.AMOUNT.gt(new BigDecimal(&quot;10.00&quot;)));
+System.out.println(cond);
+</code></pre>
+<div class="key-insight"><p>调试口诀:看 SQL 用 <code>getSQL(INLINED)</code>;看参数用 <code>getBindValues()</code>;看格式用 <code>withRenderFormatted(true)</code>;看运行时用 <code>ExecuteListener</code>。</p></div>
+<h2 id="18.9-生产守卫">18.9 生产守卫</h2>
+<h3>18.9.1 上线检查表</h3>
+<table>
+<thead>
+<tr>
+<th>检查项</th>
+<th>验证</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>默认 ParamType = INDEXED</td>
+<td>Settings 校验</td>
+</tr>
+<tr>
+<td>自定义 QueryPart 全方言覆盖</td>
+<td>单元测试 dialect 矩阵</td>
+</tr>
+<tr>
+<td><code>getBindValues().size()</code> = SQL <code>?</code> 数</td>
+<td>visitor invariant 测试</td>
+</tr>
+<tr>
+<td>大集合用 <code>field.in(Collection)</code> 扁平化</td>
+<td>代码评审</td>
+</tr>
+<tr>
+<td><code>SelectQuery</code> 不跨请求共享</td>
+<td>ThreadLocal 测试</td>
+</tr>
+<tr>
+<td><code>renderInlined</code> 仅用于 DDL / 日志</td>
+<td>代码评审</td>
+</tr>
+<tr>
+<td><code>Plain SQL</code> 入口不接用户输入</td>
+<td>静态检查</td>
+</tr>
+</tbody>
+</table>
+<h3>18.9.2 visitor 不变量</h3>
+<pre><code class="language-java">@Test
+void render_and_bind_have_consistent_count() {
+    Query q = dsl.select(ORDERS.ID).from(ORDERS)
+        .where(ORDERS.ID.like(&quot;%jOOQ%&quot;))
+        .and(ORDERS.AMOUNT.between(
+            new BigDecimal(&quot;30.00&quot;), new BigDecimal(&quot;99.00&quot;)));
+
+    String sql = q.getSQL(ParamType.INDEXED);
+    long placeholders = sql.chars().filter(c -&gt; c == '?').count();
+    int  binds = q.getBindValues().size();
+
+    assertThat(binds).isEqualTo((int) placeholders);
+}
+</code></pre>
+<h2 id="18.10-测试护栏">18.10 测试护栏</h2>
+<h3>18.10.1 方言矩阵</h3>
+<pre><code class="language-java">@ParameterizedTest
+@EnumSource(value = SQLDialect.class,
+    names = {&quot;POSTGRES&quot;, &quot;ORACLE&quot;, &quot;SQLSERVER&quot;, &quot;MYSQL&quot;})
+void limit_offset_renders_per_dialect(SQLDialect dialect) {
+    DSLContext ctx = DSL.using(dialect);
+    String sql = ctx.renderInlined(
+        select(ORDERS.ID).from(ORDERS).orderBy(ORDERS.ID).limit(10).offset(20));
+
+    if (dialect == SQLDialect.POSTGRES || dialect == SQLDialect.MYSQL) {
+        assertThat(sql).contains(&quot;limit 10&quot;).contains(&quot;offset 20&quot;);
+    } else {
+        assertThat(sql).contains(&quot;offset 20 rows&quot;).contains(&quot;fetch next 10 rows only&quot;);
+    }
+}
+</code></pre>
+<h3>18.10.2 SQL 形状快照</h3>
+<pre><code class="language-java">@Test
+void list_orders_renders_expected_postgres_sql() {
+    Query q = dsl.select(ORDERS.ID, ORDERS.AMOUNT).from(ORDERS).where(ORDERS.STATUS.eq(&quot;PAID&quot;));
+
+    assertThat(q.getSQL(ParamType.INDEXED)).isEqualToNormalizingWhitespace(&quot;&quot;&quot;
+        select &quot;orders&quot;.&quot;id&quot;, &quot;orders&quot;.&quot;amount&quot;
+        from &quot;orders&quot;
+        where &quot;orders&quot;.&quot;status&quot; = ?
+        &quot;&quot;&quot;);
+    assertThat(q.getBindValues()).containsExactly(&quot;PAID&quot;);
+}
+</code></pre>
+<h3>18.10.3 自定义节点回归</h3>
+<pre><code class="language-java">@Test
+void json_text_renders_for_postgres_and_mysql() {
+    Field&lt;String&gt; p = new JsonText(ORDERS.META, &quot;title&quot;);
+
+    String pg = DSL.using(SQLDialect.POSTGRES).renderInlined(select(p).from(ORDERS));
+    String my = DSL.using(SQLDialect.MYSQL).renderInlined(select(p).from(ORDERS));
+
+    assertThat(pg).contains(&quot;-&gt;&gt;&quot;);
+    assertThat(my).contains(&quot;json_unquote(json_extract(&quot;);
+}
+</code></pre>
+<div class="chapter-summary">
+<h2>18.11 源码深潜与本章要点</h2>
+
+<h3>表 18-11:源码入口</h3>
+<table>
+<thead>
+<tr>
+<th>入口</th>
+<th>路径</th>
+<th>关注点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>QueryPart</code></td>
+<td><code>org/jooq/QueryPart.java</code></td>
+<td>组合基类型</td>
+</tr>
+<tr>
+<td><code>Context</code></td>
+<td><code>org/jooq/Context.java</code></td>
+<td>visitor 接口</td>
+</tr>
+<tr>
+<td><code>RenderContext</code></td>
+<td><code>org/jooq/RenderContext.java</code></td>
+<td>SQL 文本</td>
+</tr>
+<tr>
+<td><code>BindContext</code></td>
+<td><code>org/jooq/BindContext.java</code></td>
+<td>参数绑定</td>
+</tr>
+<tr>
+<td><code>Param</code> / <code>Val</code></td>
+<td><code>org/jooq/Param.java</code> / <code>impl/Val.java</code></td>
+<td>常量节点</td>
+</tr>
+<tr>
+<td><code>Query</code></td>
+<td><code>org/jooq/Query.java</code></td>
+<td>顶层语句</td>
+</tr>
+<tr>
+<td><code>AbstractQueryPart</code></td>
+<td><code>org/jooq/impl/AbstractQueryPart.java</code></td>
+<td>accept 默认</td>
+</tr>
+<tr>
+<td><code>AbstractField</code></td>
+<td><code>org/jooq/impl/AbstractField.java</code></td>
+<td>表达式基类</td>
+</tr>
+<tr>
+<td><code>SelectQueryImpl</code></td>
+<td><code>org/jooq/impl/SelectQueryImpl.java</code></td>
+<td>SELECT 根</td>
+</tr>
+</tbody>
+</table>
+<h3>设计取舍</h3>
+<p><strong>取舍 1:统一 <code>QueryPart</code> 而非按节点类型分别接口</strong></p>
+<p>所有 SQL 元素实现同一接口。代价是 <code>QueryPart</code> API 看起来较"宽",收益是 visitor 可统一遍历整棵树。</p>
+<p><strong>取舍 2:Render / Bind 双 Context 而非合一</strong></p>
+<p>SQL 文本与参数值分离匹配 JDBC <code>PreparedStatement</code> 协议,天然防注入。代价是自定义节点必须保证两趟遍历顺序一致。</p>
+<p><strong>取舍 3:方言逻辑写在 <code>accept</code> 内分支</strong></p>
+<p>节点根据 <code>ctx.family()</code> 输出不同语法。方言边界集中,但源码阅读复杂。建议为每方言写快照测试。</p>
+<p><strong>取舍 4:<code>ParamType.INLINED</code> 可切换</strong></p>
+<p>INLINED 便于 DDL / 调试,但生产 SELECT/DML 应保留绑定变量。</p>
+<p><strong>取舍 5:Visitor 不内置 SQL 优化</strong></p>
+<p>jOOQ 不试图在渲染期做 SQL 重写或优化,把这部分留给数据库自身的优化器。</p>
+<h3>18.11.1 本章要点</h3>
+<table>
+<thead>
+<tr>
+<th>要点</th>
+<th>验证依据</th>
+<th>易错点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>一切皆 QueryPart</td>
+<td>类型层次</td>
+<td>业务里裸实现 QueryPart</td>
+</tr>
+<tr>
+<td>表达式树 = DSL 链式产物</td>
+<td><code>getClass()</code></td>
+<td>误以为字符串拼接</td>
+</tr>
+<tr>
+<td>双 Context 两趟</td>
+<td>bind count = <code>?</code> count</td>
+<td>两趟顺序不一致</td>
+</tr>
+<tr>
+<td>深度优先前序</td>
+<td>accept 顺序日志</td>
+<td>自定义节点漏 visit</td>
+</tr>
+<tr>
+<td>方言由 ctx.family 分发</td>
+<td><code>renderInlined</code> 多方言</td>
+<td>单方言开发</td>
+</tr>
+<tr>
+<td>INDEXED 防注入</td>
+<td>ParamType 默认</td>
+<td>拼用户输入</td>
+</tr>
+<tr>
+<td>子查询无限嵌套</td>
+<td>递归 visit</td>
+<td>深度过大 SOE</td>
+</tr>
+<tr>
+<td><code>SelectQuery</code> 可变</td>
+<td>测试 thread-safety</td>
+<td>跨请求共享</td>
+</tr>
+<tr>
+<td>调试用 <code>getSQL(INLINED)</code></td>
+<td>复现 SQL</td>
+<td>直接读 ?\n</td>
+</tr>
+<tr>
+<td>方言矩阵测试</td>
+<td><code>@EnumSource</code></td>
+<td>仅测一种方言</td>
+</tr>
+</tbody>
+</table>
+<p>最小回归:</p>
+<pre><code class="language-text">mvn -B test -Dtest=*RenderTest,*VisitorTest
+</code></pre>
+<pre><code class="language-log">[INFO] Tests run: 18, Failures: 0
+</code></pre>
+<hr>
+<p>下一章在本章基础上展开 jOOQ 3.16+ 公开的 Query Object Model(QOM):遍历、转换、重写表达式树的可操作 API。</p>
+</div>
+
+
+<div class="chapter-nav">
+  <a href="ch17-bestpractice.html">&larr; ch17-bestpractice · 第 17 章 · 陷阱、限制与最佳实践</a>
+  <a href="ch19-qom.html">ch19-qom · 第 19 章 · Query Object Model (QOM) &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 jOOQ &middot; 第 18 章 · QueryPart 表达式树与渲染管线</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){setTimeout(function(){document.querySelectorAll('.mermaid svg,.diagram svg').forEach(function(svg){var h=parseInt(svg.getAttribute('height')||svg.getBoundingClientRect().height);if(h>500){svg.style.maxHeight='500px';svg.style.width='auto';var p=svg.closest('.diagram');if(p)p.style.overflowX='auto';}});},1500);});</script>
+</body>
+</html>

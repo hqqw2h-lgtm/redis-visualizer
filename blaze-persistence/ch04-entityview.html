@@ -1,0 +1,1063 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-book="blaze">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 4 章 · Entity View 基础 — 图解 Blaze-Persistence</title>
+<link rel="stylesheet" href="books.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Blaze-Persistence</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <span class="sep">|</span>
+  <a href="ch03-criteria.html">← 第 3 章</a>
+  <a href="ch05-advanced-view.html">第 5 章 →</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s4-1">4.1 什么是 Entity View</a>
+  <a href="#s4-1-pipeline" class="depth-2">数据流管线</a>
+  <a href="#s4-1-compare" class="depth-2">代码量对比</a>
+  <a href="#s4-2">4.2 核心注解体系</a>
+  <a href="#s4-2-class" class="depth-2">注解关系图</a>
+  <a href="#s4-2-table" class="depth-2">注解速查表</a>
+  <a href="#s4-2-code" class="depth-2">完整示例</a>
+  <a href="#s4-3">4.3 接口投影 vs 抽象类投影</a>
+  <a href="#s4-3-decision" class="depth-2">决策流程</a>
+  <a href="#s4-3-examples" class="depth-2">代码对比</a>
+  <a href="#s4-4">4.4 SELECT 优化原理</a>
+  <a href="#s4-4-seq" class="depth-2">生成管线</a>
+  <a href="#s4-4-n1" class="depth-2">N+1 消除</a>
+  <a href="#s4-5">4.5 EntityViewSetting 与查询集成</a>
+  <a href="#s4-5-pipeline" class="depth-2">Setting 管线</a>
+  <a href="#s4-5-code" class="depth-2">集成代码</a>
+  <a href="#s4-6">4.6 陷阱与限制</a>
+  <a href="#s4-6-traps" class="depth-2">常见陷阱</a>
+  <a href="#summary">本章小结</a>
+</aside>
+
+<article class="article">
+
+<h1>第 4 章 · Entity View 基础</h1>
+<p class="subtitle">@EntityView · @IdMapping · @Mapping · 接口投影 · SELECT 优化</p>
+
+<div class="chapter-intro">
+  <p class="lead">
+    Entity View 是 Blaze-Persistence 最具特色的功能——<strong>用一个 Java 接口定义 DTO，框架自动生成只查询所需列的 SELECT</strong>。
+    本章从概念、注解、投影方式、SQL 优化原理到查询集成，完整拆解 Entity View 的基础用法。
+  </p>
+  <ul class="will-learn">
+    <li>Entity View 的设计理念与数据流管线</li>
+    <li>@EntityView / @IdMapping / @Mapping 三大核心注解</li>
+    <li>接口投影与抽象类投影的选择策略</li>
+    <li>SELECT 精准裁剪与 N+1 自动消除原理</li>
+    <li>EntityViewSetting 的过滤、排序与分页集成</li>
+    <li>常见陷阱与性能注意事项</li>
+  </ul>
+  <p class="prereq">前置要求：已阅读 <a href="ch03-criteria.html">第 3 章 · CriteriaBuilder 查询引擎</a>，了解 CriteriaBuilder 基本用法。</p>
+</div>
+
+<!-- ============================================================ -->
+<!-- 4.1 什么是 Entity View -->
+<!-- ============================================================ -->
+<h2 id="s4-1">4.1 什么是 Entity View</h2>
+
+<p>在传统 JPA 开发中，查询结果要么是完整的 Entity 对象（包含所有列），要么需要手写 JPQL 投影并手动构建 DTO。两种方式各有痛点：Entity 全列加载浪费带宽和内存，手动 DTO 映射则代码冗余且容易出错。</p>
+
+<p><strong>Entity View 的核心思想</strong>：用 Java 接口（或抽象类）声明你需要的字段，Blaze-Persistence 自动生成 <em>只包含这些字段</em> 的 SELECT 语句，并将结果映射为类型安全的 DTO 实例。</p>
+
+<div class="diagram" id="s4-1-pipeline">
+<div class="diagram-title">Entity View 数据流管线</div>
+<div class="mermaid">
+flowchart LR
+    A["🗄️ JPA Entity<br/>User.class"] --> B["📐 Entity View 定义<br/>UserView.interface"]
+    B --> C["⚙️ EntityViewManager<br/>解析注解"]
+    C --> D["📝 优化 SELECT<br/>SELECT u.id, u.name"]
+    D --> E["🚀 执行查询<br/>JDBC → ResultSet"]
+    E --> F["📦 结果 DTO<br/>UserView 实例"]
+
+    style A fill:#1e3a5f,stroke:#2563eb
+    style B fill:#2d1f4e,stroke:#7c3aed
+    style C fill:#2d1f4e,stroke:#7c3aed
+    style D fill:#1a3a2a,stroke:#22c55e
+    style E fill:#3a2a1a,stroke:#d97706
+    style F fill:#1a3a2a,stroke:#22c55e
+</div>
+</div>
+
+<div class="key-insight">
+  <strong>💡 核心价值：</strong>Entity View 同时解决了三个问题——①消除手写 DTO 映射代码，②自动裁剪 SELECT 只查必要列，③通过 JOIN FETCH 策略消除 N+1 查询。只用一个接口声明，三重优化自动完成。
+</div>
+
+<h3 id="s4-1-compare">传统方式 vs Entity View 代码量对比</h3>
+
+<div class="diagram">
+<div class="diagram-title">开发流程对比</div>
+<div style="display:flex;flex-wrap:wrap;gap:20px;justify-content:center;padding:16px 0;">
+  <div style="flex:1;min-width:240px;max-width:360px;border:1px solid #f85149;border-radius:10px;padding:18px;background:rgba(248,81,73,.06);">
+    <div style="font-weight:bold;color:#f85149;margin-bottom:10px;">❌ 传统 JPQL + 手动映射</div>
+    <div style="display:flex;flex-direction:column;gap:4px;">
+      <div style="background:rgba(248,81,73,.08);border-radius:6px;padding:5px 10px;color:#e6edf3;font-size:13px;">1. 编写 JPQL — SELECT new DTO(...)</div>
+      <div style="color:#8b949e;text-align:center;font-size:12px;">↓</div>
+      <div style="background:rgba(248,81,73,.08);border-radius:6px;padding:5px 10px;color:#e6edf3;font-size:13px;">2. 定义 DTO 类 — 字段 + 构造函数</div>
+      <div style="color:#8b949e;text-align:center;font-size:12px;">↓</div>
+      <div style="background:rgba(248,81,73,.08);border-radius:6px;padding:5px 10px;color:#e6edf3;font-size:13px;">3. 手动处理嵌套关联</div>
+      <div style="color:#8b949e;text-align:center;font-size:12px;">↓</div>
+      <div style="background:rgba(248,81,73,.08);border-radius:6px;padding:5px 10px;color:#e6edf3;font-size:13px;">4. 手动优化 N+1 问题</div>
+      <div style="color:#8b949e;text-align:center;font-size:12px;">↓</div>
+      <div style="background:rgba(248,81,73,.08);border-radius:6px;padding:5px 10px;color:#e6edf3;font-size:13px;">5. 维护 JPQL 与 DTO 同步</div>
+    </div>
+  </div>
+  <div style="flex:1;min-width:240px;max-width:360px;border:1px solid #3fb950;border-radius:10px;padding:18px;background:rgba(63,185,80,.06);">
+    <div style="font-weight:bold;color:#3fb950;margin-bottom:10px;">✅ Entity View</div>
+    <div style="display:flex;flex-direction:column;gap:4px;">
+      <div style="background:rgba(63,185,80,.08);border-radius:6px;padding:5px 10px;color:#e6edf3;font-size:13px;">1. 定义接口 — @EntityView</div>
+      <div style="color:#8b949e;text-align:center;font-size:12px;">↓</div>
+      <div style="background:rgba(63,185,80,.08);border-radius:6px;padding:5px 10px;color:#e6edf3;font-size:13px;">2. 声明 getter — @Mapping</div>
+      <div style="color:#8b949e;text-align:center;font-size:12px;">↓</div>
+      <div style="background:rgba(63,185,80,.1);border:1px solid #3fb950;border-radius:6px;padding:8px 10px;color:#3fb950;font-size:13px;font-weight:bold;">✓ 自动完成：SELECT / JOIN / DTO</div>
+    </div>
+  </div>
+</div>
+</div>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+<pre><code>// 1. 手写 JPQL
+String jpql = "SELECT new com.example.UserDTO("
+    + "u.id, u.name, u.email, d.name) "
+    + "FROM User u "
+    + "JOIN u.department d";
+
+// 2. 定义 DTO 类
+public class UserDTO {
+    private Long id;
+    private String name;
+    private String email;
+    private String deptName;
+    // 构造函数、getter、setter...
+    // 约 30+ 行样板代码
+}</code></pre>
+  </div>
+  <div class="compare-good">
+<pre><code>// 只需一个接口，全部搞定
+@EntityView(User.class)
+public interface UserView {
+
+    @IdMapping
+    Long getId();
+
+    String getName();
+
+    String getEmail();
+
+    @Mapping("department.name")
+    String getDeptName();
+}
+// 0 行样板代码，自动优化 SELECT</code></pre>
+  </div>
+</div>
+
+<div class="metric-row">
+  <div class="metric"><div class="value">~60%</div><div class="label">代码量减少</div></div>
+  <div class="metric"><div class="value">0</div><div class="label">手动映射</div></div>
+  <div class="metric"><div class="value">自动</div><div class="label">SELECT 裁剪</div></div>
+  <div class="metric"><div class="value">自动</div><div class="label">N+1 消除</div></div>
+</div>
+
+<!-- ============================================================ -->
+<!-- 4.2 核心注解体系 -->
+<!-- ============================================================ -->
+<h2 id="s4-2">4.2 核心注解体系</h2>
+
+<p>Entity View 通过三个核心注解构建映射关系：<code>@EntityView</code> 绑定目标实体，<code>@IdMapping</code> 标识主键，<code>@Mapping</code> 映射任意表达式。</p>
+
+<div class="diagram" id="s4-2-class">
+<div class="diagram-title">Entity View 注解关系类图</div>
+<div class="mermaid">
+classDiagram
+    class EntityView {
+        &lt;&lt;annotation&gt;&gt;
+        +Class value()
+    }
+
+    class IdMapping {
+        &lt;&lt;annotation&gt;&gt;
+        +String value()
+    }
+
+    class Mapping {
+        &lt;&lt;annotation&gt;&gt;
+        +String value()
+        +String fetch()
+    }
+
+    class MappingParameter {
+        &lt;&lt;annotation&gt;&gt;
+        +String value()
+    }
+
+    class MappingSubquery {
+        &lt;&lt;annotation&gt;&gt;
+        +Class value()
+    }
+
+    class ViewFilter {
+        &lt;&lt;annotation&gt;&gt;
+        +String name()
+    }
+
+    class ViewConstructor {
+        &lt;&lt;annotation&gt;&gt;
+        +String value()
+    }
+
+    EntityView <|-- IdMapping : 必须包含
+    EntityView <|-- Mapping : 字段映射
+    EntityView <|-- MappingParameter : 参数绑定
+    EntityView <|-- MappingSubquery : 子查询映射
+    EntityView <|-- ViewFilter : 过滤器声明
+    EntityView <|-- ViewConstructor : 构造函数选择
+
+    note for EntityView "标注在接口/抽象类上\n绑定目标 JPA 实体"
+    note for IdMapping "标注在 getId() 方法上\n标识视图的唯一标识"
+    note for Mapping "标注在 getter 方法上\n值为 JPQL 路径表达式"
+</div>
+</div>
+
+<h3 id="s4-2-table">注解速查表</h3>
+
+<table>
+<thead>
+  <tr><th>注解</th><th>目标</th><th>作用</th><th>示例</th></tr>
+</thead>
+<tbody>
+  <tr>
+    <td><code>@EntityView</code></td>
+    <td>接口 / 抽象类</td>
+    <td>将视图绑定到 JPA 实体</td>
+    <td><code>@EntityView(User.class)</code></td>
+  </tr>
+  <tr>
+    <td><code>@IdMapping</code></td>
+    <td>getter 方法</td>
+    <td>映射实体的 @Id 字段</td>
+    <td><code>@IdMapping Long getId();</code></td>
+  </tr>
+  <tr>
+    <td><code>@Mapping</code></td>
+    <td>getter 方法</td>
+    <td>映射 JPQL 路径或表达式</td>
+    <td><code>@Mapping("department.name")</code></td>
+  </tr>
+  <tr>
+    <td><code>@MappingParameter</code></td>
+    <td>getter 方法</td>
+    <td>绑定查询运行时参数</td>
+    <td><code>@MappingParameter("locale")</code></td>
+  </tr>
+  <tr>
+    <td><code>@MappingSubquery</code></td>
+    <td>getter 方法</td>
+    <td>映射子查询结果</td>
+    <td><code>@MappingSubquery(OrderCountProvider.class)</code></td>
+  </tr>
+  <tr>
+    <td><code>@ViewFilter</code></td>
+    <td>接口 / 抽象类</td>
+    <td>声明命名过滤器</td>
+    <td><code>@ViewFilter(name="active")</code></td>
+  </tr>
+  <tr>
+    <td><code>@ViewConstructor</code></td>
+    <td>构造函数</td>
+    <td>选择抽象类的构造函数</td>
+    <td><code>@ViewConstructor("init")</code></td>
+  </tr>
+</tbody>
+</table>
+
+<div class="diagram">
+<div class="diagram-title">注解在视图定义中的位置</div>
+<div class="mermaid">
+flowchart TD
+    A["@EntityView(User.class)<br/>接口声明"] --> B["@IdMapping<br/>Long getId()"]
+    A --> C["隐式映射<br/>String getName()"]
+    A --> D["@Mapping('email')<br/>String getEmail()"]
+    A --> E["@Mapping('department.name')<br/>String getDeptName()"]
+    A --> F["@Mapping('SIZE(orders)')<br/>Long getOrderCount()"]
+
+    B --> G["生成 SELECT"]
+    C --> G
+    D --> G
+    E --> G
+    F --> G
+
+    G --> H["SELECT u.id, u.name,<br/>u.email, d.name,<br/>SIZE(u.orders)<br/>FROM User u<br/>JOIN u.department d"]
+
+    style A fill:#2d1f4e,stroke:#7c3aed
+    style B fill:#1e3a5f,stroke:#2563eb
+    style C fill:#1a3a2a,stroke:#22c55e
+    style D fill:#1a3a2a,stroke:#22c55e
+    style E fill:#1a3a2a,stroke:#22c55e
+    style F fill:#1a3a2a,stroke:#22c55e
+    style G fill:#3a2a1a,stroke:#d97706
+    style H fill:#1a2a3a,stroke:#06b6d4
+</div>
+</div>
+
+<h3 id="s4-2-code">完整 Entity View 示例</h3>
+
+<p>下面展示一个包含所有核心注解的完整示例，从 JPA Entity 到 Entity View 的映射：</p>
+
+<pre><code>// ── JPA Entity ──────────────────────────────
+@Entity
+@Table(name = "t_user")
+public class User {
+    @Id @GeneratedValue
+    private Long id;
+    private String name;
+    private String email;
+    private LocalDateTime createdAt;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    private Department department;
+
+    @OneToMany(mappedBy = "user")
+    private Set&lt;Order&gt; orders;
+}
+
+// ── Entity View ─────────────────────────────
+@EntityView(User.class)
+public interface UserView {
+
+    @IdMapping
+    Long getId();
+
+    // 隐式映射：方法名匹配实体属性名
+    String getName();
+
+    // 显式映射：可重命名
+    @Mapping("email")
+    String getEmailAddress();
+
+    // 关联路径：自动 JOIN department
+    @Mapping("department.name")
+    String getDeptName();
+
+    // 表达式映射：聚合计算
+    @Mapping("SIZE(orders)")
+    Long getOrderCount();
+
+    // 格式化表达式
+    @Mapping("CONCAT(name, ' &lt;', email, '&gt;')")
+    String getDisplayName();
+}</code></pre>
+
+<div class="key-insight">
+  <strong>💡 隐式映射规则：</strong>当 getter 方法名去掉 <code>get</code> 前缀并首字母小写后，与实体属性名一致时，可以省略 <code>@Mapping</code> 注解。例如 <code>getName()</code> 自动映射到 <code>name</code> 属性。
+</div>
+
+<!-- ============================================================ -->
+<!-- 4.3 接口投影 vs 抽象类投影 -->
+<!-- ============================================================ -->
+<h2 id="s4-3">4.3 接口投影 vs 抽象类投影</h2>
+
+<p>Entity View 支持两种定义方式：<strong>接口</strong>（Interface）和<strong>抽象类</strong>（Abstract Class）。选择哪种取决于你是否需要在视图中添加自定义逻辑。</p>
+
+<div class="diagram" id="s4-3-decision">
+<div class="diagram-title">接口 vs 抽象类决策流程</div>
+<div class="mermaid">
+flowchart TD
+    Q1{"需要自定义<br/>计算逻辑？"}
+    Q1 -->|"否"| Q2{"需要可变<br/>状态/字段？"}
+    Q1 -->|"是"| Q3{"逻辑能用<br/>JPQL 表达？"}
+
+    Q2 -->|"否"| R1["✅ 接口投影<br/>最简洁"]
+    Q2 -->|"是"| R2["✅ 抽象类投影<br/>可添加字段"]
+
+    Q3 -->|"是"| R3["✅ 接口 + @Mapping<br/>数据库端计算"]
+    Q3 -->|"否"| R4["✅ 抽象类投影<br/>Java 端计算"]
+
+    R1 --> NOTE1["不可变 · 无状态<br/>推荐默认选择"]
+    R2 --> NOTE2["可添加 transient 字段<br/>自定义构造函数"]
+    R3 --> NOTE1
+    R4 --> NOTE2
+
+    style Q1 fill:#2d1f4e,stroke:#7c3aed
+    style Q2 fill:#1e3a5f,stroke:#2563eb
+    style Q3 fill:#1e3a5f,stroke:#2563eb
+    style R1 fill:#1a3a2a,stroke:#3fb950
+    style R2 fill:#1a3a2a,stroke:#3fb950
+    style R3 fill:#1a3a2a,stroke:#3fb950
+    style R4 fill:#1a3a2a,stroke:#3fb950
+    style NOTE1 fill:#0a1a0a,stroke:#22c55e
+    style NOTE2 fill:#0a1a0a,stroke:#22c55e
+</div>
+</div>
+
+<table>
+<thead>
+  <tr><th>特性</th><th>接口投影</th><th>抽象类投影</th></tr>
+</thead>
+<tbody>
+  <tr><td>定义方式</td><td>只有 getter 方法签名</td><td>可包含方法实现和字段</td></tr>
+  <tr><td>不可变性</td><td>天然不可变</td><td>可添加 setter（不推荐）</td></tr>
+  <tr><td>自定义逻辑</td><td>不支持（仅 default 方法）</td><td>完全支持</td></tr>
+  <tr><td>构造函数</td><td>不适用</td><td>可定义多个构造函数</td></tr>
+  <tr><td>transient 字段</td><td>不支持</td><td>支持</td></tr>
+  <tr><td>代码量</td><td>最少</td><td>稍多</td></tr>
+  <tr><td>推荐场景</td><td>纯数据传输（DTO）</td><td>需要 Java 端计算或状态</td></tr>
+</tbody>
+</table>
+
+<h3 id="s4-3-examples">两种方式代码对比</h3>
+
+<div class="compare-grid">
+  <div class="compare-good">
+    <strong style="color:var(--accent);">接口投影（推荐默认选择）</strong>
+<pre><code>@EntityView(User.class)
+public interface UserView {
+
+    @IdMapping
+    Long getId();
+
+    String getName();
+
+    @Mapping("email")
+    String getEmailAddress();
+
+    @Mapping("department.name")
+    String getDeptName();
+
+    // Java 8+ default 方法
+    default String getDisplayLabel() {
+        return getName() + " (" + getDeptName() + ")";
+    }
+}</code></pre>
+  </div>
+  <div class="compare-good">
+    <strong style="color:var(--cyan);">抽象类投影（需要自定义逻辑时）</strong>
+<pre><code>@EntityView(User.class)
+public abstract class UserView {
+
+    @IdMapping
+    public abstract Long getId();
+
+    public abstract String getName();
+
+    @Mapping("email")
+    public abstract String getEmailAddress();
+
+    @Mapping("department.name")
+    public abstract String getDeptName();
+
+    // 自定义 Java 逻辑
+    public String getDisplayLabel() {
+        String dept = getDeptName();
+        return dept != null
+            ? getName() + " (" + dept + ")"
+            : getName();
+    }
+}</code></pre>
+  </div>
+</div>
+
+<div class="diagram">
+<div class="diagram-title">运行时代理生成过程</div>
+<div class="mermaid">
+flowchart LR
+    A["接口定义<br/>UserView"] --> B["EntityViewManager<br/>扫描注解"]
+    B --> C["生成代理类<br/>UserView_$$_impl"]
+    C --> D["代理实现所有<br/>getter 方法"]
+    D --> E["查询结果直接<br/>注入代理字段"]
+
+    A2["抽象类定义<br/>UserView"] --> B2["EntityViewManager<br/>扫描注解"]
+    B2 --> C2["生成子类<br/>UserView_$$_impl"]
+    C2 --> D2["子类实现抽象方法<br/>保留自定义方法"]
+    D2 --> E2["查询结果注入<br/>+ 自定义逻辑可用"]
+
+    style A fill:#2d1f4e,stroke:#7c3aed
+    style A2 fill:#1a2a3a,stroke:#06b6d4
+    style C fill:#2d1f4e,stroke:#7c3aed
+    style C2 fill:#1a2a3a,stroke:#06b6d4
+    style E fill:#1a3a2a,stroke:#22c55e
+    style E2 fill:#1a3a2a,stroke:#22c55e
+</div>
+</div>
+
+<div class="os-note">
+  <strong>📝 实践建议：</strong>优先使用接口投影。只有在确实需要以下功能时才使用抽象类：①复杂的 Java 端计算逻辑（超出 default 方法的能力），②需要 transient 状态字段，③需要通过构造函数注入非映射依赖。
+</div>
+
+<!-- ============================================================ -->
+<!-- 4.4 SELECT 优化原理 -->
+<!-- ============================================================ -->
+<h2 id="s4-4">4.4 SELECT 优化原理</h2>
+
+<p>Entity View 最强大的特性之一是<strong>自动 SELECT 裁剪</strong>：框架分析视图定义中声明的 getter 方法，只生成包含这些字段的 SELECT 子句，而不是像加载 Entity 那样 <code>SELECT *</code>。</p>
+
+<div class="diagram" id="s4-4-seq">
+<div class="diagram-title">Entity View 查询生成管线（序列图）</div>
+<div class="mermaid">
+sequenceDiagram
+    participant App as 应用代码
+    participant EVS as EntityViewSetting
+    participant CB as CriteriaBuilder
+    participant EVM as EntityViewManager
+    participant JPQL as JPQL Generator
+    participant DB as 数据库
+
+    App->>EVS: create(UserView.class)
+    App->>CB: cbf.create(em, User.class)
+    App->>EVM: applySetting(setting, cb)
+
+    EVM->>EVM: 解析 UserView 注解
+    EVM->>EVM: 收集所有 getter 映射
+    EVM->>CB: 注入 SELECT 表达式
+    EVM->>CB: 注入必要 JOIN
+    EVM->>JPQL: 生成优化 JPQL
+
+    JPQL-->>DB: SELECT u.id, u.name,<br/>u.email, d.name<br/>FROM User u<br/>JOIN u.department d
+
+    DB-->>EVM: ResultSet
+    EVM->>EVM: 实例化 UserView 代理
+    EVM-->>App: List&lt;UserView&gt;
+</div>
+</div>
+
+<h3>JPA Entity 加载 vs Entity View 对比</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <strong>JPA Entity 查询</strong>
+<pre><code>-- em.find(User.class, 1L) 生成：
+SELECT u.id, u.name, u.email,
+       u.created_at, u.updated_at,
+       u.avatar_url, u.bio,
+       u.phone, u.address,
+       u.department_id, u.role_id,
+       u.last_login, u.status,
+       u.preferences
+FROM t_user u
+WHERE u.id = 1
+
+-- 加载了 14 列，但页面只需要 3 列！</code></pre>
+  </div>
+  <div class="compare-good">
+    <strong>Entity View 查询</strong>
+<pre><code>-- UserView 只声明了 id, name, deptName
+-- 自动生成精准 SELECT：
+SELECT u.id, u.name, d.name
+FROM t_user u
+JOIN t_department d
+  ON u.department_id = d.id
+
+-- 只查 3 列 + 自动 JOIN！
+-- 网络传输量减少 ~80%</code></pre>
+  </div>
+</div>
+
+<div class="diagram">
+<div class="diagram-title">SELECT 裁剪效果可视化</div>
+<div style="display:flex;flex-wrap:wrap;gap:20px;justify-content:center;padding:16px 0;">
+  <div style="flex:1;min-width:260px;max-width:420px;border:1px solid #f85149;border-radius:10px;padding:18px;background:rgba(248,81,73,.06);">
+    <div style="font-weight:bold;color:#f85149;margin-bottom:10px;">⚠️ JPA Entity 加载（SELECT *）→ 14 列</div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;">
+      <span style="background:rgba(63,185,80,.15);border:1px solid #3fb950;border-radius:4px;padding:3px 8px;font-size:12px;color:#3fb950;">id ✓</span>
+      <span style="background:rgba(63,185,80,.15);border:1px solid #3fb950;border-radius:4px;padding:3px 8px;font-size:12px;color:#3fb950;">name ✓</span>
+      <span style="background:rgba(139,148,158,.1);border:1px solid #30363d;border-radius:4px;padding:3px 8px;font-size:12px;color:#8b949e;">email</span>
+      <span style="background:rgba(139,148,158,.1);border:1px solid #30363d;border-radius:4px;padding:3px 8px;font-size:12px;color:#8b949e;">createdAt</span>
+      <span style="background:rgba(139,148,158,.1);border:1px solid #30363d;border-radius:4px;padding:3px 8px;font-size:12px;color:#8b949e;">updatedAt</span>
+      <span style="background:rgba(139,148,158,.1);border:1px solid #30363d;border-radius:4px;padding:3px 8px;font-size:12px;color:#8b949e;">avatarUrl</span>
+      <span style="background:rgba(139,148,158,.1);border:1px solid #30363d;border-radius:4px;padding:3px 8px;font-size:12px;color:#8b949e;">bio</span>
+      <span style="background:rgba(139,148,158,.1);border:1px solid #30363d;border-radius:4px;padding:3px 8px;font-size:12px;color:#8b949e;">phone</span>
+      <span style="background:rgba(139,148,158,.1);border:1px solid #30363d;border-radius:4px;padding:3px 8px;font-size:12px;color:#8b949e;">address</span>
+      <span style="background:rgba(139,148,158,.1);border:1px solid #30363d;border-radius:4px;padding:3px 8px;font-size:12px;color:#8b949e;">departmentId</span>
+      <span style="background:rgba(139,148,158,.1);border:1px solid #30363d;border-radius:4px;padding:3px 8px;font-size:12px;color:#8b949e;">roleId</span>
+      <span style="background:rgba(139,148,158,.1);border:1px solid #30363d;border-radius:4px;padding:3px 8px;font-size:12px;color:#8b949e;">status</span>
+    </div>
+    <div style="color:#f85149;font-size:13px;margin-top:10px;text-align:center;">网络、内存开销大 — 浪费资源</div>
+  </div>
+  <div style="flex:1;min-width:260px;max-width:420px;border:1px solid #3fb950;border-radius:10px;padding:18px;background:rgba(63,185,80,.06);">
+    <div style="font-weight:bold;color:#3fb950;margin-bottom:10px;">✅ Entity View 加载（精准裁剪）→ 3 列</div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;">
+      <span style="background:rgba(63,185,80,.15);border:1px solid #3fb950;border-radius:4px;padding:3px 8px;font-size:12px;color:#3fb950;">id ✓</span>
+      <span style="background:rgba(63,185,80,.15);border:1px solid #3fb950;border-radius:4px;padding:3px 8px;font-size:12px;color:#3fb950;">name ✓</span>
+      <span style="background:rgba(63,185,80,.15);border:1px solid #3fb950;border-radius:4px;padding:3px 8px;font-size:12px;color:#3fb950;">deptName ✓</span>
+    </div>
+    <div style="color:#3fb950;font-size:13px;margin-top:10px;text-align:center;">精准高效 — 最优性能</div>
+  </div>
+</div>
+</div>
+
+<h3 id="s4-4-n1">N+1 查询自动消除</h3>
+
+<p>当 Entity View 包含关联路径（如 <code>department.name</code>）时，框架自动将其转换为 JOIN 查询，而非触发延迟加载。</p>
+
+<div class="diagram">
+<div class="diagram-title">N+1 问题 vs Entity View 解决方案</div>
+<div class="mermaid">
+sequenceDiagram
+    participant App as 应用代码
+    participant JPA as JPA (原生)
+    participant DB as 数据库
+
+    Note over App,DB: ❌ 原生 JPA → N+1 问题
+    App->>JPA: findAll Users (10条)
+    JPA->>DB: SELECT * FROM t_user
+    DB-->>JPA: 10 行结果
+
+    loop 每个 User 访问 department
+        App->>JPA: user.getDepartment().getName()
+        JPA->>DB: SELECT * FROM t_department WHERE id=?
+        DB-->>JPA: 1 行
+    end
+    Note over DB: 共 1 + 10 = 11 条 SQL ❌
+
+    Note over App,DB: ✅ Entity View → 1 条 SQL
+    App->>JPA: applySetting(UserView.class)
+    JPA->>DB: SELECT u.id, u.name, d.name<br/>FROM t_user u JOIN t_department d<br/>ON u.department_id = d.id
+    DB-->>JPA: 10 行（包含 dept 信息）
+    Note over DB: 仅 1 条 SQL ✅
+</div>
+</div>
+
+<div class="key-insight">
+  <strong>💡 优化原理：</strong>Entity View 在 JPQL 生成阶段就确定了所有需要的关联路径，并将其转换为 <code>JOIN</code>。这意味着无论结果集有多少行，关联数据获取永远是 <strong>O(1)</strong> 次查询——从根本上杜绝了 N+1 问题。
+</div>
+
+<!-- ============================================================ -->
+<!-- 4.5 EntityViewSetting 与查询集成 -->
+<!-- ============================================================ -->
+<h2 id="s4-5">4.5 EntityViewSetting 与查询集成</h2>
+
+<p><code>EntityViewSetting</code> 是 Entity View 与 CriteriaBuilder 之间的桥梁。它封装了视图类型、过滤条件、排序规则和分页参数，一次性应用到查询中。</p>
+
+<div class="diagram" id="s4-5-pipeline">
+<div class="diagram-title">EntityViewSetting 查询集成管线</div>
+<div class="mermaid">
+flowchart TD
+    A["EntityViewSetting.create<br/>(UserView.class)"] --> B{"添加配置"}
+
+    B --> C["addAttributeFilter<br/>过滤条件"]
+    B --> D["addAttributeSorter<br/>排序规则"]
+    B --> E["withKeysetPage<br/>分页参数"]
+
+    C --> F["EntityViewManager<br/>.applySetting()"]
+    D --> F
+    E --> F
+
+    F --> G["CriteriaBuilder<br/>注入 SELECT / JOIN"]
+    G --> H["注入 WHERE 子句"]
+    G --> I["注入 ORDER BY"]
+    G --> J["注入分页限制"]
+
+    H --> K["生成最终 JPQL"]
+    I --> K
+    J --> K
+
+    K --> L["执行查询<br/>返回 List&lt;UserView&gt;"]
+
+    style A fill:#2d1f4e,stroke:#7c3aed
+    style B fill:#1e3a5f,stroke:#2563eb
+    style C fill:#3a2a1a,stroke:#d97706
+    style D fill:#3a2a1a,stroke:#d97706
+    style E fill:#3a2a1a,stroke:#d97706
+    style F fill:#2d1f4e,stroke:#7c3aed
+    style G fill:#1a3a2a,stroke:#22c55e
+    style K fill:#1a2a3a,stroke:#06b6d4
+    style L fill:#1a3a2a,stroke:#3fb950
+</div>
+</div>
+
+<h3 id="s4-5-code">完整查询集成代码</h3>
+
+<pre><code>// ── 步骤 1：定义 Entity View（带过滤器和排序器）──
+@EntityView(User.class)
+@ViewFilter(name = "activeFilter",
+    value = "status = 'ACTIVE'")
+public interface UserListView {
+
+    @IdMapping
+    Long getId();
+
+    @Mapping("name")
+    @AttributeFilter(ContainsFilter.class)
+    String getName();
+
+    @Mapping("email")
+    String getEmail();
+
+    @Mapping("department.name")
+    @AttributeSorter
+    String getDeptName();
+
+    @Mapping("createdAt")
+    LocalDateTime getCreatedAt();
+}
+
+// ── 步骤 2：构建查询 ──────────────────────────
+CriteriaBuilder&lt;User&gt; cb = cbf.create(em, User.class);
+
+// ── 步骤 3：创建 EntityViewSetting ────────────
+EntityViewSetting&lt;UserListView, CriteriaBuilder&lt;UserListView&gt;&gt; setting =
+    EntityViewSetting.create(UserListView.class);
+
+// 添加过滤：名字包含 "张"
+setting.addAttributeFilter("name", "张");
+
+// 添加排序：按部门名称升序
+setting.addAttributeSorter("deptName", Sorters.ascending());
+
+// 启用命名过滤器
+setting.withViewFilter("activeFilter");
+
+// ── 步骤 4：应用并执行 ────────────────────────
+CriteriaBuilder&lt;UserListView&gt; resultCb =
+    evm.applySetting(setting, cb);
+
+List&lt;UserListView&gt; users = resultCb.getResultList();</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">上述代码生成的 JPQL</div>
+<div class="mermaid">
+flowchart LR
+    A["输入配置"] --> B["SELECT<br/>u.id, u.name, u.email,<br/>d.name, u.createdAt"]
+    B --> C["FROM User u<br/>JOIN u.department d"]
+    C --> D["WHERE u.status = 'ACTIVE'<br/>AND u.name LIKE '%张%'"]
+    D --> E["ORDER BY d.name ASC"]
+
+    style A fill:#2d1f4e,stroke:#7c3aed
+    style B fill:#1a3a2a,stroke:#22c55e
+    style C fill:#1a3a2a,stroke:#22c55e
+    style D fill:#3a2a1a,stroke:#d97706
+    style E fill:#1e3a5f,stroke:#2563eb
+</div>
+</div>
+
+<h3>EntityViewSetting 常用 API</h3>
+
+<table>
+<thead>
+  <tr><th>方法</th><th>作用</th><th>示例</th></tr>
+</thead>
+<tbody>
+  <tr>
+    <td><code>create(Class)</code></td>
+    <td>创建视图设置</td>
+    <td><code>EntityViewSetting.create(UserView.class)</code></td>
+  </tr>
+  <tr>
+    <td><code>addAttributeFilter</code></td>
+    <td>按属性过滤</td>
+    <td><code>setting.addAttributeFilter("name", "张")</code></td>
+  </tr>
+  <tr>
+    <td><code>addAttributeSorter</code></td>
+    <td>按属性排序</td>
+    <td><code>setting.addAttributeSorter("name", Sorters.ascending())</code></td>
+  </tr>
+  <tr>
+    <td><code>withViewFilter</code></td>
+    <td>启用命名过滤器</td>
+    <td><code>setting.withViewFilter("active")</code></td>
+  </tr>
+  <tr>
+    <td><code>withOptionalParameter</code></td>
+    <td>传递可选参数</td>
+    <td><code>setting.withOptionalParameter("locale", "zh")</code></td>
+  </tr>
+  <tr>
+    <td><code>withKeysetPage</code></td>
+    <td>Keyset 分页</td>
+    <td><code>setting.withKeysetPage(keysetPage)</code></td>
+  </tr>
+</tbody>
+</table>
+
+<div class="diagram">
+<div class="diagram-title">EntityViewSetting 与 Spring Controller 集成示意</div>
+<div class="mermaid">
+flowchart LR
+    A["HTTP 请求<br/>GET /users?name=张&sort=dept"] --> B["Spring Controller<br/>解析参数"]
+    B --> C["EntityViewSetting<br/>addFilter + addSorter"]
+    C --> D["CriteriaBuilder<br/>构建基础查询"]
+    D --> E["EntityViewManager<br/>applySetting"]
+    E --> F["执行查询<br/>返回 DTO"]
+    F --> G["JSON 序列化<br/>返回 HTTP 响应"]
+
+    style A fill:#1e3a5f,stroke:#2563eb
+    style C fill:#2d1f4e,stroke:#7c3aed
+    style E fill:#2d1f4e,stroke:#7c3aed
+    style G fill:#1a3a2a,stroke:#3fb950
+</div>
+</div>
+
+<!-- ============================================================ -->
+<!-- 4.6 陷阱与限制 -->
+<!-- ============================================================ -->
+<h2 id="s4-6">4.6 陷阱与限制</h2>
+
+<p>Entity View 虽然强大，但在实际使用中有一些需要注意的陷阱和限制。提前了解这些问题可以避免踩坑。</p>
+
+<div class="diagram" id="s4-6-traps">
+<div class="diagram-title">Entity View 常见陷阱一览</div>
+<div class="mermaid">
+flowchart TD
+    TRAP["⚠️ Entity View 陷阱"]
+
+    TRAP --> T1["🐢 首次代理生成开销"]
+    TRAP --> T2["💥 映射表达式运行时错误"]
+    TRAP --> T3["🔄 循环视图引用"]
+    TRAP --> T4["📚 深层视图嵌套"]
+    TRAP --> T5["📡 序列化问题"]
+    TRAP --> T6["🔒 类型擦除陷阱"]
+
+    T1 --> S1["解决：预热或启动时初始化"]
+    T2 --> S2["解决：集成测试覆盖所有视图"]
+    T3 --> S3["解决：避免 A→B→A 引用"]
+    T4 --> S4["解决：限制嵌套不超过 3 层"]
+    T5 --> S5["解决：Jackson 模块注册"]
+    T6 --> S6["解决：显式指定泛型参数"]
+
+    style TRAP fill:#3a1a1a,stroke:#f85149
+    style T1 fill:#2a1010,stroke:#f85149
+    style T2 fill:#2a1010,stroke:#f85149
+    style T3 fill:#2a1010,stroke:#f85149
+    style T4 fill:#2a1010,stroke:#f85149
+    style T5 fill:#2a1010,stroke:#f85149
+    style T6 fill:#2a1010,stroke:#f85149
+    style S1 fill:#102a10,stroke:#3fb950
+    style S2 fill:#102a10,stroke:#3fb950
+    style S3 fill:#102a10,stroke:#3fb950
+    style S4 fill:#102a10,stroke:#3fb950
+    style S5 fill:#102a10,stroke:#3fb950
+    style S6 fill:#102a10,stroke:#3fb950
+</div>
+</div>
+
+<h3>陷阱 1：代理生成开销</h3>
+
+<p>Entity View 在首次使用某个视图类型时，需要通过字节码技术生成代理类。这个过程存在一次性的性能开销。</p>
+
+<div class="warning">
+  <strong>⚠️ 注意：</strong>代理生成发生在 <code>EntityViewManager</code> 初始化阶段。在生产环境中，务必让 EntityViewManager 在应用启动时初始化完成（Spring Boot 自动完成），而不是在首个请求到达时才触发。
+</div>
+
+<pre><code>// ✅ 推荐：在 @Configuration 中预先初始化
+@Bean
+public EntityViewManager evm(CriteriaBuilderFactory cbf,
+                              EntityViewConfiguration config) {
+    // 所有 Entity View 代理在此时生成
+    return config.createEntityViewManager(cbf);
+}
+
+// ❌ 避免：延迟初始化
+@Lazy
+@Bean
+public EntityViewManager evm(...) { ... } // 首次请求会变慢</code></pre>
+
+<h3>陷阱 2：映射表达式运行时错误</h3>
+
+<p><code>@Mapping</code> 注解中的表达式是字符串，编译器无法检查。拼写错误或路径不存在只会在运行时抛出异常。</p>
+
+<div class="diagram">
+<div class="diagram-title">映射错误检测时机</div>
+<div class="mermaid">
+flowchart LR
+    A["@Mapping('departmnet.name')<br/>← 拼写错误"] --> B["编译通过 ✓"]
+    B --> C["EntityViewManager<br/>初始化"]
+    C --> D{"表达式解析"}
+    D -->|"失败"| E["💥 运行时异常<br/>IllegalArgumentException"]
+
+    F["解决方案"] --> G["集成测试覆盖<br/>所有 View 的初始化"]
+    F --> H["CI 中启动完整<br/>ApplicationContext"]
+
+    style A fill:#2a1010,stroke:#f85149
+    style B fill:#3a2a1a,stroke:#d97706
+    style E fill:#2a1010,stroke:#f85149
+    style G fill:#102a10,stroke:#3fb950
+    style H fill:#102a10,stroke:#3fb950
+</div>
+</div>
+
+<pre><code>// 集成测试：验证所有 Entity View 映射正确
+@SpringBootTest
+class EntityViewValidationTest {
+
+    @Autowired
+    EntityViewManager evm; // 如果映射有误，启动即失败
+
+    @Test
+    void allViewsShouldInitialize() {
+        // EntityViewManager 成功注入 = 所有映射正确
+        assertNotNull(evm);
+    }
+}</code></pre>
+
+<h3>陷阱 3：循环视图引用</h3>
+
+<div class="warning">
+  <strong>⚠️ 危险：</strong>如果 <code>UserView</code> 包含 <code>DepartmentView</code>，而 <code>DepartmentView</code> 又包含 <code>List&lt;UserView&gt;</code>，会导致无限递归。Blaze-Persistence 会在初始化时检测到循环引用并抛出异常。
+</div>
+
+<pre><code>// ❌ 循环引用 — 初始化失败
+@EntityView(User.class)
+public interface UserView {
+    @IdMapping Long getId();
+    DepartmentView getDepartment(); // → 引用 DepartmentView
+}
+
+@EntityView(Department.class)
+public interface DepartmentView {
+    @IdMapping Long getId();
+    List&lt;UserView&gt; getUsers(); // → 又引用 UserView → 循环！
+}
+
+// ✅ 解决：为不同场景创建不同视图
+@EntityView(Department.class)
+public interface DepartmentSimpleView {
+    @IdMapping Long getId();
+    String getName();
+    // 不包含 users 引用，打破循环
+}</code></pre>
+
+<h3>陷阱 4：深层嵌套性能</h3>
+
+<div class="diagram">
+<div class="diagram-title">视图嵌套深度与 JOIN 数量关系</div>
+<div class="mermaid">
+flowchart TD
+    A["UserView"] --> B["DepartmentView<br/>JOIN 1"]
+    B --> C["CompanyView<br/>JOIN 2"]
+    C --> D["CountryView<br/>JOIN 3"]
+    D --> E["RegionView<br/>JOIN 4"]
+
+    F["⚠️ 每层嵌套 = 额外 JOIN"]
+    G["JOIN 过多 → 笛卡尔积风险<br/>查询性能急剧下降"]
+
+    E --> F
+    F --> G
+
+    style A fill:#1a3a2a,stroke:#3fb950
+    style B fill:#1a3a2a,stroke:#22c55e
+    style C fill:#3a2a1a,stroke:#d97706
+    style D fill:#2a1010,stroke:#f85149
+    style E fill:#2a1010,stroke:#f85149
+    style F fill:#3a2a1a,stroke:#d97706
+    style G fill:#2a1010,stroke:#f85149
+</div>
+</div>
+
+<h3>陷阱 5：JSON 序列化</h3>
+
+<p>Entity View 的代理对象不是普通 POJO，某些 JSON 库可能无法正确序列化。需要注册专用的 Jackson 模块。</p>
+
+<pre><code>// 注册 Blaze-Persistence Jackson 模块
+@Bean
+public ObjectMapper objectMapper(EntityViewManager evm) {
+    ObjectMapper mapper = new ObjectMapper();
+    mapper.registerModule(
+        new EntityViewAwareObjectMapper(evm)  // 核心：注册视图感知模块
+    );
+    mapper.registerModule(new JavaTimeModule());
+    return mapper;
+}</code></pre>
+
+<h3>陷阱速查清单</h3>
+
+<table>
+<thead>
+  <tr><th>陷阱</th><th>症状</th><th>解决方案</th><th>严重程度</th></tr>
+</thead>
+<tbody>
+  <tr>
+    <td>代理生成开销</td>
+    <td>首次请求延迟高</td>
+    <td>启动时初始化 EntityViewManager</td>
+    <td style="color:var(--orange)">中</td>
+  </tr>
+  <tr>
+    <td>映射表达式错误</td>
+    <td>运行时异常</td>
+    <td>集成测试覆盖 + CI 验证</td>
+    <td style="color:var(--red)">高</td>
+  </tr>
+  <tr>
+    <td>循环引用</td>
+    <td>初始化失败</td>
+    <td>拆分视图，打破循环</td>
+    <td style="color:var(--red)">高</td>
+  </tr>
+  <tr>
+    <td>深层嵌套</td>
+    <td>查询性能下降</td>
+    <td>限制嵌套 ≤3 层</td>
+    <td style="color:var(--orange)">中</td>
+  </tr>
+  <tr>
+    <td>序列化问题</td>
+    <td>JSON 输出异常</td>
+    <td>注册 Jackson 模块</td>
+    <td style="color:var(--orange)">中</td>
+  </tr>
+  <tr>
+    <td>类型擦除</td>
+    <td>集合映射失败</td>
+    <td>显式指定泛型参数</td>
+    <td style="color:var(--orange)">中</td>
+  </tr>
+</tbody>
+</table>
+
+<!-- ============================================================ -->
+<!-- 本章小结 -->
+<!-- ============================================================ -->
+<div class="chapter-summary" id="summary">
+  <h2>📋 本章小结</h2>
+  <ul>
+    <li><strong>Entity View 是类型安全的 DTO 投影</strong>——用 Java 接口声明所需字段，框架自动生成优化 SELECT</li>
+    <li><strong>三大核心注解</strong>：<code>@EntityView</code>（绑定实体）、<code>@IdMapping</code>（映射 ID）、<code>@Mapping</code>（映射表达式）</li>
+    <li><strong>接口投影</strong>是默认推荐方式，简洁不可变；<strong>抽象类投影</strong>适用于需要自定义 Java 逻辑的场景</li>
+    <li><strong>SELECT 自动裁剪</strong>只查询视图声明的字段，减少网络传输和内存消耗</li>
+    <li><strong>N+1 问题</strong>通过将关联路径转换为 JOIN 从根本上消除，始终保持 O(1) 查询</li>
+    <li><strong>EntityViewSetting</strong>是视图与查询的桥梁，支持过滤、排序、分页的统一配置</li>
+    <li><strong>常见陷阱</strong>：注意代理生成开销、映射表达式的运行时校验、循环引用和深层嵌套</li>
+  </ul>
+  <p class="next-hint">
+    下一章 <a href="ch05-advanced-view.html">第 5 章 · 高级 Entity View</a> 将深入子视图嵌套、继承映射、集合映射、<code>@MappingCorrelated</code> 关联子查询与 Flat View 等高级特性。
+  </p>
+</div>
+
+<nav class="chapter-nav">
+  <a href="ch03-criteria.html">← 第 3 章 · CriteriaBuilder 查询引擎</a>
+  <a href="ch05-advanced-view.html">第 5 章 · 高级 Entity View →</a>
+</nav>
+
+<p class="footer">&copy; 2026 图解 Blaze-Persistence &middot; 第 4 章 · Entity View 基础</p>
+
+</article>
+</div><!-- /container -->
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+mermaid.initialize({
+  theme: 'dark',
+  themeVariables: {
+    primaryColor: '#58a6ff', primaryTextColor: '#e6edf3', primaryBorderColor: '#30363d',
+    lineColor: '#8b949e', secondaryColor: '#161b22', tertiaryColor: '#0d1117',
+    background: '#161b22', mainBkg: '#161b22', nodeBorder: '#30363d',
+    clusterBkg: 'rgba(22,27,34,.5)', clusterBorder: '#30363d', titleColor: '#e6edf3',
+    edgeLabelBackground: '#161b22',
+  },
+  flowchart: { curve: 'basis', padding: 15 },
+  sequence: { actorMargin: 50, messageMargin: 30 },
+});
+</script>
+</body>
+</html>

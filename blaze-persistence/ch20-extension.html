@@ -1,0 +1,1526 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 20 章 · 扩展体系与框架自用机制 — 图解 Blaze-Persistence</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Blaze-Persistence</span>
+  <span class="sep">|</span>
+  <a href="index.html">目录</a>
+  <a href="ch19-codepath.html">← 第 19 章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s20-1">20.1 扩展点全景图</a>
+  <a href="#s20-2">20.2 JpqlFunction</a>
+  <a href="#s20-3">20.3 JpqlMacro</a>
+  <a href="#s20-4">20.4 DbmsDialect</a>
+  <a href="#s20-5">20.5 ObjectBuilder</a>
+  <a href="#s20-6">20.6 EntityViewListener</a>
+  <a href="#s20-7">20.7 ViewFilter</a>
+  <a href="#s20-8">20.8 ConfigurationContributor</a>
+  <a href="#s20-9">20.9 Spring Data Repository 扩展</a>
+  <a href="#s20-10">20.10 框架自用全景图</a>
+  <a href="#summary">本章小结</a>
+</aside>
+
+<article class="article">
+
+<h1>第 20 章 · 扩展体系与框架自用机制</h1>
+<p class="subtitle">JpqlFunction · JpqlMacro · DbmsDialect · ObjectBuilder · EntityViewListener · ViewFilter · ConfigContributor · Spring Data</p>
+
+<div class="chapter-intro">
+  <p class="lead">Blaze-Persistence 不仅仅提供了一套强大的查询 API——它本身就构建在一套精心设计的扩展体系之上。框架核心功能——窗口函数、CTE、方言适配、Entity View 映射——全部通过同一套 SPI 实现。理解这些扩展点，既是理解框架内核的钥匙，也是打造业务定制能力的基石。</p>
+  <ul class="will-learn">
+    <li>查询扩展：JpqlFunction 自定义函数 · JpqlMacro 宏表达式 · DbmsDialect 方言适配</li>
+    <li>View 扩展：ObjectBuilder ResultSet 桥接 · EntityViewListener/ViewFilter 业务横切</li>
+    <li>集成与全景：Spring Data Repository 扩展 · 零配置自动注册 · 框架 Dogfooding 全景</li>
+  </ul>
+  <p class="prereq">前置知识：<a href="ch14-rendering.html">第 14 章 · SQL 渲染</a> 的渲染管线概念，<a href="ch15-provider.html">第 15 章 · JPA Provider 适配</a> 的 Provider 抽象，以及 <a href="ch19-codepath.html">第 19 章 · 代码到 SQL 全路径追踪</a> 的执行路径。</p>
+</div>
+
+
+<!-- ================================================================== -->
+<h2 id="s20-1">20.1 扩展点全景图</h2>
+<!-- ================================================================== -->
+
+<p>Blaze-Persistence 的扩展点分布在三个层次：<strong>Core Layer</strong>（查询构建与 SQL 渲染）、<strong>Entity View Layer</strong>（对象映射与生命周期）、<strong>Integration Layer</strong>（Spring / Quarkus 框架集成）。下图将所有 SPI 接口映射到查询生命周期的对应阶段。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 20-1 Blaze-Persistence 扩展点全景架构</div>
+<div class="mermaid">
+flowchart TB
+    subgraph CORE ["Core Layer — 查询构建与 SQL 渲染"]
+        F1["JpqlFunction<br/>自定义函数渲染"]
+        F2["JpqlMacro<br/>宏表达式展开"]
+        F3["DbmsDialect<br/>数据库方言适配"]
+        F4["ObjectBuilder<br/>结果映射构建"]
+        F5["CriteriaBuilderConfiguration<br/>Contributor<br/>启动时自动配置"]
+    end
+
+    subgraph VIEW ["Entity View Layer — 对象映射与生命周期"]
+        V1["EntityViewListener<br/>视图生命周期钩子"]
+        V2["ViewFilter<br/>可复用命名过滤器"]
+        V3["ViewFilterProvider<br/>过滤参数动态提供"]
+        V4["EntityViewManager SPI<br/>视图管理器接口"]
+    end
+
+    subgraph INTEG ["Integration Layer — 框架集成"]
+        I1["EntityViewSpecification<br/>Executor 动态查询"]
+        I2["KeysetAwareRepository<br/>游标分页"]
+        I3["EntityViewRepository<br/>视图仓库基类"]
+    end
+
+    EXPR["表达式解析<br/>ExpressionParser"] --> F2
+    F2 -->|宏展开后| F1
+    F1 --> SQL["SQL 渲染<br/>SqlQueryGenerator"]
+    SQL --> F3
+    F3 --> EXEC["JDBC 执行"]
+    EXEC --> F4
+    F4 --> V1
+    V1 --> RESULT["返回结果"]
+    F5 -.->|ServiceLoader 自动发现| CORE
+    V2 -.->|@ViewFilter 注解| VIEW
+    V3 -.->|参数注入| V2
+    I1 & I2 & I3 -.->|Spring Data 自动代理| INTEG
+
+    style F1 fill:#1e3a5f,stroke:#58a6ff
+    style F2 fill:#1e3a5f,stroke:#58a6ff
+    style F3 fill:#2d1f4e,stroke:#bc8cff
+    style F4 fill:#1a3a2a,stroke:#3fb950
+    style F5 fill:#3a2a1a,stroke:#d29922
+    style V1 fill:#1a3a2a,stroke:#3fb950
+    style V2 fill:#1a3a2a,stroke:#3fb950
+    style V3 fill:#1a3a2a,stroke:#3fb950
+    style V4 fill:#1a3a2a,stroke:#3fb950
+    style I1 fill:#3a2a1a,stroke:#d29922
+    style I2 fill:#3a2a1a,stroke:#d29922
+    style I3 fill:#3a2a1a,stroke:#d29922
+</div>
+</div>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>SPI 接口</th><th>所属层</th><th>职责</th><th>典型用户用例</th><th>框架内部自用</th></tr>
+</thead>
+<tbody>
+<tr><td><code>JpqlFunction</code></td><td>Core</td><td>注册自定义 JPQL 函数并渲染为原生 SQL</td><td>array_agg, 全文搜索, GIS 函数</td><td>SET_UNION, WINDOW_ROW_NUMBER 等 30+ 函数</td></tr>
+<tr><td><code>JpqlMacro</code></td><td>Core</td><td>表达式解析前宏展开</td><td>审计列注入, 租户 ID 宏</td><td>VIEW_ROOT, EMBEDDING_VIEW_ROOT</td></tr>
+<tr><td><code>DbmsDialect</code></td><td>Core</td><td>数据库差异适配</td><td>自定义方言覆盖</td><td>PostgreSQL / MySQL / Oracle / H2 / DB2 / SQL Server</td></tr>
+<tr><td><code>ObjectBuilder</code></td><td>Core</td><td>Object[] 元组 → 目标对象</td><td>自定义 DTO 构建</td><td>ViewTypeObjectBuilder 构建 Entity View 代理</td></tr>
+<tr><td><code>EntityViewListener</code></td><td>View</td><td>视图创建/更新/删除生命周期钩子</td><td>审计日志, 事件发布</td><td>脏跟踪初始化, 级联传播, 版本校验</td></tr>
+<tr><td><code>ViewFilter</code></td><td>View</td><td>可复用命名过滤器</td><td>软删除, 多租户, 状态过滤</td><td>纯用户扩展点</td></tr>
+<tr><td><code>ConfigurationContributor</code></td><td>Core</td><td>ServiceLoader 自动注册配置</td><td>自动注册函数/方言包</td><td>Hibernate / EclipseLink Provider 注册</td></tr>
+<tr><td><code>EntityViewRepository</code></td><td>Integration</td><td>Spring Data Entity View 仓库</td><td>CRUD + 派生查询</td><td>SimpleEntityViewRepository 自动实现</td></tr>
+<tr><td><code>KeysetAwareRepository</code></td><td>Integration</td><td>游标分页</td><td>高性能列表分页</td><td>游标 SQL 自动生成</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="metric-row">
+  <div class="metric"><div class="value">9</div><div class="label">核心 SPI 接口</div></div>
+  <div class="metric"><div class="value">30+</div><div class="label">框架内置 JpqlFunction</div></div>
+  <div class="metric"><div class="value">7</div><div class="label">DbmsDialect 方言实现</div></div>
+  <div class="metric"><div class="value">5+</div><div class="label">ObjectBuilder 变体</div></div>
+</div>
+
+
+<!-- ================================================================== -->
+<h2 id="s20-2">20.2 JpqlFunction — 自定义函数注册</h2>
+<!-- ================================================================== -->
+
+<h3>这个 SPI 是什么</h3>
+
+<p><code>JpqlFunction</code> 是 Blaze-Persistence 最核心的扩展点。它让开发者在 JPQL 层面注册任意函数，框架在 SQL 渲染时调用函数的 <code>render()</code> 方法产出目标数据库的原生 SQL 片段。接口定义只有四个方法：</p>
+
+<pre><code class="language-java">public interface JpqlFunction {
+
+    boolean hasArguments();
+
+    boolean hasParenthesesIfNoArguments();
+
+    Class&lt;?&gt; getReturnType(Class&lt;?&gt; firstArgumentType);
+
+    void render(FunctionRenderContext context);
+}
+</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">Fig 20-2 JpqlFunction 渲染调用时序</div>
+<div class="mermaid">
+sequenceDiagram
+    participant U as 用户代码
+    participant CB as CriteriaBuilder
+    participant EP as ExpressionParser
+    participant FR as FunctionRenderer
+    participant JF as JpqlFunction
+    participant FRC as FunctionRenderContext
+    participant SQL as SQL Buffer
+
+    U->>CB: .select("FUNCTION('array_agg', o.product.name)")
+    CB->>EP: 解析表达式
+    EP->>FR: 查找注册函数 "array_agg"
+    FR->>JF: hasArguments()? → true
+    FR->>JF: getReturnType(String.class) → String.class
+    FR->>JF: render(FunctionRenderContext)
+    JF->>FRC: addChunk("array_agg(")
+    JF->>FRC: addArgument(0)
+    FRC-->>FRC: 渲染参数: product_1.name
+    JF->>FRC: addChunk(")")
+    FRC->>SQL: 拼接: array_agg(product_1.name)
+    SQL-->>U: 最终 SQL 片段就绪
+</div>
+</div>
+
+<h3>Step 1: 定义自定义函数</h3>
+
+<pre><code class="language-java">public class PostgresArrayAggFunction implements JpqlFunction {
+
+    @Override
+    public boolean hasArguments() {
+        return true;
+    }
+
+    @Override
+    public boolean hasParenthesesIfNoArguments() {
+        return true;
+    }
+
+    @Override
+    public Class&lt;?&gt; getReturnType(Class&lt;?&gt; firstArgType) {
+        return String.class;
+    }
+
+    @Override
+    public void render(FunctionRenderContext ctx) {
+        ctx.addChunk("array_agg(");
+        ctx.addArgument(0);     // 渲染第一个参数
+        ctx.addChunk(")");
+    }
+}
+</code></pre>
+
+<h3>Step 2: 注册到 CriteriaBuilderConfiguration</h3>
+
+<pre><code class="language-java">CriteriaBuilderConfiguration config = Criteria.getDefault();
+config.registerFunction(
+    new JpqlFunctionGroup("array_agg", new PostgresArrayAggFunction())
+);
+CriteriaBuilderFactory cbf = config.createCriteriaBuilderFactory(emf);
+</code></pre>
+
+<h3>Step 3: 在查询中使用 + 输出 SQL</h3>
+
+<pre><code class="language-java">CriteriaBuilder&lt;Tuple&gt; cb = cbf.create(em, Tuple.class)
+    .from(Order.class, "o")
+    .select("o.customer.name")
+    .select("FUNCTION('array_agg', o.product.name)")
+    .groupBy("o.customer.name");
+
+System.out.println(cb.getQueryString());
+</code></pre>
+
+<pre><code class="language-sql">-- 生成的 JPQL:
+SELECT o.customer.name, array_agg(product_1.name)
+FROM Order o JOIN o.product product_1
+GROUP BY o.customer.name
+
+-- PostgreSQL 原生 SQL:
+SELECT customer_1.name, array_agg(product_1.name)
+FROM orders o
+JOIN customers customer_1 ON o.customer_id = customer_1.id
+JOIN products product_1 ON o.product_id = product_1.id
+GROUP BY customer_1.name
+</code></pre>
+
+<h3>框架自己怎么用：30+ 内置函数</h3>
+
+<p>Blaze-Persistence 自身通过 <code>JpqlFunction</code> 注册了大量内置函数。这些函数覆盖集合运算、窗口函数、聚合增强、分页辅助等多个领域，且针对不同数据库有不同的渲染实现。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 20-3 框架内置 JpqlFunction 分类与 SQL 映射</div>
+<div style="display:flex;flex-wrap:wrap;gap:16px;justify-content:center;padding:16px 0;">
+  <div style="border:1px solid #58a6ff;border-radius:8px;padding:14px 18px;min-width:200px;max-width:250px;background:rgba(88,166,255,.06);">
+    <div style="font-weight:bold;color:#58a6ff;margin-bottom:8px;">集合运算函数</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">SET_UNION → UNION / UNION ALL<br/>SET_INTERSECT → INTERSECT<br/>SET_EXCEPT → EXCEPT / MINUS</div>
+  </div>
+  <div style="border:1px solid #bc8cff;border-radius:8px;padding:14px 18px;min-width:200px;max-width:250px;background:rgba(188,140,255,.06);">
+    <div style="font-weight:bold;color:#bc8cff;margin-bottom:8px;">窗口函数</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">WINDOW_ROW_NUMBER → ROW_NUMBER()<br/>WINDOW_RANK → RANK()<br/>WINDOW_DENSE_RANK → DENSE_RANK()<br/>WINDOW_SUM/AVG/COUNT → OVER(...)</div>
+  </div>
+  <div style="border:1px solid #3fb950;border-radius:8px;padding:14px 18px;min-width:200px;max-width:250px;background:rgba(63,185,80,.06);">
+    <div style="font-weight:bold;color:#3fb950;margin-bottom:8px;">聚合增强</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">COUNT_TUPLE → COUNT(DISTINCT a, b)<br/>GROUP_CONCAT → STRING_AGG / GROUP_CONCAT</div>
+  </div>
+  <div style="border:1px solid #d29922;border-radius:8px;padding:14px 18px;min-width:200px;max-width:250px;background:rgba(210,153,34,.06);">
+    <div style="font-weight:bold;color:#d29922;margin-bottom:8px;">工具函数</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">PAGE_POSITION → 子查询偏移量<br/>ENTITY_FUNCTION → 实体类型判定<br/>NULLFN → CAST(NULL AS type)<br/>PARAM → 参数占位渲染</div>
+  </div>
+</div>
+</div>
+
+<p>以 <code>GROUP_CONCAT</code> 为例——同一个 JPQL 函数调用，框架为不同数据库渲染完全不同的原生 SQL：</p>
+
+<pre><code class="language-java">// 用户代码 — 与数据库无关:
+CriteriaBuilder&lt;Tuple&gt; cb = cbf.create(em, Tuple.class)
+    .from(Order.class, "o")
+    .select("o.customer.name")
+    .select("GROUP_CONCAT(o.product.name SEPARATOR ',')")
+    .groupBy("o.customer.name");
+</code></pre>
+
+<pre><code class="language-sql">-- PostgreSQL 渲染:
+SELECT c.name, STRING_AGG(p.name, ',')
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+JOIN products p ON o.product_id = p.id
+GROUP BY c.name
+
+-- MySQL 渲染:
+SELECT c.name, GROUP_CONCAT(p.name SEPARATOR ',')
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+JOIN products p ON o.product_id = p.id
+GROUP BY c.name
+
+-- Oracle 渲染:
+SELECT c.name, LISTAGG(p.name, ',') WITHIN GROUP (ORDER BY p.name)
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+JOIN products p ON o.product_id = p.id
+GROUP BY c.name
+
+-- SQL Server 渲染:
+SELECT c.name, STRING_AGG(p.name, ',')
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+JOIN products p ON o.product_id = p.id
+GROUP BY c.name
+</code></pre>
+
+<div class="key-insight">
+  <strong>Dogfooding 设计</strong>：JpqlFunction 不是"给用户的附加功能"。框架自身的窗口函数（<code>WINDOW_ROW_NUMBER</code>）、集合运算（<code>SET_UNION</code>）、聚合增强（<code>COUNT_TUPLE</code>）全部通过同一 SPI 实现。你的自定义函数与框架内置函数享有完全相同的渲染管线。
+</div>
+
+
+<!-- ================================================================== -->
+<h2 id="s20-3">20.3 JpqlMacro — 宏表达式</h2>
+<!-- ================================================================== -->
+
+<h3>这个 SPI 是什么</h3>
+
+<p><code>JpqlMacro</code> 工作在表达式解析的最前端——在 <code>JpqlFunction</code> 查找之前。它不产出 SQL，而是将宏调用展开为新的 JPQL 表达式片段。接口只有一个方法：</p>
+
+<pre><code class="language-java">public interface JpqlMacro {
+
+    void render(FunctionRenderContext context);
+}
+</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">Fig 20-4 JpqlMacro 在表达式解析管线中的位置</div>
+<div class="mermaid">
+flowchart LR
+    INPUT["用户表达式<br/>NOW()"] --> LEXER["词法分析器"]
+    LEXER --> MACRO["宏展开<br/>JpqlMacro.render()"]
+    MACRO --> EXPANDED["展开后表达式<br/>CURRENT_TIMESTAMP"]
+    EXPANDED --> PARSER["表达式解析树"]
+    PARSER --> FUNC["JpqlFunction 查找<br/>（如有函数调用）"]
+    FUNC --> RENDER["SQL 渲染器"]
+
+    style INPUT fill:#3a2a1a,stroke:#d29922
+    style MACRO fill:#2d1f4e,stroke:#bc8cff
+    style EXPANDED fill:#1a3a2a,stroke:#3fb950
+    style RENDER fill:#1e3a5f,stroke:#58a6ff
+</div>
+</div>
+
+<h3>我们怎么用：NOW 时间戳宏</h3>
+
+<pre><code class="language-java">public class NowMacro implements JpqlMacro {
+
+    @Override
+    public void render(FunctionRenderContext ctx) {
+        ctx.addChunk("CURRENT_TIMESTAMP");
+    }
+}
+
+// 注册宏
+config.registerMacro("NOW", new NowMacro());
+</code></pre>
+
+<pre><code class="language-java">// 使用宏进行查询:
+CriteriaBuilder&lt;Order&gt; cb = cbf.create(em, Order.class, "o")
+    .where("o.createdAt").ltExpression("NOW()");
+
+System.out.println(cb.getQueryString());
+</code></pre>
+
+<pre><code class="language-sql">-- 生成的 JPQL（宏展开后）:
+SELECT o
+FROM Order o
+WHERE o.createdAt &lt; CURRENT_TIMESTAMP
+
+-- PostgreSQL 原生 SQL:
+SELECT o.*
+FROM orders o
+WHERE o.created_at &lt; CURRENT_TIMESTAMP
+</code></pre>
+
+<h3>我们怎么用：多租户宏</h3>
+
+<pre><code class="language-java">public class CurrentTenantMacro implements JpqlMacro {
+
+    @Override
+    public void render(FunctionRenderContext ctx) {
+        ctx.addChunk(":currentTenantId");
+    }
+}
+
+config.registerMacro("CURRENT_TENANT", new CurrentTenantMacro());
+
+// 在任何查询中自动注入租户条件:
+CriteriaBuilder&lt;Order&gt; cb = cbf.create(em, Order.class, "o")
+    .where("o.tenantId").eqExpression("CURRENT_TENANT()")
+    .where("o.status").eq(OrderStatus.ACTIVE);
+
+cb.setParameter("currentTenantId", SecurityContext.getTenantId());
+System.out.println(cb.getQueryString());
+</code></pre>
+
+<pre><code class="language-sql">-- 宏展开后生成的 JPQL:
+SELECT o
+FROM Order o
+WHERE o.tenantId = :currentTenantId
+  AND o.status = :param_0
+
+-- PostgreSQL 原生 SQL:
+SELECT o.*
+FROM orders o
+WHERE o.tenant_id = ?
+  AND o.status = ?
+</code></pre>
+
+<h3>框架自己怎么用：VIEW_ROOT 和 EMBEDDING_VIEW_ROOT</h3>
+
+<p>Entity View 中的子查询关联（<code>@MappingCorrelated</code>）需要引用"当前视图的根实体"和"嵌入视图的父实体"。框架通过内置宏完成这一关联：</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 20-5 框架内置宏的展开逻辑</div>
+<div class="mermaid">
+flowchart TD
+    subgraph MACROS ["框架内置宏"]
+        VR["VIEW_ROOT(attr)"] -->|展开为| VRE["当前 Entity View<br/>根实体的关联路径"]
+        EVR["EMBEDDING_VIEW_ROOT(attr)"] -->|展开为| EVRE["父级嵌入 View<br/>根实体的关联路径"]
+    end
+
+    subgraph EXAMPLE ["展开示例"]
+        M1["VIEW_ROOT(id)"] -->|CatView 根实体| E1["cat.id"]
+        M2["VIEW_ROOT(owner.name)"] -->|关联路径| E2["cat.owner.name"]
+        M3["EMBEDDING_VIEW_ROOT(id)"] -->|父 View 根| E3["parentCat.id"]
+    end
+
+    VRE --> CORR["用于 @MappingCorrelated<br/>子查询关联"]
+    EVRE --> EMBED["用于嵌套 View 中<br/>引用外层实体"]
+
+    style VR fill:#1e3a5f,stroke:#58a6ff
+    style EVR fill:#2d1f4e,stroke:#bc8cff
+    style CORR fill:#1a3a2a,stroke:#3fb950
+    style EMBED fill:#3a2a1a,stroke:#d29922
+</div>
+</div>
+
+<pre><code class="language-java">// 框架内部使用 VIEW_ROOT 宏的场景:
+@EntityView(Cat.class)
+public interface CatDetailView {
+
+    @IdMapping
+    Long getId();
+
+    String getName();
+
+    // @MappingCorrelated 使用 VIEW_ROOT 宏引用根实体
+    @MappingCorrelated(
+        correlationBasis = "VIEW_ROOT(id)",
+        correlationExpression = "kitten.parent.id = EMBEDDING_VIEW_ROOT(id)",
+        correlationResult = "kitten"
+    )
+    List&lt;KittenView&gt; getKittens();
+}
+
+// VIEW_ROOT(id) 在宏展开阶段被替换为:  cat.id
+// EMBEDDING_VIEW_ROOT(id) 被替换为:   parentCat.id
+</code></pre>
+
+<pre><code class="language-sql">-- 宏展开后最终生成的 SQL:
+SELECT c.id, c.name,
+       k.id AS kittens_id, k.name AS kittens_name
+FROM cats c
+LEFT JOIN cats k ON k.parent_id = c.id
+</code></pre>
+
+
+<!-- ================================================================== -->
+<h2 id="s20-4">20.4 DbmsDialect — 数据库方言扩展</h2>
+<!-- ================================================================== -->
+
+<h3>这个 SPI 是什么</h3>
+
+<p><code>DbmsDialect</code> 是 Blaze-Persistence 能够跨数据库工作的关键。每个方言实现了同一套接口，控制 CTE、窗口函数、分页、LATERAL JOIN、DML 等高级特性在不同数据库上的渲染策略。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 20-6 DbmsDialect 继承体系</div>
+<div class="mermaid">
+classDiagram
+    class DbmsDialect {
+        &lt;&lt;interface&gt;&gt;
+        +isCTE() boolean
+        +isLateralJoin() boolean
+        +isSetOperation() boolean
+        +isWindowFunction() boolean
+        +getPaginationStrategy() PaginationStrategy
+        +renderCTE() String
+        +renderWindowFunction() String
+        +renderSetOperation() String
+        +renderDmlWithJoin() String
+    }
+
+    class DefaultDbmsDialect {
+        通用默认实现
+    }
+
+    class PostgreSQLDbmsDialect {
+        WITH RECURSIVE
+        LATERAL JOIN
+        WINDOW 完整支持
+        LIMIT / OFFSET
+    }
+
+    class MySQLDbmsDialect {
+        CTE 模拟 5.x / 原生 8.0
+        无 LATERAL / 8.0.14+
+        WINDOW 8.0+
+        LIMIT offset count
+    }
+
+    class OracleDbmsDialect {
+        WITH 子句
+        LATERAL JOIN
+        分析函数语法
+        ROWNUM / FETCH FIRST
+    }
+
+    class SQLServerDbmsDialect {
+        WITH CTE
+        CROSS / OUTER APPLY
+        WINDOW 完整支持
+        OFFSET FETCH
+    }
+
+    class H2DbmsDialect {
+        WITH 子句
+        LATERAL 模拟
+        WINDOW 部分支持
+        LIMIT / OFFSET
+    }
+
+    class DB2DbmsDialect {
+        WITH CTE
+        LATERAL JOIN
+        OLAP 函数
+        FETCH FIRST n ROWS
+    }
+
+    DbmsDialect <|.. DefaultDbmsDialect
+    DefaultDbmsDialect <|-- PostgreSQLDbmsDialect
+    DefaultDbmsDialect <|-- MySQLDbmsDialect
+    DefaultDbmsDialect <|-- OracleDbmsDialect
+    DefaultDbmsDialect <|-- SQLServerDbmsDialect
+    DefaultDbmsDialect <|-- H2DbmsDialect
+    DefaultDbmsDialect <|-- DB2DbmsDialect
+</div>
+</div>
+
+<h3>完整代码：同一 CTE API，不同 SQL 输出</h3>
+
+<pre><code class="language-java">// 用户代码 — 完全与数据库无关:
+@CTE
+@Entity
+public class OrderSummaryCTE {
+    @Id Long id;
+    String customerName;
+    BigDecimal totalAmount;
+}
+
+CriteriaBuilder&lt;Tuple&gt; cb = cbf.create(em, Tuple.class)
+    .with(OrderSummaryCTE.class)
+        .from(Order.class, "o")
+        .bind("id").select("o.id")
+        .bind("customerName").select("o.customer.name")
+        .bind("totalAmount").select("o.totalAmount")
+    .end()
+    .from(OrderSummaryCTE.class, "s")
+    .select("s.customerName")
+    .select("SUM(s.totalAmount)")
+    .groupBy("s.customerName")
+    .orderByAsc("s.customerName");
+
+System.out.println(cb.getQueryString());
+</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">Fig 20-7 相同 CTE API 在不同数据库上的 SQL 渲染对比</div>
+<div class="mermaid">
+flowchart TD
+    API["CriteriaBuilder<br/>with(OrderSummaryCTE.class)<br/>.from(Order.class)<br/>.bind(...).select(...)"]
+
+    API --> PG["PostgreSQL<br/>DbmsDialect"]
+    API --> MY["MySQL 5.7<br/>DbmsDialect"]
+    API --> ORA["Oracle<br/>DbmsDialect"]
+
+    PG --> PGSQL["WITH OrderSummaryCTE AS (<br/>  SELECT ...<br/>)<br/>SELECT ... FROM OrderSummaryCTE"]
+
+    MY --> MYSQLS["SELECT ... FROM (<br/>  SELECT ... FROM orders o<br/>) AS OrderSummaryCTE"]
+
+    ORA --> ORASQL["WITH OrderSummaryCTE AS (<br/>  SELECT o.id AS id, ...<br/>)<br/>SELECT ..."]
+
+    style API fill:#3a2a1a,stroke:#d29922
+    style PG fill:#1e3a5f,stroke:#58a6ff
+    style MY fill:#2d1f4e,stroke:#bc8cff
+    style ORA fill:#1a3a2a,stroke:#3fb950
+    style PGSQL fill:#1e3a5f,stroke:#58a6ff
+    style MYSQLS fill:#2d1f4e,stroke:#bc8cff
+    style ORASQL fill:#1a3a2a,stroke:#3fb950
+</div>
+</div>
+
+<pre><code class="language-sql">-- PostgreSQL 输出（原生 CTE 支持）:
+WITH OrderSummaryCTE(id, customerName, totalAmount) AS (
+    SELECT o.id, c.name, o.total_amount
+    FROM orders o
+    JOIN customers c ON o.customer_id = c.id
+)
+SELECT s.customerName, SUM(s.totalAmount)
+FROM OrderSummaryCTE s
+GROUP BY s.customerName
+ORDER BY s.customerName ASC
+
+-- MySQL 5.7 输出（无 CTE — 自动降级为派生表）:
+SELECT s.customerName, SUM(s.totalAmount)
+FROM (
+    SELECT o.id AS id, c.name AS customerName, o.total_amount AS totalAmount
+    FROM orders o
+    JOIN customers c ON o.customer_id = c.id
+) AS OrderSummaryCTE s
+GROUP BY s.customerName
+ORDER BY s.customerName ASC
+
+-- MySQL 8.0+ 输出（原生 CTE）:
+WITH OrderSummaryCTE(id, customerName, totalAmount) AS (
+    SELECT o.id, c.name, o.total_amount
+    FROM orders o
+    JOIN customers c ON o.customer_id = c.id
+)
+SELECT s.customerName, SUM(s.totalAmount)
+FROM OrderSummaryCTE s
+GROUP BY s.customerName
+ORDER BY s.customerName ASC
+
+-- Oracle 输出:
+WITH OrderSummaryCTE AS (
+    SELECT o.id AS id, c.name AS customerName, o.total_amount AS totalAmount
+    FROM orders o
+    JOIN customers c ON o.customer_id = c.id
+)
+SELECT s.customerName, SUM(s.totalAmount)
+FROM OrderSummaryCTE s
+GROUP BY s.customerName
+ORDER BY s.customerName ASC
+</code></pre>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>特性</th><th><span class="provider-badge pg">PostgreSQL</span></th><th><span class="provider-badge mysql">MySQL 5.x</span></th><th><span class="provider-badge mysql">MySQL 8.0+</span></th><th><span class="provider-badge oracle">Oracle</span></th><th><span class="provider-badge sqlserver">SQL Server</span></th></tr>
+</thead>
+<tbody>
+<tr><td>CTE</td><td>WITH ... AS</td><td>派生表模拟</td><td>WITH ... AS</td><td>WITH ... AS</td><td>WITH ... AS</td></tr>
+<tr><td>递归 CTE</td><td>WITH RECURSIVE</td><td>不支持</td><td>WITH RECURSIVE</td><td>CONNECT BY / WITH</td><td>WITH ... AS</td></tr>
+<tr><td>LATERAL JOIN</td><td>LATERAL</td><td>不支持</td><td>LATERAL (8.0.14+)</td><td>LATERAL</td><td>CROSS/OUTER APPLY</td></tr>
+<tr><td>窗口函数</td><td>完整支持</td><td>不支持</td><td>完整支持</td><td>分析函数语法</td><td>完整支持</td></tr>
+<tr><td>分页</td><td>LIMIT/OFFSET</td><td>LIMIT m,n</td><td>LIMIT m,n</td><td>FETCH FIRST</td><td>OFFSET FETCH</td></tr>
+<tr><td>DML + JOIN</td><td>UPDATE FROM</td><td>UPDATE JOIN</td><td>UPDATE JOIN</td><td>MERGE INTO</td><td>UPDATE FROM</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>分页的方言差异</h3>
+
+<pre><code class="language-java">// 用户代码:
+PaginatedCriteriaBuilder&lt;Tuple&gt; pcb = cbf.create(em, Tuple.class)
+    .from(Order.class, "o")
+    .select("o.id").select("o.customer.name")
+    .orderByAsc("o.id")
+    .page(0, 20);    // 第一页，20 条
+</code></pre>
+
+<pre><code class="language-sql">-- PostgreSQL:
+SELECT o.id, c.name FROM orders o
+JOIN customers c ON o.customer_id = c.id
+ORDER BY o.id ASC
+LIMIT 20 OFFSET 0
+
+-- Oracle 12c+:
+SELECT o.id, c.name FROM orders o
+JOIN customers c ON o.customer_id = c.id
+ORDER BY o.id ASC
+FETCH FIRST 20 ROWS ONLY
+
+-- SQL Server:
+SELECT o.id, c.name FROM orders o
+JOIN customers c ON o.customer_id = c.id
+ORDER BY o.id ASC
+OFFSET 0 ROWS FETCH NEXT 20 ROWS ONLY
+
+-- MySQL:
+SELECT o.id, c.name FROM orders o
+JOIN customers c ON o.customer_id = c.id
+ORDER BY o.id ASC
+LIMIT 20
+</code></pre>
+
+
+<!-- ================================================================== -->
+<h2 id="s20-5">20.5 ObjectBuilder — 结果映射扩展</h2>
+<!-- ================================================================== -->
+
+<h3>这个 SPI 是什么</h3>
+
+<p><code>ObjectBuilder&lt;T&gt;</code> 定义了如何将查询返回的 <code>Object[]</code> 元组转换为目标对象。它是 Entity View 代理构建的底层基础设施。</p>
+
+<pre><code class="language-java">public interface ObjectBuilder&lt;T&gt; {
+
+    T build(Object[] tuple);
+
+    List&lt;T&gt; buildList(List&lt;T&gt; list);
+}
+</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">Fig 20-8 ObjectBuilder 在查询结果转换管线中的位置</div>
+<div class="mermaid">
+flowchart LR
+    JDBC["JDBC ResultSet<br/>原始行数据"] --> TUPLE["Object[] 元组<br/>[1, 'Alice', 299.50]"]
+    TUPLE --> OB["ObjectBuilder&lt;T&gt;<br/>.build(tuple)"]
+    OB --> OBJ["目标对象<br/>DTO / Entity View 代理"]
+
+    subgraph FRAMEWORK ["框架自用: ViewTypeObjectBuilder"]
+        EV_OB["ViewTypeObjectBuilder"] --> PROXY["创建代理实例<br/>CatView_$$_impl"]
+        PROXY --> DIRTY["初始化脏跟踪快照"]
+        DIRTY --> NESTED["递归构建嵌套 View"]
+    end
+
+    subgraph CUSTOM ["用户自定义 ObjectBuilder"]
+        C_OB["OrderDtoBuilder"] --> DTO["构建扁平 DTO"]
+        DTO --> CALC["计算派生字段"]
+    end
+
+    OB -.-> FRAMEWORK
+    OB -.-> CUSTOM
+
+    style JDBC fill:#3a2a1a,stroke:#d29922
+    style TUPLE fill:#2d1f4e,stroke:#bc8cff
+    style OB fill:#1e3a5f,stroke:#58a6ff
+    style OBJ fill:#1a3a2a,stroke:#3fb950
+    style EV_OB fill:#1e3a5f,stroke:#58a6ff
+    style C_OB fill:#1a3a2a,stroke:#3fb950
+</div>
+</div>
+
+<h3>我们怎么用：自定义 DTO 构建</h3>
+
+<pre><code class="language-java">public class OrderDtoBuilder implements ObjectBuilder&lt;OrderDto&gt; {
+
+    @Override
+    public OrderDto build(Object[] tuple) {
+        return new OrderDto(
+            (String) tuple[0],       // customerName
+            (BigDecimal) tuple[1]    // totalAmount
+        );
+    }
+
+    @Override
+    public List&lt;OrderDto&gt; buildList(List&lt;OrderDto&gt; list) {
+        return list;  // 可在此做排序、去重等后处理
+    }
+}
+
+// 使用 ObjectBuilder:
+CriteriaBuilder&lt;OrderDto&gt; cb = cbf.create(em, Tuple.class)
+    .from(Order.class, "o")
+    .selectNew(new OrderDtoBuilder())
+        .with("o.customer.name")
+        .with("SUM(o.totalAmount)")
+    .end()
+    .groupBy("o.customer.name")
+    .orderByDesc("SUM(o.totalAmount)");
+
+List&lt;OrderDto&gt; results = cb.getResultList();
+</code></pre>
+
+<pre><code class="language-sql">-- 生成的 SQL:
+SELECT c.name, SUM(o.total_amount)
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+GROUP BY c.name
+ORDER BY SUM(o.total_amount) DESC
+
+-- ResultSet 中的每一行 Object[] 被 OrderDtoBuilder.build() 转换为 OrderDto
+</code></pre>
+
+<h3>框架自己怎么用：ViewTypeObjectBuilder</h3>
+
+<div class="diagram">
+<div class="diagram-title">Fig 20-9 ViewTypeObjectBuilder 递归构建嵌套 View</div>
+<div class="mermaid">
+flowchart TD
+    T["ResultSet 元组:<br/>[1, 'Tom', 2, 'Jerry', 'Science']"]
+    T --> OB1["CatViewObjectBuilder<br/>取 tuple[0..1]"]
+    OB1 --> CAT["CatView<br/>{ id=1, name='Tom' }"]
+    T --> OB2["OwnerViewObjectBuilder<br/>取 tuple[2..3]"]
+    OB2 --> OWNER["OwnerView<br/>{ id=2, name='Jerry' }"]
+    T --> OB3["字段提取<br/>取 tuple[4]"]
+    OB3 --> DEPT["department = 'Science'"]
+    CAT --> ASSEMBLE["组装: CatView<br/>{ id=1, name='Tom',<br/>  owner: OwnerView{2, 'Jerry'},<br/>  department: 'Science' }"]
+    OWNER --> ASSEMBLE
+    DEPT --> ASSEMBLE
+
+    style T fill:#3a2a1a,stroke:#d29922
+    style OB1 fill:#1e3a5f,stroke:#58a6ff
+    style OB2 fill:#2d1f4e,stroke:#bc8cff
+    style OB3 fill:#1a3a2a,stroke:#3fb950
+    style ASSEMBLE fill:#1a3a2a,stroke:#3fb950
+</div>
+</div>
+
+<pre><code class="language-java">// 框架内部: ViewTypeObjectBuilder 的核心逻辑（简化）
+class ViewTypeObjectBuilder implements ObjectBuilder&lt;Object&gt; {
+
+    private final ProxyFactory proxyFactory;
+    private final int[] tupleMapping;
+    private final ObjectBuilder&lt;?&gt;[] nestedBuilders;
+
+    @Override
+    public Object build(Object[] tuple) {
+        Object proxy = proxyFactory.create(tupleMapping.length);
+        for (int i = 0; i &lt; tupleMapping.length; i++) {
+            int tupleIndex = tupleMapping[i];
+            if (nestedBuilders[i] != null) {
+                proxy.$$_setAttribute(i,
+                    nestedBuilders[i].build(tuple));
+            } else {
+                proxy.$$_setAttribute(i, tuple[tupleIndex]);
+            }
+        }
+        proxy.$$_initDirtyTracker();
+        return proxy;
+    }
+}
+</code></pre>
+
+
+<!-- ================================================================== -->
+<h2 id="s20-6">20.6 EntityViewListener — 视图生命周期钩子</h2>
+<!-- ================================================================== -->
+
+<h3>这个 SPI 是什么</h3>
+
+<p><code>EntityViewListener</code> 在 Entity View 的创建、更新、删除操作前后触发，提供 AOP 风格的横切逻辑注入点。它的注解生命周期与 JPA 实体生命周期一一对应：<code>@PrePersist</code> → <code>@PreCreate</code>，<code>@PreUpdate</code> → <code>@PreUpdate</code>，<code>@PreRemove</code> → <code>@PreRemove</code>。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 20-10 Entity View CRUD 生命周期与 Listener 钩子</div>
+<div class="mermaid">
+sequenceDiagram
+    participant App as 应用代码
+    participant EVM as EntityViewManager
+    participant L as EntityViewListener
+    participant EM as EntityManager
+    participant DB as 数据库
+
+    rect rgb(30,58,95)
+    Note over App,DB: 创建流程
+    App->>EVM: evm.save(orderView)
+    EVM->>L: @PreCreate(orderView)
+    L-->>EVM: 注入 createdAt / createdBy
+    EVM->>EM: em.persist(entity)
+    EM->>DB: INSERT INTO orders ...
+    DB-->>EM: OK
+    EVM->>L: @PostCreate(orderView)
+    end
+
+    rect rgb(45,31,78)
+    Note over App,DB: 更新流程
+    App->>EVM: evm.save(orderView)
+    EVM->>L: @PreUpdate(orderView)
+    L-->>EVM: 注入 updatedAt / updatedBy
+    EVM->>EM: em.merge(entity)
+    EM->>DB: UPDATE orders SET ...
+    DB-->>EM: OK
+    EVM->>L: @PostUpdate(orderView)
+    end
+
+    rect rgb(26,58,42)
+    Note over App,DB: 删除流程
+    App->>EVM: evm.remove(orderView)
+    EVM->>L: @PreRemove(orderView)
+    L-->>EVM: 审计记录; return true 允许删除
+    EVM->>EM: em.remove(entity)
+    EM->>DB: DELETE FROM orders ...
+    DB-->>EM: OK
+    EVM->>L: @PostRemove(orderView)
+    end
+</div>
+</div>
+
+<h3>我们怎么用：审计 Listener</h3>
+
+<pre><code class="language-java">// 定义可审计视图接口
+public interface AuditableView {
+    void setCreatedAt(Instant createdAt);
+    void setCreatedBy(String user);
+    void setUpdatedAt(Instant updatedAt);
+    void setUpdatedBy(String user);
+}
+
+// 审计 Listener
+@ViewListener
+public class AuditViewListener implements EntityViewListener {
+
+    @PrePersist
+    public void onPrePersist(Object view) {
+        if (view instanceof AuditableView av) {
+            av.setCreatedAt(Instant.now());
+            av.setCreatedBy(SecurityContext.getCurrentUser());
+            av.setUpdatedAt(Instant.now());
+            av.setUpdatedBy(SecurityContext.getCurrentUser());
+        }
+    }
+
+    @PreUpdate
+    public void onPreUpdate(Object view) {
+        if (view instanceof AuditableView av) {
+            av.setUpdatedAt(Instant.now());
+            av.setUpdatedBy(SecurityContext.getCurrentUser());
+        }
+    }
+
+    @PreRemove
+    public boolean onPreRemove(Object view) {
+        AuditLog.record("DELETE",
+            view.getClass().getSimpleName(),
+            ((Identifiable) view).getId(),
+            SecurityContext.getCurrentUser());
+        return true;   // false → 取消删除操作
+    }
+
+    @PostUpdate
+    public void onPostUpdate(Object view) {
+        EventBus.publish(new EntityUpdatedEvent(
+            view.getClass().getSimpleName(),
+            ((Identifiable) view).getId()));
+    }
+}
+</code></pre>
+
+<pre><code class="language-sql">-- @PrePersist 注入后实际执行的 SQL:
+INSERT INTO orders (id, customer_name, total_amount,
+                    created_at, created_by,
+                    updated_at, updated_by)
+VALUES (?, ?, ?,
+        '2026-04-21T10:30:00Z', 'admin',
+        '2026-04-21T10:30:00Z', 'admin')
+
+-- @PreUpdate 注入后实际执行的 SQL:
+UPDATE orders
+SET customer_name = ?, total_amount = ?,
+    updated_at = '2026-04-21T14:15:00Z',
+    updated_by = 'admin'
+WHERE id = ?
+</code></pre>
+
+<h3>框架自己怎么用</h3>
+
+<div class="diagram">
+<div class="diagram-title">Fig 20-11 框架内部 Listener 用途</div>
+<div class="mermaid">
+flowchart LR
+    subgraph INTERNAL ["框架内部 Listener"]
+        DT["脏跟踪 Listener<br/>DirtyTrackingListener"]
+        CP["级联传播 Listener<br/>CascadePropagationListener"]
+        VL["版本校验 Listener<br/>VersionValidationListener"]
+    end
+
+    DT --> D1["@PreCreate:<br/>标记所有字段为 NEW"]
+    DT --> D2["@PostLoad:<br/>记录初始状态快照"]
+    CP --> C1["@PreUpdate:<br/>递归检查子 View 变更"]
+    CP --> C2["@PreRemove:<br/>级联删除嵌套 View"]
+    VL --> V1["@PreUpdate:<br/>校验 @Version 一致<br/>不一致 → OptimisticLockException"]
+
+    style DT fill:#1e3a5f,stroke:#58a6ff
+    style CP fill:#2d1f4e,stroke:#bc8cff
+    style VL fill:#1a3a2a,stroke:#3fb950
+</div>
+</div>
+
+
+<!-- ================================================================== -->
+<h2 id="s20-7">20.7 ViewFilter — 视图过滤器</h2>
+<!-- ================================================================== -->
+
+<h3>这个 SPI 是什么</h3>
+
+<p><code>@ViewFilter</code> 为 Entity View 定义可复用的命名过滤条件。查询时按名称激活——适合软删除、多租户、状态过滤等横切逻辑。<code>ViewFilter</code> 是纯用户扩展点——框架内部不使用它。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 20-12 ViewFilter 应用管线</div>
+<div class="mermaid">
+flowchart TD
+    DEF["@ViewFilter(name='activeOnly',<br/>  value='deleted = false')<br/>@ViewFilter(name='tenant',<br/>  value='tenantId = :tid')"]
+    DEF --> SETTING["EntityViewSetting<br/>.addViewFilter('activeOnly')<br/>.addViewFilter('tenant')"]
+    SETTING --> MERGE["合并过滤条件<br/>追加到 WHERE 子句"]
+    MERGE --> SQL["最终 SQL"]
+
+    subgraph PIPELINE ["过滤器合并管线"]
+        BASE["基础 CriteriaBuilder<br/>SELECT o FROM Order o"] --> F1["应用 activeOnly<br/>追加: AND o.deleted = false"]
+        F1 --> F2["应用 tenant<br/>追加: AND o.tenantId = :tid"]
+        F2 --> FINAL["SELECT o FROM Order o<br/>WHERE o.deleted = false<br/>AND o.tenantId = :tid"]
+    end
+
+    MERGE -.-> PIPELINE
+
+    style DEF fill:#3a2a1a,stroke:#d29922
+    style SETTING fill:#1e3a5f,stroke:#58a6ff
+    style MERGE fill:#2d1f4e,stroke:#bc8cff
+    style SQL fill:#1a3a2a,stroke:#3fb950
+</div>
+</div>
+
+<h3>完整代码：软删除 + 多租户过滤</h3>
+
+<pre><code class="language-java">// Step 1: 定义 Entity View，声明过滤器
+@EntityView(Order.class)
+@ViewFilter(name = "activeOnly", value = "deleted = false")
+@ViewFilter(name = "currentTenant", value = "tenantId = :tenantId")
+public interface OrderView {
+
+    @IdMapping
+    Long getId();
+
+    String getCustomerName();
+
+    BigDecimal getTotalAmount();
+
+    OrderStatus getStatus();
+
+    boolean isDeleted();
+}
+</code></pre>
+
+<pre><code class="language-java">// Step 2: 查询时激活过滤器
+EntityViewSetting&lt;OrderView, CriteriaBuilder&lt;OrderView&gt;&gt; setting =
+    EntityViewSetting.create(OrderView.class);
+
+setting.addViewFilter("activeOnly");
+setting.addViewFilter("currentTenant");
+setting.addOptionalParameter("tenantId", currentTenantId);
+
+CriteriaBuilder&lt;OrderView&gt; cb = cbf.create(em, Order.class);
+List&lt;OrderView&gt; orders = evm.applySetting(setting, cb)
+    .getResultList();
+</code></pre>
+
+<pre><code class="language-sql">-- 生成的 JPQL（两个过滤器合并后）:
+SELECT o
+FROM Order o
+WHERE o.deleted = false
+  AND o.tenantId = :tenantId
+
+-- PostgreSQL 原生 SQL:
+SELECT o.id, o.customer_name, o.total_amount, o.status, o.deleted
+FROM orders o
+WHERE o.deleted = false
+  AND o.tenant_id = ?
+</code></pre>
+
+<h3>ViewFilterProvider — 动态过滤参数</h3>
+
+<pre><code class="language-java">// ViewFilterProvider: 无需手动设置参数，由 Provider 自动注入
+public class TenantFilterProvider implements ViewFilterProvider {
+
+    @Override
+    public String getFilterName() {
+        return "currentTenant";
+    }
+
+    @Override
+    public Map&lt;String, Object&gt; getFilterParameters() {
+        return Map.of("tenantId", SecurityContext.getTenantId());
+    }
+}
+
+// 注册后，activeOnly 过滤器自动生效，无需手动 addViewFilter:
+EntityViewSetting&lt;OrderView, CriteriaBuilder&lt;OrderView&gt;&gt; setting =
+    EntityViewSetting.create(OrderView.class);
+
+// tenantId 参数由 TenantFilterProvider 自动注入
+List&lt;OrderView&gt; orders = evm.applySetting(setting, cb)
+    .getResultList();
+</code></pre>
+
+
+<!-- ================================================================== -->
+<h2 id="s20-8">20.8 CriteriaBuilderConfigurationContributor — 启动时扩展</h2>
+<!-- ================================================================== -->
+
+<h3>这个 SPI 是什么</h3>
+
+<p><code>CriteriaBuilderConfigurationContributor</code> 基于 Java <code>ServiceLoader</code> 机制，让扩展模块在框架启动时自动注册自定义函数、方言、宏等配置——零显式代码。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 20-13 ServiceLoader 自动发现与配置流程</div>
+<div class="mermaid">
+flowchart TD
+    START["应用启动<br/>Criteria.getDefault()"] --> SL["ServiceLoader.load(<br/>CriteriaBuilderConfiguration<br/>Contributor.class)"]
+    SL --> SCAN["扫描 classpath 所有 JAR<br/>META-INF/services/"]
+    SCAN --> D1["发现: HibernateContributor<br/>blaze-persistence-integration-hibernate"]
+    SCAN --> D2["发现: EclipseLinkContributor<br/>blaze-persistence-integration-eclipselink"]
+    SCAN --> D3["发现: MyAppContributor<br/>用户自定义"]
+    D1 --> APPLY["调用 contribute(config)"]
+    D2 --> APPLY
+    D3 --> APPLY
+    APPLY --> REG1["注册 Hibernate 特定<br/>JPA Provider 实现"]
+    APPLY --> REG2["注册 EclipseLink<br/>适配器"]
+    APPLY --> REG3["注册 array_agg<br/>ST_DISTANCE 等业务函数"]
+    REG1 & REG2 & REG3 --> CBF["CriteriaBuilderFactory<br/>就绪 — 所有扩展已加载"]
+
+    style START fill:#3a2a1a,stroke:#d29922
+    style SL fill:#1e3a5f,stroke:#58a6ff
+    style SCAN fill:#2d1f4e,stroke:#bc8cff
+    style APPLY fill:#2d1f4e,stroke:#bc8cff
+    style CBF fill:#1a3a2a,stroke:#3fb950
+</div>
+</div>
+
+<h3>框架自己怎么用</h3>
+
+<p>Blaze-Persistence 的 Hibernate 集成模块通过此机制自动注册 Hibernate 特有的 JPA Provider 实现。开发者只要引入 <code>blaze-persistence-integration-hibernate-5.x</code> Maven 依赖，ServiceLoader 会自动发现 <code>HibernateRegistrationContributor</code> 并注册 Hibernate Provider——无需手动配置。</p>
+
+<h3>我们怎么用：自定义 Contributor</h3>
+
+<pre><code class="language-java">// Step 1: 实现 Contributor
+public class MyAppContributor
+        implements CriteriaBuilderConfigurationContributor {
+
+    @Override
+    public void contribute(CriteriaBuilderConfiguration config) {
+        // 注册自定义 JPQL 函数
+        config.registerFunction(
+            new JpqlFunctionGroup("array_agg",
+                new PostgresArrayAggFunction()));
+        config.registerFunction(
+            new JpqlFunctionGroup("ts_rank",
+                new PostgresTsRankFunction()));
+
+        // 注册自定义宏
+        config.registerMacro("CURRENT_TENANT",
+            new CurrentTenantMacro());
+        config.registerMacro("NOW",
+            new NowMacro());
+    }
+}
+</code></pre>
+
+<pre><code class="language-text"># Step 2: 创建 ServiceLoader 配置文件
+# 文件路径: META-INF/services/com.blazebit.persistence.spi.CriteriaBuilderConfigurationContributor
+# 文件内容（每行一个全限定类名）:
+com.example.MyAppContributor
+</code></pre>
+
+<pre><code class="language-java">// Step 3: 零配置 — 应用启动时自动发现
+// 无需任何额外代码！ServiceLoader 自动调用 contribute():
+
+CriteriaBuilderConfiguration config = Criteria.getDefault();
+//  ↑ 此时 MyAppContributor.contribute(config) 已被调用
+//    array_agg, ts_rank 函数已注册
+//    CURRENT_TENANT, NOW 宏已注册
+
+CriteriaBuilderFactory cbf = config.createCriteriaBuilderFactory(emf);
+
+// 直接使用注册的函数:
+CriteriaBuilder&lt;Tuple&gt; cb = cbf.create(em, Tuple.class)
+    .from(Order.class, "o")
+    .select("FUNCTION('array_agg', o.product.name)")
+    .groupBy("o.customer.name");
+</code></pre>
+
+<pre><code class="language-sql">-- 自动注册后直接可用的查询:
+SELECT array_agg(p.name)
+FROM orders o
+JOIN products p ON o.product_id = p.id
+GROUP BY o.customer_name
+</code></pre>
+
+<div class="key-insight">
+  <strong>ServiceLoader 的威力</strong>：将函数/宏/方言打包为独立 JAR，消费方只需添加 Maven 依赖——ServiceLoader 自动发现并注册所有扩展。这正是 Blaze-Persistence 自身 Hibernate/EclipseLink 集成模块的工作方式。
+</div>
+
+
+<!-- ================================================================== -->
+<h2 id="s20-9">20.9 Spring Data Repository 扩展</h2>
+<!-- ================================================================== -->
+
+<h3>这个 SPI 是什么</h3>
+
+<p>Blaze-Persistence 在 Spring Data 层面提供三个核心扩展接口，让 Repository 具备 Entity View 感知能力、动态查询能力和游标分页能力。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 20-14 Spring Data Repository 扩展继承体系</div>
+<div class="mermaid">
+classDiagram
+    class JpaRepository~T, ID~ {
+        &lt;&lt;Spring Data&gt;&gt;
+        +findAll() List~T~
+        +save(entity) T
+        +deleteById(id)
+    }
+
+    class EntityViewRepository~V, ID~ {
+        &lt;&lt;Blaze-Persistence&gt;&gt;
+        +findAll() List~V~
+        +findOne(EntityViewSetting) V
+    }
+
+    class EntityViewSpecificationExecutor~V~ {
+        &lt;&lt;Blaze-Persistence&gt;&gt;
+        +findAll(spec) List~V~
+        +findAll(spec, pageable) Page~V~
+        +findOne(spec) Optional~V~
+        +count(spec) long
+    }
+
+    class KeysetAwareRepository~V, ID~ {
+        &lt;&lt;Blaze-Persistence&gt;&gt;
+        +findAll(pageable) KeysetAwarePage~V~
+        +findAll(spec, pageable) KeysetAwarePage~V~
+    }
+
+    class OrderViewRepository {
+        &lt;&lt;用户定义&gt;&gt;
+        +findByStatus(status) List~OrderView~
+        +findByTotalAmountGreaterThan(min) List~OrderView~
+    }
+
+    JpaRepository <|-- EntityViewRepository
+    EntityViewRepository <|-- OrderViewRepository
+    EntityViewSpecificationExecutor <|.. OrderViewRepository
+    KeysetAwareRepository <|.. OrderViewRepository
+</div>
+</div>
+
+<div class="diagram">
+<div class="diagram-title">Fig 20-15 Spring Data 自动代理生成流程</div>
+<div class="mermaid">
+flowchart LR
+    IFACE["OrderViewRepository<br/>接口定义"] --> PROXY["Spring Data<br/>代理工厂"]
+    PROXY --> DETECT["检测: extends<br/>EntityViewRepository?"]
+    DETECT -->|是| BP_IMPL["Blaze-Persistence<br/>SimpleEntityViewRepository<br/>自动生成实现"]
+    DETECT -->|否| JPA_IMPL["标准 JPA<br/>SimpleJpaRepository"]
+    BP_IMPL --> INJECT["注入<br/>CriteriaBuilderFactory<br/>EntityViewManager"]
+    INJECT --> READY["Repository Bean<br/>可用于 @Autowired"]
+
+    style IFACE fill:#3a2a1a,stroke:#d29922
+    style PROXY fill:#1e3a5f,stroke:#58a6ff
+    style BP_IMPL fill:#2d1f4e,stroke:#bc8cff
+    style READY fill:#1a3a2a,stroke:#3fb950
+</div>
+</div>
+
+<h3>完整代码：Repository 定义</h3>
+
+<pre><code class="language-java">public interface OrderViewRepository
+        extends EntityViewRepository&lt;OrderView, Long&gt;,
+                EntityViewSpecificationExecutor&lt;OrderView, Long&gt;,
+                KeysetAwareRepository&lt;OrderView, Long&gt; {
+
+    // 派生查询 — Spring Data 自动解析方法名:
+    List&lt;OrderView&gt; findByStatusAndTotalAmountGreaterThan(
+        OrderStatus status, BigDecimal minAmount);
+
+    // 游标分页:
+    KeysetAwarePage&lt;OrderView&gt; findAll(Pageable pageable);
+
+    // 自定义 JPQL:
+    @Query("SELECT o FROM Order o WHERE o.customer.name LIKE :keyword")
+    List&lt;OrderView&gt; searchByCustomerName(
+        @Param("keyword") String keyword);
+}
+</code></pre>
+
+<h3>用法 1：派生查询</h3>
+
+<pre><code class="language-java">List&lt;OrderView&gt; results = repo.findByStatusAndTotalAmountGreaterThan(
+    OrderStatus.CONFIRMED, new BigDecimal("100.00"));
+</code></pre>
+
+<pre><code class="language-sql">-- Spring Data 自动解析方法名生成:
+SELECT o.id, o.customer_name, o.total_amount, o.status
+FROM orders o
+WHERE o.status = ?
+  AND o.total_amount > ?
+-- 参数: ['CONFIRMED', 100.00]
+</code></pre>
+
+<h3>用法 2：Specification 组合查询</h3>
+
+<pre><code class="language-java">// 定义 Specification:
+class OrderSpecifications {
+    static Specification&lt;Order&gt; hasStatus(OrderStatus s) {
+        return (root, query, cb) ->
+            cb.equal(root.get("status"), s);
+    }
+
+    static Specification&lt;Order&gt; totalGreaterThan(BigDecimal min) {
+        return (root, query, cb) ->
+            cb.greaterThan(root.get("totalAmount"), min);
+    }
+
+    static Specification&lt;Order&gt; customerNameLike(String keyword) {
+        return (root, query, cb) ->
+            cb.like(root.get("customer").get("name"),
+                    "%" + keyword + "%");
+    }
+}
+
+// 组合 Specification:
+Page&lt;OrderView&gt; page = repo.findAll(
+    hasStatus(CONFIRMED)
+        .and(totalGreaterThan(new BigDecimal("100")))
+        .and(customerNameLike("Alice")),
+    PageRequest.of(0, 20, Sort.by("totalAmount").descending())
+);
+</code></pre>
+
+<pre><code class="language-sql">-- 三个 Specification 组合后生成:
+SELECT o.id, o.customer_name, o.total_amount, o.status
+FROM orders o
+JOIN customers c ON o.customer_id = c.id
+WHERE o.status = ?
+  AND o.total_amount > ?
+  AND c.name LIKE ?
+ORDER BY o.total_amount DESC
+LIMIT 20 OFFSET 0
+-- 参数: ['CONFIRMED', 100.00, '%Alice%']
+</code></pre>
+
+<h3>用法 3：游标分页（Keyset Pagination）</h3>
+
+<pre><code class="language-java">// 第一页:
+KeysetAwarePage&lt;OrderView&gt; firstPage = repo.findAll(
+    new KeysetPageRequest(null, Sort.by("id"), 20));
+
+// 下一页 — 基于游标，不使用 OFFSET:
+KeysetAwarePage&lt;OrderView&gt; nextPage = repo.findAll(
+    firstPage.nextPageable());
+</code></pre>
+
+<pre><code class="language-sql">-- 第一页:
+SELECT o.id, o.customer_name, o.total_amount, o.status
+FROM orders o
+ORDER BY o.id ASC
+LIMIT 20
+
+-- 第二页（游标分页，避免 OFFSET）:
+SELECT o.id, o.customer_name, o.total_amount, o.status
+FROM orders o
+WHERE o.id > ?              -- 上一页最后一条的 id
+ORDER BY o.id ASC
+LIMIT 20
+-- 参数: [lastId]          -- 无 OFFSET！O(1) 性能
+</code></pre>
+
+<div class="key-insight">
+  <strong>游标分页 vs OFFSET 分页</strong>：<code>OFFSET 10000</code> 需要数据库扫描前 10000 行后丢弃；游标分页用 <code>WHERE id > ?</code> 直接定位，性能恒定 O(1)，不随页码增长而下降。
+</div>
+
+
+<!-- ================================================================== -->
+<h2 id="s20-10">20.10 框架自用全景图</h2>
+<!-- ================================================================== -->
+
+<p>最后，用一张全景图展示 Blaze-Persistence 如何 Dogfooding 自己的扩展体系——每个扩展点都先被框架自身验证使用，再开放给开发者。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 20-16 框架自用全景：查询生命周期 × 扩展点</div>
+<!-- 8 阶段管线 — 水平布局 -->
+<div style="display:flex;align-items:stretch;gap:6px;justify-content:center;flex-wrap:wrap;padding:16px 0;">
+  <div style="border:1px solid #d29922;border-radius:8px;padding:10px 12px;min-width:110px;max-width:150px;background:rgba(210,153,34,.08);text-align:center;">
+    <div style="font-weight:bold;color:#d29922;font-size:13px;margin-bottom:6px;">① 查询构建</div>
+    <div style="color:#8b949e;font-size:12px;">CriteriaBuilder API → ExpressionParser</div>
+  </div>
+  <span style="color:#8b949e;font-size:18px;align-self:center;">→</span>
+  <div style="border:1px solid #58a6ff;border-radius:8px;padding:10px 12px;min-width:130px;max-width:170px;background:rgba(88,166,255,.06);text-align:center;">
+    <div style="font-weight:bold;color:#58a6ff;font-size:13px;margin-bottom:6px;">② JpqlMacro</div>
+    <div style="color:#58a6ff;font-size:11px;">框架: VIEW_ROOT, EMBEDDING_VIEW_ROOT</div>
+    <div style="color:#3fb950;font-size:11px;margin-top:4px;">用户: CURRENT_TENANT, NOW</div>
+  </div>
+  <span style="color:#8b949e;font-size:18px;align-self:center;">→</span>
+  <div style="border:1px solid #58a6ff;border-radius:8px;padding:10px 12px;min-width:140px;max-width:180px;background:rgba(88,166,255,.06);text-align:center;">
+    <div style="font-weight:bold;color:#58a6ff;font-size:13px;margin-bottom:6px;">③ JpqlFunction</div>
+    <div style="color:#58a6ff;font-size:11px;">框架: 30+ 内置<br/>SET_UNION, WINDOW_ROW_NUMBER …</div>
+    <div style="color:#3fb950;font-size:11px;margin-top:4px;">用户: array_agg, ts_rank …</div>
+  </div>
+  <span style="color:#8b949e;font-size:18px;align-self:center;">→</span>
+  <div style="border:1px solid #bc8cff;border-radius:8px;padding:10px 12px;min-width:130px;max-width:170px;background:rgba(188,140,255,.06);text-align:center;">
+    <div style="font-weight:bold;color:#bc8cff;font-size:13px;margin-bottom:6px;">④ DbmsDialect</div>
+    <div style="color:#bc8cff;font-size:11px;">框架: 7 方言<br/>PG / MySQL / Oracle …</div>
+    <div style="color:#3fb950;font-size:11px;margin-top:4px;">用户: 自定义方言覆盖</div>
+  </div>
+  <span style="color:#8b949e;font-size:18px;align-self:center;">→</span>
+  <div style="border:1px solid #8b949e;border-radius:8px;padding:10px 12px;min-width:90px;max-width:120px;background:rgba(139,148,158,.06);text-align:center;">
+    <div style="font-weight:bold;color:#e6edf3;font-size:13px;margin-bottom:6px;">⑤ JDBC</div>
+    <div style="color:#8b949e;font-size:12px;">执行 SQL<br/>获取 ResultSet</div>
+  </div>
+  <span style="color:#8b949e;font-size:18px;align-self:center;">→</span>
+  <div style="border:1px solid #58a6ff;border-radius:8px;padding:10px 12px;min-width:130px;max-width:170px;background:rgba(88,166,255,.06);text-align:center;">
+    <div style="font-weight:bold;color:#58a6ff;font-size:13px;margin-bottom:6px;">⑥ ObjectBuilder</div>
+    <div style="color:#58a6ff;font-size:11px;">框架: ViewType / Tuple / FlatView</div>
+    <div style="color:#3fb950;font-size:11px;margin-top:4px;">用户: OrderDtoBuilder</div>
+  </div>
+  <span style="color:#8b949e;font-size:18px;align-self:center;">→</span>
+  <div style="border:1px solid #bc8cff;border-radius:8px;padding:10px 12px;min-width:130px;max-width:170px;background:rgba(188,140,255,.06);text-align:center;">
+    <div style="font-weight:bold;color:#bc8cff;font-size:13px;margin-bottom:6px;">⑦ ViewListener</div>
+    <div style="color:#bc8cff;font-size:11px;">框架: DirtyTracking, Cascade, Version</div>
+    <div style="color:#3fb950;font-size:11px;margin-top:4px;">用户: Audit, Events</div>
+  </div>
+  <span style="color:#8b949e;font-size:18px;align-self:center;">→</span>
+  <div style="border:1px solid #d29922;border-radius:8px;padding:10px 12px;min-width:90px;max-width:120px;background:rgba(210,153,34,.08);text-align:center;">
+    <div style="font-weight:bold;color:#d29922;font-size:13px;margin-bottom:6px;">⑧ 结果</div>
+    <div style="color:#8b949e;font-size:12px;">Entity View / DTO</div>
+  </div>
+</div>
+</div>
+
+<div class="diagram">
+<div class="diagram-title">Fig 20-17 框架内置 JpqlFunction 完整注册清单</div>
+<div style="display:flex;flex-wrap:wrap;gap:16px;justify-content:center;padding:16px 0;">
+  <div style="border:1px solid #58a6ff;border-radius:8px;padding:14px 18px;min-width:180px;max-width:220px;background:rgba(88,166,255,.06);">
+    <div style="font-weight:bold;color:#58a6ff;margin-bottom:8px;">集合运算 (5)</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">SET_UNION<br/>SET_UNION_ALL<br/>SET_INTERSECT<br/>SET_INTERSECT_ALL<br/>SET_EXCEPT</div>
+  </div>
+  <div style="border:1px solid #bc8cff;border-radius:8px;padding:14px 18px;min-width:180px;max-width:220px;background:rgba(188,140,255,.06);">
+    <div style="font-weight:bold;color:#bc8cff;margin-bottom:8px;">窗口函数 (10)</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">WINDOW_ROW_NUMBER<br/>WINDOW_RANK<br/>WINDOW_DENSE_RANK<br/>WINDOW_NTILE<br/>WINDOW_LEAD / LAG<br/>WINDOW_SUM / AVG<br/>WINDOW_MIN / MAX</div>
+  </div>
+  <div style="border:1px solid #3fb950;border-radius:8px;padding:14px 18px;min-width:180px;max-width:220px;background:rgba(63,185,80,.06);">
+    <div style="font-weight:bold;color:#3fb950;margin-bottom:8px;">聚合增强 (5)</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">COUNT_TUPLE<br/>GROUP_CONCAT<br/>WINDOW_COUNT<br/>WINDOW_FIRST_VALUE<br/>WINDOW_LAST_VALUE</div>
+  </div>
+  <div style="border:1px solid #d29922;border-radius:8px;padding:14px 18px;min-width:180px;max-width:220px;background:rgba(210,153,34,.06);">
+    <div style="font-weight:bold;color:#d29922;margin-bottom:8px;">工具函数 (10+)</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">PAGE_POSITION<br/>ENTITY_FUNCTION<br/>NULLFN / PARAM<br/>CAST_TYPE / TREAT_TYPE<br/>SUBQUERY / ALIAS<br/>COLUMN_TRUNC / EXIST</div>
+  </div>
+</div>
+</div>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>扩展点</th><th>框架内部实现数</th><th>框架自用场景</th><th>开发者扩展场景</th></tr>
+</thead>
+<tbody>
+<tr><td><code>JpqlFunction</code></td><td>30+</td><td>集合运算、窗口函数、聚合增强、分页辅助</td><td>PostgreSQL array_agg、全文搜索 ts_rank、GIS 函数</td></tr>
+<tr><td><code>JpqlMacro</code></td><td>2</td><td>VIEW_ROOT / EMBEDDING_VIEW_ROOT 关联子查询</td><td>租户 ID、审计用户、时间戳宏</td></tr>
+<tr><td><code>DbmsDialect</code></td><td>7</td><td>PostgreSQL / MySQL / Oracle / SQL Server / H2 / DB2 + Default</td><td>自定义方言覆盖</td></tr>
+<tr><td><code>ObjectBuilder</code></td><td>5+</td><td>ViewType / Tuple / FlatView / Collection / Subquery 构建器</td><td>自定义 DTO 构建器</td></tr>
+<tr><td><code>EntityViewListener</code></td><td>3</td><td>脏跟踪初始化、级联传播、乐观锁版本校验</td><td>审计日志、事件发布、自定义校验</td></tr>
+<tr><td><code>ViewFilter</code></td><td>0</td><td>纯用户扩展点（框架不自用）</td><td>软删除、多租户、状态过滤</td></tr>
+<tr><td><code>ConfigContributor</code></td><td>3+</td><td>Hibernate / EclipseLink / DataNucleus Provider 集成注册</td><td>自动注册自定义函数/方言包</td></tr>
+<tr><td><code>Repository 扩展</code></td><td>4</td><td>SimpleEntityViewRepository 自动实现</td><td>派生查询、Specification 组合、游标分页</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="diagram">
+<div class="diagram-title">Fig 20-18 Dogfooding 设计哲学</div>
+<div class="mermaid">
+flowchart TD
+    PHIL["设计哲学: Dogfooding<br/>框架自己是第一个用户"]
+
+    PHIL --> P1["JpqlFunction<br/>框架先用它实现<br/>30+ 内置函数<br/>才开放给开发者"]
+    PHIL --> P2["DbmsDialect<br/>框架先用它适配<br/>7 种数据库<br/>才允许用户覆盖"]
+    PHIL --> P3["ObjectBuilder<br/>框架先用它构建<br/>Entity View 代理<br/>才暴露为扩展接口"]
+    PHIL --> P4["ConfigContributor<br/>框架先用它注册<br/>JPA Provider<br/>才开放为自动发现"]
+    PHIL --> P5["EntityViewListener<br/>框架先用它做<br/>脏跟踪和级联<br/>才开放生命周期钩子"]
+
+    P1 & P2 & P3 & P4 & P5 --> BENEFIT["结果: 每个扩展点都经过<br/>框架自身的严格验证<br/>开发者使用的 SPI<br/>与框架内核完全一致<br/>— 没有二等公民"]
+
+    style PHIL fill:#3a2a1a,stroke:#d29922
+    style P1 fill:#1e3a5f,stroke:#58a6ff
+    style P2 fill:#2d1f4e,stroke:#bc8cff
+    style P3 fill:#1a3a2a,stroke:#3fb950
+    style P4 fill:#1e3a5f,stroke:#58a6ff
+    style P5 fill:#2d1f4e,stroke:#bc8cff
+    style BENEFIT fill:#1a3a2a,stroke:#3fb950
+</div>
+</div>
+
+
+<!-- ================================================================== -->
+<div class="chapter-summary" id="summary">
+  <h2>本章小结</h2>
+  <ul>
+    <li><strong>JpqlFunction</strong> 让我们在 JPQL 层面注册自定义函数——<code>render()</code> 方法产出原生 SQL。框架自身用它实现了 30+ 内置函数（SET_UNION、WINDOW_ROW_NUMBER、GROUP_CONCAT 等），且 GROUP_CONCAT 在 PostgreSQL、MySQL、Oracle、SQL Server 上分别渲染为 STRING_AGG、GROUP_CONCAT、LISTAGG、STRING_AGG</li>
+    <li><strong>JpqlMacro</strong> 在表达式解析前完成宏展开——比 JpqlFunction 更早介入。框架用 VIEW_ROOT / EMBEDDING_VIEW_ROOT 实现 Entity View 子查询关联；开发者可注册 CURRENT_TENANT、NOW 等业务宏</li>
+    <li><strong>DbmsDialect</strong> 是跨数据库的枢纽——同一 CTE API，PostgreSQL 输出 <code>WITH ... AS</code>，MySQL 5.7 降级为派生表，Oracle 用列别名语法。分页、窗口函数、LATERAL JOIN、DML + JOIN 同理</li>
+    <li><strong>ObjectBuilder</strong> 将 <code>Object[]</code> 元组映射为目标对象——框架的 ViewTypeObjectBuilder 负责创建 Entity View 代理、初始化脏跟踪、递归构建嵌套 View</li>
+    <li><strong>EntityViewListener</strong> 提供 @PreCreate / @PreUpdate / @PreRemove 等生命周期钩子——框架内部用于脏跟踪和级联传播，开发者用于审计、事件发布</li>
+    <li><strong>ViewFilter</strong> 是纯用户扩展点——通过 <code>@ViewFilter</code> 注解定义命名过滤器，查询时按名称激活，适合软删除和多租户</li>
+    <li><strong>ConfigurationContributor</strong> 通过 ServiceLoader 实现零配置自动注册——将函数和宏打包为 JAR，消费方只需添加 Maven 依赖</li>
+    <li><strong>Spring Data Repository 扩展</strong> 让 Repository 具备 Entity View 感知、Specification 动态查询、游标分页能力，生成高效的 <code>WHERE id > ?</code> 分页 SQL</li>
+    <li><strong>Dogfooding 设计哲学</strong>：每个扩展点都先被框架自身使用验证，再开放给开发者——没有二等公民</li>
+  </ul>
+  <p class="next-hint">下一章 <a href="ch21-optimization.html">第 21 章 · SQL 优化与实战模式</a> 将前 20 章的知识融会贯通——用 Entity View 精确投影消灭 SELECT *，用 Keyset 分页替代 OFFSET，用 CTE + 窗口函数构建高性能报表，用 @ViewFilter 实现透明的软删除和多租户。</p>
+</div>
+
+<div class="chapter-nav">
+  <a href="ch19-codepath.html">← 第 19 章 · 代码到 SQL 全路径追踪</a>
+  <a href="ch21-optimization.html">第 21 章 · SQL 优化与实战模式 →</a>
+</div>
+
+<p class="footer">&copy; 2026 图解 Blaze-Persistence · 第 20 章</p>
+
+</article>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+mermaid.initialize({
+  theme: 'dark',
+  themeVariables: {
+    primaryColor: '#58a6ff', primaryTextColor: '#e6edf3', primaryBorderColor: '#30363d',
+    lineColor: '#8b949e', secondaryColor: '#161b22', tertiaryColor: '#0d1117',
+    background: '#161b22', mainBkg: '#161b22', nodeBorder: '#30363d',
+    clusterBkg: 'rgba(22,27,34,.5)', clusterBorder: '#30363d', titleColor: '#e6edf3',
+    edgeLabelBackground: '#161b22',
+  },
+  flowchart: { curve: 'basis', padding: 15 },
+  sequence: { actorMargin: 50, messageMargin: 30 },
+});
+</script>
+</body>
+</html>

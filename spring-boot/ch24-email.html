@@ -1,0 +1,1957 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 24 章 · 邮件服务 — 图解 Spring Boot</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="g-blue" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1e3a8a"/><stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="g-green" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#14532d"/><stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="g-orange" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7c2d12"/><stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="g-red" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7f1d1d"/><stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="g-purple" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#4c1d95"/><stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8b949e"/>
+    </marker>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Spring Boot</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="ch23-security.html">上一章 ch23-security</a>
+  <a href="ch25-remoting.html">下一章 ch25-remoting</a>
+</nav>
+
+<aside class="toc">
+<a href="#24.1-javamail-与-spring-抽象">24.1 JavaMail 与 Spring 抽象</a>
+<a href="#24.2-spring-boot-邮件自动配置">24.2 Spring Boot 邮件自动配置</a>
+<a href="#24.3-html-邮件与模板引擎">24.3 HTML 邮件与模板引擎</a>
+<a href="#24.4-附件与多部分邮件">24.4 附件与多部分邮件</a>
+<a href="#24.5-异步发送与重试">24.5 异步发送与重试</a>
+<a href="#24.6-源码到运行时">24.6 源码到运行时</a>
+<a href="#24.7-陷阱与限制">24.7 陷阱与限制</a>
+<a href="#24.8-本章小结">24.8 本章小结</a>
+</aside>
+
+<div class="article">
+
+<h1>第 24 章 · 邮件服务</h1>
+<p class="subtitle">v7 图解版 · 自动从 v6 markdown 生成 · Mermaid 图原样保留</p>
+<div class="chapter-intro"><p>订单创建后的确认邮件、支付授权后的通知、每月账单的 PDF 附件推送——邮件是几乎所有业务系统绕不开的基础能力。然而直接使用 JavaMail API 发送一封带 HTML 正文、嵌入式图片与 PDF 附件的多部分邮件,需要手动管理 <code>Session</code>、<code>Transport</code>、<code>MimeMultipart</code>、<code>BodyPart</code> 的层层嵌套,代码冗长且极易出错。</p>
+<p>Spring 从 1.x 时代就提供了 <code>MailSender</code> 与 <code>JavaMailSender</code> 抽象层,将 JavaMail 的底层复杂性封装到极致;Spring Boot 更进一步,通过 <code>MailSenderAutoConfiguration</code> 读取 <code>spring.mail.*</code> 配置即可自动装配一个生产就绪的 <code>JavaMailSenderImpl</code>。本章按"JavaMail 与 Spring 抽象 → Boot 自动配置 → HTML 模板邮件 → MIME 多部分附件 → 异步与重试 → 源码与陷阱"的顺序展开。前置知识:第 20 章 异步处理与 <code>TaskExecutor</code> 线程池体系,第 2 章 自动配置原理。</p>
+</div>
+<h2 id="24.1-javamail-与-spring-抽象">24.1 JavaMail 与 Spring 抽象</h2>
+<p>在理解 Spring 的邮件抽象之前,必须先搞清楚它所封装的底层——JavaMail API。这套 Jakarta(原 javax)标准 API 从 JDK 1.2 时代沿用至今,是 Java 世界发送与接收邮件的事实标准。</p>
+<h3>24.1.1 JavaMail 核心三件套</h3>
+<p>JavaMail 的世界围绕三个核心类运转:<code>Session</code> 负责配置与认证、<code>Transport</code> 负责连接 SMTP 服务器并投递邮件、<code>MimeMessage</code> 承载邮件内容。理解它们之间的关系是掌握 Spring 邮件抽象的基础。</p>
+<pre><code class="language-java">Properties props = new Properties();
+props.put(&quot;mail.smtp.host&quot;, &quot;smtp.company.com&quot;);
+props.put(&quot;mail.smtp.port&quot;, &quot;587&quot;);
+props.put(&quot;mail.smtp.auth&quot;, &quot;true&quot;);
+props.put(&quot;mail.smtp.starttls.enable&quot;, &quot;true&quot;);
+
+Session session = Session.getInstance(props, new Authenticator() {
+    @Override
+    protected PasswordAuthentication getPasswordAuthentication() {
+        return new PasswordAuthentication(&quot;order@company.com&quot;, &quot;secret&quot;);
+    }
+});
+
+MimeMessage message = new MimeMessage(session);
+message.setFrom(new InternetAddress(&quot;noreply@company.com&quot;));
+message.setRecipient(Message.RecipientType.TO,
+    new InternetAddress(&quot;customer@example.com&quot;));
+message.setSubject(&quot;订单确认&quot;, &quot;UTF-8&quot;);
+
+MimeMultipart multipart = new MimeMultipart(&quot;mixed&quot;);
+MimeBodyPart htmlPart = new MimeBodyPart();
+htmlPart.setContent(&quot;&lt;h1&gt;订单已确认&lt;/h1&gt;&quot;, &quot;text/html; charset=UTF-8&quot;);
+multipart.addBodyPart(htmlPart);
+
+MimeBodyPart attachPart = new MimeBodyPart();
+attachPart.attachFile(new File(&quot;/reports/payment-receipt-O1001.pdf&quot;));
+multipart.addBodyPart(attachPart);
+
+message.setContent(multipart);
+Transport.send(message);
+</code></pre>
+<p>运行时可以打开 JavaMail debug 日志,确认它走到了 SMTP 协议的哪一步:</p>
+<pre><code class="language-text">DEBUG SMTP: trying to connect to host smtp.company.com port 587
+DEBUG SMTP: connected to host smtp.company.com port 587
+EHLO app-server-01
+250-smtp.company.com Hello
+STARTTLS
+220 Ready to start TLS
+AUTH LOGIN
+235 2.7.0 Authentication successful
+MAIL FROM noreply@company.com
+RCPT TO customer@example.com
+DATA
+250 2.0.0 Ok queued as 8F2D6A1C3
+</code></pre>
+<p>这段代码虽然能工作,但存在几个明显问题:SMTP 配置散落在 Properties 中缺乏类型安全;<code>Session</code> 的创建方式(<code>getInstance</code> 与 <code>getDefaultInstance</code>)容易混淆;<code>MimeMultipart</code> 的手动嵌套极易出错;异常处理与资源清理全靠开发者自己管理。</p>
+<h3>24.1.2 Spring MailSender 抽象体系</h3>
+<p>Spring 从 1.x 开始就提供了 <code>org.springframework.mail</code> 包来简化邮件发送。这套抽象的核心设计理念是:将"发什么"与"怎么发"彻底分离。</p>
+<pre><code class="language-java">public interface MailSender {
+    void send(SimpleMailMessage simpleMessage) throws MailException;
+    void send(SimpleMailMessage... simpleMessages) throws MailException;
+}
+
+public interface JavaMailSender extends MailSender {
+    MimeMessage createMimeMessage();
+    MimeMessage createMimeMessage(InputStream contentStream);
+    void send(MimeMessage mimeMessage);
+    void send(MimeMessage... mimeMessages);
+    void send(MimeMessagePreparator mimeMessagePreparator);
+    void send(MimeMessagePreparator... mimeMessagePreparators);
+}
+
+@FunctionalInterface
+public interface MimeMessagePreparator {
+    void prepare(MimeMessage mimeMessage) throws Exception;
+}
+</code></pre>
+<p><code>MailSender</code> 是最顶层的抽象——只支持纯文本邮件,接口极简。<code>JavaMailSender</code> 扩展了它,增加了 <code>MimeMessage</code> 的创建与发送能力,并引入了 <code>MimeMessagePreparator</code> 回调模式来简化 <code>MimeMessage</code> 的构建。<code>JavaMailSenderImpl</code> 是 Spring 提供的标准实现,内部持有 JavaMail 的 <code>Session</code> 并管理 <code>Transport</code> 连接。</p>
+<div class="diagram">
+<div class="diagram-title">图 24-1 · Spring MailSender 抽象层次类图</div>
+<svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="22" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">接口体系:从最简到全功能,实现类只一个 JavaMailSenderImpl</text>
+
+  <rect x="340" y="50" width="240" height="60" rx="6" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="460" y="72" text-anchor="middle" fill="#dbeafe" font-size="12" font-weight="bold">★ MailSender(接口)</text>
+  <line x1="360" y1="80" x2="560" y2="80" stroke="#58a6ff" opacity="0.5"/>
+  <text x="460" y="98" text-anchor="middle" fill="#dbeafe" font-size="10">+ send(SimpleMailMessage)</text>
+
+  <rect x="280" y="160" width="360" height="100" rx="6" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="460" y="182" text-anchor="middle" fill="#dbeafe" font-size="12" font-weight="bold">★ JavaMailSender extends MailSender</text>
+  <line x1="300" y1="190" x2="620" y2="190" stroke="#58a6ff" opacity="0.5"/>
+  <text x="300" y="208" fill="#dbeafe" font-size="10">+ MimeMessage createMimeMessage()</text>
+  <text x="300" y="224" fill="#dbeafe" font-size="10">+ send(MimeMessage)</text>
+  <text x="300" y="240" fill="#dbeafe" font-size="10">+ send(MimeMessagePreparator)</text>
+  <text x="300" y="254" fill="#fed7aa" font-size="9">★ 支持完整 MIME 邮件</text>
+
+  <rect x="280" y="300" width="360" height="120" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="460" y="322" text-anchor="middle" fill="#bbf7d0" font-size="12" font-weight="bold">★ JavaMailSenderImpl(标准实现)</text>
+  <line x1="300" y1="330" x2="620" y2="330" stroke="#3fb950" opacity="0.5"/>
+  <text x="300" y="348" fill="#bbf7d0" font-size="10">- host port protocol</text>
+  <text x="300" y="362" fill="#bbf7d0" font-size="10">- username password</text>
+  <text x="300" y="376" fill="#bbf7d0" font-size="10">- javaMailProperties</text>
+  <text x="300" y="390" fill="#bbf7d0" font-size="10">- defaultEncoding session</text>
+  <text x="300" y="408" fill="#bbf7d0" font-size="10">+ testConnection()</text>
+
+  <rect x="40" y="160" width="180" height="80" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="130" y="182" text-anchor="middle" fill="#fed7aa" font-size="11" font-weight="bold">SimpleMailMessage</text>
+  <line x1="60" y1="190" x2="200" y2="190" stroke="#d29922" opacity="0.5"/>
+  <text x="60" y="208" fill="#fed7aa" font-size="9">from / to / cc / bcc</text>
+  <text x="60" y="222" fill="#fed7aa" font-size="9">subject / text</text>
+  <text x="60" y="236" fill="#fed7aa" font-size="9">sentDate</text>
+
+  <rect x="700" y="160" width="200" height="80" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="800" y="182" text-anchor="middle" fill="#e9d5ff" font-size="11" font-weight="bold">MimeMessagePreparator</text>
+  <line x1="720" y1="190" x2="880" y2="190" stroke="#bc8cff" opacity="0.5"/>
+  <text x="720" y="208" fill="#e9d5ff" font-size="9">@FunctionalInterface</text>
+  <text x="720" y="222" fill="#e9d5ff" font-size="9">prepare(MimeMessage)</text>
+  <text x="720" y="236" fill="#e9d5ff" font-size="9">回调风格构建</text>
+
+  <rect x="700" y="300" width="200" height="100" rx="6" fill="url(#g-red)" stroke="#f87171" stroke-width="2"/>
+  <text x="800" y="322" text-anchor="middle" fill="#fecaca" font-size="11" font-weight="bold">★ MimeMessageHelper</text>
+  <line x1="720" y1="330" x2="880" y2="330" stroke="#f87171" opacity="0.5"/>
+  <text x="720" y="348" fill="#fecaca" font-size="9">setText(html, isHtml)</text>
+  <text x="720" y="362" fill="#fecaca" font-size="9">addInline(cid, resource)</text>
+  <text x="720" y="376" fill="#fecaca" font-size="9">addAttachment(name, src)</text>
+  <text x="720" y="390" fill="#fecaca" font-size="9">multipartMode 0/1/2/3</text>
+
+  <path d="M460,110 L460,160" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="475" y="138" fill="#58a6ff" font-size="9">extends</text>
+  <path d="M460,260 L460,300" stroke="#3fb950" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="475" y="285" fill="#3fb950" font-size="9">implements</text>
+  <path d="M220,200 L280,200" stroke="#d29922" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#arr)" fill="none"/>
+  <text x="240" y="194" fill="#fed7aa" font-size="9">uses</text>
+  <path d="M700,200 L640,200" stroke="#bc8cff" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#arr)" fill="none"/>
+  <text x="660" y="194" fill="#e9d5ff" font-size="9">callback</text>
+  <path d="M700,340 L640,340" stroke="#f87171" stroke-width="1" stroke-dasharray="3,2" marker-end="url(#arr)" fill="none"/>
+  <text x="660" y="334" fill="#fecaca" font-size="9">构建 MIME</text>
+
+  <text x="20" y="450" fill="#fed7aa" font-size="10">★ 业务代码注入 JavaMailSender 即可,Helper 是工具类按需 new,实现细节藏在 Impl 里</text>
+</svg>
+</div>
+<h3>24.1.3 SimpleMailMessage 纯文本极简方案</h3>
+<p><code>SimpleMailMessage</code> 是 Spring 为最常见的纯文本邮件场景设计的值对象。它不依赖 JavaMail API,因此可以在测试中轻松创建与断言。</p>
+<pre><code class="language-java">@Service
+public class WelcomeEmailService {
+    private final MailSender mailSender;
+
+    public WelcomeEmailService(MailSender mailSender) {
+        this.mailSender = mailSender;
+    }
+
+    public void sendWelcome(String to, String username) {
+        SimpleMailMessage msg = new SimpleMailMessage();
+        msg.setFrom(&quot;noreply@myapp.com&quot;);
+        msg.setTo(to);
+        msg.setSubject(&quot;注册成功通知&quot;);
+        msg.setText(String.format(
+            &quot;尊敬的 %s\n\n感谢注册 MyApp\n账号已激活\n如有问题请联系 support@myapp.com&quot;,
+            username));
+        msg.setSentDate(new Date());
+        mailSender.send(msg);
+    }
+}
+</code></pre>
+<p>纯文本邮件成功发送时,业务日志一般只需要记录收件人、主题与消息类型,避免把正文全文打进日志:</p>
+<pre><code class="language-text">2026-05-08 10:15:21 INFO WelcomeEmailService : mail.sent type=simple to=customer-c1001@example.com subject=注册成功通知
+</code></pre>
+<h3>24.1.4 MimeMessageHelper 富邮件瑞士军刀</h3>
+<p><code>MimeMessageHelper</code> 是 Spring 邮件模块中最重要的工具类。它将 JavaMail 的 <code>MimeMessage</code> 加 <code>MimeMultipart</code> 加 <code>MimeBodyPart</code> 的复杂嵌套封装为直观的方法调用,是构建 HTML 邮件、内嵌图片、多附件邮件的首选。</p>
+<pre><code class="language-java">@Service
+public class OrderConfirmationService {
+    private final JavaMailSender mailSender;
+
+    public void sendConfirmation(Order order) throws MessagingException {
+        MimeMessage message = mailSender.createMimeMessage();
+        MimeMessageHelper helper = new MimeMessageHelper(
+            message,
+            MimeMessageHelper.MULTIPART_MODE_MIXED_RELATED,
+            StandardCharsets.UTF_8.name()
+        );
+
+        helper.setFrom(&quot;orders@shop.com&quot;, &quot;MyShop 订单中心&quot;);
+        helper.setTo(order.getCustomerEmail());
+        helper.setSubject(&quot;订单 &quot; + order.getId() + &quot; 确认&quot;);
+        helper.setPriority(1);
+
+        String htmlContent = buildOrderHtml(order);
+        helper.setText(htmlContent, true);
+
+        helper.addInline(&quot;logo&quot;,
+            new ClassPathResource(&quot;static/images/logo.png&quot;));
+
+        helper.addAttachment(&quot;payment-receipt-O1001.pdf&quot;,
+            new ByteArrayResource(generateInvoicePdf(order)),
+            &quot;application/pdf&quot;);
+
+        mailSender.send(message);
+    }
+}
+</code></pre>
+<p>这段代码生成的 MIME 结构可以用 MailHog 或 GreenMail 查看,重点是正文、内嵌图片与附件被放在正确层级:</p>
+<pre><code class="language-text">Content-Type: multipart/mixed
+  multipart/related
+    text/html charset UTF-8
+    image/png name logo.png Content-ID logo
+  application/pdf name payment-receipt-O1001.pdf
+
+Subject: 订单 O1001 确认
+X-Priority: 1
+</code></pre>
+<p>对比原生 JavaMail 代码,使用 <code>MimeMessageHelper</code> 后代码量减少了近 60%,而且不需要手动管理 <code>MimeMultipart</code> 的嵌套结构。Helper 内部会根据 <code>multipartMode</code> 自动创建正确的 MIME 层次。</p>
+<h3>24.1.5 MailException 异常体系</h3>
+<p>Spring 把所有 JavaMail 的 checked exception 统一翻译为 <code>MailException</code> 的 unchecked 子类,便于业务代码处理。</p>
+<table>
+<thead>
+<tr>
+<th>异常类型</th>
+<th>触发场景</th>
+<th>处理建议</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>MailAuthenticationException</code></td>
+<td>SMTP 用户名或密码错误</td>
+<td>不要重试,检查配置</td>
+</tr>
+<tr>
+<td><code>MailSendException</code></td>
+<td>SMTP 投递失败(网络、被拒等)</td>
+<td>可重试,看 SMTP 返回码决定</td>
+</tr>
+<tr>
+<td><code>MailParseException</code></td>
+<td>消息构建失败(MIME 格式错误)</td>
+<td>不要重试,代码 bug</td>
+</tr>
+<tr>
+<td><code>MailPreparationException</code></td>
+<td><code>MimeMessagePreparator</code> 内部异常</td>
+<td>不要重试,代码 bug</td>
+</tr>
+</tbody>
+</table>
+<h2 id="24.2-spring-boot-邮件自动配置">24.2 Spring Boot 邮件自动配置</h2>
+<p>Spring Boot 对邮件的自动配置堪称"零代码集成"的典范——只需在 <code>application.yml</code> 中填入 SMTP 服务器信息,就能获得一个生产就绪的 <code>JavaMailSender</code> Bean。</p>
+<h3>24.2.1 spring.mail 属性全景</h3>
+<p>Spring Boot 通过 <code>MailProperties</code> 类将所有邮件相关配置绑定到 <code>spring.mail.*</code> 命名空间。理解每个属性的含义与默认值是正确配置的前提。</p>
+<pre><code class="language-yaml">spring:
+  mail:
+    host: smtp.company.com
+    port: 587
+    username: sender@company.com
+    password: ${MAIL_PASSWORD}
+    protocol: smtp
+    default-encoding: UTF-8
+    test-connection: true
+    properties:
+      mail.smtp.auth: true
+      mail.smtp.starttls.enable: true
+      mail.smtp.starttls.required: true
+      mail.smtp.connectiontimeout: 5000
+      mail.smtp.timeout: 5000
+      mail.smtp.writetimeout: 5000
+      mail.smtp.ssl.trust: smtp.company.com
+</code></pre>
+<p>启用 <code>spring.mail.test-connection=true</code> 后,应用启动阶段会立即验证 SMTP 可用性;这能把错误提前暴露在启动日志里,而非等第一封业务邮件才失败:</p>
+<pre><code class="language-text">2026-05-08 10:18:03 INFO MailSenderValidatorAutoConfiguration : Testing mail server connection
+2026-05-08 10:18:03 INFO MailSenderValidatorAutoConfiguration : Mail server connection validated
+</code></pre>
+<h3>24.2.2 MailSenderAutoConfiguration 决策树</h3>
+<p><code>MailSenderAutoConfiguration</code> 的条件判断逻辑清晰而严谨。它首先检查 classpath 上是否存在 JavaMail 相关类,然后根据是否配置了 <code>spring.mail.host</code> 或 JNDI 名称来决定创建哪种类型的 <code>JavaMailSender</code>。</p>
+<div class="diagram">
+<div class="diagram-title">图 24-2 · MailSenderAutoConfiguration 装配决策树</div>
+<svg viewBox="0 0 920 540" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="22" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">三层条件:classpath → 已有 Bean → host/JNDI → 测试连接</text>
+
+  <rect x="380" y="40" width="160" height="40" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="460" y="64" text-anchor="middle" fill="#e9d5ff" font-size="11" font-weight="bold">Spring Boot 启动</text>
+
+  <polygon points="460,110 600,140 460,170 320,140" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="460" y="138" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">classpath 有</text>
+  <text x="460" y="154" text-anchor="middle" fill="#dbeafe" font-size="10">jakarta.mail.Session?</text>
+
+  <polygon points="460,200 600,230 460,260 320,230" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="460" y="228" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">已有用户自定义</text>
+  <text x="460" y="244" text-anchor="middle" fill="#dbeafe" font-size="10">MailSender Bean?</text>
+
+  <polygon points="460,290 600,320 460,350 320,320" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="460" y="318" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">spring.mail.jndi-name</text>
+  <text x="460" y="334" text-anchor="middle" fill="#dbeafe" font-size="10">已配置?</text>
+
+  <polygon points="460,380 600,410 460,440 320,410" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="460" y="408" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">spring.mail.host</text>
+  <text x="460" y="424" text-anchor="middle" fill="#dbeafe" font-size="10">已配置?</text>
+
+  <rect x="700" y="120" width="200" height="50" rx="6" fill="url(#g-red)" stroke="#f87171"/>
+  <text x="800" y="140" text-anchor="middle" fill="#fecaca" font-size="11" font-weight="bold">SKIP 不创建</text>
+  <text x="800" y="158" text-anchor="middle" fill="#fecaca" font-size="10">MailSender Bean</text>
+
+  <rect x="700" y="210" width="200" height="50" rx="6" fill="url(#g-red)" stroke="#f87171"/>
+  <text x="800" y="230" text-anchor="middle" fill="#fecaca" font-size="11" font-weight="bold">SKIP 用户已有 Bean</text>
+  <text x="800" y="248" text-anchor="middle" fill="#fecaca" font-size="10">@ConditionalOnMissingBean</text>
+
+  <rect x="20" y="300" width="200" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="120" y="320" text-anchor="middle" fill="#fed7aa" font-size="11" font-weight="bold">JndiConfiguration</text>
+  <text x="120" y="338" text-anchor="middle" fill="#fed7aa" font-size="10">从 JNDI 获取 Session</text>
+
+  <rect x="20" y="390" width="200" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="120" y="410" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">★ PropertiesConfiguration</text>
+  <text x="120" y="428" text-anchor="middle" fill="#bbf7d0" font-size="10">new JavaMailSenderImpl()</text>
+
+  <rect x="700" y="390" width="200" height="50" rx="6" fill="url(#g-red)" stroke="#f87171"/>
+  <text x="800" y="410" text-anchor="middle" fill="#fecaca" font-size="11" font-weight="bold">SKIP 无 host 无 JNDI</text>
+  <text x="800" y="428" text-anchor="middle" fill="#fecaca" font-size="10">不创建任何 sender</text>
+
+  <rect x="280" y="465" width="360" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="460" y="485" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">★ 绑定 MailProperties + 合并 javaMailProperties</text>
+  <text x="460" y="503" text-anchor="middle" fill="#bbf7d0" font-size="10">test-connection=true 则启动期 testConnection()</text>
+
+  <path d="M460,80 L460,110" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M600,140 L700,140" stroke="#f87171" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="640" y="134" fill="#fecaca" font-size="10">否</text>
+  <path d="M460,170 L460,200" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="475" y="188" fill="#dbeafe" font-size="9">是</text>
+  <path d="M600,230 L700,230" stroke="#f87171" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="640" y="224" fill="#fecaca" font-size="10">是</text>
+  <path d="M460,260 L460,290" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="475" y="278" fill="#dbeafe" font-size="9">否</text>
+  <path d="M320,320 L220,325" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="240" y="315" fill="#fed7aa" font-size="9">是</text>
+  <path d="M460,350 L460,380" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="475" y="368" fill="#dbeafe" font-size="9">否</text>
+  <path d="M600,410 L700,410" stroke="#f87171" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="640" y="404" fill="#fecaca" font-size="10">否</text>
+  <path d="M320,410 L220,415" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="240" y="405" fill="#bbf7d0" font-size="9">是</text>
+  <path d="M120,440 L380,475" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M120,350 L120,390" stroke="#d29922" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+
+  <text x="20" y="535" fill="#fed7aa" font-size="10">★ 90% 场景走 PropertiesConfiguration 路径;只要 spring.mail.host 配了就够</text>
+</svg>
+</div>
+<h3>24.2.3 自动配置源码</h3>
+<pre><code class="language-java">@AutoConfiguration
+@ConditionalOnClass({ MimeMessage.class, MimeType.class })
+@ConditionalOnMissingBean(MailSender.class)
+@EnableConfigurationProperties(MailProperties.class)
+@Import({ MailSenderJndiConfiguration.class,
+           MailSenderPropertiesConfiguration.class })
+public class MailSenderAutoConfiguration {
+}
+
+@Configuration
+@ConditionalOnProperty(prefix = &quot;spring.mail&quot;, name = &quot;host&quot;)
+class MailSenderPropertiesConfiguration {
+
+    @Bean
+    JavaMailSenderImpl mailSender(MailProperties properties) {
+        JavaMailSenderImpl sender = new JavaMailSenderImpl();
+        sender.setHost(properties.getHost());
+        sender.setPort(properties.getPort());
+        sender.setProtocol(properties.getProtocol());
+        sender.setDefaultEncoding(properties.getDefaultEncoding().name());
+
+        if (StringUtils.hasText(properties.getUsername())) {
+            sender.setUsername(properties.getUsername());
+            sender.setPassword(properties.getPassword());
+        }
+
+        if (properties.getProperties().isEmpty() == false) {
+            sender.setJavaMailProperties(asProperties(properties.getProperties()));
+        }
+        return sender;
+    }
+}
+</code></pre>
+<h3>24.2.4 主流 SMTP 服务商配置示例</h3>
+<p>不同 SMTP 服务商的配置差异主要在端口号、加密方式与认证机制上。以下是最常见的三种场景:</p>
+<pre><code class="language-yaml">spring:
+  mail:
+    host: smtp.gmail.com
+    port: 587
+    username: your-email@gmail.com
+    password: ${GMAIL_APP_PASSWORD}
+    properties:
+      mail.smtp.auth: true
+      mail.smtp.starttls.enable: true
+</code></pre>
+<pre><code class="language-yaml">spring:
+  mail:
+    host: smtp.office365.com
+    port: 587
+    username: your-email@outlook.com
+    password: ${OUTLOOK_PASSWORD}
+    properties:
+      mail.smtp.auth: true
+      mail.smtp.starttls.enable: true
+      mail.smtp.starttls.required: true
+</code></pre>
+<pre><code class="language-yaml">spring:
+  mail:
+    host: email-smtp.us-east-1.amazonaws.com
+    port: 587
+    username: ${AWS_SMTP_ACCESS_KEY}
+    password: ${AWS_SMTP_SECRET_KEY}
+    properties:
+      mail.smtp.auth: true
+      mail.smtp.starttls.enable: true
+      mail.smtp.starttls.required: true
+</code></pre>
+<h3>24.2.5 通知服务案例</h3>
+<p>将上述配置与业务逻辑结合,一个典型的通知服务只需注入 <code>JavaMailSender</code> 即可。Spring Boot 的自动配置让代码完全不需要关心 <code>Session</code> 的创建与 <code>Transport</code> 的管理。</p>
+<pre><code class="language-java">@Service
+@Slf4j
+public class NotificationService {
+
+    private final JavaMailSender mailSender;
+
+    @Value(&quot;${app.mail.from:noreply@myapp.com}&quot;)
+    private String fromAddress;
+
+    public NotificationService(JavaMailSender mailSender) {
+        this.mailSender = mailSender;
+    }
+
+    public void sendPasswordReset(String to, String resetToken) {
+        try {
+            MimeMessage message = mailSender.createMimeMessage();
+            MimeMessageHelper helper = new MimeMessageHelper(message, false, &quot;UTF-8&quot;);
+
+            helper.setFrom(fromAddress, &quot;MyApp 安全中心&quot;);
+            helper.setTo(to);
+            helper.setSubject(&quot;密码重置请求&quot;);
+            helper.setText(
+                &quot;&lt;p&gt;系统收到密码重置请求&lt;/p&gt;&quot; +
+                &quot;&lt;p&gt;请点击链接重置密码 &lt;a href='https://myapp.com/reset?token=&quot; +
+                resetToken + &quot;'&gt;重置密码&lt;/a&gt;&lt;/p&gt;&quot; +
+                &quot;&lt;p&gt;链接 24 小时内有效&lt;/p&gt;&quot;,
+                true);
+
+            mailSender.send(message);
+            log.info(&quot;password reset mail sent to={}&quot;, to);
+        } catch (MailException | MessagingException e) {
+            log.error(&quot;send password reset mail failed to={}&quot;, to, e);
+            throw new EmailSendException(&quot;password reset mail send failed&quot;, e);
+        }
+    }
+}
+</code></pre>
+<p>成功路径应该只有一条业务日志,能把邮件投递动作与客户请求关联起来:</p>
+<pre><code class="language-text">2026-05-08 10:22:44 INFO NotificationService : password reset mail sent to=bob@example.com
+</code></pre>
+<p>认证失败、地址非法、服务器拒绝都会被 Spring 包装成 <code>MailException</code> 的不同子类;异常块要保留原始 cause,方便定位 SMTP 返回码:</p>
+<pre><code class="language-text">2026-05-08 10:23:12 ERROR NotificationService : send password reset mail failed to=bob@example.com
+
+org.springframework.mail.MailAuthenticationException: Authentication failed
+Caused by: jakarta.mail.AuthenticationFailedException
+  535 5.7.8 Username and Password not accepted
+</code></pre>
+<h3>24.2.6 完整发送流程</h3>
+<div class="diagram">
+<div class="diagram-title">图 24-3 · 事务性邮件发送时序(业务 → NotificationService → JavaMailSender → SMTP)</div>
+<svg viewBox="0 0 920 540" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="22" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">五方协作:Spring 抽象 + JavaMail Session + SMTP 协议握手</text>
+
+  <text x="100" y="55" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">业务服务</text>
+  <text x="280" y="55" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">NotificationService</text>
+  <text x="470" y="55" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">JavaMailSenderImpl</text>
+  <text x="660" y="55" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">JavaMail Session</text>
+  <text x="840" y="55" text-anchor="middle" fill="#f87171" font-size="11" font-weight="bold">SMTP Server</text>
+
+  <line x1="100" y1="70" x2="100" y2="510" stroke="#bc8cff" stroke-dasharray="3,2"/>
+  <line x1="280" y1="70" x2="280" y2="510" stroke="#58a6ff" stroke-dasharray="3,2"/>
+  <line x1="470" y1="70" x2="470" y2="510" stroke="#3fb950" stroke-dasharray="3,2"/>
+  <line x1="660" y1="70" x2="660" y2="510" stroke="#d29922" stroke-dasharray="3,2"/>
+  <line x1="840" y1="70" x2="840" y2="510" stroke="#f87171" stroke-dasharray="3,2"/>
+
+  <path d="M100,90 L280,90" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="190" y="84" text-anchor="middle" fill="#e9d5ff" font-size="10">sendPasswordReset(to, token)</text>
+
+  <path d="M280,115 L470,115" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="375" y="109" text-anchor="middle" fill="#dbeafe" font-size="10">createMimeMessage()</text>
+
+  <path d="M470,140 L660,140" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="565" y="134" text-anchor="middle" fill="#bbf7d0" font-size="10">基于 MailProperties 创建 Session</text>
+
+  <path d="M660,165 L470,165" stroke="#d29922" stroke-width="1.5" stroke-dasharray="4,2" marker-end="url(#arr)" fill="none"/>
+  <text x="565" y="159" text-anchor="middle" fill="#fed7aa" font-size="10">↩ MimeMessage(session)</text>
+
+  <path d="M470,190 L280,190" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="4,2" marker-end="url(#arr)" fill="none"/>
+  <text x="375" y="184" text-anchor="middle" fill="#bbf7d0" font-size="10">↩ MimeMessage</text>
+
+  <rect x="245" y="200" width="70" height="40" rx="3" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="280" y="218" text-anchor="middle" fill="#dbeafe" font-size="9" font-weight="bold">★ Helper</text>
+  <text x="280" y="232" text-anchor="middle" fill="#dbeafe" font-size="9">setFrom/To/Subject/Body</text>
+
+  <path d="M280,260 L470,260" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="375" y="254" text-anchor="middle" fill="#dbeafe" font-size="10">send(MimeMessage)</text>
+
+  <path d="M470,285 L660,285" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="565" y="279" text-anchor="middle" fill="#bbf7d0" font-size="10">getTransport("smtp")</text>
+
+  <path d="M660,310 L470,310" stroke="#d29922" stroke-width="1.5" stroke-dasharray="4,2" marker-end="url(#arr)" fill="none"/>
+  <text x="565" y="304" text-anchor="middle" fill="#fed7aa" font-size="10">↩ SMTPTransport</text>
+
+  <path d="M470,335 L840,335" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="655" y="329" text-anchor="middle" fill="#bbf7d0" font-size="10">★ EHLO + STARTTLS + AUTH LOGIN</text>
+
+  <path d="M840,360 L470,360" stroke="#f87171" stroke-width="1.5" stroke-dasharray="4,2" marker-end="url(#arr)" fill="none"/>
+  <text x="655" y="354" text-anchor="middle" fill="#fecaca" font-size="10">↩ 235 Authentication successful</text>
+
+  <path d="M470,385 L840,385" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="655" y="379" text-anchor="middle" fill="#bbf7d0" font-size="10">★ MAIL FROM + RCPT TO + DATA</text>
+
+  <path d="M840,410 L470,410" stroke="#f87171" stroke-width="1.5" stroke-dasharray="4,2" marker-end="url(#arr)" fill="none"/>
+  <text x="655" y="404" text-anchor="middle" fill="#fecaca" font-size="10">↩ 250 OK queued as 8F2D6A1C3</text>
+
+  <path d="M470,435 L280,435" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="4,2" marker-end="url(#arr)" fill="none"/>
+  <text x="375" y="429" text-anchor="middle" fill="#bbf7d0" font-size="10">↩ 发送成功</text>
+
+  <path d="M280,460 L100,460" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="4,2" marker-end="url(#arr)" fill="none"/>
+  <text x="190" y="454" text-anchor="middle" fill="#dbeafe" font-size="10">↩ void(成功返回)</text>
+
+  <text x="20" y="495" fill="#fed7aa" font-size="10">★ 关键性能特征:每次 send 都会创建新 Transport 连接,高并发场景需启用 connection pooling</text>
+</svg>
+</div>
+<h2 id="24.3-html-邮件与模板引擎">24.3 HTML 邮件与模板引擎</h2>
+<p>在真实的业务系统中,纯文本邮件只能覆盖最简单的通知场景。用户期望看到的是带有品牌 Logo、格式化表格、行动按钮的富文本邮件。但构建 HTML 邮件比构建 Web 页面要复杂得多——邮件客户端对 HTML 与 CSS 的支持参差不齐。</p>
+<h3>24.3.1 Thymeleaf 邮件模板引擎</h3>
+<p>Spring Boot 项目中最自然的选择是使用 Thymeleaf 作为邮件模板引擎。关键在于:为邮件创建一个独立的 <code>TemplateEngine</code>,而非复用 Web MVC 的引擎——邮件模板的解析上下文与缓存策略与 Web 页面不同。</p>
+<pre><code class="language-java">@Configuration
+public class EmailTemplateConfig {
+
+    @Bean(&quot;emailTemplateEngine&quot;)
+    public TemplateEngine emailTemplateEngine() {
+        SpringTemplateEngine engine = new SpringTemplateEngine();
+
+        ClassLoaderTemplateResolver resolver = new ClassLoaderTemplateResolver();
+        resolver.setPrefix(&quot;mail-templates/&quot;);
+        resolver.setSuffix(&quot;.html&quot;);
+        resolver.setTemplateMode(TemplateMode.HTML);
+        resolver.setCharacterEncoding(&quot;UTF-8&quot;);
+        resolver.setCacheable(true);
+
+        engine.setTemplateResolver(resolver);
+        return engine;
+    }
+}
+</code></pre>
+<p>模板引擎单独注册后,可以在启动日志或 Bean 列表里看到它与 Web MVC 的模板引擎分离:</p>
+<pre><code class="language-text">2026-05-08 10:27:01 INFO EmailTemplateConfig : registered bean=emailTemplateEngine prefix=mail-templates suffix=.html cacheable=true
+</code></pre>
+<h3>24.3.2 Thymeleaf 模板示例</h3>
+<p>邮件模板文件放在 <code>src/main/resources/mail-templates/</code> 目录下,使用标准 Thymeleaf 语法:</p>
+<pre><code class="language-html">&lt;!DOCTYPE html&gt;
+&lt;html xmlns:th=&quot;http://www.thymeleaf.org&quot;&gt;
+&lt;head&gt;
+  &lt;meta charset=&quot;UTF-8&quot;/&gt;
+  &lt;style&gt;
+    body { font-family: Arial, sans-serif; color: #333; }
+    .header { background: #1a73e8; color: white; padding: 20px; text-align: center; }
+    .order-table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+    .order-table th { background: #f5f5f5; padding: 10px; border: 1px solid #ddd; }
+    .order-table td { padding: 10px; border: 1px solid #ddd; }
+    .btn { display: inline-block; padding: 12px 24px; background: #1a73e8;
+           color: white; text-decoration: none; border-radius: 4px; }
+  &lt;/style&gt;
+&lt;/head&gt;
+&lt;body&gt;
+  &lt;div class=&quot;header&quot;&gt;
+    &lt;img th:src=&quot;'cid:logo'&quot; alt=&quot;MyShop&quot; width=&quot;120&quot;/&gt;
+    &lt;h1&gt;订单确认&lt;/h1&gt;
+  &lt;/div&gt;
+  &lt;div class=&quot;content&quot;&gt;
+    &lt;p&gt;客户 &lt;span th:text=&quot;${customerName}&quot;&gt;张三&lt;/span&gt;&lt;/p&gt;
+    &lt;p&gt;订单 &lt;strong th:text=&quot;'#' + ${orderId}&quot;&gt;12345&lt;/strong&gt; 已确认&lt;/p&gt;
+
+    &lt;table class=&quot;order-table&quot;&gt;
+      &lt;thead&gt;&lt;tr&gt;
+        &lt;th&gt;商品&lt;/th&gt;&lt;th&gt;数量&lt;/th&gt;&lt;th&gt;单价&lt;/th&gt;&lt;th&gt;小计&lt;/th&gt;
+      &lt;/tr&gt;&lt;/thead&gt;
+      &lt;tbody&gt;
+        &lt;tr th:each=&quot;item : ${items}&quot;&gt;
+          &lt;td th:text=&quot;${item.name}&quot;&gt;商品名&lt;/td&gt;
+          &lt;td th:text=&quot;${item.quantity}&quot;&gt;1&lt;/td&gt;
+          &lt;td th:text=&quot;${#numbers.formatDecimal(item.price, 1, 2)}&quot;&gt;99.00&lt;/td&gt;
+          &lt;td th:text=&quot;${#numbers.formatDecimal(item.subtotal, 1, 2)}&quot;&gt;99.00&lt;/td&gt;
+        &lt;/tr&gt;
+      &lt;/tbody&gt;
+    &lt;/table&gt;
+
+    &lt;p&gt;&lt;a class=&quot;btn&quot; th:href=&quot;@{https://shop.com/orders/{id}(id=${orderId})}&quot;&gt;查看订单&lt;/a&gt;&lt;/p&gt;
+  &lt;/div&gt;
+&lt;/body&gt;
+&lt;/html&gt;
+</code></pre>
+<p>传入订单模型后,Thymeleaf 输出的是最终发送给 <code>MimeMessageHelper.setText(html, true)</code> 的 HTML 字符串。</p>
+<h3>24.3.3 FreeMarker 模板替代方案</h3>
+<p>如项目已经在使用 FreeMarker,也可以用它来渲染邮件模板。FreeMarker 的模板语法比 Thymeleaf 更传统(类似 JSP 的标签式),在纯字符串模板场景下性能略优。</p>
+<pre><code class="language-java">@Configuration
+public class FreeMarkerEmailConfig {
+
+    @Bean(&quot;emailFreeMarkerConfig&quot;)
+    public freemarker.template.Configuration freeMarkerConfiguration() throws IOException {
+        freemarker.template.Configuration config = new freemarker.template.Configuration(
+            freemarker.template.Configuration.VERSION_2_3_32);
+        config.setClassLoaderForTemplateLoading(getClass().getClassLoader(), &quot;mail-templates&quot;);
+        config.setDefaultEncoding(&quot;UTF-8&quot;);
+        config.setTemplateExceptionHandler(TemplateExceptionHandler.RETHROW_HANDLER);
+        return config;
+    }
+}
+
+@Service
+public class FreeMarkerEmailService {
+
+    @Qualifier(&quot;emailFreeMarkerConfig&quot;)
+    private final freemarker.template.Configuration fmConfig;
+    private final JavaMailSender mailSender;
+
+    public void sendOrderConfirmation(Order order) throws Exception {
+        Template template = fmConfig.getTemplate(&quot;order-confirmation.ftl&quot;);
+
+        Map&lt;String, Object&gt; model = Map.of(
+            &quot;customerName&quot;, order.getCustomerName(),
+            &quot;orderId&quot;, order.getId(),
+            &quot;items&quot;, order.getItems(),
+            &quot;totalAmount&quot;, order.getTotalAmount());
+
+        String html = FreeMarkerTemplateUtils.processTemplateIntoString(template, model);
+
+        MimeMessage message = mailSender.createMimeMessage();
+        MimeMessageHelper helper = new MimeMessageHelper(message, true, &quot;UTF-8&quot;);
+        helper.setTo(order.getCustomerEmail());
+        helper.setSubject(&quot;订单 &quot; + order.getId() + &quot; 确认&quot;);
+        helper.setText(html, true);
+        mailSender.send(message);
+    }
+}
+</code></pre>
+<p>FreeMarker 模板缺少变量或语法错误时会在渲染阶段失败,邮件还没有进入 SMTP 发送阶段:</p>
+<pre><code class="language-text">2026-05-08 10:31:46 ERROR FreeMarkerEmailService : render failed template=order-confirmation.ftl orderId=12345
+
+freemarker.core.InvalidReferenceException
+The following has evaluated to null or missing
+customerName in template order-confirmation.ftl at line 12 column 18
+</code></pre>
+<h3>24.3.4 内联 CSS 与邮件客户端兼容性</h3>
+<p>邮件 HTML 的最大痛点是 CSS 支持。多数邮件客户端会剥离 <code>&lt;style&gt;</code> 标签与外部样式表,只保留行内 <code>style</code> 属性。因此在发送前需要将 CSS 规则"内联化"。</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>时机</th>
+<th>性能</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>jsoup 加 CSSInliner Java 库</td>
+<td>运行时</td>
+<td>中</td>
+<td>模板动态变化</td>
+</tr>
+<tr>
+<td>Premailer Ruby 或 juice JS</td>
+<td>构建时</td>
+<td>高</td>
+<td>模板固定,Maven 构建阶段处理</td>
+</tr>
+<tr>
+<td><code>&lt;style&gt;</code> 加 行内混合</td>
+<td>编写时</td>
+<td>低</td>
+<td>快速 demo,生产不推荐</td>
+</tr>
+</tbody>
+</table>
+<h3>24.3.5 嵌入内联图片</h3>
+<p>邮件中的图片有两种方式:外链 URL 与内嵌 CID(Content-ID)。外链受制于邮件客户端的图片拦截策略,而 CID 内嵌图片会直接包含在邮件 MIME 结构中,显示更可靠。</p>
+<pre><code class="language-java">public void sendWithInlineImages(String to, String html) throws MessagingException {
+    MimeMessage message = mailSender.createMimeMessage();
+    MimeMessageHelper helper = new MimeMessageHelper(message,
+        MimeMessageHelper.MULTIPART_MODE_MIXED_RELATED, &quot;UTF-8&quot;);
+
+    helper.setTo(to);
+    helper.setSubject(&quot;带内嵌图片的邮件&quot;);
+    helper.setText(html, true);
+
+    helper.addInline(&quot;logo&quot;,
+        new ClassPathResource(&quot;images/logo.png&quot;), &quot;image/png&quot;);
+    helper.addInline(&quot;banner&quot;,
+        new ClassPathResource(&quot;images/banner.jpg&quot;), &quot;image/jpeg&quot;);
+    helper.addInline(&quot;product-1&quot;,
+        new UrlResource(&quot;https://cdn.shop.com/product/1.jpg&quot;), &quot;image/jpeg&quot;);
+
+    mailSender.send(message);
+}
+</code></pre>
+<p>内联图片的关键验证点是 <code>Content-ID</code> 与 HTML 中的 <code>cid:</code> 完全一致;大小写或尖括号处理错误都会导致客户端显示红叉:</p>
+<pre><code class="language-text">HTML body
+  img src cid logo
+  img src cid banner
+
+MIME parts
+  Content-Type image/png name logo.png
+  Content-ID logo
+  Content-Disposition inline
+
+  Content-Type image/jpeg name banner.jpg
+  Content-ID banner
+  Content-Disposition inline
+</code></pre>
+<h3>24.3.6 模板邮件完整管线</h3>
+<div class="diagram">
+<div class="diagram-title">图 24-4 · 模板邮件完整管线(模板 → 渲染 → MimeMessage → SMTP)</div>
+<svg viewBox="0 0 920 320" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="22" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">五段流水线:每一段独立可测,职责单一,失败定位精确</text>
+
+  <rect x="20" y="80" width="160" height="100" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="100" y="105" text-anchor="middle" fill="#e9d5ff" font-size="12" font-weight="bold">1 模板层</text>
+  <line x1="40" y1="115" x2="160" y2="115" stroke="#bc8cff" opacity="0.5"/>
+  <text x="100" y="135" text-anchor="middle" fill="#e9d5ff" font-size="10">Thymeleaf .html</text>
+  <text x="100" y="151" text-anchor="middle" fill="#e9d5ff" font-size="10">FreeMarker .ftl</text>
+  <text x="100" y="170" text-anchor="middle" fill="#bc8cff" font-size="9">classpath 资源</text>
+
+  <rect x="200" y="80" width="160" height="100" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="280" y="105" text-anchor="middle" fill="#dbeafe" font-size="12" font-weight="bold">2 渲染层</text>
+  <line x1="220" y1="115" x2="340" y2="115" stroke="#58a6ff" opacity="0.5"/>
+  <text x="280" y="135" text-anchor="middle" fill="#dbeafe" font-size="10">变量替换 / 循环</text>
+  <text x="280" y="151" text-anchor="middle" fill="#dbeafe" font-size="10">CSS 内联化</text>
+  <text x="280" y="170" text-anchor="middle" fill="#58a6ff" font-size="9">输出 HTML 字符串</text>
+
+  <rect x="380" y="80" width="160" height="100" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="460" y="105" text-anchor="middle" fill="#bbf7d0" font-size="12" font-weight="bold">★ 3 构建层</text>
+  <line x1="400" y1="115" x2="520" y2="115" stroke="#3fb950" opacity="0.5"/>
+  <text x="460" y="133" text-anchor="middle" fill="#bbf7d0" font-size="10">MimeMessageHelper</text>
+  <text x="460" y="148" text-anchor="middle" fill="#bbf7d0" font-size="10">addInline(cid, ...)</text>
+  <text x="460" y="163" text-anchor="middle" fill="#bbf7d0" font-size="10">addAttachment(file)</text>
+
+  <rect x="560" y="80" width="160" height="100" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="640" y="105" text-anchor="middle" fill="#fed7aa" font-size="12" font-weight="bold">4 发送层</text>
+  <line x1="580" y1="115" x2="700" y2="115" stroke="#d29922" opacity="0.5"/>
+  <text x="640" y="135" text-anchor="middle" fill="#fed7aa" font-size="10">JavaMailSenderImpl</text>
+  <text x="640" y="151" text-anchor="middle" fill="#fed7aa" font-size="10">EHLO + AUTH + DATA</text>
+  <text x="640" y="170" text-anchor="middle" fill="#d29922" font-size="9">Transport.send()</text>
+
+  <rect x="740" y="80" width="160" height="100" rx="8" fill="url(#g-red)" stroke="#f87171"/>
+  <text x="820" y="105" text-anchor="middle" fill="#fecaca" font-size="12" font-weight="bold">5 SMTP Server</text>
+  <line x1="760" y1="115" x2="880" y2="115" stroke="#f87171" opacity="0.5"/>
+  <text x="820" y="135" text-anchor="middle" fill="#fecaca" font-size="10">Gmail / SES / 企业</text>
+  <text x="820" y="151" text-anchor="middle" fill="#fecaca" font-size="10">250 OK queued</text>
+  <text x="820" y="170" text-anchor="middle" fill="#fecaca" font-size="9">→ 收件方</text>
+
+  <path d="M180,130 L200,130" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M360,130 L380,130" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M540,130 L560,130" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M720,130 L740,130" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <text x="20" y="220" fill="#fed7aa" font-size="10">★ 模板层失败:模板文件不存在 → 抓 FileNotFoundException</text>
+  <text x="20" y="238" fill="#fed7aa" font-size="10">★ 渲染层失败:变量缺失 → InvalidReferenceException(SMTP 还没参与)</text>
+  <text x="20" y="256" fill="#fed7aa" font-size="10">★ 构建层失败:multipart 嵌套错误 → MailParseException(代码 bug,不要重试)</text>
+  <text x="20" y="274" fill="#fed7aa" font-size="10">★ 发送层失败:认证错 → MailAuthenticationException(检查配置)</text>
+  <text x="20" y="292" fill="#fed7aa" font-size="10">★ SMTP 失败:超限/拒收 → MailSendException + 4xx/5xx 返回码(可重试)</text>
+</svg>
+</div>
+<h2 id="24.4-附件与多部分邮件">24.4 附件与多部分邮件</h2>
+<p>当邮件需要同时携带 HTML 正文、内嵌图片与文件附件时,底层的 MIME 结构变得复杂——它是一个多层嵌套的"信封套信封"结构。理解 MIME multipart 的三种模式是构建复杂邮件的关键。</p>
+<h3>24.4.1 MIME 多部分结构解析</h3>
+<p>MIME(Multipurpose Internet Mail Extensions)定义了三种常用的 multipart 子类型:</p>
+<table>
+<thead>
+<tr>
+<th>子类型</th>
+<th>语义</th>
+<th>典型用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>multipart/mixed</code></td>
+<td>正文与附件混合在一个层级</td>
+<td>正文 加 附件</td>
+</tr>
+<tr>
+<td><code>multipart/related</code></td>
+<td>HTML 正文与内嵌资源关联,共同组成整体</td>
+<td>HTML 加 CID 内嵌图片</td>
+</tr>
+<tr>
+<td><code>multipart/alternative</code></td>
+<td>同一内容的多种格式,客户端选择最优</td>
+<td>纯文本 加 HTML(降级显示)</td>
+</tr>
+</tbody>
+</table>
+<div class="diagram">
+<div class="diagram-title">图 24-5 · MIME 多部分消息嵌套结构(信封套信封套信封)</div>
+<svg viewBox="0 0 920 540" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="22" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">嵌套规则:mixed → related → alternative,从外到内三层包装</text>
+
+  <rect x="40" y="50" width="840" height="460" rx="10" fill="#0d1117" stroke="#bc8cff" stroke-width="2" stroke-dasharray="6,3"/>
+  <text x="60" y="78" fill="#bc8cff" font-size="12" font-weight="bold">MimeMessage(信封最外层)</text>
+
+  <rect x="80" y="100" width="760" height="380" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="100" y="124" fill="#dbeafe" font-size="12" font-weight="bold">★ multipart/mixed(正文容器 + 附件层)</text>
+
+  <rect x="120" y="150" width="500" height="250" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="140" y="174" fill="#fed7aa" font-size="11" font-weight="bold">★ multipart/related(HTML + 内嵌资源层)</text>
+
+  <rect x="160" y="200" width="280" height="160" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="180" y="224" fill="#bbf7d0" font-size="11" font-weight="bold">multipart/alternative</text>
+  <text x="180" y="240" fill="#bbf7d0" font-size="9">同一内容多种格式</text>
+
+  <rect x="180" y="258" width="120" height="40" rx="4" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="240" y="282" text-anchor="middle" fill="#e9d5ff" font-size="10" font-weight="bold">text/plain</text>
+
+  <rect x="310" y="258" width="120" height="40" rx="4" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="370" y="282" text-anchor="middle" fill="#e9d5ff" font-size="10" font-weight="bold">text/html</text>
+
+  <text x="180" y="320" fill="#3fb950" font-size="9">客户端从两种格式中选择最优</text>
+  <text x="180" y="338" fill="#3fb950" font-size="9">老式客户端选 plain,现代选 html</text>
+
+  <rect x="460" y="200" width="140" height="44" rx="4" fill="url(#g-red)" stroke="#f87171"/>
+  <text x="530" y="220" text-anchor="middle" fill="#fecaca" font-size="10" font-weight="bold">image/png</text>
+  <text x="530" y="236" text-anchor="middle" fill="#fecaca" font-size="9">Content-ID: logo</text>
+
+  <rect x="460" y="252" width="140" height="44" rx="4" fill="url(#g-red)" stroke="#f87171"/>
+  <text x="530" y="272" text-anchor="middle" fill="#fecaca" font-size="10" font-weight="bold">image/jpeg</text>
+  <text x="530" y="288" text-anchor="middle" fill="#fecaca" font-size="9">Content-ID: banner</text>
+
+  <text x="460" y="318" fill="#fed7aa" font-size="9">★ 内嵌图片与 HTML 同处</text>
+  <text x="460" y="334" fill="#fed7aa" font-size="9">  related,以便 HTML 引用</text>
+
+  <rect x="660" y="150" width="160" height="100" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="740" y="174" text-anchor="middle" fill="#e9d5ff" font-size="11" font-weight="bold">application/pdf</text>
+  <text x="740" y="194" text-anchor="middle" fill="#e9d5ff" font-size="9">payment-receipt.pdf</text>
+  <text x="740" y="220" text-anchor="middle" fill="#bc8cff" font-size="9">附件挂在</text>
+  <text x="740" y="236" text-anchor="middle" fill="#bc8cff" font-size="9">最外层 mixed</text>
+
+  <rect x="660" y="270" width="160" height="100" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="740" y="294" text-anchor="middle" fill="#e9d5ff" font-size="11" font-weight="bold">application/excel</text>
+  <text x="740" y="314" text-anchor="middle" fill="#e9d5ff" font-size="9">report.xlsx</text>
+  <text x="740" y="340" text-anchor="middle" fill="#bc8cff" font-size="9">多附件并列</text>
+  <text x="740" y="356" text-anchor="middle" fill="#bc8cff" font-size="9">在同一层级</text>
+
+  <text x="80" y="430" fill="#fed7aa" font-size="10">★ 嵌套依据:related 内部的资源被 HTML 引用形成"整体"; mixed 内部的附件是"独立"实体</text>
+  <text x="80" y="450" fill="#fed7aa" font-size="10">★ MimeMessageHelper 用 multipartMode = MIXED_RELATED(3) 一次性创建完整三层结构</text>
+  <text x="80" y="470" fill="#fed7aa" font-size="10">★ 调试技巧:RFC 822 raw 邮件用 grep "Content-Type:" 看层级 boundary 是否正确</text>
+</svg>
+</div>
+<p>嵌套规则:<code>mixed</code> 包含 <code>related</code>,<code>related</code> 包含 <code>alternative</code>。附件挂最外,内嵌图片挂中间,多格式文本挂最内。</p>
+<h3>24.4.2 MimeMessageHelper 的四种 multipartMode</h3>
+<p><code>MimeMessageHelper</code> 提供四种模式来自动管理上述嵌套结构,只需在构造时指定模式,Helper 会自动创建正确的 <code>MimeMultipart</code> 层次。</p>
+<pre><code class="language-java">public static final int MULTIPART_MODE_NO = 0;
+public static final int MULTIPART_MODE_MIXED = 1;
+public static final int MULTIPART_MODE_RELATED = 2;
+public static final int MULTIPART_MODE_MIXED_RELATED = 3;
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>数值</th>
+<th>创建的 MIME 结构</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>NO</code></td>
+<td>0</td>
+<td>无 multipart</td>
+<td>纯文本或纯 HTML</td>
+</tr>
+<tr>
+<td><code>MIXED</code></td>
+<td>1</td>
+<td>mixed</td>
+<td>正文 加 附件</td>
+</tr>
+<tr>
+<td><code>RELATED</code></td>
+<td>2</td>
+<td>related</td>
+<td>HTML 加 内嵌图片(无附件)</td>
+</tr>
+<tr>
+<td><code>MIXED_RELATED</code></td>
+<td>3</td>
+<td>mixed 包含 related 包含 alternative</td>
+<td>全功能,支持所有场景</td>
+</tr>
+</tbody>
+</table>
+<h3>24.4.3 文件附件的多种来源</h3>
+<p>生产环境中附件来源多样——本地文件、classpath 资源、内存字节流、远程 URL。<code>MimeMessageHelper.addAttachment()</code> 统一接受 <code>InputStreamSource</code>,而 Spring 的 <code>Resource</code> 体系天然实现了这个接口。</p>
+<pre><code class="language-java">@Service
+public class ReportEmailService {
+
+    private final JavaMailSender mailSender;
+    private final ReportGenerator reportGenerator;
+
+    public void sendMonthlyReport(String to, YearMonth month) throws MessagingException {
+        MimeMessage message = mailSender.createMimeMessage();
+        MimeMessageHelper helper = new MimeMessageHelper(message,
+            MimeMessageHelper.MULTIPART_MODE_MIXED_RELATED, &quot;UTF-8&quot;);
+
+        helper.setTo(to);
+        helper.setSubject(month + &quot; 月度报告&quot;);
+        helper.setText(&quot;&lt;h2&gt;请查收附件中的月度报告&lt;/h2&gt;&quot;, true);
+
+        byte[] pdfBytes = reportGenerator.generatePdf(month);
+        helper.addAttachment(month + &quot;-report.pdf&quot;,
+            new ByteArrayResource(pdfBytes), &quot;application/pdf&quot;);
+
+        helper.addAttachment(&quot;template.xlsx&quot;,
+            new ClassPathResource(&quot;templates/report-template.xlsx&quot;));
+
+        File csvFile = reportGenerator.exportCsv(month);
+        helper.addAttachment(month + &quot;-data.csv&quot;,
+            new FileSystemResource(csvFile));
+
+        helper.addAttachment(&quot;logo.png&quot;,
+            new UrlResource(&quot;https://cdn.company.com/logo.png&quot;));
+
+        mailSender.send(message);
+    }
+}
+</code></pre>
+<p>附件示例发送后,应在测试收件箱中同时看到 4 个附件来源被编码成独立 MIME part:</p>
+<pre><code class="language-text">Subject: 2026-04 月度报告
+Attachments:
+  2026-04-report.pdf  application/pdf  482 KB
+  template.xlsx       application/excel 18 KB
+  2026-04-data.csv    text/csv         64 KB
+  logo.png            image/png        9 KB
+</code></pre>
+<h3>24.4.4 动态附件 InputStreamSource 模式</h3>
+<p>对于需要按需生成的附件(如实时导出的 CSV、按用户权限过滤的 Excel),可以使用 <code>InputStreamSource</code> 的延迟读取特性——在 <code>Transport.send()</code> 真正编码邮件时才读取流。</p>
+<pre><code class="language-java">helper.addAttachment(&quot;real-time-data.csv&quot;,
+    new InputStreamSource() {
+        @Override
+        public InputStream getInputStream() throws IOException {
+            return generateCsvStream();
+        }
+    },
+    &quot;text/csv&quot;);
+</code></pre>
+<p>如果把 <code>InputStreamSource</code> 写成复用同一个已经读完的流,第二次读取会发送空附件。正确实现应保证每次调用都产生新流:</p>
+<pre><code class="language-text">2026-05-08 10:39:08 DEBUG CsvAttachmentSource : getInputStream called attachment=real-time-data.csv invocation=1 bytes=12984
+2026-05-08 10:39:09 DEBUG CsvAttachmentSource : getInputStream called attachment=real-time-data.csv invocation=2 bytes=12984
+2026-05-08 10:39:09 INFO  ReportEmailService : attachment encoded name=real-time-data.csv size=12.7KB
+</code></pre>
+<h3>24.4.5 附件来源与 Resource 体系</h3>
+<div class="diagram">
+<div class="diagram-title">图 24-6 · 附件来源与 Spring Resource 体系的对接</div>
+<svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="22" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">所有来源最终统一到 InputStreamSource 接口,Helper 不关心来源细节</text>
+
+  <rect x="280" y="50" width="360" height="80" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="460" y="74" text-anchor="middle" fill="#bbf7d0" font-size="12" font-weight="bold">★ MimeMessageHelper</text>
+  <line x1="300" y1="82" x2="620" y2="82" stroke="#3fb950" opacity="0.5"/>
+  <text x="460" y="100" text-anchor="middle" fill="#bbf7d0" font-size="10">addAttachment(name, source)</text>
+  <text x="460" y="116" text-anchor="middle" fill="#bbf7d0" font-size="10">addInline(contentId, resource)</text>
+
+  <rect x="320" y="170" width="280" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="460" y="190" text-anchor="middle" fill="#dbeafe" font-size="12" font-weight="bold">★ InputStreamSource(顶层接口)</text>
+  <text x="460" y="208" text-anchor="middle" fill="#dbeafe" font-size="10">+ InputStream getInputStream() throws IOException</text>
+
+  <rect x="320" y="250" width="280" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="460" y="270" text-anchor="middle" fill="#fed7aa" font-size="12" font-weight="bold">Resource extends InputStreamSource</text>
+  <text x="460" y="288" text-anchor="middle" fill="#fed7aa" font-size="10">+ exists() / getFilename() / contentLength()</text>
+
+  <rect x="20" y="340" width="200" height="80" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="120" y="362" text-anchor="middle" fill="#e9d5ff" font-size="11" font-weight="bold">ClassPathResource</text>
+  <text x="120" y="380" text-anchor="middle" fill="#e9d5ff" font-size="10">JAR / classpath</text>
+  <text x="120" y="398" text-anchor="middle" fill="#bc8cff" font-size="9">templates/, static/</text>
+  <text x="120" y="412" text-anchor="middle" fill="#bc8cff" font-size="9">部署后位置固定</text>
+
+  <rect x="240" y="340" width="200" height="80" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="340" y="362" text-anchor="middle" fill="#e9d5ff" font-size="11" font-weight="bold">FileSystemResource</text>
+  <text x="340" y="380" text-anchor="middle" fill="#e9d5ff" font-size="10">本地 Path / File</text>
+  <text x="340" y="398" text-anchor="middle" fill="#bc8cff" font-size="9">/tmp, 用户上传</text>
+  <text x="340" y="412" text-anchor="middle" fill="#bc8cff" font-size="9">大文件友好(流式)</text>
+
+  <rect x="460" y="340" width="200" height="80" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="560" y="362" text-anchor="middle" fill="#e9d5ff" font-size="11" font-weight="bold">UrlResource</text>
+  <text x="560" y="380" text-anchor="middle" fill="#e9d5ff" font-size="10">HTTP / file URL</text>
+  <text x="560" y="398" text-anchor="middle" fill="#bc8cff" font-size="9">CDN / 对象存储</text>
+  <text x="560" y="412" text-anchor="middle" fill="#bc8cff" font-size="9">注意网络延迟</text>
+
+  <rect x="680" y="340" width="200" height="80" rx="6" fill="url(#g-red)" stroke="#f87171" stroke-width="2"/>
+  <text x="780" y="362" text-anchor="middle" fill="#fecaca" font-size="11" font-weight="bold">★ ByteArrayResource</text>
+  <text x="780" y="380" text-anchor="middle" fill="#fecaca" font-size="10">in-memory bytes</text>
+  <text x="780" y="398" text-anchor="middle" fill="#fecaca" font-size="9">动态生成内容</text>
+  <text x="780" y="412" text-anchor="middle" fill="#fecaca" font-size="9">PDF/Excel 字节</text>
+
+  <path d="M460,130 L460,170" stroke="#3fb950" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="475" y="155" fill="#3fb950" font-size="9">accepts</text>
+  <path d="M460,220 L460,250" stroke="#d29922" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="475" y="240" fill="#d29922" font-size="9">extends</text>
+  <path d="M380,300 L120,340" stroke="#bc8cff" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M420,300 L340,340" stroke="#bc8cff" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M500,300 L560,340" stroke="#bc8cff" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+  <path d="M540,300 L780,340" stroke="#f87171" stroke-width="1" marker-end="url(#arr)" fill="none"/>
+
+  <text x="20" y="450" fill="#fed7aa" font-size="10">★ 自定义 InputStreamSource 可不实现 Resource——动态/延迟生成附件最佳选择</text>
+</svg>
+</div>
+<h2 id="24.5-异步发送与重试">24.5 异步发送与重试</h2>
+<p>SMTP 邮件发送是一个典型的 I O 密集型操作——从 DNS 解析、TCP 三次握手、TLS 协商到数据传输,一封邮件的发送通常需要 200ms 到 2s。如在 Web 请求的线程中同步发送,会严重拖慢接口响应。</p>
+<h3>24.5.1 @Async 非阻塞发送</h3>
+<p>最简单的异步方案是使用 Spring 的 <code>@Async</code> 注解。它将邮件发送操作从调用线程转移到专用的 <code>TaskExecutor</code> 线程池,让业务逻辑能立即返回。</p>
+<pre><code class="language-java">@Configuration
+@EnableAsync
+public class AsyncConfig {
+
+    @Bean(&quot;emailExecutor&quot;)
+    public TaskExecutor emailTaskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(2);
+        executor.setMaxPoolSize(5);
+        executor.setQueueCapacity(100);
+        executor.setThreadNamePrefix(&quot;email-&quot;);
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.initialize();
+        return executor;
+    }
+}
+
+@Service
+@Slf4j
+public class AsyncEmailService {
+
+    private final JavaMailSender mailSender;
+    private final TemplateEngine emailTemplateEngine;
+
+    @Async(&quot;emailExecutor&quot;)
+    public CompletableFuture&lt;Boolean&gt; sendAsync(String to, String subject,
+            String templateName, Map&lt;String, Object&gt; variables) {
+        try {
+            Context ctx = new Context();
+            ctx.setVariables(variables);
+            String html = emailTemplateEngine.process(templateName, ctx);
+
+            MimeMessage message = mailSender.createMimeMessage();
+            MimeMessageHelper helper = new MimeMessageHelper(message, true, &quot;UTF-8&quot;);
+            helper.setTo(to);
+            helper.setSubject(subject);
+            helper.setText(html, true);
+
+            mailSender.send(message);
+            log.info(&quot;async mail sent to={}&quot;, to);
+            return CompletableFuture.completedFuture(true);
+        } catch (Exception e) {
+            log.error(&quot;async mail failed to={}&quot;, to, e);
+            return CompletableFuture.completedFuture(false);
+        }
+    }
+}
+</code></pre>
+<p>异步发送的业务接口会先返回,邮件线程稍后写入自己的日志;这正是 <code>@Async</code> 的可观测特征:</p>
+<pre><code class="language-text">2026-05-08 10:45:11 INFO UserRegistrationService : registered id=42 email=customer-c1001@example.com cost=38ms
+2026-05-08 10:45:11 INFO AsyncEmailService : start async mail to=customer-c1001@example.com template=welcome
+2026-05-08 10:45:11 INFO AsyncEmailService : async mail sent to=customer-c1001@example.com
+</code></pre>
+<h3>24.5.2 Spring Retry 自动重试</h3>
+<p>SMTP 连接偶发性失败(网络抖动、服务器繁忙返回 421)是常态。使用 Spring Retry 可以自动在失败后按退避策略重试。</p>
+<pre><code class="language-java">@Configuration
+@EnableRetry
+public class RetryConfig { }
+
+@Service
+@Slf4j
+public class ReliableEmailService {
+
+    private final JavaMailSender mailSender;
+
+    @Retryable(
+        retryFor = { MailSendException.class },
+        noRetryFor = { MailAuthenticationException.class, MailParseException.class },
+        maxAttempts = 3,
+        backoff = @Backoff(delay = 1000, multiplier = 2.0, maxDelay = 10000)
+    )
+    public void sendWithRetry(MimeMessage message) {
+        log.info(&quot;attempting mail send&quot;);
+        mailSender.send(message);
+    }
+
+    @Recover
+    public void handleSendFailure(MailException ex, MimeMessage message) {
+        log.error(&quot;mail send failed exhausted retries reason={}&quot;, ex.getMessage());
+        saveToFailedQueue(message, ex);
+    }
+}
+</code></pre>
+<p>瞬时 SMTP 失败时,Spring Retry 会按退避策略重新调用同一个方法;日志中应能看到多次尝试与最终恢复逻辑:</p>
+<pre><code class="language-text">2026-05-08 10:48:20 INFO ReliableEmailService : attempting mail send
+2026-05-08 10:48:20 WARN RetryTemplate : Retry count=1 reason=421 4.7.0 Temporary System Problem
+2026-05-08 10:48:21 INFO ReliableEmailService : attempting mail send
+2026-05-08 10:48:21 WARN RetryTemplate : Retry count=2
+2026-05-08 10:48:23 INFO ReliableEmailService : attempting mail send
+2026-05-08 10:48:23 ERROR ReliableEmailService : mail send failed exhausted retries
+</code></pre>
+<h3>24.5.3 数据库队列加调度器模式</h3>
+<p>对于高可靠性要求的场景(如交易通知、法规邮件),仅靠 <code>@Async</code> 与 Retry 还不够——应用重启会丢失内存中等待发送的邮件。更健壮的方案是使用数据库作为持久化队列。</p>
+<pre><code class="language-java">@Entity
+@Table(name = &quot;email_queue&quot;)
+public class EmailTask {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false)
+    private String toAddress;
+
+    @Column(nullable = false)
+    private String subject;
+
+    @Lob
+    private String htmlBody;
+
+    @Lob
+    private byte[] attachmentData;
+    private String attachmentName;
+    private String attachmentType;
+
+    @Enumerated(EnumType.STRING)
+    private EmailStatus status = EmailStatus.PENDING;
+
+    private int retryCount = 0;
+    private int maxRetries = 3;
+    private String lastError;
+
+    private LocalDateTime createdAt = LocalDateTime.now();
+    private LocalDateTime nextRetryAt = LocalDateTime.now();
+    private LocalDateTime sentAt;
+}
+
+public enum EmailStatus {
+    PENDING, SENDING, SENT, FAILED, DEAD_LETTER
+}
+</code></pre>
+<pre><code class="language-java">@Service
+@Slf4j
+public class EmailQueueProcessor {
+
+    private final EmailTaskRepository repository;
+    private final JavaMailSender mailSender;
+
+    @Scheduled(fixedDelay = 5000)
+    @Transactional
+    public void processQueue() {
+        List&lt;EmailTask&gt; tasks = repository
+            .findTop20ByStatusAndNextRetryAtBeforeOrderByCreatedAt(
+                EmailStatus.PENDING, LocalDateTime.now());
+
+        for (EmailTask task : tasks) {
+            try {
+                task.setStatus(EmailStatus.SENDING);
+                repository.save(task);
+
+                sendEmail(task);
+
+                task.setStatus(EmailStatus.SENT);
+                task.setSentAt(LocalDateTime.now());
+            } catch (Exception e) {
+                task.setRetryCount(task.getRetryCount() + 1);
+                task.setLastError(e.getMessage());
+
+                if (task.getRetryCount() &gt;= task.getMaxRetries()) {
+                    task.setStatus(EmailStatus.DEAD_LETTER);
+                    log.error(&quot;email entered dead letter id={}&quot;, task.getId());
+                } else {
+                    task.setStatus(EmailStatus.PENDING);
+                    task.setNextRetryAt(LocalDateTime.now()
+                        .plusSeconds((long) Math.pow(2, task.getRetryCount()) * 30));
+                }
+            }
+            repository.save(task);
+        }
+    }
+
+    private void sendEmail(EmailTask task) throws MessagingException {
+        MimeMessage message = mailSender.createMimeMessage();
+        MimeMessageHelper helper = new MimeMessageHelper(message,
+            task.getAttachmentData() != null, &quot;UTF-8&quot;);
+        helper.setTo(task.getToAddress());
+        helper.setSubject(task.getSubject());
+        helper.setText(task.getHtmlBody(), true);
+
+        if (task.getAttachmentData() != null) {
+            helper.addAttachment(task.getAttachmentName(),
+                new ByteArrayResource(task.getAttachmentData()),
+                task.getAttachmentType());
+        }
+
+        mailSender.send(message);
+    }
+}
+</code></pre>
+<p>数据库队列的输出不是控制台返回值,而是任务状态从 <code>PENDING</code> 到 <code>SENT</code> 或 <code>DEAD_LETTER</code> 的可追踪变化:</p>
+<pre><code class="language-text">SELECT id, to_address, status, retry_count, next_retry_at, sent_at FROM email_queue WHERE id = 9001;
+
+id   | to_address       | status | retry_count | next_retry_at       | sent_at
+-----+------------------+--------+-------------+---------------------+--------------------
+9001 | finance@corp.com | SENT   | 0           | 2026-05-08 10:50:00 | 2026-05-08 10:50:06
+</code></pre>
+<p>失败并进入死信时,<code>lastError</code> 要保留 SMTP 返回码,方便后续人工重放或修正配置:</p>
+<pre><code class="language-text">2026-05-08 10:51:35 ERROR EmailQueueProcessor : email entered dead letter id=9002
+lastError 554 5.7.1 Message rejected due to missing DKIM signature
+status DEAD_LETTER retryCount 3
+</code></pre>
+<h3>24.5.4 异步邮件发送管线</h3>
+<div class="diagram">
+<div class="diagram-title">图 24-7 · 异步邮件发送管线(业务触发 → 持久化队列 → 调度处理 → SMTP 投递)</div>
+<svg viewBox="0 0 920 400" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="22" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">事件入队 + 调度轮询 + 状态机驱动重试,应用重启不丢消息</text>
+
+  <rect x="20" y="60" width="160" height="80" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="100" y="82" text-anchor="middle" fill="#e9d5ff" font-size="11" font-weight="bold">业务触发</text>
+  <line x1="40" y1="90" x2="160" y2="90" stroke="#bc8cff" opacity="0.5"/>
+  <text x="100" y="108" text-anchor="middle" fill="#e9d5ff" font-size="9">订单创建</text>
+  <text x="100" y="122" text-anchor="middle" fill="#e9d5ff" font-size="9">支付授权</text>
+  <text x="100" y="136" text-anchor="middle" fill="#e9d5ff" font-size="9">发货创建</text>
+
+  <rect x="240" y="60" width="180" height="80" rx="6" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="330" y="82" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">★ email_queue</text>
+  <line x1="260" y1="90" x2="400" y2="90" stroke="#58a6ff" opacity="0.5"/>
+  <text x="330" y="108" text-anchor="middle" fill="#dbeafe" font-size="9">id, status, retryCount</text>
+  <text x="330" y="122" text-anchor="middle" fill="#dbeafe" font-size="9">nextRetryAt, htmlBody</text>
+  <text x="330" y="136" text-anchor="middle" fill="#dbeafe" font-size="9">attachment</text>
+
+  <rect x="480" y="60" width="180" height="80" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="570" y="82" text-anchor="middle" fill="#fed7aa" font-size="11" font-weight="bold">@Scheduled</text>
+  <line x1="500" y1="90" x2="640" y2="90" stroke="#d29922" opacity="0.5"/>
+  <text x="570" y="108" text-anchor="middle" fill="#fed7aa" font-size="9">每 5 秒轮询</text>
+  <text x="570" y="122" text-anchor="middle" fill="#fed7aa" font-size="9">findTop20</text>
+  <text x="570" y="136" text-anchor="middle" fill="#fed7aa" font-size="9">PENDING + due</text>
+
+  <rect x="720" y="60" width="180" height="80" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="810" y="82" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">★ JavaMailSender</text>
+  <line x1="740" y1="90" x2="880" y2="90" stroke="#3fb950" opacity="0.5"/>
+  <text x="810" y="108" text-anchor="middle" fill="#bbf7d0" font-size="9">SMTP Server</text>
+  <text x="810" y="122" text-anchor="middle" fill="#bbf7d0" font-size="9">DATA + queued</text>
+  <text x="810" y="136" text-anchor="middle" fill="#bbf7d0" font-size="9">250 / 5xx</text>
+
+  <polygon points="570,200 700,230 570,260 440,230" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="570" y="228" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">发送结果</text>
+
+  <rect x="40" y="290" width="200" height="60" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="140" y="312" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">★ SENT</text>
+  <text x="140" y="330" text-anchor="middle" fill="#bbf7d0" font-size="10">记录 sentAt</text>
+  <text x="140" y="344" text-anchor="middle" fill="#bbf7d0" font-size="9">250 OK queued</text>
+
+  <rect x="360" y="290" width="200" height="60" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="460" y="312" text-anchor="middle" fill="#fed7aa" font-size="11" font-weight="bold">★ PENDING(指数退避)</text>
+  <text x="460" y="330" text-anchor="middle" fill="#fed7aa" font-size="10">retryCount &lt; max</text>
+  <text x="460" y="344" text-anchor="middle" fill="#fed7aa" font-size="9">nextRetryAt = 2^n * 30s</text>
+
+  <rect x="680" y="290" width="220" height="60" rx="6" fill="url(#g-red)" stroke="#f87171" stroke-width="2"/>
+  <text x="790" y="312" text-anchor="middle" fill="#fecaca" font-size="11" font-weight="bold">★ DEAD_LETTER</text>
+  <text x="790" y="330" text-anchor="middle" fill="#fecaca" font-size="10">retryCount = max</text>
+  <text x="790" y="344" text-anchor="middle" fill="#fecaca" font-size="9">人工介入查 lastError</text>
+
+  <path d="M180,100 L240,100" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="195" y="94" fill="#bc8cff" font-size="9">enqueue</text>
+  <path d="M420,100 L480,100" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M660,100 L720,100" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M810,140 L600,200" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M460,250 L160,290" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="290" y="270" fill="#bbf7d0" font-size="10">250 OK</text>
+  <path d="M570,260 L460,290" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="490" y="280" fill="#fed7aa" font-size="10">5xx 可重试</text>
+  <path d="M680,250 L790,290" stroke="#f87171" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="710" y="270" fill="#fecaca" font-size="10">耗尽</text>
+  <path d="M460,290 L380,150 L420,150" stroke="#d29922" stroke-width="1" stroke-dasharray="4,2" marker-end="url(#arr)" fill="none"/>
+  <text x="380" y="200" fill="#fed7aa" font-size="9">回到队列</text>
+
+  <text x="20" y="385" fill="#fed7aa" font-size="10">★ 关键状态机:PENDING → SENDING → SENT/FAILED/DEAD_LETTER,失败可重放,死信报警</text>
+</svg>
+</div>
+<h3>24.5.5 速率限制与发送节流</h3>
+<p>SMTP 服务商通常有速率限制——Gmail 每天 500 封、Amazon SES 每秒 14 封。超限会导致 <code>421 Too many connections</code> 或 <code>454 Too many messages</code> 错误。需要在发送层加入速率控制。</p>
+<pre><code class="language-java">@Service
+public class RateLimitedEmailSender {
+
+    private final JavaMailSender mailSender;
+    private final RateLimiter rateLimiter;
+
+    public RateLimitedEmailSender(JavaMailSender mailSender) {
+        this.mailSender = mailSender;
+        this.rateLimiter = RateLimiter.create(14.0);
+    }
+
+    public void send(MimeMessage message) {
+        rateLimiter.acquire();
+        mailSender.send(message);
+    }
+
+    public void sendBatch(List&lt;MimeMessage&gt; messages) {
+        for (MimeMessage msg : messages) {
+            rateLimiter.acquire();
+            try {
+                mailSender.send(msg);
+            } catch (MailException e) {
+                handleFailure(msg, e);
+            }
+        }
+    }
+}
+</code></pre>
+<p>速率限制的可观测结果是发送吞吐稳定在服务商限额以内,而非出现一串 <code>421</code> 或 <code>454</code> 拒绝:</p>
+<pre><code class="language-text">Batch size 100
+Rate limit 14.0 messages per second
+Elapsed 7.22s
+Throughput 13.85 messages per second
+SMTP throttling errors 0
+</code></pre>
+<h2 id="24.6-源码到运行时">24.6 源码到运行时</h2>
+<p>邮件发送链路横跨 Spring Boot 自动配置、Spring Mail 抽象、Jakarta Mail 与 SMTP 协议。排查时要把"Bean 是否创建"、"MIME 是否正确"、"SMTP 是否接受"、"收件方是否投递"分开看。</p>
+<h3>24.6.1 关键源码入口</h3>
+<table>
+<thead>
+<tr>
+<th>层次</th>
+<th>关键源码入口</th>
+<th>运行时职责</th>
+<th>典型断点观察点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>自动配置入口</td>
+<td><code>MailSenderAutoConfiguration</code></td>
+<td>判断 classpath、已有 Bean、host JNDI</td>
+<td>为什么没有 <code>JavaMailSender</code></td>
+</tr>
+<tr>
+<td>属性绑定</td>
+<td><code>MailProperties</code></td>
+<td>绑定 <code>spring.mail</code> 与底层 JavaMail 属性</td>
+<td>超时、TLS、编码</td>
+</tr>
+<tr>
+<td>Sender 创建</td>
+<td><code>MailSenderPropertiesConfiguration.mailSender</code></td>
+<td>创建并填充 <code>JavaMailSenderImpl</code></td>
+<td>host port username</td>
+</tr>
+<tr>
+<td>连接验证</td>
+<td><code>MailSenderValidatorAutoConfiguration</code></td>
+<td>启动期调用 <code>testConnection</code></td>
+<td>启动失败 与 首封失败</td>
+</tr>
+<tr>
+<td>消息创建</td>
+<td><code>JavaMailSenderImpl.createMimeMessage</code></td>
+<td>用 <code>Session</code> 创建 <code>MimeMessage</code></td>
+<td>Session 属性是否正确</td>
+</tr>
+<tr>
+<td>MIME 构建</td>
+<td><code>MimeMessageHelper</code></td>
+<td>封装 multipart 与 附件 与 CID</td>
+<td>multipart 层级、编码</td>
+</tr>
+<tr>
+<td>实际发送</td>
+<td><code>JavaMailSenderImpl.doSend</code></td>
+<td>获取 <code>Transport</code>、connect、sendMessage</td>
+<td>SMTP 返回码、连接复用</td>
+</tr>
+<tr>
+<td>协议层</td>
+<td><code>SMTPTransport.protocolConnect</code></td>
+<td>EHLO STARTTLS AUTH MAIL RCPT DATA</td>
+<td>535、421、552、554</td>
+</tr>
+</tbody>
+</table>
+<h3>24.6.2 源码到运行时全链路</h3>
+<div class="diagram">
+<div class="diagram-title">图 24-8 · 邮件源码到运行时调用全链路时序</div>
+<svg viewBox="0 0 920 480" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="22" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">从启动期 Bean 装配 → 业务调用 → SMTP 协议握手</text>
+
+  <text x="80" y="55" text-anchor="middle" fill="#bc8cff" font-size="10" font-weight="bold">AutoConfig</text>
+  <text x="240" y="55" text-anchor="middle" fill="#58a6ff" font-size="10" font-weight="bold">MailProperties</text>
+  <text x="400" y="55" text-anchor="middle" fill="#3fb950" font-size="10" font-weight="bold">JavaMailSenderImpl</text>
+  <text x="560" y="55" text-anchor="middle" fill="#d29922" font-size="10" font-weight="bold">MimeMessageHelper</text>
+  <text x="720" y="55" text-anchor="middle" fill="#bc8cff" font-size="10" font-weight="bold">Jakarta Session</text>
+  <text x="860" y="55" text-anchor="middle" fill="#f87171" font-size="10" font-weight="bold">SMTP Server</text>
+
+  <line x1="80" y1="70" x2="80" y2="450" stroke="#bc8cff" stroke-dasharray="3,2"/>
+  <line x1="240" y1="70" x2="240" y2="450" stroke="#58a6ff" stroke-dasharray="3,2"/>
+  <line x1="400" y1="70" x2="400" y2="450" stroke="#3fb950" stroke-dasharray="3,2"/>
+  <line x1="560" y1="70" x2="560" y2="450" stroke="#d29922" stroke-dasharray="3,2"/>
+  <line x1="720" y1="70" x2="720" y2="450" stroke="#bc8cff" stroke-dasharray="3,2"/>
+  <line x1="860" y1="70" x2="860" y2="450" stroke="#f87171" stroke-dasharray="3,2"/>
+
+  <rect x="0" y="80" width="920" height="120" rx="4" fill="#161b22" stroke="#bc8cff" stroke-width="1" stroke-dasharray="2,2" opacity="0.3"/>
+  <text x="20" y="100" fill="#bc8cff" font-size="10" font-weight="bold">[ 启动期装配 ]</text>
+
+  <path d="M80,120 L240,120" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="160" y="114" text-anchor="middle" fill="#e9d5ff" font-size="9">bind spring.mail.*</text>
+
+  <path d="M80,150 L400,150" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="240" y="144" text-anchor="middle" fill="#e9d5ff" font-size="9">★ create JavaMailSenderImpl Bean</text>
+
+  <path d="M400,180 L720,180" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="560" y="174" text-anchor="middle" fill="#bbf7d0" font-size="9">getSession(properties)</text>
+
+  <rect x="0" y="220" width="920" height="220" rx="4" fill="#161b22" stroke="#3fb950" stroke-width="1" stroke-dasharray="2,2" opacity="0.3"/>
+  <text x="20" y="240" fill="#3fb950" font-size="10" font-weight="bold">[ 运行时发送 ]</text>
+
+  <path d="M560,260 L400,260" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="480" y="254" text-anchor="middle" fill="#fed7aa" font-size="9">createMimeMessage()</text>
+
+  <rect x="525" y="270" width="70" height="36" rx="3" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="560" y="287" text-anchor="middle" fill="#fed7aa" font-size="9" font-weight="bold">★ Helper</text>
+  <text x="560" y="299" text-anchor="middle" fill="#fed7aa" font-size="9">setText/addInline/addAttachment</text>
+
+  <path d="M560,320 L400,320" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="480" y="314" text-anchor="middle" fill="#fed7aa" font-size="9">send(message)</text>
+
+  <path d="M400,350 L720,350" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="560" y="344" text-anchor="middle" fill="#bbf7d0" font-size="9">getTransport("smtp")</text>
+
+  <path d="M400,380 L860,380" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="630" y="374" text-anchor="middle" fill="#bbf7d0" font-size="9">★ connect + AUTH + MAIL FROM + RCPT TO + DATA</text>
+
+  <path d="M860,410 L400,410" stroke="#f87171" stroke-width="1.5" stroke-dasharray="4,2" marker-end="url(#arr)" fill="none"/>
+  <text x="630" y="404" text-anchor="middle" fill="#fecaca" font-size="9">↩ 250 queued / 5xx error</text>
+
+  <text x="20" y="465" fill="#fed7aa" font-size="10">★ 排查路径:Bean 装配看启动日志 → MIME 看 RFC822 raw → SMTP 看返回码 → 收件方看退信</text>
+</svg>
+</div>
+<h3>24.6.3 设计取舍与被拒绝方案</h3>
+<p>Spring Mail 的抽象很薄,这是刻意设计:它不试图重新实现 SMTP,也不隐藏 Jakarta Mail 的 MIME 模型,而是把 JavaMail 最容易写错的配置、异常与 multipart 结构包起来。</p>
+<table>
+<thead>
+<tr>
+<th>设计选择</th>
+<th>得到什么</th>
+<th>代价</th>
+<th>适用边界</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>JavaMailSenderImpl</code> 直接封装 Jakarta Mail</td>
+<td>透传所有 SMTP 与 MIME 细节</td>
+<td>仍需理解底层属性名</td>
+<td>标准 SMTP、企业邮件服务</td>
+</tr>
+<tr>
+<td><code>MimeMessageHelper</code> 管 multipart</td>
+<td>减少嵌套错误,统一编码</td>
+<td>极复杂邮件仍需检查原始 MIME</td>
+<td>HTML、CID、附件</td>
+</tr>
+<tr>
+<td>Boot 自动配置仅在 <code>host</code> 存在时生效</td>
+<td>不误创建无效 sender</td>
+<td>本地测试需显式提供 Fake SMTP</td>
+<td>生产配置清晰</td>
+</tr>
+<tr>
+<td>邮件发送默认同步</td>
+<td>调用语义简单,异常直接返回</td>
+<td>Web 请求线程可能被 SMTP 阻塞</td>
+<td>低频管理邮件</td>
+</tr>
+<tr>
+<td>异步与队列由应用层选择</td>
+<td>可按可靠性定制</td>
+<td>需要额外状态机与幂等</td>
+<td>交易通知、批量报表</td>
+</tr>
+</tbody>
+</table>
+<p>被拒绝的方案:不应在业务代码里手写 <code>Transport.send()</code> 旁路 Spring 配置;不应把大附件硬塞进 MIME;不应把"SMTP 返回 250"当成"用户收到了邮件";不应把模板渲染、附件生成与 SMTP 投递放在同一个数据库事务里长时间执行。</p>
+<h3>24.6.4 扩展边界与验证护栏</h3>
+<p>邮件系统的扩展边界建议按阶段划分:模板渲染服务只输出 HTML,MIME 构建服务只负责 <code>MimeMessage</code>,投递服务只负责 SMTP 与 队列状态,投递结果再异步回写。</p>
+<pre><code class="language-java">@Test
+void mimeMessageContainsHtmlInlineImageAndAttachment() throws Exception {
+    MimeMessage message = mailSender.createMimeMessage();
+    MimeMessageHelper helper = new MimeMessageHelper(message,
+        MimeMessageHelper.MULTIPART_MODE_MIXED_RELATED, &quot;UTF-8&quot;);
+
+    helper.setTo(&quot;customer-c1001@example.com&quot;);
+    helper.setSubject(&quot;订单确认&quot;);
+    helper.setText(&quot;&lt;img src='cid:logo'/&gt;&lt;p&gt;ok&lt;/p&gt;&quot;, true);
+    helper.addInline(&quot;logo&quot;, new ByteArrayResource(new byte[] {1, 2}), &quot;image/png&quot;);
+    helper.addAttachment(&quot;payment-receipt-O1001.pdf&quot;,
+        new ByteArrayResource(new byte[] {3, 4}), &quot;application/pdf&quot;);
+
+    MimeMultipart mixed = (MimeMultipart) message.getContent();
+    assertThat(mixed.getCount()).isGreaterThanOrEqualTo(2);
+    assertThat(message.getSubject()).isEqualTo(&quot;订单确认&quot;);
+}
+
+@Test
+void greenMailReceivesMessageWithExpectedHeaders() {
+    emailService.sendWelcome(&quot;customer-c1001@example.com&quot;, &quot;Customer C1001&quot;);
+
+    MimeMessage[] messages = greenMail.getReceivedMessages();
+    assertThat(messages).hasSize(1);
+    assertThat(messages[0].getAllRecipients()[0].toString())
+        .isEqualTo(&quot;customer-c1001@example.com&quot;);
+    assertThat(messages[0].getHeader(&quot;Content-Type&quot;, null)).contains(&quot;charset=UTF-8&quot;);
+}
+</code></pre>
+<p>生产护栏至少包含:启动期 <code>test-connection</code> 或独立 SMTP health check;每封邮件记录 message id、模板名、收件域、SMTP 返回码,不记录完整正文;附件 raw size 与 Base64 后估算大小;队列任务状态机 PENDING 到 SENDING 到 SENT 或 DEAD_LETTER;对 Gmail、Outlook、Apple Mail 做截图或人工验收快照。</p>
+<h2 id="24.7-陷阱与限制">24.7 陷阱与限制</h2>
+<p>邮件发送看似简单——<code>mailSender.send(message)</code> 一行代码的事。但生产环境中,从 SMTP 协议层到邮件客户端渲染层,处处暗藏陷阱。以下是六大高频问题。</p>
+<h3>24.7.1 陷阱 1 SMTP 连接超时与资源泄漏</h3>
+<p>JavaMail 底层使用 <code>java.net.Socket</code>,其默认超时为 0(无限等待)。当 SMTP 服务器因负载过高或网络分区导致无响应时,发送线程会永久阻塞,最终耗尽线程池。</p>
+<p>修复:必须显式设置三种超时。</p>
+<pre><code class="language-yaml">spring:
+  mail:
+    properties:
+      mail.smtp.connectiontimeout: 5000
+      mail.smtp.timeout: 5000
+      mail.smtp.writetimeout: 5000
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>属性</th>
+<th>控制阶段</th>
+<th>推荐值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>mail.smtp.connectiontimeout</code></td>
+<td>TCP 三次握手</td>
+<td>5 秒</td>
+</tr>
+<tr>
+<td><code>mail.smtp.timeout</code></td>
+<td>Socket 读(等待 SMTP 响应)</td>
+<td>10 秒</td>
+</tr>
+<tr>
+<td><code>mail.smtp.writetimeout</code></td>
+<td>Socket 写(发送邮件数据)</td>
+<td>10 秒</td>
+</tr>
+</tbody>
+</table>
+<p>缺少超时配置时,线程会长时间卡在 <code>SMTPTransport.protocolConnect()</code> 或 socket 读写上;配置超时后,异常会在可控时间内返回:</p>
+<pre><code class="language-text">2026-05-08 10:58:12 ERROR NotificationService : send mail timeout to=ops@example.com
+
+org.springframework.mail.MailSendException Mail server connection failed
+Caused by com.sun.mail.util.MailConnectException
+  Couldn't connect to host port smtp.company.com 587 timeout 5000
+Caused by java.net.SocketTimeoutException Connect timed out
+</code></pre>
+<h3>24.7.2 陷阱 2 HTML 邮件渲染兼容性</h3>
+<p>邮件 HTML 与网页 HTML 是两个完全不同的语境。邮件客户端的渲染引擎差异远大于浏览器:</p>
+<table>
+<thead>
+<tr>
+<th>客户端</th>
+<th>渲染引擎</th>
+<th>常见不兼容</th>
+<th>稳妥做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Outlook Windows</td>
+<td>Word 渲染引擎</td>
+<td><code>max-width</code>、<code>float</code>、复杂背景图</td>
+<td>TABLE 布局、固定宽度、必要时 VML</td>
+</tr>
+<tr>
+<td>Gmail</td>
+<td>自定义清洗器</td>
+<td>外部 CSS、部分 <code>&lt;style&gt;</code> 媒体查询</td>
+<td>发送前 CSS 内联化</td>
+</tr>
+<tr>
+<td>Apple Mail</td>
+<td>WebKit</td>
+<td>仍受图片拦截影响</td>
+<td>指定图片尺寸与替代文本</td>
+</tr>
+<tr>
+<td>Yahoo 与 企业网关</td>
+<td>自定义改写器</td>
+<td>class 改名、脚本与表单被剥离</td>
+<td>避免依赖 class 选择器与交互脚本</td>
+</tr>
+</tbody>
+</table>
+<p>邮件 HTML 的生存法则:用 TABLE 布局,不用 <code>div</code> 加 CSS;所有样式内联(行内 <code>style</code> 属性);不用 CSS3 动画、<code>transition</code>、<code>transform</code>;不用 <code>&lt;video&gt;</code>、<code>&lt;audio&gt;</code>、<code>&lt;iframe&gt;</code>;图片必须指定 <code>width</code> 与 <code>height</code>;背景图片用 VML 兜底。</p>
+<h3>24.7.3 陷阱 3 附件大小超限</h3>
+<table>
+<thead>
+<tr>
+<th>SMTP 服务商</th>
+<th>附件大小限制</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Gmail</td>
+<td>25 MB</td>
+<td></td>
+</tr>
+<tr>
+<td>Outlook</td>
+<td>20 MB</td>
+<td></td>
+</tr>
+<tr>
+<td>Amazon SES</td>
+<td>10 MB</td>
+<td>raw message 上限 40 MB</td>
+</tr>
+<tr>
+<td>企业 Exchange</td>
+<td>10 至 50 MB</td>
+<td>管理员配置</td>
+</tr>
+</tbody>
+</table>
+<p>需要注意:附件经过 Base64 编码后体积增大约 33%,一个 7.5 MB 的文件编码后约 10 MB。大文件应上传到云存储,邮件中放下载链接:</p>
+<pre><code class="language-java">public void sendWithLargeAttachment(String to, File file) throws MessagingException {
+    if (file.length() &gt; 10 * 1024 * 1024) {
+        String downloadUrl = cloudStorage.upload(file);
+        String html = String.format(
+            &quot;&lt;p&gt;附件过大,请通过链接下载&lt;/p&gt;&quot; +
+            &quot;&lt;p&gt;&lt;a href='%s'&gt;%s %s&lt;/a&gt;&lt;/p&gt;&quot; +
+            &quot;&lt;p&gt;链接 7 天内有效&lt;/p&gt;&quot;,
+            downloadUrl, file.getName(), humanReadableSize(file.length()));
+        sendHtmlEmail(to, &quot;文件分享&quot;, html);
+    } else {
+        sendWithAttachment(to, &quot;文件分享&quot;, file);
+    }
+}
+</code></pre>
+<p>如仍然把大文件塞进 MIME,很多 SMTP 服务器会在 <code>DATA</code> 阶段直接拒绝整封邮件:</p>
+<pre><code class="language-text">2026-05-08 11:02:18 ERROR ReportEmailService : send attachment failed file=backup.zip rawSize=209715200
+
+org.springframework.mail.MailSendException Failed messages 552 5.3.4 Message size exceeds fixed maximum message size
+SMTP reply 552 5.3.4 Message size exceeds fixed maximum message size
+</code></pre>
+<h3>24.7.4 陷阱 4 SPF DKIM DMARC 域名验证</h3>
+<p>使用未经验证的发件人地址,邮件会被标记为垃圾或直接被拒收。完整的可送达性需要三个 DNS 配置:</p>
+<table>
+<thead>
+<tr>
+<th>协议</th>
+<th>全称</th>
+<th>作用</th>
+<th>DNS 记录类型</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SPF</td>
+<td>Sender Policy Framework</td>
+<td>声明哪些 IP 可代表域名发信</td>
+<td>TXT 在主域名</td>
+</tr>
+<tr>
+<td>DKIM</td>
+<td>DomainKeys Identified Mail</td>
+<td>数字签名防篡改,接收方用 DNS 公钥验证</td>
+<td>TXT 在 <code>selector._domainkey</code> 子域</td>
+</tr>
+<tr>
+<td>DMARC</td>
+<td>Domain-based Message Authentication</td>
+<td>基于 SPF 加 DKIM 的策略层</td>
+<td>TXT 在 <code>_dmarc</code> 子域</td>
+</tr>
+</tbody>
+</table>
+<p>完整可送达性清单:配置 SPF 记录;配置 DKIM 签名;配置 DMARC 策略;设置 <code>List-Unsubscribe</code> 头(Gmail 要求);避免垃圾词汇;维护发件人信誉(控制退信率小于 2 percent)。</p>
+<p>域名认证失败时,邮件可能并非"发送失败",而是在接收方被拒收或进入垃圾箱;这类问题要看退信与 DMARC 报告:</p>
+<pre><code class="language-text">Final-Recipient rfc822 customer@gmail.com
+Action failed
+Status 5.7.26
+Diagnostic-Code smtp
+  550-5.7.26 This mail is unauthenticated which poses a security risk
+  550-5.7.26 SPF FAIL with IP 203.0.113.10
+  550-5.7.26 DKIM none
+  550-5.7.26 DMARC fail
+</code></pre>
+<h3>24.7.5 陷阱 5 默认 Session 全局共享</h3>
+<p>错误认知:<code>Session.getDefaultInstance()</code> 适合多租户动态配置。真相:<code>getDefaultInstance()</code> 返回 JVM 级默认 <code>Session</code>,第一次调用的 Properties 会被锁定,后续调用忽略新 Properties。</p>
+<pre><code class="language-java">Properties tenant1Props = new Properties();
+tenant1Props.put(&quot;mail.smtp.host&quot;, &quot;smtp.tenant1.com&quot;);
+Session s1 = Session.getDefaultInstance(tenant1Props);
+
+Properties tenant2Props = new Properties();
+tenant2Props.put(&quot;mail.smtp.host&quot;, &quot;smtp.tenant2.com&quot;);
+Session s2 = Session.getDefaultInstance(tenant2Props);
+
+Session s1Fixed = Session.getInstance(tenant1Props, auth1);
+Session s2Fixed = Session.getInstance(tenant2Props, auth2);
+</code></pre>
+<p><code>JavaMailSenderImpl</code> 内部使用 <code>Session.getInstance()</code>,所以默认不会串租户。但如自定义 <code>Session</code> Bean,务必使用 <code>getInstance()</code> 而非 <code>getDefaultInstance()</code>。</p>
+<h3>24.7.6 陷阱 6 非 ASCII 字符编码</h3>
+<p>JavaMail 默认使用平台编码,不同 OS 默认编码不同:Windows 是 GBK 或 GB2312,Linux 与 macOS 是 UTF-8。直接设置中文主题会导致乱码。</p>
+<p>修复:始终显式指定 UTF-8 编码。</p>
+<pre><code class="language-java">message.setSubject(&quot;订单确认&quot;, &quot;UTF-8&quot;);
+
+MimeMessageHelper helper = new MimeMessageHelper(message, true, &quot;UTF-8&quot;);
+helper.setSubject(&quot;订单确认&quot;);
+
+String encodedName = MimeUtility.encodeText(&quot;月度报告.pdf&quot;, &quot;UTF-8&quot;, &quot;B&quot;);
+helper.addAttachment(encodedName, resource);
+</code></pre>
+<p>Spring Boot 全局配置:<code>spring.mail.default-encoding=UTF-8</code>。</p>
+<h3>24.7.7 陷阱汇总速查</h3>
+<table>
+<thead>
+<tr>
+<th>陷阱</th>
+<th>现象</th>
+<th>根因</th>
+<th>修复</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SMTP 超时</td>
+<td>线程阻塞,线程池耗尽</td>
+<td>JavaMail Socket 默认无超时</td>
+<td>设置三种 timeout</td>
+</tr>
+<tr>
+<td>HTML 渲染差异</td>
+<td>Outlook 下布局错乱</td>
+<td>Word 渲染引擎</td>
+<td>TABLE 布局加行内样式加 VML 兜底</td>
+</tr>
+<tr>
+<td>附件超限</td>
+<td>552 Message size exceeds limit</td>
+<td>SMTP 服务商限制</td>
+<td>检查大小,超限改用云存储链接</td>
+</tr>
+<tr>
+<td>域名验证</td>
+<td>邮件进垃圾箱或被拒</td>
+<td>缺少 SPF DKIM DMARC</td>
+<td>完整配置 DNS 验证记录</td>
+</tr>
+<tr>
+<td>默认 Session 共享</td>
+<td>多租户 SMTP 配置串</td>
+<td><code>getDefaultInstance</code> 全局默认</td>
+<td>使用 <code>getInstance</code> 创建独立实例</td>
+</tr>
+<tr>
+<td>字符编码</td>
+<td>中文主题或附件名乱码</td>
+<td>依赖平台默认编码</td>
+<td><code>MimeMessageHelper</code> 构造时指定 UTF-8</td>
+</tr>
+</tbody>
+</table>
+<h3>24.7.8 邮件发送全链路检查清单</h3>
+<table>
+<thead>
+<tr>
+<th>序号</th>
+<th>检查项</th>
+<th>失败时的修复</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>SMTP 三种超时已配置 connection read write</td>
+<td>显式设置三种 timeout(建议各 5s 10s 10s)</td>
+</tr>
+<tr>
+<td>2</td>
+<td>HTML 已内联 CSS</td>
+<td>用 Premailer 或 juice 内联化,在三端实测</td>
+</tr>
+<tr>
+<td>3</td>
+<td>附件小于 10 MB</td>
+<td>改用对象存储 加 临时签名链接</td>
+</tr>
+<tr>
+<td>4</td>
+<td>SPF DKIM DMARC 已配置</td>
+<td>在域名 DNS 添加三条记录</td>
+</tr>
+<tr>
+<td>5</td>
+<td>编码为 UTF-8</td>
+<td><code>MimeMessageHelper</code> 构造时指定字符集</td>
+</tr>
+</tbody>
+</table>
+<h3>24.7.9 高并发邮件系统架构</h3>
+<div class="diagram">
+<div class="diagram-title">图 24-9 · 高并发邮件系统架构(多业务源 → 队列 → Worker 池 → 连接池 → SMTP)</div>
+<svg viewBox="0 0 920 400" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="22" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">解耦 + 分流 + 限速:支撑千级 QPS 邮件,稳定运行不超限</text>
+
+  <rect x="20" y="60" width="160" height="50" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="100" y="80" text-anchor="middle" fill="#e9d5ff" font-size="11" font-weight="bold">订单服务</text>
+  <text x="100" y="98" text-anchor="middle" fill="#bc8cff" font-size="10">大量交易通知</text>
+
+  <rect x="20" y="140" width="160" height="50" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="100" y="160" text-anchor="middle" fill="#e9d5ff" font-size="11" font-weight="bold">客户服务</text>
+  <text x="100" y="178" text-anchor="middle" fill="#bc8cff" font-size="10">注册 / 重置密码</text>
+
+  <rect x="20" y="220" width="160" height="50" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="100" y="240" text-anchor="middle" fill="#e9d5ff" font-size="11" font-weight="bold">报表服务</text>
+  <text x="100" y="258" text-anchor="middle" fill="#bc8cff" font-size="10">批量月度报告</text>
+
+  <rect x="280" y="120" width="180" height="120" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="370" y="148" text-anchor="middle" fill="#dbeafe" font-size="12" font-weight="bold">★ email_queue</text>
+  <text x="370" y="168" text-anchor="middle" fill="#dbeafe" font-size="10">数据库持久化队列</text>
+  <line x1="300" y1="178" x2="440" y2="178" stroke="#58a6ff" opacity="0.5"/>
+  <text x="370" y="196" text-anchor="middle" fill="#dbeafe" font-size="10">PENDING / SENDING</text>
+  <text x="370" y="212" text-anchor="middle" fill="#dbeafe" font-size="10">SENT / DEAD_LETTER</text>
+  <text x="370" y="228" text-anchor="middle" fill="#58a6ff" font-size="9">支持失败重放</text>
+
+  <rect x="540" y="80" width="180" height="60" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="630" y="100" text-anchor="middle" fill="#fed7aa" font-size="11" font-weight="bold">★ Worker 1</text>
+  <text x="630" y="118" text-anchor="middle" fill="#fed7aa" font-size="10">RateLimiter 14 / s</text>
+  <text x="630" y="132" text-anchor="middle" fill="#fed7aa" font-size="9">@Scheduled 5s 轮询</text>
+
+  <rect x="540" y="220" width="180" height="60" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="630" y="240" text-anchor="middle" fill="#fed7aa" font-size="11" font-weight="bold">★ Worker 2</text>
+  <text x="630" y="258" text-anchor="middle" fill="#fed7aa" font-size="10">RateLimiter 14 / s</text>
+  <text x="630" y="272" text-anchor="middle" fill="#fed7aa" font-size="9">水平扩展</text>
+
+  <rect x="780" y="120" width="120" height="120" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="840" y="146" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">★ SMTP 池</text>
+  <text x="840" y="164" text-anchor="middle" fill="#bbf7d0" font-size="10">Session 1</text>
+  <text x="840" y="180" text-anchor="middle" fill="#bbf7d0" font-size="10">Session 2</text>
+  <text x="840" y="196" text-anchor="middle" fill="#bbf7d0" font-size="10">Session 3</text>
+  <text x="840" y="216" text-anchor="middle" fill="#3fb950" font-size="9">连接复用</text>
+  <text x="840" y="232" text-anchor="middle" fill="#3fb950" font-size="9">→ Amazon SES</text>
+
+  <path d="M180,85 L280,140" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M180,165 L280,180" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M180,245 L280,220" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M460,160 L540,110" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M460,200 L540,250" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M720,110 L780,160" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M720,250 L780,200" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <text x="20" y="320" fill="#fed7aa" font-size="10">★ 业务异步入队 < 5ms,业务接口立即返回;Worker 异步出队按速率发送</text>
+  <text x="20" y="338" fill="#fed7aa" font-size="10">★ 多 Worker 共享 RateLimiter 总配额(分布式可用 Redis 限流);避免超 SES 14/s 限制</text>
+  <text x="20" y="356" fill="#fed7aa" font-size="10">★ 连接池复用 Session,避免每次 send 都重建 TLS,吞吐提升 3-5 倍</text>
+  <text x="20" y="374" fill="#fed7aa" font-size="10">★ 失败任务回到队列指数退避;耗尽进入 DEAD_LETTER + 报警通知运维</text>
+</svg>
+</div>
+<div class="chapter-summary">
+<h2>24.8 本章小结</h2>
+
+<p>JavaMail 抽象:<code>Session</code> 加 <code>Transport</code> 加 <code>MimeMessage</code> 三件套;Spring 通过 <code>MailSender</code> 加 <code>JavaMailSender</code> 接口将其简化,<code>JavaMailSenderImpl</code> 是标准实现。</p>
+<p>工具类:<code>SimpleMailMessage</code> 适合纯文本场景;<code>MimeMessageHelper</code> 是富邮件构建的瑞士军刀,封装了 multipart 嵌套、附件、内嵌图片与编码。</p>
+<p>Boot 自动配置:<code>spring.mail.host</code> 触发 <code>MailSenderAutoConfiguration</code> 创建 <code>JavaMailSenderImpl</code>;<code>test-connection=true</code> 在启动期验证 SMTP 可用性。</p>
+<p>模板引擎:为邮件配置独立的 <code>TemplateEngine</code>(Thymeleaf 或 FreeMarker);CSS 必须内联化;内嵌图片用 CID 协议;<code>MULTIPART_MODE_MIXED_RELATED</code> 支持完整结构。</p>
+<p>MIME 多部分:<code>mixed</code> 包含 <code>related</code> 包含 <code>alternative</code> 的嵌套规则;附件来源覆盖 ClassPath、FileSystem、Url、ByteArray 与自定义 <code>InputStreamSource</code>。</p>
+<p>异步与可靠性:<code>@Async</code> 加专用线程池避免 Web 线程阻塞;Spring Retry 处理 SMTP 瞬时失败;数据库队列加 <code>@Scheduled</code> 调度器实现持久化重试与死信;<code>RateLimiter</code> 控制发送速率以适应服务商限制。</p>
+<p>六大陷阱:SMTP 超时未配置导致线程泄漏;HTML 在 Outlook 中布局错乱;附件超过 SMTP 服务商限制;SPF 与 DKIM 与 DMARC 未配置导致进垃圾箱;<code>getDefaultInstance</code> 多租户串配置;非 UTF-8 编码导致中文乱码。</p>
+<p>下一章 第 25 章 · Remoting 远程调用 将探讨 Spring 远程调用的演进——从 RMI、HTTP Invoker 到 REST、gRPC、GraphQL、RSocket 的现代化替代方案。</p>
+</div>
+
+
+<div class="chapter-nav">
+  <a href="ch23-security.html">&larr; ch23-security · 第 23 章 · Spring Security 过滤器链</a>
+  <a href="ch25-remoting.html">ch25-remoting · 第 25 章 · 远程调用 &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 Spring Boot &middot; 第 24 章 · 邮件服务</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+</body>
+</html>

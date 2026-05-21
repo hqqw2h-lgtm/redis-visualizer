@@ -1,0 +1,2170 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 2 章 · 自动配置引擎 — 图解 Spring Boot</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Spring Boot</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="ch01-startup.html">上一章 ch01-startup</a>
+  <a href="ch03-ioc.html">下一章 ch03-ioc</a>
+</nav>
+
+<aside class="toc">
+<a href="#2.0-章首速览">2.0 章首速览</a>
+<a href="#2.1-宏观流程">2.1 宏观流程</a>
+<a href="#2.2-@conditional-条件求值">2.2 @Conditional 条件求值</a>
+<a href="#2.3-conditionevaluationreport">2.3 ConditionEvaluationReport</a>
+<a href="#2.4-拓扑排序">2.4 拓扑排序</a>
+<a href="#2.5-spring.factories-至-.imports-迁移">2.5 spring.factories 至 .imports 迁移</a>
+<a href="#2.6-自定义-autoconfiguration">2.6 自定义 AutoConfiguration</a>
+<a href="#2.7-调试技巧">2.7 调试技巧</a>
+<a href="#2.8-源码深潜">2.8 源码深潜</a>
+<a href="#2.末-本章要点">2.末 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 2 章 · 自动配置引擎</h1>
+<p class="subtitle">v7 图解版 · 自动从 v6 markdown 生成 · Mermaid 图原样保留</p>
+<div class="chapter-intro"><p><code>@SpringBootApplication</code> 注解的核心扩展点是 <code>@EnableAutoConfiguration</code>。该注解通过 <code>@Import(AutoConfigurationImportSelector.class)</code> 引入一个 <code>DeferredImportSelector</code> 实现,负责加载 classpath 中所有 <code>META-INF/spring/...AutoConfiguration.imports</code> 文件中列出的自动配置类。</p>
+<p>候选清单加载完成后,自动配置引擎执行三层处理:第一层是 <code>AutoConfigurationImportFilter</code> 预过滤,基于元数据进行 <code>OnClassCondition</code> 快速过滤;第二层是 <code>AutoConfigurationSorter</code> 按 <code>@AutoConfigureBefore</code> / <code>@AutoConfigureAfter</code> / <code>@AutoConfigureOrder</code> 注解执行 Kahn 拓扑排序;第三层是 <code>ConditionEvaluator</code> 在配置类解析期执行 13 类 <code>@Conditional</code> 注解的短路求值。</p>
+<p>本章按"宏观流程 → 条件求值 → 评估报告 → 排序算法 → 注册机制 → 自定义实战 → 调试技巧 → 源码深潜"八个层次组织。所有设计决策的目标是建立一套可覆盖、可排序、可诊断的自动装配系统:用户自定义 Bean 优先级高于框架默认实现,基础设施依赖顺序由声明决定,失败原因可通过条件评估报告完整追溯。</p>
+</div>
+<h2 id="2.0-章首速览">2.0 章首速览</h2>
+<div class="diagram">
+<div class="diagram-title">图 2-0 · 自动配置引擎全景(8 节 + 8 关键概念)</div>
+<svg viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg">
+  <rect x="340" y="14" width="240" height="44" rx="6" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+  <text x="460" y="40" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="bold">自动配置引擎</text>
+
+  <path d="M460,58 L70,100"  stroke="#58a6ff" stroke-width="1" fill="none"/>
+  <path d="M460,58 L170,100" stroke="#58a6ff" stroke-width="1" fill="none"/>
+  <path d="M460,58 L270,100" stroke="#58a6ff" stroke-width="1" fill="none"/>
+  <path d="M460,58 L370,100" stroke="#58a6ff" stroke-width="1" fill="none"/>
+  <path d="M460,58 L555,100" stroke="#58a6ff" stroke-width="1" fill="none"/>
+  <path d="M460,58 L655,100" stroke="#58a6ff" stroke-width="1" fill="none"/>
+  <path d="M460,58 L755,100" stroke="#58a6ff" stroke-width="1" fill="none"/>
+  <path d="M460,58 L850,100" stroke="#58a6ff" stroke-width="1" fill="none"/>
+
+  <rect x="14"  y="100" width="112" height="44" rx="6" fill="url(#g-blue)"   stroke="#58a6ff"/>
+  <rect x="114" y="100" width="112" height="44" rx="6" fill="url(#g-red)"    stroke="#f85149" stroke-width="2"/>
+  <rect x="214" y="100" width="112" height="44" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <rect x="314" y="100" width="112" height="44" rx="6" fill="url(#g-blue)"   stroke="#58a6ff"/>
+  <rect x="499" y="100" width="112" height="44" rx="6" fill="url(#g-blue)"   stroke="#58a6ff"/>
+  <rect x="599" y="100" width="112" height="44" rx="6" fill="url(#g-green)"  stroke="#3fb950"/>
+  <rect x="699" y="100" width="112" height="44" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <rect x="794" y="100" width="112" height="44" rx="6" fill="url(#g-blue)"   stroke="#58a6ff"/>
+
+  <text x="70"  y="118" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">§2.1</text>
+  <text x="70"  y="135" text-anchor="middle" fill="#c9d1d9" font-size="10">宏观流程</text>
+  <text x="170" y="118" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">§2.2 ★</text>
+  <text x="170" y="135" text-anchor="middle" fill="#fee2e2" font-size="10">@Conditional 求值</text>
+  <text x="270" y="118" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">§2.3</text>
+  <text x="270" y="135" text-anchor="middle" fill="#c9d1d9" font-size="10">EvaluationReport</text>
+  <text x="370" y="118" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">§2.4</text>
+  <text x="370" y="135" text-anchor="middle" fill="#c9d1d9" font-size="10">拓扑排序</text>
+  <text x="555" y="118" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">§2.5</text>
+  <text x="555" y="135" text-anchor="middle" fill="#c9d1d9" font-size="10">.imports 迁移</text>
+  <text x="655" y="118" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">§2.6</text>
+  <text x="655" y="135" text-anchor="middle" fill="#c9d1d9" font-size="10">自定义</text>
+  <text x="755" y="118" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">§2.7</text>
+  <text x="755" y="135" text-anchor="middle" fill="#c9d1d9" font-size="10">调试技巧</text>
+  <text x="850" y="118" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">§2.8</text>
+  <text x="850" y="135" text-anchor="middle" fill="#c9d1d9" font-size="10">源码深潜</text>
+
+  <path d="M70,144 L70,180"  stroke="#8b949e" stroke-width="1" fill="none"/>
+  <path d="M170,144 L170,180" stroke="#8b949e" stroke-width="1" fill="none"/>
+  <path d="M270,144 L270,180" stroke="#8b949e" stroke-width="1" fill="none"/>
+  <path d="M370,144 L370,180" stroke="#8b949e" stroke-width="1" fill="none"/>
+  <path d="M555,144 L555,180" stroke="#8b949e" stroke-width="1" fill="none"/>
+  <path d="M655,144 L655,180" stroke="#8b949e" stroke-width="1" fill="none"/>
+
+  <rect x="14"  y="180" width="112" height="36" rx="4" fill="#1f2937" stroke="#30363d"/>
+  <rect x="114" y="180" width="112" height="36" rx="4" fill="#1f2937" stroke="#30363d"/>
+  <rect x="214" y="180" width="112" height="36" rx="4" fill="#1f2937" stroke="#30363d"/>
+  <rect x="314" y="180" width="112" height="36" rx="4" fill="#1f2937" stroke="#30363d"/>
+  <rect x="499" y="180" width="112" height="36" rx="4" fill="#1f2937" stroke="#30363d"/>
+  <rect x="599" y="180" width="112" height="36" rx="4" fill="#1f2937" stroke="#30363d"/>
+
+  <text x="70"  y="200" text-anchor="middle" fill="#c9d1d9" font-size="9">@SpringBootApp</text>
+  <text x="70"  y="211" text-anchor="middle" fill="#8b949e" font-size="9">注解层级</text>
+  <text x="170" y="200" text-anchor="middle" fill="#c9d1d9" font-size="9">13 类</text>
+  <text x="170" y="211" text-anchor="middle" fill="#8b949e" font-size="9">@Conditional</text>
+  <text x="270" y="200" text-anchor="middle" fill="#c9d1d9" font-size="9">positive/negative</text>
+  <text x="270" y="211" text-anchor="middle" fill="#8b949e" font-size="9">/exclusion</text>
+  <text x="370" y="200" text-anchor="middle" fill="#c9d1d9" font-size="9">Kahn 算法</text>
+  <text x="370" y="211" text-anchor="middle" fill="#8b949e" font-size="9">+ 环检测</text>
+  <text x="555" y="200" text-anchor="middle" fill="#c9d1d9" font-size="9">factories</text>
+  <text x="555" y="211" text-anchor="middle" fill="#8b949e" font-size="9">vs .imports</text>
+  <text x="655" y="200" text-anchor="middle" fill="#c9d1d9" font-size="9">Notification</text>
+  <text x="655" y="211" text-anchor="middle" fill="#8b949e" font-size="9">Starter 案例</text>
+
+  <rect x="60"  y="260" width="800" height="80" rx="10" fill="#0d1117" stroke="#bc8cff" stroke-width="2"/>
+  <text x="460" y="282" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">8 个关键概念速览</text>
+  <line x1="80" y1="290" x2="840" y2="290" stroke="#30363d"/>
+  <text x="100" y="308" text-anchor="start" fill="#c9d1d9" font-size="10" font-weight="bold">AutoConfigurationImportSelector</text>
+  <text x="370" y="308" text-anchor="start" fill="#c9d1d9" font-size="10" font-weight="bold">ConditionEvaluator</text>
+  <text x="600" y="308" text-anchor="start" fill="#c9d1d9" font-size="10" font-weight="bold">ConditionEvaluationReport</text>
+  <text x="100" y="324" text-anchor="start" fill="#c9d1d9" font-size="10" font-weight="bold">AutoConfigurationSorter</text>
+  <text x="370" y="324" text-anchor="start" fill="#c9d1d9" font-size="10" font-weight="bold">ImportCandidates</text>
+  <text x="600" y="324" text-anchor="start" fill="#c9d1d9" font-size="10" font-weight="bold">@AutoConfiguration</text>
+</svg>
+</div>
+<h3>表 2-0:章节关键概念</h3>
+<table>
+<thead>
+<tr>
+<th>概念</th>
+<th>作用</th>
+<th>章节</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AutoConfigurationImportSelector</td>
+<td>加载候选配置类清单</td>
+<td>2.1</td>
+</tr>
+<tr>
+<td>ConditionEvaluator</td>
+<td>执行 13 类 @Conditional 注解</td>
+<td>2.2</td>
+</tr>
+<tr>
+<td>ConditionEvaluationReport</td>
+<td>记录每个候选类的匹配证据</td>
+<td>2.3</td>
+</tr>
+<tr>
+<td>AutoConfigurationSorter</td>
+<td>按声明依赖执行拓扑排序</td>
+<td>2.4</td>
+</tr>
+<tr>
+<td>ImportCandidates</td>
+<td>读取 .imports 文件</td>
+<td>2.5</td>
+</tr>
+<tr>
+<td>@AutoConfiguration</td>
+<td>声明自动配置类</td>
+<td>2.6</td>
+</tr>
+<tr>
+<td>/actuator/conditions</td>
+<td>暴露条件评估结果</td>
+<td>2.3 / 2.7</td>
+</tr>
+<tr>
+<td>AutoConfigurationImportFilter</td>
+<td>元数据级预过滤</td>
+<td>2.8</td>
+</tr>
+</tbody>
+</table>
+<h2 id="2.1-宏观流程">2.1 宏观流程</h2>
+<div class="diagram">
+<div class="diagram-title">图 2-1-1 · @SpringBootApplication 注解层级(3 → 5 关联)</div>
+<svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
+  <rect x="320" y="14" width="280" height="44" rx="6" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+  <text x="460" y="40" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="bold">@SpringBootApplication</text>
+
+  <path d="M460,58 L160,120" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M460,58 L460,120" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M460,58 L760,120" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="40"  y="120" width="240" height="50" rx="6" fill="url(#g-blue)"   stroke="#58a6ff"/>
+  <rect x="340" y="120" width="240" height="50" rx="6" fill="url(#g-red)"    stroke="#f85149" stroke-width="2"/>
+  <rect x="640" y="120" width="240" height="50" rx="6" fill="url(#g-green)"  stroke="#3fb950"/>
+
+  <text x="160" y="140" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">@SpringBootConfiguration</text>
+  <text x="160" y="158" text-anchor="middle" fill="#8b949e" font-size="10">等价于 @Configuration</text>
+
+  <text x="460" y="140" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">@EnableAutoConfiguration ★</text>
+  <text x="460" y="158" text-anchor="middle" fill="#fee2e2" font-size="10">自动装配核心入口</text>
+
+  <text x="760" y="140" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">@ComponentScan</text>
+  <text x="760" y="158" text-anchor="middle" fill="#8b949e" font-size="10">扫描组件 + excludeFilters</text>
+
+  <path d="M160,170 L160,210" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M380,170 L320,210" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M540,170 L600,210" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="40"  y="210" width="240" height="50" rx="6" fill="url(#g-blue)"   stroke="#58a6ff"/>
+  <rect x="180" y="210" width="280" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="0"/>
+  <rect x="180" y="210" width="280" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <rect x="500" y="210" width="380" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+
+  <text x="160" y="230" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">@Configuration</text>
+  <text x="160" y="248" text-anchor="middle" fill="#8b949e" font-size="10">JSR-330 配置类</text>
+
+  <text x="320" y="230" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">@Import(...ImportSelector)</text>
+  <text x="320" y="248" text-anchor="middle" fill="#c9d1d9" font-size="10">DeferredImportSelector 延迟语义</text>
+
+  <text x="690" y="230" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">@AutoConfigurationPackage</text>
+  <text x="690" y="248" text-anchor="middle" fill="#c9d1d9" font-size="10">@Import(...Registrar) 记录主类包</text>
+
+  <path d="M160,260 L160,300" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <rect x="60"  y="300" width="200" height="40" rx="4" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="160" y="325" text-anchor="middle" fill="#c9d1d9" font-size="11">@Component (基础元注解)</text>
+
+  <text x="460" y="360" text-anchor="middle" fill="#bc8cff" font-size="11">DeferredImportSelector → 所有 @Configuration 解析后才执行 → 用户 Bean 优先级高于框架默认</text>
+</svg>
+</div>
+<p><code>@SpringBootApplication</code> 由三类注解组合而成:<code>@SpringBootConfiguration</code>(继承 <code>@Configuration</code>)、<code>@EnableAutoConfiguration</code> 与 <code>@ComponentScan</code>。<code>@EnableAutoConfiguration</code> 通过 <code>@Import</code> 引入 <code>AutoConfigurationImportSelector</code>,该类实现 <code>DeferredImportSelector</code>,在所有常规 <code>@Configuration</code> 处理完毕后再执行,确保用户自定义配置具备更高优先级。</p>
+<div class="diagram">
+<div class="diagram-title">图 2-1-2 · 端到端自动配置 13 步管线</div>
+<svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <rect x="40"  y="20"  width="160" height="40" rx="6" fill="url(#g-blue)"   stroke="#58a6ff"/>
+  <rect x="240" y="20"  width="160" height="40" rx="6" fill="url(#g-blue)"   stroke="#58a6ff"/>
+  <rect x="440" y="20"  width="160" height="40" rx="6" fill="url(#g-blue)"   stroke="#58a6ff"/>
+  <rect x="640" y="20"  width="200" height="40" rx="6" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+
+  <text x="120" y="44" text-anchor="middle" fill="#c9d1d9" font-size="11">①SpringApp.run</text>
+  <text x="320" y="44" text-anchor="middle" fill="#c9d1d9" font-size="11">②创建 Context</text>
+  <text x="520" y="44" text-anchor="middle" fill="#c9d1d9" font-size="11">③解析 @SpringBootApp</text>
+  <text x="740" y="44" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">④发现 @EnableAutoConfig</text>
+
+  <path d="M200,40 L240,40" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M400,40 L440,40" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M600,40 L640,40" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <path d="M740,60 L740,90" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="40"  y="100" width="200" height="40" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <rect x="280" y="100" width="200" height="40" rx="6" fill="url(#g-blue)"   stroke="#58a6ff"/>
+  <rect x="520" y="100" width="160" height="40" rx="6" fill="url(#g-blue)"   stroke="#58a6ff"/>
+  <rect x="720" y="100" width="160" height="40" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+
+  <text x="140" y="124" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">⑤AutoConfigImportSelector</text>
+  <text x="380" y="124" text-anchor="middle" fill="#c9d1d9" font-size="11">⑥读取 .imports 文件</text>
+  <text x="600" y="124" text-anchor="middle" fill="#c9d1d9" font-size="11">⑦去重 + 排除</text>
+  <text x="800" y="124" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">⑧ImportFilter ★</text>
+
+  <path d="M740,60  L740,80" stroke="#bc8cff" stroke-width="1" fill="none"/>
+  <path d="M740,80  L240,90" stroke="#bc8cff" stroke-width="1" fill="none"/>
+  <path d="M240,140 L280,120" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M480,120 L520,120" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M680,120 L720,120" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="40"  y="180" width="200" height="40" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <rect x="280" y="180" width="200" height="40" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <rect x="520" y="180" width="200" height="40" rx="6" fill="url(#g-red)"    stroke="#f85149" stroke-width="2"/>
+
+  <text x="140" y="204" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">⑨拓扑排序</text>
+  <text x="140" y="216" text-anchor="middle" fill="#c9d1d9" font-size="9">before/after/order</text>
+  <text x="380" y="204" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">⑩逐个解析 @Configuration</text>
+  <text x="620" y="204" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">⑪@Conditional 求值 ★</text>
+
+  <path d="M800,140 L140,170" stroke="#d29922" stroke-width="1" fill="none"/>
+  <path d="M140,170 L140,180" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M240,200 L280,200" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M480,200 L520,200" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <path d="M620,220 L300,290" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="430" y="270" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">⑫匹配</text>
+  <path d="M620,220 L760,290" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="730" y="270" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">⑫不匹配</text>
+
+  <rect x="180" y="290" width="240" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <rect x="600" y="290" width="280" height="50" rx="6" fill="url(#g-red)"   stroke="#f85149"/>
+
+  <text x="300" y="312" text-anchor="middle" fill="#fee2e2" font-size="12" font-weight="bold">⑬注册 BeanDefinition ✓</text>
+  <text x="300" y="328" text-anchor="middle" fill="#c9d1d9" font-size="10">→ Bean 实例化与注入</text>
+  <text x="740" y="312" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">跳过 ✗ + 记录 EvaluationReport</text>
+  <text x="740" y="328" text-anchor="middle" fill="#c9d1d9" font-size="10">/actuator/conditions 暴露证据</text>
+
+  <text x="460" y="395" text-anchor="middle" fill="#bc8cff" font-size="11">关键: ⑧ImportFilter 元数据预过滤(ASM 不加载类) · ⑨拓扑排序 + 环检测 · ⑪短路求值降低评估成本</text>
+  <text x="460" y="420" text-anchor="middle" fill="#8b949e" font-size="10">候选总数 144 → 通过 30-40 类(典型 Web 应用)</text>
+</svg>
+</div>
+<h3>表 2-1-1:DeferredImportSelector 与普通 ImportSelector 对比</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>ImportSelector</th>
+<th>DeferredImportSelector</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>执行时机</td>
+<td>ConfigurationClassParser 处理当前类时立即</td>
+<td>所有常规 @Configuration 解析完毕后批量处理</td>
+</tr>
+<tr>
+<td>用户 Bean 可见性</td>
+<td>不可见(可能尚未注册)</td>
+<td>可见(已注册)</td>
+</tr>
+<tr>
+<td>@ConditionalOnMissingBean 准确性</td>
+<td>不可靠</td>
+<td>可靠</td>
+</tr>
+<tr>
+<td>主要用途</td>
+<td>普通条件导入</td>
+<td>自动配置类导入</td>
+</tr>
+</tbody>
+</table>
+<pre><code class="language-java">public class AutoConfigurationImportSelector
+    implements DeferredImportSelector, Ordered {
+
+  @Override
+  public String[] selectImports(AnnotationMetadata metadata) {
+    List&lt;String&gt; configs = getCandidateConfigurations(metadata, attributes);
+    configs = removeDuplicates(configs);
+    configs = removeExclusions(configs, exclusions);
+    configs = applyFilters(configs, autoConfigurationMetadata);
+    return configs.toArray(new String[0]);
+  }
+
+  protected List&lt;String&gt; getCandidateConfigurations(...) {
+    return ImportCandidates.load(
+      AutoConfiguration.class, getBeanClassLoader()
+    ).getCandidates();
+  }
+}
+</code></pre>
+<pre><code class="language-log">DEBUG o.s.b.a.AutoConfigurationImportSelector :
+  Loaded 146 auto configuration class names from
+  META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
+
+TRACE o.s.b.a.AutoConfigurationImportSelector :
+  Excluded auto configuration classes: []
+
+TRACE o.s.b.a.AutoConfigurationImportSelector :
+  Auto configuration class order:
+  DataSourceAutoConfiguration
+  DataSourceTransactionManagerAutoConfiguration
+  JdbcTemplateAutoConfiguration
+</code></pre>
+<p>候选类总数随 classpath 中 starter 数量变化。Spring Boot 3.4 默认 144 类,典型 Web 应用最终通过约 30 至 40 类条件评估。</p>
+<h2 id="2.2-@conditional-条件求值">2.2 @Conditional 条件求值</h2>
+<div class="diagram">
+<div class="diagram-title">图 2-2-1 · 两阶段短路求值(类级 + 方法级)</div>
+<svg viewBox="0 0 920 320" xmlns="http://www.w3.org/2000/svg">
+  <rect x="20"  y="50" width="120" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="80"  y="72" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">候选自动</text>
+  <text x="80"  y="90" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">配置类</text>
+
+  <path d="M140,75 L180,75" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <path d="M260,30 L260,55 L180,75 L260,95 L340,75 Z" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="260" y="62" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">①Phase 1</text>
+  <text x="260" y="78" text-anchor="middle" fill="#fee2e2" font-size="10">OnClassCondition</text>
+  <text x="260" y="92" text-anchor="middle" fill="#fee2e2" font-size="9">(ASM 元数据)</text>
+
+  <path d="M260,95 L260,140" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="290" y="122" text-anchor="start" fill="#f85149" font-size="10" font-weight="bold">缺类</text>
+
+  <path d="M340,75 L400,75" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="370" y="65" text-anchor="middle" fill="#3fb950" font-size="10" font-weight="bold">类存在</text>
+
+  <path d="M480,30 L480,55 L400,75 L480,95 L560,75 Z" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="480" y="62" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">②Phase 2</text>
+  <text x="480" y="78" text-anchor="middle" fill="#fee2e2" font-size="9">属性/Web/Bean</text>
+  <text x="480" y="92" text-anchor="middle" fill="#fee2e2" font-size="9">条件</text>
+
+  <path d="M480,95 L260,140" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="370" y="120" text-anchor="middle" fill="#f85149" font-size="10" font-weight="bold">任一失败</text>
+
+  <path d="M560,75 L620,75" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="590" y="65" text-anchor="middle" fill="#3fb950" font-size="10" font-weight="bold">全匹配</text>
+
+  <rect x="620" y="50" width="160" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="700" y="80" text-anchor="middle" fill="#c9d1d9" font-size="11">③解析 @Bean 方法</text>
+
+  <path d="M780,75 L820,75" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <path d="M860,40 L860,55 L820,75 L860,95 L900,75 Z" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="860" y="65" text-anchor="middle" fill="#fee2e2" font-size="9">④方法级</text>
+  <text x="860" y="78" text-anchor="middle" fill="#fee2e2" font-size="9">OnMissingBean</text>
+  <text x="860" y="91" text-anchor="middle" fill="#fee2e2" font-size="9">/OnBean</text>
+
+  <path d="M860,95 L860,180" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M860,95 L500,180" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="700" y="160" text-anchor="middle" fill="#3fb950" font-size="10" font-weight="bold">匹配</text>
+  <text x="890" y="155" text-anchor="end" fill="#f85149" font-size="10" font-weight="bold">不匹配</text>
+
+  <rect x="180" y="140" width="200" height="50" rx="6" fill="url(#g-red)"  stroke="#f85149"/>
+  <rect x="400" y="180" width="200" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <rect x="780" y="180" width="160" height="50" rx="6" fill="url(#g-red)"  stroke="#f85149"/>
+
+  <text x="280" y="162" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">跳过整个类 ✗</text>
+  <text x="280" y="180" text-anchor="middle" fill="#c9d1d9" font-size="10">记 negative match</text>
+
+  <text x="500" y="208" text-anchor="middle" fill="#fee2e2" font-size="12" font-weight="bold">注册 BeanDefinition ✓</text>
+  <text x="860" y="208" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">跳过该 @Bean 方法</text>
+
+  <text x="460" y="280" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">短路: SpringBootCondition.matches() 返回 noMatch → 立即返回,后续不评估</text>
+  <text x="460" y="300" text-anchor="middle" fill="#8b949e" font-size="10">Phase 1 用 ASM MetadataReader 读取元数据,避免 Class.forName 加载 → 性能关键路径</text>
+</svg>
+</div>
+<p><code>SpringBootCondition.matches()</code> 一旦返回 <code>ConditionOutcome.noMatch(...)</code>,<code>ConditionEvaluator</code> 立即返回,后续条件不再求值。类级 <code>OnClassCondition</code> 优先通过 ASM <code>MetadataReader</code> 读取元数据,避免直接 <code>Class.forName</code> 加载候选类,实现快速跳过。</p>
+<div class="diagram">
+<div class="diagram-title">图 2-2-2 · 条件优先级金字塔(成本由低到高)</div>
+<svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="26" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">SpringBootCondition · 评估顺序按成本递增</text>
+
+  <rect x="240" y="60"  width="440" height="44" rx="6" fill="url(#g-green)"  stroke="#3fb950" stroke-width="2"/>
+  <rect x="270" y="118" width="380" height="44" rx="6" fill="url(#g-blue)"   stroke="#58a6ff"/>
+  <rect x="300" y="176" width="320" height="44" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <rect x="330" y="234" width="260" height="44" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <rect x="360" y="292" width="200" height="44" rx="6" fill="url(#g-red)"    stroke="#f85149" stroke-width="2"/>
+
+  <text x="460" y="80"  text-anchor="middle" fill="#fee2e2" font-size="12" font-weight="bold">①@ConditionalOnClass</text>
+  <text x="460" y="96"  text-anchor="middle" fill="#fee2e2" font-size="10">类路径检查 · 成本最低 (~ns)</text>
+
+  <text x="460" y="138" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">②@ConditionalOnWebApplication</text>
+  <text x="460" y="154" text-anchor="middle" fill="#c9d1d9" font-size="10">应用类型 (SERVLET/REACTIVE/NONE)</text>
+
+  <text x="460" y="196" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">③@ConditionalOnProperty</text>
+  <text x="460" y="212" text-anchor="middle" fill="#c9d1d9" font-size="10">配置属性匹配 · Map 查找</text>
+
+  <text x="460" y="254" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">④@ConditionalOnBean / OnMissingBean</text>
+  <text x="460" y="270" text-anchor="middle" fill="#c9d1d9" font-size="10">扫描已注册 BeanDefinition</text>
+
+  <text x="460" y="312" text-anchor="middle" fill="#fee2e2" font-size="12" font-weight="bold">⑤@ConditionalOnExpression ★</text>
+  <text x="460" y="328" text-anchor="middle" fill="#fee2e2" font-size="10">SpEL 解析 · 成本最高 (~µs-ms)</text>
+
+  <text x="40"  y="80"  text-anchor="start" fill="#3fb950" font-size="11" font-weight="bold">≈ 0 ns</text>
+  <text x="40"  y="138" text-anchor="start" fill="#58a6ff" font-size="11" font-weight="bold">≈ 几 ns</text>
+  <text x="40"  y="196" text-anchor="start" fill="#d29922" font-size="11" font-weight="bold">≈ 几十 ns</text>
+  <text x="40"  y="254" text-anchor="start" fill="#d29922" font-size="11" font-weight="bold">≈ 几百 ns</text>
+  <text x="40"  y="312" text-anchor="start" fill="#f85149" font-size="11" font-weight="bold">≈ µs-ms</text>
+
+  <text x="800" y="80"  text-anchor="start" fill="#8b949e" font-size="10">ClassLoader 查询</text>
+  <text x="800" y="138" text-anchor="start" fill="#8b949e" font-size="10">枚举判断</text>
+  <text x="800" y="196" text-anchor="start" fill="#8b949e" font-size="10">环境属性查找</text>
+  <text x="800" y="254" text-anchor="start" fill="#8b949e" font-size="10">遍历 BeanDef 表</text>
+  <text x="800" y="312" text-anchor="start" fill="#8b949e" font-size="10">解析 + 求值</text>
+
+  <text x="460" y="362" text-anchor="middle" fill="#bc8cff" font-size="11">★ 设计原则: 成本最低的检查最先执行 → 短路立即返回 → 减少昂贵评估</text>
+</svg>
+</div>
+<p>成本由低到高排列:<code>@ConditionalOnClass</code> 仅查 ClassLoader,几近零开销;<code>@ConditionalOnBean</code> 需扫描已注册 BeanDefinition;<code>@ConditionalOnExpression</code> 需解析 SpEL 表达式,开销最高。优先级设计原则是成本最低的检查最先执行。</p>
+<h3>表 2-2-1:13 类 @Conditional 注解</h3>
+<table>
+<thead>
+<tr>
+<th>注解</th>
+<th>判断维度</th>
+<th>求值阶段</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>@ConditionalOnClass</td>
+<td>classpath 存在指定类</td>
+<td>ImportFilter + Parse</td>
+</tr>
+<tr>
+<td>@ConditionalOnMissingClass</td>
+<td>classpath 不存在指定类</td>
+<td>Parse</td>
+</tr>
+<tr>
+<td>@ConditionalOnBean</td>
+<td>容器已存在指定 Bean</td>
+<td>Parse(类 / 方法)</td>
+</tr>
+<tr>
+<td>@ConditionalOnMissingBean</td>
+<td>容器不存在指定 Bean</td>
+<td>Parse(方法)</td>
+</tr>
+<tr>
+<td>@ConditionalOnProperty</td>
+<td>配置属性值匹配</td>
+<td>Parse</td>
+</tr>
+<tr>
+<td>@ConditionalOnResource</td>
+<td>classpath 存在指定资源</td>
+<td>Parse</td>
+</tr>
+<tr>
+<td>@ConditionalOnWebApplication</td>
+<td>当前为 Servlet / Reactive Web</td>
+<td>ImportFilter + Parse</td>
+</tr>
+<tr>
+<td>@ConditionalOnNotWebApplication</td>
+<td>当前不是 Web 应用</td>
+<td>Parse</td>
+</tr>
+<tr>
+<td>@ConditionalOnExpression</td>
+<td>SpEL 表达式求值为 true</td>
+<td>Parse</td>
+</tr>
+<tr>
+<td>@ConditionalOnJava</td>
+<td>JDK 版本范围匹配</td>
+<td>Parse</td>
+</tr>
+<tr>
+<td>@ConditionalOnJndi</td>
+<td>JNDI 路径可查找</td>
+<td>Parse</td>
+</tr>
+<tr>
+<td>@ConditionalOnSingleCandidate</td>
+<td>容器中仅一个候选 Bean 或带 @Primary</td>
+<td>Parse</td>
+</tr>
+<tr>
+<td>@ConditionalOnCloudPlatform</td>
+<td>检测特定云平台</td>
+<td>Parse</td>
+</tr>
+<tr>
+<td>@ConditionalOnWarDeployment</td>
+<td>应用以 WAR 包部署</td>
+<td>Parse</td>
+</tr>
+</tbody>
+</table>
+<div class="diagram">
+<div class="diagram-title">图 2-2-3 · 三种短路场景(Class → Property → Bean)</div>
+<svg viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg">
+  <path d="M150,30 L150,55 L70,90 L150,125 L230,90 Z" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="150" y="80" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">①OnClass</text>
+  <text x="150" y="98" text-anchor="middle" fill="#fee2e2" font-size="10">Condition</text>
+
+  <path d="M70,90  L60,200" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="40" y="150" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">类不存在</text>
+  <path d="M230,90 L350,90" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="290" y="80" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">类存在</text>
+
+  <path d="M430,30 L430,55 L350,90 L430,125 L510,90 Z" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="430" y="80" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">②OnProperty</text>
+  <text x="430" y="98" text-anchor="middle" fill="#fee2e2" font-size="10">Condition</text>
+
+  <path d="M350,90 L300,200" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="290" y="160" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">属性关闭</text>
+  <path d="M510,90 L630,90" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="570" y="80" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">属性匹配</text>
+
+  <path d="M710,30 L710,55 L630,90 L710,125 L790,90 Z" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="710" y="80" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">③OnMissingBean</text>
+
+  <path d="M630,90 L580,200" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="570" y="170" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">已存在</text>
+  <path d="M790,90 L860,200" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="850" y="160" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">不存在</text>
+
+  <rect x="20"  y="200" width="200" height="60" rx="6" fill="url(#g-red)"   stroke="#f85149" stroke-width="2"/>
+  <rect x="240" y="200" width="200" height="60" rx="6" fill="url(#g-red)"   stroke="#f85149"/>
+  <rect x="460" y="200" width="240" height="60" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <rect x="720" y="200" width="180" height="60" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+
+  <text x="120" y="225" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">A. short-circuit ★</text>
+  <text x="120" y="243" text-anchor="middle" fill="#c9d1d9" font-size="10">未读取后续条件</text>
+  <text x="120" y="255" text-anchor="middle" fill="#8b949e" font-size="10">→ 整个类跳过</text>
+
+  <text x="340" y="225" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">B. short-circuit</text>
+  <text x="340" y="243" text-anchor="middle" fill="#c9d1d9" font-size="10">属性级未匹配</text>
+  <text x="340" y="255" text-anchor="middle" fill="#8b949e" font-size="10">→ 整个类跳过</text>
+
+  <text x="580" y="225" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">C. 跳过该 @Bean 方法</text>
+  <text x="580" y="243" text-anchor="middle" fill="#c9d1d9" font-size="10">使用用户已注册 Bean</text>
+  <text x="580" y="255" text-anchor="middle" fill="#8b949e" font-size="10">类继续处理其他方法</text>
+
+  <text x="810" y="225" text-anchor="middle" fill="#fee2e2" font-size="12" font-weight="bold">匹配 + 注册 ✓</text>
+  <text x="810" y="245" text-anchor="middle" fill="#c9d1d9" font-size="10">positive match</text>
+
+  <text x="460" y="295" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">短路 = 任一 Condition.matches() 返回 noMatch → 立即停止后续评估</text>
+  <text x="460" y="318" text-anchor="middle" fill="#8b949e" font-size="10">关键收益: A 场景节省 100% 后续评估时间; B 节省 ~67%; C 仅影响单方法</text>
+  <text x="460" y="340" text-anchor="middle" fill="#8b949e" font-size="10">@ConditionalOnMissingBean 仅在方法级,确保用户 Bean 优先权</text>
+</svg>
+</div>
+<pre><code class="language-java">@AutoConfiguration
+@ConditionalOnClass(name = &quot;com.example.demo.OptionalClient&quot;)
+@ConditionalOnProperty(prefix = &quot;demo.feature&quot;, name = &quot;enabled&quot;, havingValue = &quot;true&quot;)
+public class DemoFeatureAutoConfiguration {
+
+    @Bean
+    @ConditionalOnMissingBean
+    DemoFeatureClient demoFeatureClient() {
+        return new DemoFeatureClient();
+    }
+}
+</code></pre>
+<pre><code class="language-text">Negative matches:
+-----------------
+  DemoFeatureAutoConfiguration:
+    Did not match:
+      - @ConditionalOnClass did not find required class
+        'com.example.demo.OptionalClient' (OnClassCondition)
+</code></pre>
+<pre><code class="language-text">Negative matches:
+-----------------
+  DemoFeatureAutoConfiguration:
+    Did not match:
+      - @ConditionalOnProperty (demo.feature.enabled=true)
+        found different value in property 'enabled' (OnPropertyCondition)
+</code></pre>
+<pre><code class="language-text">Positive matches:
+-----------------
+  DemoFeatureAutoConfiguration matched:
+    - @ConditionalOnClass found required class
+      'com.example.demo.OptionalClient' (OnClassCondition)
+    - @ConditionalOnProperty (demo.feature.enabled=true)
+      matched (OnPropertyCondition)
+
+  DemoFeatureAutoConfiguration#demoFeatureClient matched:
+    - @ConditionalOnMissingBean (types: com.example.demo.DemoFeatureClient)
+      did not find any beans (OnBeanCondition)
+</code></pre>
+<p><code>@ConditionalOnBean</code> 与 <code>@ConditionalOnMissingBean</code> 的结果取决于当前已处理的 BeanDefinition 集合,依赖处理顺序的正确性。该正确性由 <code>AutoConfigurationSorter</code> 拓扑排序保证(详见 §2.4)。</p>
+<h3>拓展案例:MyBatis Starter 条件组合</h3>
+<p><code>MybatisAutoConfiguration</code> 同时使用 <code>@ConditionalOnClass</code> 与 <code>@ConditionalOnSingleCandidate</code> 双重条件:仅当 <code>SqlSessionFactory</code> 存在 classpath 且容器中恰好一个 <code>DataSource</code> 候选时激活。该模式在多数据源场景下避免歧义注入。</p>
+<pre><code class="language-java">@Configuration
+@ConditionalOnClass({ SqlSessionFactory.class, SqlSessionFactoryBean.class })
+@ConditionalOnSingleCandidate(DataSource.class)
+@EnableConfigurationProperties(MybatisProperties.class)
+@AutoConfigureAfter(DataSourceAutoConfiguration.class)
+public class MybatisAutoConfiguration {
+
+    @Bean
+    @ConditionalOnMissingBean
+    public SqlSessionFactory sqlSessionFactory(DataSource dataSource) throws Exception {
+        SqlSessionFactoryBean factory = new SqlSessionFactoryBean();
+        factory.setDataSource(dataSource);
+        return factory.getObject();
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    public SqlSessionTemplate sqlSessionTemplate(SqlSessionFactory sqlSessionFactory) {
+        return new SqlSessionTemplate(sqlSessionFactory);
+    }
+}
+</code></pre>
+<h3>拓展案例:SpringDoc 默认启用模式</h3>
+<p>SpringDoc 使用 <code>@ConditionalOnProperty(matchIfMissing = true)</code> 实现默认启用、按需关闭的设计模式。开发环境无需额外配置即获得 API 文档界面,生产环境通过单行属性禁用。</p>
+<pre><code class="language-java">@Configuration
+@ConditionalOnProperty(
+    name = &quot;springdoc.api-docs.enabled&quot;,
+    matchIfMissing = true
+)
+@ConditionalOnClass(OpenAPI.class)
+public class SpringDocAutoConfiguration {
+
+    @Bean
+    @ConditionalOnMissingBean
+    public OpenAPI openAPI() {
+        return new OpenAPI()
+            .info(new Info().title(&quot;API Documentation&quot;));
+    }
+}
+</code></pre>
+<h2 id="2.3-conditionevaluationreport">2.3 ConditionEvaluationReport</h2>
+<div class="diagram">
+<div class="diagram-title">图 2-3-1 · ConditionEvaluationReport 构建流程</div>
+<svg viewBox="0 0 920 320" xmlns="http://www.w3.org/2000/svg">
+  <rect x="40"  y="20" width="280" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="180" y="44" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">ConditionEvaluator.shouldSkip()</text>
+
+  <path d="M180,60 L180,90" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <path d="M180,90 L180,118 L100,150 L180,182 L260,150 Z" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="180" y="148" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">①条件注解存在?</text>
+
+  <path d="M100,150 L60,220" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="60" y="195" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">否</text>
+  <path d="M260,150 L380,150" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="320" y="140" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">是</text>
+
+  <rect x="20"  y="220" width="80" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="60" y="240" text-anchor="middle" fill="#c9d1d9" font-size="10">直接通过</text>
+  <text x="60" y="252" text-anchor="middle" fill="#8b949e" font-size="9">不记录</text>
+
+  <rect x="380" y="130" width="180" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="470" y="155" text-anchor="middle" fill="#c9d1d9" font-size="11">②遍历 Condition 实现</text>
+
+  <path d="M560,150 L600,150" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="600" y="100" width="280" height="100" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="740" y="125" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">③ConditionOutcome 累加</text>
+  <text x="740" y="148" text-anchor="middle" fill="#c9d1d9" font-size="10">- match() / noMatch() 收集消息</text>
+  <text x="740" y="165" text-anchor="middle" fill="#c9d1d9" font-size="10">- 任一 noMatch → 返回 skip=true</text>
+  <text x="740" y="185" text-anchor="middle" fill="#c9d1d9" font-size="10">全 match → skip=false</text>
+
+  <path d="M740,200 L740,230" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="600" y="230" width="280" height="36" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="740" y="253" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">④存入 ConditionEvaluationReport</text>
+
+  <path d="M600,248 L470,248" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="280" y="225" width="240" height="60" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="400" y="246" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">⑤Logger 输出</text>
+  <text x="400" y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">--debug → INFO 完整报告</text>
+  <text x="400" y="277" text-anchor="middle" fill="#c9d1d9" font-size="10">/actuator/conditions → JSON</text>
+</svg>
+</div>
+<p><code>ConditionEvaluationReport</code> 绑定到 <code>ApplicationContext</code>,记录所有自动配置类的条件评估证据。报告包含四类:</p>
+<h3>表 2-3-1:报告四类信息</h3>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>含义</th>
+<th>调试用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Positive matches</td>
+<td>全部条件匹配,配置类已加载</td>
+<td>确认期望的配置已生效</td>
+</tr>
+<tr>
+<td>Negative matches</td>
+<td>至少一个条件未匹配,配置类被跳过</td>
+<td>排查"为什么 Bean 未注册"</td>
+</tr>
+<tr>
+<td>Exclusions</td>
+<td>用户通过 spring.autoconfigure.exclude 显式排除</td>
+<td>验证排除是否生效</td>
+</tr>
+<tr>
+<td>Unconditional classes</td>
+<td>无任何 @Conditional,始终加载</td>
+<td>内核功能,通常无需诊断</td>
+</tr>
+</tbody>
+</table>
+<pre><code class="language-text">============================
+CONDITIONS EVALUATION REPORT
+============================
+
+Positive matches:
+-----------------
+  DataSourceAutoConfiguration matched:
+    - @ConditionalOnClass found required classes
+      'javax.sql.DataSource',
+      'org.springframework.jdbc.datasource.embedded.EmbeddedDatabaseType'
+      (OnClassCondition)
+
+  DataSourceAutoConfiguration.PooledDataSourceConfiguration matched:
+    - @ConditionalOnMissingBean (types:
+      javax.sql.DataSource,
+       javax.sql.XADataSource)
+      did not find any beans (OnBeanCondition)
+
+  HikariAutoConfiguration matched:
+    - @ConditionalOnClass found required class
+      'com.zaxxer.hikari.HikariDataSource'
+      (OnClassCondition)
+    - @ConditionalOnProperty (spring.datasource.type)
+      matched with value 'com.zaxxer.hikari.HikariDataSource'
+      (OnPropertyCondition)
+
+Negative matches:
+-----------------
+  ActiveMQAutoConfiguration:
+    Did not match:
+      - @ConditionalOnClass did not find required class
+        'jakarta.jms.ConnectionFactory'
+        (OnClassCondition)
+
+Exclusions:
+-----------
+  org.springframework.boot.autoconfigure.security.reactive.ReactiveSecurityAutoConfiguration
+
+Unconditional classes:
+----------------------
+  org.springframework.boot.autoconfigure.context.ConfigurationPropertiesAutoConfiguration
+  org.springframework.boot.autoconfigure.context.LifecycleAutoConfiguration
+</code></pre>
+<div class="diagram">
+<div class="diagram-title">图 2-3-2 · 报告获取的 3 种途径</div>
+<svg viewBox="0 0 920 240" xmlns="http://www.w3.org/2000/svg">
+  <rect x="320" y="14" width="280" height="44" rx="6" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+  <text x="460" y="40" text-anchor="middle" fill="#e6edf3" font-size="13" font-weight="bold">ConditionEvaluationReport</text>
+
+  <path d="M460,58 L150,100" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M460,58 L460,100" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M460,58 L770,100" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="20"  y="100" width="260" height="50" rx="6" fill="url(#g-blue)"   stroke="#58a6ff"/>
+  <rect x="330" y="100" width="260" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <rect x="640" y="100" width="260" height="50" rx="6" fill="url(#g-green)"  stroke="#3fb950"/>
+
+  <text x="150" y="120" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">①启动参数 --debug</text>
+  <text x="150" y="138" text-anchor="middle" fill="#8b949e" font-size="10">java -jar app.jar --debug</text>
+
+  <text x="460" y="120" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">②/actuator/conditions ★</text>
+  <text x="460" y="138" text-anchor="middle" fill="#fee2e2" font-size="10">推荐: 结构化 + 实时</text>
+
+  <text x="770" y="120" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">③ConditionEvaluationReport.get()</text>
+  <text x="770" y="138" text-anchor="middle" fill="#8b949e" font-size="10">程序化访问</text>
+
+  <path d="M150,150 L150,180" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M460,150 L460,180" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M770,150 L770,180" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="20"  y="180" width="260" height="40" rx="6" fill="url(#g-blue)"   stroke="#58a6ff"/>
+  <rect x="330" y="180" width="260" height="40" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <rect x="640" y="180" width="260" height="40" rx="6" fill="url(#g-green)"  stroke="#3fb950"/>
+
+  <text x="150" y="205" text-anchor="middle" fill="#c9d1d9" font-size="11">INFO 日志输出完整报告</text>
+  <text x="460" y="205" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">JSON 结构化数据</text>
+  <text x="770" y="205" text-anchor="middle" fill="#c9d1d9" font-size="11">代码读取 + 自定义诊断</text>
+</svg>
+</div>
+<pre><code class="language-bash">curl -s http://localhost:8080/actuator/conditions \
+  | jq '.contexts.application.negativeMatches.ActiveMQAutoConfiguration'
+</code></pre>
+<pre><code class="language-json">[
+  {
+    &quot;condition&quot;: &quot;OnClassCondition&quot;,
+    &quot;message&quot;: &quot;@ConditionalOnClass did not find required class 'jakarta.jms.ConnectionFactory'&quot;
+  }
+]
+</code></pre>
+<p>调试时优先查看 Negative matches 确认期望的配置为何未生效。Actuator 端点适合在测试或排障脚本中执行结构化断言。</p>
+<h2 id="2.4-拓扑排序">2.4 拓扑排序</h2>
+<div class="diagram">
+<div class="diagram-title">图 2-4-1 · AutoConfiguration 依赖 DAG(@AutoConfigureAfter)</div>
+<svg viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="26" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">A → B 表示 B 声明 @AutoConfigureAfter(A) (B 需在 A 之后处理)</text>
+
+  <rect x="380" y="60" width="200" height="50" rx="6" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+  <text x="480" y="83" text-anchor="middle" fill="#fee2e2" font-size="12" font-weight="bold">DataSource ★</text>
+  <text x="480" y="100" text-anchor="middle" fill="#c9d1d9" font-size="10">入度 = 0(根节点)</text>
+
+  <rect x="40"  y="160" width="180" height="44" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <rect x="240" y="160" width="180" height="44" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <rect x="540" y="160" width="180" height="44" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+
+  <text x="130" y="180" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">HikariAutoConfig</text>
+  <text x="130" y="196" text-anchor="middle" fill="#8b949e" font-size="10">入度=1</text>
+
+  <text x="330" y="180" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">JdbcTemplateAutoConfig</text>
+  <text x="330" y="196" text-anchor="middle" fill="#8b949e" font-size="10">入度=1</text>
+
+  <text x="630" y="180" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">FlywayAutoConfig</text>
+  <text x="630" y="196" text-anchor="middle" fill="#8b949e" font-size="10">入度=1</text>
+
+  <rect x="540" y="240" width="180" height="44" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="630" y="260" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">JpaAutoConfig</text>
+  <text x="630" y="276" text-anchor="middle" fill="#8b949e" font-size="10">入度=2 (DS + Flyway)</text>
+
+  <rect x="240" y="290" width="200" height="44" rx="6" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+  <text x="340" y="310" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">TransactionAutoConfig</text>
+  <text x="340" y="326" text-anchor="middle" fill="#fee2e2" font-size="10">入度=2 (Jdbc + Jpa) · 末端</text>
+
+  <path d="M430,110 L130,160" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M460,110 L330,160" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M530,110 L630,160" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M520,110 L630,240" stroke="#bc8cff" stroke-width="1" stroke-dasharray="3 3" fill="none"/>
+
+  <path d="M630,204 L630,240" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <path d="M330,204 L340,290" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M580,284 L420,290" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <text x="800" y="160" text-anchor="start" fill="#bc8cff" font-size="10" font-weight="bold">DAG 节点 = 6</text>
+  <text x="800" y="175" text-anchor="start" fill="#8b949e" font-size="10">边 = 7</text>
+  <text x="800" y="195" text-anchor="start" fill="#8b949e" font-size="10">拓扑顺序:</text>
+  <text x="800" y="210" text-anchor="start" fill="#c9d1d9" font-size="10">1.DataSource</text>
+  <text x="800" y="222" text-anchor="start" fill="#c9d1d9" font-size="10">2.Hikari</text>
+  <text x="800" y="234" text-anchor="start" fill="#c9d1d9" font-size="10">3.Jdbc</text>
+  <text x="800" y="246" text-anchor="start" fill="#c9d1d9" font-size="10">4.Flyway</text>
+  <text x="800" y="258" text-anchor="start" fill="#c9d1d9" font-size="10">5.Jpa</text>
+  <text x="800" y="270" text-anchor="start" fill="#c9d1d9" font-size="10">6.Transaction</text>
+</svg>
+</div>
+<p>箭头 A → B 表示 B 声明 <code>@AutoConfigureAfter(A.class)</code>,即 A 必须在 B 之前处理。这些有向边构成有向无环图(DAG),需经拓扑排序确定最终处理顺序。</p>
+<h3>表 2-4-1:Kahn 算法步骤</h3>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>处理节点</th>
+<th>入度变化</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>t0</td>
+<td>入度 0:DataSource</td>
+<td>-</td>
+</tr>
+<tr>
+<td>t1</td>
+<td>移除 DataSource</td>
+<td>Hikari / Jdbc / Flyway 入度 0</td>
+</tr>
+<tr>
+<td>t2</td>
+<td>移除 Hikari</td>
+<td>-</td>
+</tr>
+<tr>
+<td>t3</td>
+<td>移除 Jdbc</td>
+<td>Tx 入度 1</td>
+</tr>
+<tr>
+<td>t4</td>
+<td>移除 Flyway</td>
+<td>Jpa 入度 0</td>
+</tr>
+<tr>
+<td>t5</td>
+<td>移除 Jpa</td>
+<td>Tx 入度 0</td>
+</tr>
+<tr>
+<td>t6</td>
+<td>移除 Tx</td>
+<td>排序完成</td>
+</tr>
+</tbody>
+</table>
+<div class="diagram">
+<div class="diagram-title">图 2-4-2 · Kahn 算法时间轴(7 步移除节点)</div>
+<svg viewBox="0 0 920 240" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="26" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">Kahn 拓扑排序 · 每轮选入度=0 节点出列</text>
+
+  <rect x="20"  y="60" width="120" height="64" rx="6" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+  <rect x="150" y="60" width="120" height="64" rx="6" fill="url(#g-blue)"   stroke="#58a6ff"/>
+  <rect x="280" y="60" width="120" height="64" rx="6" fill="url(#g-blue)"   stroke="#58a6ff"/>
+  <rect x="410" y="60" width="120" height="64" rx="6" fill="url(#g-blue)"   stroke="#58a6ff"/>
+  <rect x="540" y="60" width="120" height="64" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <rect x="670" y="60" width="120" height="64" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <rect x="800" y="60" width="100" height="64" rx="6" fill="url(#g-green)"  stroke="#3fb950" stroke-width="2"/>
+
+  <text x="80"  y="80" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">t0</text>
+  <text x="80"  y="98" text-anchor="middle" fill="#c9d1d9" font-size="10">入度 0 队列:</text>
+  <text x="80"  y="115" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">DataSource</text>
+
+  <text x="210" y="80" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">t1</text>
+  <text x="210" y="96" text-anchor="middle" fill="#c9d1d9" font-size="9">移除 DataSource</text>
+  <text x="210" y="108" text-anchor="middle" fill="#3fb950" font-size="9">Hikari/Jdbc/</text>
+  <text x="210" y="119" text-anchor="middle" fill="#3fb950" font-size="9">Flyway 入度=0</text>
+
+  <text x="340" y="80" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">t2</text>
+  <text x="340" y="96" text-anchor="middle" fill="#c9d1d9" font-size="10">移除 Hikari</text>
+  <text x="340" y="115" text-anchor="middle" fill="#8b949e" font-size="9">无新入度=0</text>
+
+  <text x="470" y="80" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">t3</text>
+  <text x="470" y="96" text-anchor="middle" fill="#c9d1d9" font-size="10">移除 Jdbc</text>
+  <text x="470" y="115" text-anchor="middle" fill="#d29922" font-size="9">Tx 入度 -1=1</text>
+
+  <text x="600" y="80" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">t4</text>
+  <text x="600" y="96" text-anchor="middle" fill="#c9d1d9" font-size="10">移除 Flyway</text>
+  <text x="600" y="115" text-anchor="middle" fill="#3fb950" font-size="9">Jpa 入度=0</text>
+
+  <text x="730" y="80" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">t5</text>
+  <text x="730" y="96" text-anchor="middle" fill="#c9d1d9" font-size="10">移除 Jpa</text>
+  <text x="730" y="115" text-anchor="middle" fill="#3fb950" font-size="9">Tx 入度=0</text>
+
+  <text x="850" y="80" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">t6 ✓</text>
+  <text x="850" y="96" text-anchor="middle" fill="#c9d1d9" font-size="10">移除 Tx</text>
+  <text x="850" y="115" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">完成</text>
+
+  <path d="M140,90 L150,90" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M270,90 L280,90" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M400,90 L410,90" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M530,90 L540,90" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M660,90 L670,90" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M790,90 L800,90" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="60" y="150" width="800" height="60" rx="10" fill="#0d1117" stroke="#3fb950" stroke-width="2"/>
+  <text x="460" y="172" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">最终顺序</text>
+  <text x="460" y="195" text-anchor="middle" fill="#c9d1d9" font-size="11" font-family="monospace">DataSource → Hikari → Jdbc → Flyway → Jpa → Transaction</text>
+</svg>
+</div>
+<pre><code class="language-text">function topologicalSort(Graph dag):
+    Map&lt;Node, Integer&gt; inDegree = computeInDegrees(dag)
+    Queue&lt;Node&gt; queue = inDegree.entrySet()
+        .stream().filter(e -&gt; e.getValue() == 0)
+        .map(Map.Entry::getKey)
+        .collect(toQueue())
+
+    List&lt;Node&gt; result = new ArrayList&lt;&gt;()
+    while (queue not empty):
+        Node node = queue.poll()
+        result.add(node)
+        for (Node neighbor : dag.neighbors(node)):
+            inDegree.merge(neighbor, -1, Integer::sum)
+            if (inDegree.get(neighbor) == 0):
+                queue.add(neighbor)
+
+    if (result.size() not equals dag.nodeCount()):
+        throw new CycleDetectedException
+    return result
+</code></pre>
+<p>参考 Kahn 算法原文:Kahn, A. B. (1962) "Topological sorting of large networks", Communications of the ACM, 5(11), 558-562。Kahn 算法时间复杂度 O(V + E),空间复杂度 O(V)。</p>
+<div class="diagram">
+<div class="diagram-title">图 2-4-3 · 循环依赖检测(Kahn 完成时 result.size &lt; V)</div>
+<svg viewBox="0 0 920 320" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="26" text-anchor="middle" fill="#f85149" font-size="13" font-weight="bold">A → B → C → A 循环 · 三个 @AutoConfigureAfter 互相矛盾</text>
+
+  <rect x="100" y="80" width="200" height="60" rx="6" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+  <rect x="640" y="80" width="200" height="60" rx="6" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+  <rect x="370" y="220" width="200" height="60" rx="6" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+
+  <text x="200" y="105" text-anchor="middle" fill="#fee2e2" font-size="12" font-weight="bold">ConfigA</text>
+  <text x="200" y="125" text-anchor="middle" fill="#c9d1d9" font-size="10">@AutoConfigureAfter(ConfigC)</text>
+
+  <text x="740" y="105" text-anchor="middle" fill="#fee2e2" font-size="12" font-weight="bold">ConfigB</text>
+  <text x="740" y="125" text-anchor="middle" fill="#c9d1d9" font-size="10">@AutoConfigureAfter(ConfigA)</text>
+
+  <text x="470" y="245" text-anchor="middle" fill="#fee2e2" font-size="12" font-weight="bold">ConfigC</text>
+  <text x="470" y="265" text-anchor="middle" fill="#c9d1d9" font-size="10">@AutoConfigureAfter(ConfigB)</text>
+
+  <path d="M300,110 L640,110" stroke="#f85149" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="470" y="100" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">A → B</text>
+
+  <path d="M740,140 L570,220" stroke="#f85149" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="690" y="190" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">B → C</text>
+
+  <path d="M370,250 L200,140" stroke="#f85149" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="240" y="200" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">C → A</text>
+
+  <text x="20" y="305" text-anchor="start" fill="#bc8cff" font-size="11" font-weight="bold">检测算法:</text>
+  <text x="160" y="305" text-anchor="start" fill="#c9d1d9" font-size="10" font-family="monospace">if (result.size() &lt; dag.nodeCount()) throw new CycleDetectedException</text>
+</svg>
+</div>
+<p>Kahn 算法结束后 <code>result.size() &lt; V</code> 表明图中存在环。Spring Boot 抛出异常并报告参与循环的配置类。生产环境的循环依赖通常由两个 starter 的 <code>@AutoConfigureBefore</code> / <code>@AutoConfigureAfter</code> 相互矛盾引起,合并第三方 starter 时需特别校验。</p>
+<h3>拓展案例:Spring Security JDBC 排序约束</h3>
+<p><code>JdbcUserDetailsManagerAutoConfiguration</code> 必须在 <code>DataSourceAutoConfiguration</code> 与 <code>HibernateJpaAutoConfiguration</code> 之后处理。该约束保证 <code>@ConditionalOnBean(DataSource.class)</code> 求值时 DataSource 已注册,认证模块得以正确初始化。</p>
+<pre><code class="language-java">@AutoConfiguration(
+    after = {
+        DataSourceAutoConfiguration.class,
+        HibernateJpaAutoConfiguration.class
+    }
+)
+@ConditionalOnClass(JdbcUserDetailsManager.class)
+@ConditionalOnBean(DataSource.class)
+public class JdbcUserDetailsManagerAutoConfiguration {
+
+    @Bean
+    @ConditionalOnMissingBean(UserDetailsService.class)
+    public JdbcUserDetailsManager jdbcUserDetailsManager(DataSource dataSource) {
+        return new JdbcUserDetailsManager(dataSource);
+    }
+}
+</code></pre>
+<h2 id="2.5-spring.factories-至-.imports-迁移">2.5 spring.factories 至 .imports 迁移</h2>
+<div class="diagram">
+<div class="diagram-title">图 2-5-1 · spring.factories → .imports 迁移对比(2.x vs 3.x)</div>
+<svg viewBox="0 0 920 280" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="26" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">Boot 3.x 拆分 SPI 文件 · 逐行类名 · AOT 友好</text>
+
+  <rect x="20"  y="50" width="420" height="200" rx="10" fill="#161b22" stroke="#f85149" stroke-width="2"/>
+  <text x="230" y="74" text-anchor="middle" fill="#f85149" font-size="13" font-weight="bold">Boot 2.x · spring.factories</text>
+  <text x="230" y="92" text-anchor="middle" fill="#8b949e" font-size="10">META-INF/spring.factories</text>
+
+  <rect x="50"  y="110" width="360" height="40" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+  <text x="230" y="135" text-anchor="middle" fill="#fee2e2" font-size="11">单文件混合多类 SPI</text>
+
+  <rect x="50"  y="160" width="360" height="40" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+  <text x="230" y="185" text-anchor="middle" fill="#fee2e2" font-size="11">解析 key=value</text>
+
+  <rect x="50"  y="210" width="360" height="32" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+  <text x="230" y="231" text-anchor="middle" fill="#fee2e2" font-size="11">逗号分隔 + 反斜杠续行</text>
+
+  <rect x="480" y="50" width="420" height="200" rx="10" fill="#161b22" stroke="#3fb950" stroke-width="2"/>
+  <text x="690" y="74" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">Boot 3.x · AutoConfiguration.imports</text>
+  <text x="690" y="92" text-anchor="middle" fill="#8b949e" font-size="9">META-INF/spring/...AutoConfiguration.imports</text>
+
+  <rect x="510" y="110" width="360" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="690" y="135" text-anchor="middle" fill="#bbf7d0" font-size="11">按 SPI 类型拆文件</text>
+
+  <rect x="510" y="160" width="360" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="690" y="185" text-anchor="middle" fill="#bbf7d0" font-size="11">逐行读取类名</text>
+
+  <rect x="510" y="210" width="360" height="32" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="690" y="231" text-anchor="middle" fill="#bbf7d0" font-size="11">AOT 与工具友好</text>
+
+  <path d="M440,150 L480,150" stroke="#d29922" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="460" y="143" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">迁移</text>
+</svg>
+</div>
+<h3>表 2-5-1:文件格式对比</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>spring.factories (Boot 2.x)</th>
+<th>AutoConfiguration.imports (Boot 3.x)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>文件路径</td>
+<td>META-INF/spring.factories</td>
+<td>META-INF/spring/...AutoConfiguration.imports</td>
+</tr>
+<tr>
+<td>格式</td>
+<td>Properties:key=value1,value2</td>
+<td>每行一个全限定类名</td>
+</tr>
+<tr>
+<td>内容</td>
+<td>多类 SPI 混合</td>
+<td>仅自动配置类</td>
+</tr>
+<tr>
+<td>解析速度</td>
+<td>解析全部 key 后过滤,粗略约 12 ms</td>
+<td>直接按行读取,粗略约 4 ms</td>
+</tr>
+<tr>
+<td>内存占用</td>
+<td>全量加载到 Map 缓存</td>
+<td>按需加载</td>
+</tr>
+<tr>
+<td>Boot 3.x 支持</td>
+<td>其他 SPI 仍走旧文件,自动配置不再读取</td>
+<td>自动配置仅支持新文件</td>
+</tr>
+<tr>
+<td>GraalVM AOT</td>
+<td>反射加载,需 reachability metadata</td>
+<td>编译期可直接分析</td>
+</tr>
+</tbody>
+</table>
+<pre><code class="language-text"># === META-INF/spring.factories (Boot 2.x) ===
+org.springframework.boot.autoconfigure.EnableAutoConfiguration=\
+  com.example.FooAutoConfiguration,\
+  com.example.BarAutoConfiguration
+
+org.springframework.boot.env.EnvironmentPostProcessor=\
+  com.example.MyEnvPostProcessor
+</code></pre>
+<pre><code class="language-text"># === META-INF/spring/...AutoConfiguration.imports (Boot 3.x) ===
+com.example.FooAutoConfiguration
+com.example.BarAutoConfiguration
+</code></pre>
+<div class="diagram">
+<div class="diagram-title">图 2-5-2 · ImportCandidates 加载时序(4 swimlane × 11 step)</div>
+<svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="26" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">App → Selector → ImportCandidates → ClassLoader · loop readLines</text>
+
+  <rect x="40"  y="50" width="180" height="36" rx="6" fill="url(#g-blue)"   stroke="#58a6ff"/>
+  <rect x="245" y="50" width="180" height="36" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <rect x="450" y="50" width="180" height="36" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <rect x="700" y="50" width="180" height="36" rx="6" fill="url(#g-green)"  stroke="#3fb950"/>
+
+  <text x="130" y="72" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">SpringApplication</text>
+  <text x="335" y="72" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">AutoConfigImportSelector</text>
+  <text x="540" y="72" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">ImportCandidates</text>
+  <text x="790" y="72" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">ClassLoader</text>
+
+  <line x1="130" y1="86"  x2="130" y2="430" stroke="#30363d" stroke-width="1" stroke-dasharray="3,3"/>
+  <line x1="335" y1="86"  x2="335" y2="430" stroke="#30363d" stroke-width="1" stroke-dasharray="3,3"/>
+  <line x1="540" y1="86"  x2="540" y2="430" stroke="#30363d" stroke-width="1" stroke-dasharray="3,3"/>
+  <line x1="790" y1="86"  x2="790" y2="430" stroke="#30363d" stroke-width="1" stroke-dasharray="3,3"/>
+
+  <path d="M130,110 L335,110" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="232" y="105" text-anchor="middle" fill="#c9d1d9" font-size="10">①  processGroupImports()</text>
+
+  <path d="M335,140 L540,140" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="437" y="135" text-anchor="middle" fill="#c9d1d9" font-size="10">②  load(AutoConfiguration.class)</text>
+
+  <path d="M540,170 L790,170" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="665" y="165" text-anchor="middle" fill="#c9d1d9" font-size="10">③  getResources(".imports")</text>
+
+  <path d="M790,200 L540,200" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr)" fill="none"/>
+  <text x="665" y="195" text-anchor="middle" fill="#3fb950" font-size="10">④  URL[] (每个 jar 一份)</text>
+
+  <rect x="445" y="220" width="190" height="118" rx="6" fill="rgba(210,153,34,0.12)" stroke="#d29922" stroke-dasharray="4,3"/>
+  <text x="540" y="240" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">loop · 逐个 URL</text>
+
+  <rect x="455" y="248" width="170" height="22" rx="4" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="540" y="263" text-anchor="middle" fill="#fee2e2" font-size="10">⑤  readLines(url)</text>
+
+  <rect x="455" y="276" width="170" height="22" rx="4" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="540" y="291" text-anchor="middle" fill="#fee2e2" font-size="10">⑥  去除注释行</text>
+
+  <rect x="455" y="304" width="170" height="22" rx="4" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="540" y="319" text-anchor="middle" fill="#fee2e2" font-size="10">⑦  trim + 收集类名</text>
+
+  <path d="M540,358 L335,358" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr)" fill="none"/>
+  <text x="437" y="353" text-anchor="middle" fill="#3fb950" font-size="10">⑧  List&lt;String&gt; candidates</text>
+
+  <rect x="245" y="378" width="180" height="22" rx="4" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="335" y="393" text-anchor="middle" fill="#fee2e2" font-size="10">⑨  removeDuplicates / Exclude / Filter</text>
+
+  <path d="M335,415 L130,415" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr)" fill="none"/>
+  <text x="232" y="410" text-anchor="middle" fill="#3fb950" font-size="10">⑩ ⑪  String[] configClassNames</text>
+</svg>
+</div>
+<p>文件路径或类名错误时,<code>ConditionEvaluationReport</code> 中不会出现该配置类,因其未进入条件求值阶段。诊断需查看 <code>TRACE o.s.b.a.AutoConfigurationImportSelector</code> 日志中的"Loaded auto configuration class names"列表。</p>
+<pre><code class="language-log">TRACE o.s.b.a.AutoConfigurationImportSelector :
+  Loaded auto configuration class names:
+    com.example.FooAutoConfiguration
+    com.example.BarAutoConfiguration
+
+WARN  o.s.b.a.AutoConfigurationImportSelector :
+  The following classes could not be loaded:
+    com.example.MissingAutoConfiguration
+</code></pre>
+<h3>拓展案例:Sentinel Boot 2.x 注册</h3>
+<p>阿里巴巴 Sentinel 流量控制组件在 Boot 2.x 通过 <code>META-INF/spring.factories</code> 注册自动配置。Boot 3.x 升级时需将相同类名迁移至 <code>META-INF/spring/...AutoConfiguration.imports</code>,否则配置类不再被加载。</p>
+<pre><code class="language-properties">org.springframework.boot.autoconfigure.EnableAutoConfiguration=\
+  com.alibaba.cloud.sentinel.SentinelWebAutoConfiguration,\
+  com.alibaba.cloud.sentinel.SentinelWebFluxAutoConfiguration,\
+  com.alibaba.cloud.sentinel.endpoint.SentinelEndpointAutoConfiguration,\
+  com.alibaba.cloud.sentinel.custom.SentinelAutoConfiguration,\
+  com.alibaba.cloud.sentinel.feign.SentinelFeignAutoConfiguration
+</code></pre>
+<pre><code class="language-java">@Configuration
+@ConditionalOnWebApplication(type = ConditionalOnWebApplication.Type.SERVLET)
+@ConditionalOnClass(SentinelWebInterceptor.class)
+@ConditionalOnProperty(
+    name = &quot;spring.cloud.sentinel.enabled&quot;,
+    matchIfMissing = true
+)
+@EnableConfigurationProperties(SentinelProperties.class)
+public class SentinelWebAutoConfiguration implements WebMvcConfigurer {
+
+    @Bean
+    @ConditionalOnMissingBean
+    public SentinelWebInterceptor sentinelWebInterceptor(
+            SentinelWebMvcConfig config) {
+        return new SentinelWebInterceptor(config);
+    }
+}
+</code></pre>
+<h2 id="2.6-自定义-autoconfiguration">2.6 自定义 AutoConfiguration</h2>
+<div class="diagram">
+<div class="diagram-title">图 2-6-1 · 自定义 starter 模块布局(3 顶层 + 7 类)</div>
+<svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="26" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">notification-spring-boot-starter · Maven 模块结构</text>
+
+  <rect x="320" y="50" width="280" height="50" rx="6" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+  <text x="460" y="73" text-anchor="middle" fill="#fee2e2" font-size="12" font-weight="bold">notification-spring-boot-starter</text>
+  <text x="460" y="90" text-anchor="middle" fill="#c9d1d9" font-size="10">(Maven 顶层模块)</text>
+
+  <rect x="40"  y="160" width="220" height="56" rx="6" fill="url(#g-blue)"  stroke="#58a6ff"/>
+  <text x="150" y="183" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">src/main/java/</text>
+  <text x="150" y="201" text-anchor="middle" fill="#c9d1d9" font-size="10">com/example/notification/</text>
+
+  <rect x="350" y="160" width="220" height="56" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="460" y="180" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">src/main/resources/</text>
+  <text x="460" y="195" text-anchor="middle" fill="#c9d1d9" font-size="10">META-INF/spring/</text>
+  <text x="460" y="208" text-anchor="middle" fill="#c9d1d9" font-size="9">...AutoConfiguration.imports</text>
+
+  <rect x="660" y="160" width="220" height="56" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="770" y="183" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">配置元数据</text>
+  <text x="770" y="201" text-anchor="middle" fill="#c9d1d9" font-size="9">spring-configuration-metadata.json</text>
+
+  <path d="M460,100 L150,160" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M460,100 L460,160" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M460,100 L770,160" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="20"  y="270" width="180" height="32" rx="4" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="110" y="290" text-anchor="middle" fill="#fee2e2" font-size="10">NotificationAutoConfiguration</text>
+
+  <rect x="20"  y="310" width="180" height="32" rx="4" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="110" y="330" text-anchor="middle" fill="#fee2e2" font-size="10">NotificationProperties</text>
+
+  <rect x="20"  y="350" width="180" height="32" rx="4" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="110" y="370" text-anchor="middle" fill="#fee2e2" font-size="10">NotificationService 接口</text>
+
+  <rect x="220" y="270" width="180" height="32" rx="4" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="310" y="290" text-anchor="middle" fill="#fee2e2" font-size="10">EmailNotificationService</text>
+
+  <rect x="220" y="310" width="180" height="32" rx="4" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="310" y="330" text-anchor="middle" fill="#fee2e2" font-size="10">SmsNotificationService</text>
+
+  <rect x="220" y="350" width="180" height="32" rx="4" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="310" y="370" text-anchor="middle" fill="#fee2e2" font-size="10">WebhookNotificationService</text>
+
+  <rect x="100" y="395" width="220" height="32" rx="4" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="210" y="415" text-anchor="middle" fill="#bbf7d0" font-size="10">NotificationHealthIndicator</text>
+
+  <path d="M150,216 L110,270" stroke="#58a6ff" stroke-width="1" marker-end="url(#arr)" fill="none" opacity="0.6"/>
+  <path d="M150,216 L210,395" stroke="#3fb950" stroke-width="1" marker-end="url(#arr)" fill="none" opacity="0.6"/>
+
+  <rect x="450" y="270" width="430" height="170" rx="6" fill="rgba(0,0,0,0.3)" stroke="#30363d" stroke-dasharray="3,3"/>
+  <text x="665" y="290" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">职责划分</text>
+  <text x="465" y="312" text-anchor="start" fill="#c9d1d9" font-size="10">• 1 个 AutoConfig + 1 个 Properties</text>
+  <text x="465" y="332" text-anchor="start" fill="#c9d1d9" font-size="10">• 1 个 Service 接口 + N 个实现 (channel)</text>
+  <text x="465" y="352" text-anchor="start" fill="#c9d1d9" font-size="10">• 可选 HealthIndicator 暴露 actuator</text>
+  <text x="465" y="372" text-anchor="start" fill="#c9d1d9" font-size="10">• imports 文件注册类全限定名</text>
+  <text x="465" y="392" text-anchor="start" fill="#c9d1d9" font-size="10">• metadata.json 提供 IDE 自动补全</text>
+  <text x="465" y="416" text-anchor="start" fill="#3fb950" font-size="10">→ 所有产出物按 starter 命名规约打包</text>
+</svg>
+</div>
+<div class="diagram">
+<div class="diagram-title">图 2-6-2 · 自定义配置注册与求值流程(2 类级 + 2 方法级条件)</div>
+<svg viewBox="0 0 920 580" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="26" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">starter 启动 → 类级短路 → 方法级 OnMissingBean → 注册 Bean</text>
+
+  <rect x="320" y="50" width="280" height="40" rx="6" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+  <text x="460" y="75" text-anchor="middle" fill="#fee2e2" font-size="12" font-weight="bold">应用启动 · 引入 starter</text>
+
+  <rect x="280" y="110" width="360" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="460" y="129" text-anchor="middle" fill="#fee2e2" font-size="11">ImportCandidates.load</text>
+  <text x="460" y="143" text-anchor="middle" fill="#c9d1d9" font-size="9">发现 NotificationAutoConfiguration</text>
+
+  <polygon points="460,170 660,210 460,250 260,210" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="460" y="206" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">OnClassCondition</text>
+  <text x="460" y="222" text-anchor="middle" fill="#fee2e2" font-size="10">NotificationService 存在?</text>
+
+  <rect x="40"  y="190" width="180" height="40" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+  <text x="130" y="210" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">跳过 · 不加载字节码</text>
+  <text x="130" y="224" text-anchor="middle" fill="#c9d1d9" font-size="9">省启动开销</text>
+
+  <polygon points="460,270 660,310 460,350 260,310" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="460" y="306" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">OnPropertyCondition</text>
+  <text x="460" y="322" text-anchor="middle" fill="#fee2e2" font-size="10">app.notification.enabled?</text>
+
+  <rect x="280" y="370" width="360" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="460" y="395" text-anchor="middle" fill="#fee2e2" font-size="11">解析 @Bean 方法</text>
+
+  <polygon points="280,420 470,455 280,490 80,455" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="280" y="450" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">OnMissingBean</text>
+  <text x="280" y="466" text-anchor="middle" fill="#fee2e2" font-size="10">notificationService?</text>
+
+  <rect x="20"  y="510" width="200" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="120" y="530" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">使用用户实现</text>
+  <text x="120" y="544" text-anchor="middle" fill="#c9d1d9" font-size="9">用户已定义 → 跳过</text>
+
+  <rect x="320" y="510" width="200" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="420" y="530" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">按 channel 创建实现</text>
+  <text x="420" y="544" text-anchor="middle" fill="#c9d1d9" font-size="9">email/sms/webhook</text>
+
+  <polygon points="710,420 880,455 710,490 540,455" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="710" y="450" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">OnBean + OnMissingBean</text>
+  <text x="710" y="466" text-anchor="middle" fill="#fee2e2" font-size="10">healthIndicator?</text>
+
+  <rect x="600" y="510" width="200" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="700" y="530" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">注册 HealthIndicator</text>
+  <text x="700" y="544" text-anchor="middle" fill="#c9d1d9" font-size="9">满足 → /actuator/health</text>
+
+  <path d="M460,90  L460,110" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M460,150 L460,170" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <path d="M260,210 L220,210" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="240" y="200" text-anchor="middle" fill="#f85149" font-size="10" font-weight="bold">否</text>
+
+  <path d="M460,250 L460,270" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="475" y="265" text-anchor="start" fill="#3fb950" font-size="10" font-weight="bold">是</text>
+
+  <path d="M260,310 L220,310 L220,210" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="225" y="270" text-anchor="middle" fill="#f85149" font-size="10" font-weight="bold">关闭</text>
+
+  <path d="M460,350 L460,370" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="475" y="365" text-anchor="start" fill="#3fb950" font-size="10" font-weight="bold">启用</text>
+
+  <path d="M380,410 L300,420" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M540,410 L640,420" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <path d="M180,475 L120,510" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="120" y="498" text-anchor="middle" fill="#3fb950" font-size="10" font-weight="bold">已定义</text>
+
+  <path d="M380,475 L420,510" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="430" y="498" text-anchor="middle" fill="#3fb950" font-size="10" font-weight="bold">未定义</text>
+
+  <path d="M710,490 L700,510" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="725" y="505" text-anchor="start" fill="#3fb950" font-size="10" font-weight="bold">满足</text>
+</svg>
+</div>
+<pre><code class="language-java">@ConfigurationProperties(prefix = &quot;app.notification&quot;)
+public class NotificationProperties {
+
+    private boolean enabled = true;
+    private String channel = &quot;email&quot;;
+    private int maxRetries = 3;
+
+    // getters &amp; setters
+}
+</code></pre>
+<pre><code class="language-java">@AutoConfiguration
+@ConditionalOnClass(NotificationService.class)
+@ConditionalOnProperty(
+    prefix = &quot;app.notification&quot;,
+    name = &quot;enabled&quot;,
+    havingValue = &quot;true&quot;,
+    matchIfMissing = true
+)
+@EnableConfigurationProperties(NotificationProperties.class)
+public class NotificationAutoConfiguration {
+
+    @Bean
+    @ConditionalOnMissingBean
+    public NotificationService notificationService(
+            NotificationProperties properties) {
+        return switch (properties.getChannel()) {
+            case &quot;email&quot;   -&gt; new EmailNotificationService(properties);
+            case &quot;sms&quot;     -&gt; new SmsNotificationService(properties);
+            case &quot;webhook&quot; -&gt; new WebhookNotificationService(properties);
+            default        -&gt; throw new IllegalArgumentException(
+                &quot;Unsupported channel: &quot; + properties.getChannel());
+        };
+    }
+
+    @Bean
+    @ConditionalOnBean(NotificationService.class)
+    @ConditionalOnMissingBean
+    public NotificationHealthIndicator notificationHealthIndicator(
+            NotificationService service) {
+        return new NotificationHealthIndicator(service);
+    }
+}
+</code></pre>
+<pre><code class="language-text"># META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports
+com.example.notification.NotificationAutoConfiguration
+</code></pre>
+<pre><code class="language-yaml">app:
+  notification:
+    enabled: true
+    channel: webhook
+    max-retries: 5
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,conditions,beans
+</code></pre>
+<pre><code class="language-text">Positive matches:
+-----------------
+  NotificationAutoConfiguration matched:
+    - @ConditionalOnClass found required class
+      'com.example.notification.NotificationService' (OnClassCondition)
+    - @ConditionalOnProperty (app.notification.enabled=true)
+      matched (OnPropertyCondition)
+
+  NotificationAutoConfiguration#notificationService matched:
+    - @ConditionalOnMissingBean (types: com.example.notification.NotificationService)
+      did not find any beans (OnBeanCondition)
+</code></pre>
+<pre><code class="language-json">{
+  &quot;bean&quot;: &quot;notificationService&quot;,
+  &quot;type&quot;: &quot;com.example.notification.WebhookNotificationService&quot;,
+  &quot;resource&quot;: &quot;class path resource [com/example/notification/NotificationAutoConfiguration.class]&quot;,
+  &quot;dependencies&quot;: [&quot;notification-com.example.notification.NotificationProperties&quot;]
+}
+</code></pre>
+<h3>表 2-6-1:自定义 AutoConfiguration 清单</h3>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>操作</th>
+<th>验证</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>定义 Properties</td>
+<td>@ConfigurationProperties</td>
+<td>spring-configuration-metadata.json</td>
+</tr>
+<tr>
+<td>编写 AutoConfiguration</td>
+<td>@AutoConfiguration + @ConditionalOnXxx</td>
+<td>至少包含 @ConditionalOnClass</td>
+</tr>
+<tr>
+<td>注册 imports</td>
+<td>META-INF/spring/...AutoConfiguration.imports</td>
+<td>TRACE 日志确认加载</td>
+</tr>
+<tr>
+<td>@Bean 方法</td>
+<td>@ConditionalOnMissingBean 提供默认</td>
+<td>/actuator/conditions 匹配</td>
+</tr>
+<tr>
+<td>单元测试</td>
+<td>ApplicationContextRunner 模拟环境</td>
+<td>验证条件命中与未命中</td>
+</tr>
+</tbody>
+</table>
+<h3>表 2-6-2:常见陷阱清单</h3>
+<table>
+<thead>
+<tr>
+<th>陷阱编号</th>
+<th>名称</th>
+<th>现象</th>
+<th>修复策略</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>@ConditionalOnMissingBean 幽灵 Bean</td>
+<td>同类型 Bean 重复注册</td>
+<td>自动配置类用 @AutoConfiguration + .imports 注册</td>
+</tr>
+<tr>
+<td>2</td>
+<td>@AutoConfigureAfter 仅对自动配置类生效</td>
+<td>普通 @Configuration 注解被忽略</td>
+<td>用 @DependsOn 或 @Bean 参数声明依赖</td>
+</tr>
+<tr>
+<td>3</td>
+<td>@ConditionalOnProperty 三大坑</td>
+<td>新环境功能不生效</td>
+<td>matchIfMissing + 对齐 havingValue 大小写</td>
+</tr>
+<tr>
+<td>4</td>
+<td>类级别 @ConditionalOnBean 不可靠</td>
+<td>求值时机受配置类处理顺序影响</td>
+<td>改用 @Bean 方法级别 @ConditionalOnBean</td>
+</tr>
+<tr>
+<td>5</td>
+<td>@AutoConfigureOrder 与 @Order 混淆</td>
+<td>用 @Order 控制配置类顺序无效</td>
+<td>@AutoConfigureOrder 用于配置类,@Order 用于 Bean</td>
+</tr>
+<tr>
+<td>6</td>
+<td>@ConditionalOnClass 字符串与 Class 形式</td>
+<td>编译期可见性差异</td>
+<td>可选依赖用 name=,必备依赖用 Class</td>
+</tr>
+<tr>
+<td>7</td>
+<td>多 starter 排序冲突</td>
+<td>StarterA 依赖 StarterB Bean 失败</td>
+<td>通过 @AutoConfigureAfter 显式声明依赖</td>
+</tr>
+<tr>
+<td>8</td>
+<td>OnMissingBean 类型匹配陷阱</td>
+<td>@Bean 返回 Object 导致条件误判</td>
+<td>@Bean 方法明确返回业务接口类型</td>
+</tr>
+</tbody>
+</table>
+<h3>拓展案例:Druid 替换默认连接池</h3>
+<p>阿里巴巴 Druid Starter 通过 <code>@AutoConfiguration(before = DataSourceAutoConfiguration.class)</code> 与 <code>@ConditionalOnMissingBean(DataSource.class)</code> 实现"有条件替换"。引入依赖即取代默认 HikariCP,无需修改业务代码。</p>
+<pre><code class="language-java">@AutoConfiguration(before = DataSourceAutoConfiguration.class)
+@ConditionalOnClass(DruidDataSource.class)
+@EnableConfigurationProperties({
+    DruidStatProperties.class,
+    DataSourceProperties.class
+})
+public class DruidDataSourceAutoConfigure {
+
+    @Bean
+    @ConditionalOnMissingBean(DataSource.class)
+    @ConfigurationProperties(&quot;spring.datasource.druid&quot;)
+    public DataSource dataSource() {
+        return DruidDataSourceBuilder.create().build();
+    }
+
+    @Bean
+    @ConditionalOnProperty(name = &quot;spring.datasource.druid.stat-view-servlet.enabled&quot;)
+    public ServletRegistrationBean&lt;StatViewServlet&gt; statViewServlet() {
+        return new ServletRegistrationBean&lt;&gt;(new StatViewServlet(), &quot;/druid/*&quot;);
+    }
+}
+</code></pre>
+<h2 id="2.7-调试技巧">2.7 调试技巧</h2>
+<div class="diagram">
+<div class="diagram-title">图 2-7-1 · 调试决策树("某 Bean 未自动配置" · 3 分支 + 5 修复路径)</div>
+<svg viewBox="0 0 920 640" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="24" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">--debug → 配置类位置 → 条件分类 → 修复策略</text>
+
+  <rect x="320" y="44" width="280" height="40" rx="6" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+  <text x="460" y="68" text-anchor="middle" fill="#fee2e2" font-size="12" font-weight="bold">问题:某 Bean 未自动配置</text>
+
+  <rect x="280" y="100" width="360" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="460" y="118" text-anchor="middle" fill="#fee2e2" font-size="11">--debug 启动 / 调 /actuator/conditions</text>
+  <text x="460" y="134" text-anchor="middle" fill="#c9d1d9" font-size="9">查看 ConditionEvaluationReport</text>
+
+  <polygon points="460,160 660,200 460,240 260,200" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="460" y="196" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">配置类出现在报告中?</text>
+  <text x="460" y="212" text-anchor="middle" fill="#c9d1d9" font-size="9">3 分支</text>
+
+  <rect x="20"  y="180" width="200" height="50" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+  <text x="120" y="200" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">未被发现</text>
+  <text x="120" y="218" text-anchor="middle" fill="#c9d1d9" font-size="9">检查 .imports 路径 + 全限定名</text>
+
+  <polygon points="240,290 410,330 240,370 70,330" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="240" y="326" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">Negative · 哪个条件?</text>
+
+  <polygon points="680,290 850,330 680,370 510,330" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="680" y="324" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">Positive · @Bean 匹配?</text>
+
+  <rect x="20"  y="400" width="180" height="48" rx="4" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="110" y="420" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">OnClassCondition</text>
+  <text x="110" y="437" text-anchor="middle" fill="#c9d1d9" font-size="9">mvn dependency:tree</text>
+
+  <rect x="220" y="400" width="180" height="48" rx="4" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="310" y="420" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">OnPropertyCondition</text>
+  <text x="310" y="437" text-anchor="middle" fill="#c9d1d9" font-size="9">键名 + Relaxed Binding</text>
+
+  <rect x="420" y="400" width="180" height="48" rx="4" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="510" y="420" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">OnWebAppCondition</text>
+  <text x="510" y="437" text-anchor="middle" fill="#c9d1d9" font-size="9">确认 Servlet / Reactive</text>
+
+  <rect x="620" y="400" width="280" height="48" rx="4" fill="url(#g-purple)" stroke="#bc8cff"/>
+  <text x="760" y="420" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">方法 Positive 但仍报错</text>
+  <text x="760" y="437" text-anchor="middle" fill="#c9d1d9" font-size="9">→ 查 Bean 初始化 stack trace</text>
+
+  <polygon points="760,490 880,530 760,570 640,530" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="760" y="528" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">方法 Negative</text>
+  <text x="760" y="542" text-anchor="middle" fill="#c9d1d9" font-size="9">→ 哪种方法级条件?</text>
+
+  <rect x="320" y="510" width="220" height="48" rx="4" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="430" y="530" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">OnMissingBean → 已有 Bean</text>
+  <text x="430" y="547" text-anchor="middle" fill="#c9d1d9" font-size="9">/actuator/beans 查重复</text>
+
+  <rect x="20"  y="580" width="320" height="48" rx="4" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="180" y="600" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">OnBean 找不到依赖 Bean</text>
+  <text x="180" y="617" text-anchor="middle" fill="#c9d1d9" font-size="9">检查排序 + @AutoConfigureAfter</text>
+
+  <path d="M460,84  L460,100" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M460,140 L460,160" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <path d="M260,200 L220,200" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="240" y="190" text-anchor="middle" fill="#f85149" font-size="10">不出现</text>
+
+  <path d="M380,220 L290,290" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="320" y="265" text-anchor="middle" fill="#d29922" font-size="10">Negative</text>
+
+  <path d="M540,220 L630,290" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="610" y="265" text-anchor="middle" fill="#bc8cff" font-size="10">Positive</text>
+
+  <path d="M170,360 L110,400" stroke="#58a6ff" stroke-width="1.2" marker-end="url(#arr)" fill="none"/>
+  <path d="M240,370 L310,400" stroke="#58a6ff" stroke-width="1.2" marker-end="url(#arr)" fill="none"/>
+  <path d="M310,370 L500,400" stroke="#58a6ff" stroke-width="1.2" marker-end="url(#arr)" fill="none"/>
+
+  <path d="M680,370 L760,400" stroke="#bc8cff" stroke-width="1.2" marker-end="url(#arr)" fill="none"/>
+  <text x="700" y="386" text-anchor="middle" fill="#bc8cff" font-size="10">方法 Positive</text>
+
+  <path d="M620,330 L760,490" stroke="#d29922" stroke-width="1.2" marker-end="url(#arr)" fill="none"/>
+  <text x="660" y="430" text-anchor="middle" fill="#d29922" font-size="10">方法 Negative</text>
+
+  <path d="M680,540 L540,535" stroke="#3fb950" stroke-width="1.2" marker-end="url(#arr)" fill="none"/>
+  <path d="M650,560 L340,600" stroke="#3fb950" stroke-width="1.2" marker-end="url(#arr)" fill="none"/>
+</svg>
+</div>
+<h3>表 2-7-1:--debug 触发的开关</h3>
+<table>
+<thead>
+<tr>
+<th>开关方式</th>
+<th>命令</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>命令行参数</td>
+<td>java -jar app.jar --debug</td>
+<td>临时排查</td>
+</tr>
+<tr>
+<td>application.properties</td>
+<td>debug=true</td>
+<td>开发环境固定开启</td>
+</tr>
+<tr>
+<td>环境变量</td>
+<td>DEBUG=true java -jar app.jar</td>
+<td>容器环境</td>
+</tr>
+</tbody>
+</table>
+<h3>表 2-7-2:Actuator 端点辅助调试</h3>
+<table>
+<thead>
+<tr>
+<th>端点</th>
+<th>用途</th>
+<th>暴露配置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>/actuator/conditions</td>
+<td>条件评估报告 JSON</td>
+<td>management.endpoints.web.exposure.include=conditions</td>
+</tr>
+<tr>
+<td>/actuator/beans</td>
+<td>容器中所有 Bean 定义</td>
+<td>management.endpoints.web.exposure.include=beans</td>
+</tr>
+<tr>
+<td>/actuator/env</td>
+<td>PropertySource 与属性值</td>
+<td>management.endpoints.web.exposure.include=env</td>
+</tr>
+<tr>
+<td>/actuator/configprops</td>
+<td>@ConfigurationProperties 绑定结果</td>
+<td>management.endpoints.web.exposure.include=configprops</td>
+</tr>
+</tbody>
+</table>
+<div class="diagram">
+<div class="diagram-title">图 2-7-2 · 程序化访问 ConditionEvaluationReport(5 步管线)</div>
+<svg viewBox="0 0 920 200" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="26" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">从 ApplicationContext 到诊断脚本 · 单线 5 节点</text>
+
+  <rect x="20"  y="80" width="160" height="60" rx="6" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+  <text x="100" y="105" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">ApplicationContext</text>
+  <text x="100" y="123" text-anchor="middle" fill="#c9d1d9" font-size="9">入口</text>
+
+  <rect x="200" y="80" width="180" height="60" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="290" y="100" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">ConditionEvaluationReport</text>
+  <text x="290" y="118" text-anchor="middle" fill="#c9d1d9" font-size="9">.get(beanFactory)</text>
+
+  <rect x="400" y="80" width="180" height="60" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="490" y="100" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">ConditionAndOutcomes</text>
+  <text x="490" y="118" text-anchor="middle" fill="#c9d1d9" font-size="9">getBySource() Map</text>
+
+  <rect x="600" y="80" width="160" height="60" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="680" y="100" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">遍历 source key</text>
+  <text x="680" y="118" text-anchor="middle" fill="#c9d1d9" font-size="9">读取 Condition+Outcome</text>
+
+  <rect x="780" y="80" width="120" height="60" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="840" y="100" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">诊断脚本</text>
+  <text x="840" y="118" text-anchor="middle" fill="#c9d1d9" font-size="9">/测试断言</text>
+
+  <path d="M180,110 L200,110" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M380,110 L400,110" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M580,110 L600,110" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M760,110 L780,110" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <text x="100"  y="170" text-anchor="middle" fill="#8b949e" font-size="9">①</text>
+  <text x="290" y="170" text-anchor="middle" fill="#8b949e" font-size="9">②</text>
+  <text x="490" y="170" text-anchor="middle" fill="#8b949e" font-size="9">③</text>
+  <text x="680" y="170" text-anchor="middle" fill="#8b949e" font-size="9">④</text>
+  <text x="840" y="170" text-anchor="middle" fill="#8b949e" font-size="9">⑤</text>
+</svg>
+</div>
+<pre><code class="language-java">@Component
+public class AutoConfigDiagnostics implements ApplicationRunner {
+
+    private final ConditionEvaluationReport report;
+
+    public AutoConfigDiagnostics(ConfigurableApplicationContext context) {
+        this.report = ConditionEvaluationReport.get(context.getBeanFactory());
+    }
+
+    @Override
+    public void run(ApplicationArguments args) {
+        ConditionEvaluationReport.ConditionAndOutcomes outcomes =
+            report.getConditionAndOutcomesBySource()
+                .get(&quot;com.example.MyAutoConfiguration&quot;);
+
+        if (outcomes != null) {
+            outcomes.forEach(co -&gt; {
+                System.out.printf(&quot;condition=%s, match=%s%n&quot;,
+                    co.getCondition().getClass().getSimpleName(),
+                    co.getOutcome().isMatch());
+            });
+        }
+    }
+}
+</code></pre>
+<pre><code class="language-text">condition=OnClassCondition, match=true
+condition=OnPropertyCondition, match=false
+</code></pre>
+<h3>拓展案例:Boot 3.x 升级 spring.factories 失效</h3>
+<p>升级 Boot 3.0 后,通过 <code>spring.factories</code> 中 <code>EnableAutoConfiguration</code> key 注册的自定义 starter 不再被加载。<code>--debug</code> 报告中既不在 Positive 也不在 Negative,表明配置类未进入条件求值。修复路径包含三步:创建新 <code>.imports</code> 文件、保留旧 <code>spring.factories</code> 兼容 Boot 2.7、改用 <code>@AutoConfiguration</code> 注解。</p>
+<pre><code class="language-text"># 修复 1:新建 .imports
+src/main/resources/META-INF/spring/
+  org.springframework.boot.autoconfigure.AutoConfiguration.imports
+</code></pre>
+<pre><code class="language-text">com.example.MyCustomAutoConfiguration
+com.example.AnotherAutoConfiguration
+</code></pre>
+<pre><code class="language-java">// 修复 2:从 @Configuration 改为 @AutoConfiguration
+@AutoConfiguration
+@ConditionalOnClass(MyService.class)
+public class MyCustomAutoConfiguration { ... }
+</code></pre>
+<h2 id="2.8-源码深潜">2.8 源码深潜</h2>
+<div class="diagram">
+<div class="diagram-title">图 2-8-1 · 条件装配源码调用链(8 节点 · 主路 + 旁路)</div>
+<svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="26" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">PostProcessor → Parser → Selector → Candidates → Filter → Sorter → Evaluator → Factory</text>
+
+  <rect x="20"  y="60" width="200" height="56" rx="6" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+  <text x="120" y="80" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">源码入口</text>
+  <text x="120" y="98" text-anchor="middle" fill="#c9d1d9" font-size="10">ConfigurationClassPostProcessor</text>
+
+  <rect x="260" y="60" width="200" height="56" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="360" y="80" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">ConfigurationClassParser</text>
+  <text x="360" y="98" text-anchor="middle" fill="#c9d1d9" font-size="10">解析 @Import</text>
+
+  <rect x="500" y="60" width="200" height="56" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="600" y="80" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">AutoConfigImportSelector</text>
+  <text x="600" y="98" text-anchor="middle" fill="#c9d1d9" font-size="10">selectImports()</text>
+
+  <rect x="700" y="60" width="200" height="56" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="800" y="80" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">ImportCandidates</text>
+  <text x="800" y="98" text-anchor="middle" fill="#c9d1d9" font-size="10">读取 .imports</text>
+
+  <rect x="700" y="160" width="200" height="56" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="800" y="180" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">AutoConfigImportFilter</text>
+  <text x="800" y="198" text-anchor="middle" fill="#c9d1d9" font-size="10">OnClassCondition 预过滤</text>
+
+  <rect x="500" y="160" width="200" height="56" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="600" y="180" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">AutoConfigSorter</text>
+  <text x="600" y="198" text-anchor="middle" fill="#c9d1d9" font-size="10">before/after/order 拓扑</text>
+
+  <rect x="260" y="160" width="200" height="56" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="360" y="180" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">ConditionEvaluator</text>
+  <text x="360" y="198" text-anchor="middle" fill="#c9d1d9" font-size="10">shouldSkip()</text>
+
+  <rect x="20"  y="160" width="200" height="56" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="120" y="180" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">BeanDefinitionRegistry</text>
+  <text x="120" y="198" text-anchor="middle" fill="#c9d1d9" font-size="10">注册 BeanDefinition</text>
+
+  <rect x="20"  y="270" width="200" height="56" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="120" y="290" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">DefaultListableBeanFactory</text>
+  <text x="120" y="308" text-anchor="middle" fill="#c9d1d9" font-size="10">preInstantiateSingletons</text>
+
+  <rect x="500" y="270" width="240" height="56" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+  <text x="620" y="290" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">ConditionEvaluationReport</text>
+  <text x="620" y="308" text-anchor="middle" fill="#c9d1d9" font-size="10">记录证据(Negative / Positive)</text>
+
+  <path d="M220,88  L260,88"  stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M460,88  L500,88"  stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M700,88  L700,88"  stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M800,116 L800,160" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M700,188 L700,188" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M500,188 L460,188" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <path d="M260,188 L220,188" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="240" y="180" text-anchor="middle" fill="#3fb950" font-size="10" font-weight="bold">匹配</text>
+
+  <path d="M360,216 L500,270" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="395" y="248" text-anchor="middle" fill="#f85149" font-size="10" font-weight="bold">不匹配</text>
+
+  <path d="M120,216 L120,270" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="135" y="246" text-anchor="start" fill="#3fb950" font-size="10" font-weight="bold">注册完成</text>
+
+  <rect x="500" y="370" width="400" height="60" rx="10" fill="rgba(0,0,0,0.4)" stroke="#30363d" stroke-dasharray="3,3"/>
+  <text x="700" y="390" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">入口阅读路径</text>
+  <text x="700" y="410" text-anchor="middle" fill="#c9d1d9" font-size="9" font-family="monospace">PostProcessor → Parser → Selector → Evaluator → BeanFactory</text>
+</svg>
+</div>
+<p>源码阅读路径:<code>ConfigurationClassPostProcessor.processConfigBeanDefinitions</code> → <code>ConfigurationClassParser.parse</code> → <code>AutoConfigurationImportSelector.selectImports</code> → <code>ConditionEvaluator.shouldSkip</code> → <code>DefaultListableBeanFactory.preInstantiateSingletons</code>。</p>
+<h3>表 2-8-1:核心类职责边界</h3>
+<table>
+<thead>
+<tr>
+<th>类</th>
+<th>主要职责</th>
+<th>输出</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ConfigurationClassPostProcessor</td>
+<td>解析配置类</td>
+<td>触发 ImportSelector</td>
+</tr>
+<tr>
+<td>ConfigurationClassParser</td>
+<td>处理 @Import / @Bean</td>
+<td>配置类树</td>
+</tr>
+<tr>
+<td>AutoConfigurationImportSelector</td>
+<td>加载候选 + 过滤 + 排序</td>
+<td>候选类名数组</td>
+</tr>
+<tr>
+<td>ConditionEvaluator</td>
+<td>执行 @Conditional</td>
+<td>跳过 / 注册决策</td>
+</tr>
+<tr>
+<td>AutoConfigurationSorter</td>
+<td>Kahn 排序</td>
+<td>排序后的配置类列表</td>
+</tr>
+<tr>
+<td>ConditionEvaluationReport</td>
+<td>记录评估证据</td>
+<td>诊断输出</td>
+</tr>
+<tr>
+<td>DefaultListableBeanFactory</td>
+<td>实例化与依赖注入</td>
+<td>单例 Bean</td>
+</tr>
+</tbody>
+</table>
+<div class="diagram">
+<div class="diagram-title">图 2-8-2 · 候选 → BeanDefinition → Bean 状态机(7 状态 + 2 终态)</div>
+<svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="26" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">每个候选类的生命周期 · 主路 5 阶段 + 1 跳过分支</text>
+
+  <circle cx="60"  cy="180" r="18" fill="#161b22" stroke="#bc8cff" stroke-width="2"/>
+  <text x="60"  y="184" text-anchor="middle" fill="#bc8cff" font-size="13">●</text>
+
+  <rect x="110" y="155" width="120" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="170" y="178" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">候选</text>
+  <text x="170" y="194" text-anchor="middle" fill="#c9d1d9" font-size="9">ImportCandidates.load</text>
+
+  <rect x="270" y="155" width="120" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="330" y="178" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">已过滤</text>
+  <text x="330" y="194" text-anchor="middle" fill="#c9d1d9" font-size="9">ImportFilter</text>
+
+  <rect x="430" y="155" width="120" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="490" y="178" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">已排序</text>
+  <text x="490" y="194" text-anchor="middle" fill="#c9d1d9" font-size="9">Sorter</text>
+
+  <rect x="590" y="155" width="140" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <text x="660" y="178" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">解析中</text>
+  <text x="660" y="194" text-anchor="middle" fill="#c9d1d9" font-size="9">ConfigClassParser</text>
+
+  <rect x="770" y="155" width="120" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="830" y="178" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">BeanDefinition</text>
+  <text x="830" y="194" text-anchor="middle" fill="#c9d1d9" font-size="9">条件匹配</text>
+
+  <rect x="630" y="280" width="160" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="710" y="303" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">单例 (Singleton)</text>
+  <text x="710" y="319" text-anchor="middle" fill="#c9d1d9" font-size="9">DefaultListableBeanFactory</text>
+
+  <rect x="290" y="280" width="160" height="50" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+  <text x="370" y="303" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">跳过 (Skipped)</text>
+  <text x="370" y="319" text-anchor="middle" fill="#c9d1d9" font-size="9">条件未匹配 · 不实例化</text>
+
+  <circle cx="200" cy="305" r="20" fill="#161b22" stroke="#f85149" stroke-width="2"/>
+  <circle cx="200" cy="305" r="13" fill="#f85149"/>
+  <text x="200" y="345" text-anchor="middle" fill="#f85149" font-size="9">终态</text>
+
+  <circle cx="900" cy="305" r="20" fill="#161b22" stroke="#3fb950" stroke-width="2"/>
+  <circle cx="900" cy="305" r="13" fill="#3fb950"/>
+  <text x="900" y="345" text-anchor="middle" fill="#3fb950" font-size="9">终态</text>
+
+  <path d="M78,180  L110,180" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M230,180 L270,180" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M390,180 L430,180" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M550,180 L590,180" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M730,180 L770,180" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <path d="M660,205 L370,280" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="445" y="248" text-anchor="middle" fill="#f85149" font-size="10" font-weight="bold">条件未匹配</text>
+
+  <path d="M830,205 L710,280" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="800" y="246" text-anchor="middle" fill="#3fb950" font-size="10" font-weight="bold">实例化</text>
+
+  <path d="M290,305 L220,305" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M790,305 L880,305" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+</svg>
+</div>
+<pre><code class="language-java">@SpringBootApplication
+public class AutoConfigProbeApp {
+    public static void main(String[] args) {
+        ConfigurableApplicationContext ctx = SpringApplication.run(AutoConfigProbeApp.class, args);
+        ConditionEvaluationReport report =
+                ConditionEvaluationReport.get(ctx.getBeanFactory());
+
+        report.getConditionAndOutcomesBySource().entrySet().stream()
+                .filter(e -&gt; e.getKey().contains(&quot;DataSourceAutoConfiguration&quot;))
+                .forEach(e -&gt; System.out.println(e.getKey() + &quot; -&gt; &quot; + e.getValue()));
+    }
+}
+</code></pre>
+<pre><code class="language-properties">debug=true
+logging.level.org.springframework.boot.autoconfigure=TRACE
+management.endpoints.web.exposure.include=conditions,beans
+</code></pre>
+<pre><code class="language-log">TRACE o.s.b.a.AutoConfigurationImportSelector : Loaded auto configuration class names from AutoConfiguration.imports
+TRACE o.s.b.a.AutoConfigurationImportSelector : Auto configuration class order: DataSourceAutoConfiguration, JdbcTemplateAutoConfiguration
+DEBUG o.s.b.a.condition.OnClassCondition : @ConditionalOnClass found required class 'javax.sql.DataSource'
+DEBUG o.s.b.a.condition.OnBeanCondition : @ConditionalOnMissingBean did not find any beans
+</code></pre>
+<h3>表 2-8-2:架构设计取舍</h3>
+<table>
+<thead>
+<tr>
+<th>设计点</th>
+<th>取舍</th>
+<th>运行时影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>候选类先进入 ImportSelector</td>
+<td>starter 仅声明类名</td>
+<td>classpath 决定能力边界,引入依赖即新增候选</td>
+</tr>
+<tr>
+<td>条件在配置类解析期执行</td>
+<td>大量 Bean 不创建</td>
+<td>缺依赖时快速跳过,降低启动成本</td>
+</tr>
+<tr>
+<td>@ConditionalOnMissingBean 依赖已有 BeanDefinition</td>
+<td>必须延迟到用户配置之后</td>
+<td>用户 Bean 可覆盖默认 Bean,starter 可定制</td>
+</tr>
+<tr>
+<td>before / after 拓扑排序</td>
+<td>增加排序复杂度</td>
+<td>DataSource、JPA、Security 等基础设施顺序可预测</td>
+</tr>
+<tr>
+<td>BeanDefinition 与实例分离</td>
+<td>多一层抽象</td>
+<td>条件评估、AOP 代理、循环依赖处理在实例化前介入</td>
+</tr>
+</tbody>
+</table>
+<pre><code class="language-text">source entry:
+  ConfigurationClassPostProcessor.postProcessBeanDefinitionRegistry
+  -&gt; ConfigurationClassParser.parse
+  -&gt; AutoConfigurationImportSelector.selectImports
+  -&gt; ConditionEvaluator.shouldSkip
+
+runtime result:
+  positive match -&gt; BeanDefinition registered
+  negative match -&gt; no BeanDefinition, no instance, only ConditionEvaluationReport evidence
+</code></pre>
+<div class="chapter-summary">
+<h2>2.末 本章要点</h2>
+
+<ul>
+<li>
+<p><code>@SpringBootApplication</code> 由 <code>@SpringBootConfiguration</code>、<code>@EnableAutoConfiguration</code> 与 <code>@ComponentScan</code> 组合而成。<code>@EnableAutoConfiguration</code> 通过 <code>@Import(AutoConfigurationImportSelector.class)</code> 引入 <code>DeferredImportSelector</code>,在用户 <code>@Configuration</code> 处理完毕后批量执行,确保用户 Bean 优先级。</p>
+</li>
+<li>
+<p>自动配置引擎包含三层处理:<code>AutoConfigurationImportFilter</code> 元数据预过滤、<code>AutoConfigurationSorter</code> 拓扑排序、<code>ConditionEvaluator</code> 13 类 <code>@Conditional</code> 注解的短路求值。短路求值显著降低典型 Web 应用的实际条件评估成本。</p>
+</li>
+<li>
+<p><code>ConditionEvaluationReport</code> 记录全部候选类的匹配证据,包含 positive matches、negative matches、exclusions 与 unconditional classes 四类。诊断时优先查看 negative matches,通过 Actuator <code>/actuator/conditions</code> 端点获得结构化 JSON。</p>
+</li>
+<li>
+<p><code>AutoConfigurationSorter</code> 使用 Kahn 算法对 <code>@AutoConfigureBefore</code> / <code>@AutoConfigureAfter</code> / <code>@AutoConfigureOrder</code> 形成的 DAG 排序,时间复杂度 O(V + E)。环检测在排序结果不完整时抛出异常并报告参与循环的类。</p>
+</li>
+<li>
+<p>Boot 3.0 起自动配置注册迁移到 <code>META-INF/spring/...AutoConfiguration.imports</code>。<code>spring.factories</code> 中 <code>EnableAutoConfiguration</code> key 不再被读取,但其他 SPI 仍走旧文件。</p>
+</li>
+<li>
+<p>自定义 starter 标准结构包含 <code>@ConfigurationProperties</code>、<code>@AutoConfiguration</code> + <code>@ConditionalOnXxx</code>、<code>META-INF/spring/...AutoConfiguration.imports</code> 与 <code>spring-configuration-metadata.json</code> 四部分。</p>
+</li>
+<li>
+<p>调试入口包含命令行 <code>--debug</code>、Actuator <code>/actuator/conditions</code> 与程序化 <code>ConditionEvaluationReport.get</code>。三者用途互补:<code>--debug</code> 用于人工排障,Actuator 用于自动化脚本,程序化访问用于集成测试断言。</p>
+</li>
+<li>
+<p>自动配置陷阱清单覆盖 <code>@ConditionalOnMissingBean</code> 幽灵 Bean、<code>@AutoConfigureAfter</code> 适用范围、<code>@ConditionalOnProperty</code> 三大坑、类级 <code>@ConditionalOnBean</code> 时机问题、<code>@AutoConfigureOrder</code> 与 <code>@Order</code> 混淆、<code>@ConditionalOnClass</code> 字符串与 Class 形式、starter 间排序冲突、OnMissingBean 类型匹配陷阱八类。</p>
+</li>
+</ul>
+<div class="diagram">
+<div class="diagram-title">图 2-末-1 · 第 2 章 9 步路径回顾(@SpringBootApplication → 实例化 → ch03)</div>
+<svg viewBox="0 0 920 220" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="26" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">注解 → Selector → 候选 → 过滤/排序/求值 → 注册 → 实例化 → ch03</text>
+
+  <rect x="20"  y="60"  width="170" height="50" rx="6" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+  <rect x="210" y="60"  width="170" height="50" rx="6" fill="url(#g-blue)"   stroke="#58a6ff"/>
+  <rect x="400" y="60"  width="170" height="50" rx="6" fill="url(#g-blue)"   stroke="#58a6ff"/>
+  <rect x="590" y="60"  width="160" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <rect x="770" y="60"  width="130" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+
+  <rect x="100" y="140" width="160" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+  <rect x="280" y="140" width="160" height="50" rx="6" fill="url(#g-green)"  stroke="#3fb950"/>
+  <rect x="460" y="140" width="140" height="50" rx="6" fill="url(#g-green)"  stroke="#3fb950" stroke-width="2"/>
+  <rect x="620" y="140" width="280" height="50" rx="10" fill="#161b22"        stroke="#bc8cff" stroke-width="2"/>
+
+  <text x="105" y="83"  text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">①  @SpringBootApplication</text>
+  <text x="105" y="100" text-anchor="middle" fill="#c9d1d9" font-size="9">入口注解</text>
+
+  <text x="295" y="83"  text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">②  AutoConfigImportSelector</text>
+  <text x="295" y="100" text-anchor="middle" fill="#c9d1d9" font-size="9">DeferredImportSelector</text>
+
+  <text x="485" y="83"  text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">③  ImportCandidates</text>
+  <text x="485" y="100" text-anchor="middle" fill="#c9d1d9" font-size="9">读取 .imports 文件</text>
+
+  <text x="670" y="83"  text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">④  元数据预过滤</text>
+  <text x="670" y="100" text-anchor="middle" fill="#c9d1d9" font-size="9">OnClassCondition</text>
+
+  <text x="835" y="83"  text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">⑤  拓扑排序</text>
+  <text x="835" y="100" text-anchor="middle" fill="#c9d1d9" font-size="9">Kahn 算法</text>
+
+  <text x="180" y="163" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">⑥  条件求值</text>
+  <text x="180" y="180" text-anchor="middle" fill="#c9d1d9" font-size="9">13 类 @Conditional</text>
+
+  <text x="360" y="163" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">⑦  注册 BeanDefinition</text>
+  <text x="360" y="180" text-anchor="middle" fill="#c9d1d9" font-size="9">BeanDefinitionRegistry</text>
+
+  <text x="530" y="163" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">⑧  实例化</text>
+  <text x="530" y="180" text-anchor="middle" fill="#c9d1d9" font-size="9">DefaultListableBF</text>
+
+  <text x="760" y="163" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">⑨  → 第 3 章 · IoC 容器</text>
+  <text x="760" y="180" text-anchor="middle" fill="#c9d1d9" font-size="9">DI / 三级缓存 / 生命周期</text>
+
+  <path d="M190,85  L210,85"  stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M380,85  L400,85"  stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M570,85  L590,85"  stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M750,85  L770,85"  stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <path d="M835,110 L835,130 L260,130 L180,140" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <path d="M260,165 L280,165" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M440,165 L460,165" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M600,165 L620,165" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+</svg>
+</div>
+<p>第 3 章将以本章自动配置注册得到的 BeanDefinition 为起点,深入 <code>DefaultListableBeanFactory</code> 的依赖注入 DAG、三级缓存解决循环依赖、Bean 生命周期完整状态机。</p>
+</div>
+
+
+<div class="chapter-nav">
+  <a href="ch01-startup.html">&larr; ch01-startup · 第 1 章 · 启动流程</a>
+  <a href="ch03-ioc.html">ch03-ioc · 第 3 章 · IoC 容器与 Bean 生命周期 &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 Spring Boot &middot; 第 2 章 · 自动配置引擎</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){setTimeout(function(){document.querySelectorAll('.mermaid svg,.diagram svg').forEach(function(svg){var h=parseInt(svg.getAttribute('height')||svg.getBoundingClientRect().height);if(h>500){svg.style.maxHeight='500px';svg.style.width='auto';var p=svg.closest('.diagram');if(p)p.style.overflowX='auto';}});},1500);});</script>
+</body>
+</html>

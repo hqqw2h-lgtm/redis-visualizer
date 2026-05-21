@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.28 Spring Data JPA 高级特性 — 图解 JPA &amp; Hibernate</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📘 图解 JPA &amp; Hibernate</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="27-multitenancy.html">上一章</a>
+  <a href="29-polymorphism-proxy.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s28-0">28.0 五种入口</a>
+  <a href="#s28-1">28.1 Repository 代理</a>
+  <a href="#s28-2">28.2 EntityGraph</a>
+  <a href="#s28-3">28.3 动态 Projection</a>
+  <a href="#s28-4">28.4 SpEL 参数</a>
+  <a href="#s28-5">28.5 Custom Fragment</a>
+  <a href="#s28-6">28.6 Lifecycle 事件</a>
+  <a href="#s28-7">28.7 Stream 大结果</a>
+  <a href="#s28-8">28.8 BaseRepository</a>
+  <a href="#s28-9">28.9 陷阱</a>
+  <a href="#s28-summary">28.10 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 28 章 · Spring Data JPA 高级特性</h1>
+<p class="subtitle">@EntityGraph · Dynamic Projection · SpEL · Custom Fragment · Lifecycle · Stream</p>
+
+<div class="chapter-intro">
+  <p class="lead">Spring Data JPA 的高级能力不是少写几行代码,而是把<strong>查询入口、fetch plan、返回形状、回归测试收束到稳定边界</strong>。上线时盯住三件事:生成了什么 SQL、返回了什么 shape、一次请求打了几条 SQL。</p>
+  <ul class="will-learn">
+    <li>5 种入口对比:派生查询 / @Query JPQL / @Query Native / Specification / Custom Fragment</li>
+    <li>@EntityGraph LOAD vs FETCH 的语义差异,以及 NamedEntityGraph vs ad-hoc attributePaths</li>
+    <li>动态 Projection:&lt;T&gt; Class&lt;T&gt; type 参数让一个方法支持多种返回形态</li>
+    <li>嵌套 interface projection 只 SELECT 必要列</li>
+    <li>SpEL 参数 :#{principal.tenantId} 自动注入当前用户上下文</li>
+    <li>@NoRepositoryBean BaseRepository + #{#entityName} 跨实体通用查询</li>
+    <li>Custom Fragment 命名约定(*Impl 后缀)与 EntityManager 注入</li>
+    <li>7 个 Lifecycle 注解(@PrePersist/@PostLoad/@PreUpdate...)的触发时机</li>
+    <li>Stream 处理百万行结果(HINT_FETCH_SIZE + try-with-resources)</li>
+  </ul>
+  <p class="prereq">前置知识:Spring Data Repository(第 20 章);Specification(第 21 章);Criteria API。</p>
+</div>
+
+<h2 id="s28-0">28.0 五种入口对比</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-0-1 · Service → Repository proxy → 5 种入口 → SQL → Entity/DTO/Page</div>
+  <svg viewBox="0 0 920 320" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1f6feb"/><stop offset="100%" stop-color="#1158c7"/></linearGradient>
+      <linearGradient id="g-green" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#238636"/><stop offset="100%" stop-color="#196c2e"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#d29922"/><stop offset="100%" stop-color="#9e6a03"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#8957e5"/><stop offset="100%" stop-color="#6e40c9"/></linearGradient>
+      <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="370" y="14"  width="180" height="44" rx="10" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="460" y="42"  text-anchor="middle" fill="#fff" font-size="13" font-weight="700">Service / Controller</text>
+
+    <rect x="370" y="80"  width="180" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="460" y="108" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">Repository proxy</text>
+
+    <rect x="20"  y="160" width="160" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="100" y="184" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">派生查询</text>
+    <text x="100" y="201" text-anchor="middle" fill="#cae3ff" font-size="10">findByStatusAnd...</text>
+
+    <rect x="195" y="160" width="160" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="275" y="184" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">@Query JPQL</text>
+    <text x="275" y="201" text-anchor="middle" fill="#cae3ff" font-size="10">显式 JPQL</text>
+
+    <rect x="370" y="160" width="180" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="460" y="184" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">@Query Native</text>
+    <text x="460" y="201" text-anchor="middle" fill="#fff5d6" font-size="10">原生 SQL</text>
+
+    <rect x="565" y="160" width="160" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="645" y="184" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">Specification</text>
+    <text x="645" y="201" text-anchor="middle" fill="#cae3ff" font-size="10">动态组合</text>
+
+    <rect x="740" y="160" width="160" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="820" y="184" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">Custom Fragment</text>
+    <text x="820" y="201" text-anchor="middle" fill="#caf0d0" font-size="10">EntityManager</text>
+
+    <rect x="370" y="250" width="180" height="44" rx="6" fill="#21262d" stroke="#7d8590"/>
+    <text x="460" y="278" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">Hibernate SQL</text>
+
+    <path d="M460,58  L460,80"  stroke="#8b949e" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M420,124 L120,160" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M440,124 L275,160" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,124 L460,160" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M480,124 L645,160" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M500,124 L800,160" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M120,210 L420,250" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M275,210 L440,250" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,210 L460,250" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M645,210 L480,250" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M800,210 L500,250" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<table>
+<thead><tr><th>入口</th><th>适用</th><th>表达力</th><th>SQL 可控</th></tr></thead>
+<tbody>
+<tr><td>派生查询</td><td>简单</td><td>低</td><td>自动</td></tr>
+<tr><td>@Query JPQL</td><td>中复杂</td><td>中</td><td>显式</td></tr>
+<tr><td>@Query Native</td><td>复杂 SQL</td><td>高</td><td>完全</td></tr>
+<tr><td>Specification</td><td>动态</td><td>中</td><td>中</td></tr>
+<tr><td>Custom Fragment</td><td>极复杂</td><td>极高</td><td>完全</td></tr>
+</tbody>
+</table>
+
+<h2 id="s28-1">28.1 Repository 代理</h2>
+
+<pre><code class="language-java">public interface OrderRepository
+    extends JpaRepository&lt;Order, Long&gt;,
+            JpaSpecificationExecutor&lt;Order&gt; {
+
+    List&lt;Order&gt; findByStatusAndCreatedAtAfter(
+        OrderStatus status, LocalDateTime since);
+
+    @Query("""
+        select o from Order o
+        join fetch o.customer c
+        where o.id = :id
+        """)
+    Optional&lt;Order&gt; findWithCustomer(@Param("id") Long id);
+}</code></pre>
+
+<pre><code>INFO  - JpaRepositoryFactoryBean started for OrderRepository
+INFO  - Bean OrderRepository class: jdk.proxy2.$Proxy120</code></pre>
+
+<h2 id="s28-2">28.2 @EntityGraph — fetch plan 显式化</h2>
+
+<pre><code class="language-java">@Entity
+@NamedEntityGraphs({
+    @NamedEntityGraph(
+        name = "Order.detail",
+        attributeNodes = {
+            @NamedAttributeNode("customer"),
+            @NamedAttributeNode(value = "items", subgraph = "items.subgraph")
+        },
+        subgraphs = @NamedSubgraph(
+            name = "items.subgraph",
+            attributeNodes = @NamedAttributeNode("product"))
+    )
+})
+public class Order { /* ... */ }
+
+public interface OrderRepository extends JpaRepository&lt;Order, Long&gt; {
+    @EntityGraph(value = "Order.detail", type = EntityGraph.EntityGraphType.FETCH)
+    Optional&lt;Order&gt; findDetailById(Long id);
+
+    // ad-hoc 用法
+    @EntityGraph(attributePaths = {"customer", "items.product"})
+    Optional&lt;Order&gt; findFullById(Long id);
+}</code></pre>
+
+<pre><code class="language-sql">SELECT o.*, c.*, i.*, p.* FROM orders o
+LEFT JOIN customers c ON o.customer_id = c.id
+LEFT JOIN order_items i ON o.id = i.order_id
+LEFT JOIN products p ON i.product_id = p.id
+WHERE o.id = ?;
+-- 一条 SQL 加载完整对象图</code></pre>
+
+<table>
+<thead><tr><th>类型</th><th>行为</th></tr></thead>
+<tbody>
+<tr><td>LOAD</td><td>在默认 LAZY 之上,加 graph 指定的 fetch</td></tr>
+<tr><td>FETCH</td><td>仅加载 graph 指定的,其他强制 LAZY</td></tr>
+</tbody>
+</table>
+
+<h2 id="s28-3">28.3 动态 Projection</h2>
+
+<pre><code class="language-java">public interface OrderRepository extends JpaRepository&lt;Order, Long&gt; {
+
+    &lt;T&gt; Optional&lt;T&gt; findById(Long id, Class&lt;T&gt; type);
+
+    &lt;T&gt; List&lt;T&gt; findByStatus(OrderStatus status, Class&lt;T&gt; type);
+}
+
+// 调用
+Optional&lt;OrderSummary&gt; summary = repo.findById(1L, OrderSummary.class);
+List&lt;OrderListItem&gt; items = repo.findByStatus(OrderStatus.PAID, OrderListItem.class);</code></pre>
+
+<pre><code class="language-java">// 嵌套 interface projection
+public interface OrderWithCustomer {
+    Long getId();
+    BigDecimal getAmount();
+    CustomerInfo getCustomer();
+
+    interface CustomerInfo {
+        String getName();
+        String getEmail();
+    }
+}</code></pre>
+
+<pre><code class="language-sql">SELECT o.id, o.amount, c.name, c.email
+FROM orders o JOIN customers c ON o.customer_id = c.id
+WHERE o.status = ?;
+-- 仅查需要的列</code></pre>
+
+<table>
+<thead><tr><th>类型</th><th>实现</th><th>性能</th></tr></thead>
+<tbody>
+<tr><td>接口投影</td><td>interface { Long getId(); ... }</td><td>高</td></tr>
+<tr><td>类投影(record)</td><td>record OrderSummary(Long id, ...)</td><td>高</td></tr>
+<tr><td>完整实体</td><td>Order.class</td><td>中</td></tr>
+<tr><td>动态选择</td><td>Class&lt;T&gt; 参数</td><td>高(按需)</td></tr>
+<tr><td>Open Projection (SpEL)</td><td>@Value("#{...}")</td><td><b style="color:#f85149">低</b></td></tr>
+</tbody>
+</table>
+
+<h2 id="s28-4">28.4 SpEL 参数</h2>
+
+<pre><code class="language-java">public interface OrderRepository extends JpaRepository&lt;Order, Long&gt; {
+
+    @Query("""
+        select o from Order o
+        where o.tenantId = :#{principal.tenantId}
+        and o.status = :status
+        """)
+    List&lt;Order&gt; findMyTenantOrders(@Param("status") OrderStatus status);
+}
+
+@NoRepositoryBean
+public interface BaseRepository&lt;T, ID&gt; extends JpaRepository&lt;T, ID&gt; {
+
+    @Query("select e from #{#entityName} e where e.deleted = false")
+    List&lt;T&gt; findAllNotDeleted();
+
+    @Query("select count(e) from #{#entityName} e where e.deleted = false")
+    long countNotDeleted();
+}</code></pre>
+
+<table>
+<thead><tr><th>表达式</th><th>含义</th></tr></thead>
+<tbody>
+<tr><td>#{...}</td><td>一般 SpEL</td></tr>
+<tr><td>:#{...}</td><td>参数注入</td></tr>
+<tr><td>?#{...}</td><td>索引参数注入</td></tr>
+<tr><td>principal</td><td>Spring Security 当前用户</td></tr>
+<tr><td>#entityName</td><td>实体名(BaseRepository 跨实体通用)</td></tr>
+</tbody>
+</table>
+
+<h2 id="s28-5">28.5 Custom Fragment</h2>
+
+<pre><code class="language-java">public interface OrderRepositoryCustom {
+    List&lt;Order&gt; searchByCriteria(OrderSearchForm form, Pageable pageable);
+    int bulkUpdateStatus(List&lt;Long&gt; ids, OrderStatus newStatus);
+}
+
+// 命名约定: *Impl 后缀
+@Component
+public class OrderRepositoryCustomImpl implements OrderRepositoryCustom {
+
+    @PersistenceContext
+    private EntityManager em;
+
+    @Override
+    public List&lt;Order&gt; searchByCriteria(OrderSearchForm form, Pageable pageable) {
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        CriteriaQuery&lt;Order&gt; cq = cb.createQuery(Order.class);
+        Root&lt;Order&gt; root = cq.from(Order.class);
+        List&lt;Predicate&gt; ps = new ArrayList&lt;&gt;();
+
+        if (form.getStatus() != null) {
+            ps.add(cb.equal(root.get(Order_.status), form.getStatus()));
+        }
+        cq.where(cb.and(ps.toArray(Predicate[]::new)))
+          .orderBy(cb.desc(root.get(Order_.createdAt)));
+
+        return em.createQuery(cq)
+            .setFirstResult((int) pageable.getOffset())
+            .setMaxResults(pageable.getPageSize())
+            .getResultList();
+    }
+
+    @Override
+    public int bulkUpdateStatus(List&lt;Long&gt; ids, OrderStatus newStatus) {
+        return em.createQuery("""
+            update Order o set o.status = :status
+            where o.id in :ids
+            """)
+            .setParameter("status", newStatus)
+            .setParameter("ids", ids)
+            .executeUpdate();
+    }
+}
+
+// Repository 接口同时继承基础与 Custom
+public interface OrderRepository
+    extends JpaRepository&lt;Order, Long&gt;, OrderRepositoryCustom {
+}</code></pre>
+
+<h2 id="s28-6">28.6 Lifecycle 事件</h2>
+
+<table>
+<thead><tr><th>注解</th><th>触发</th><th>用途</th></tr></thead>
+<tbody>
+<tr><td>@PrePersist</td><td>persist 前</td><td>默认值 / 校验</td></tr>
+<tr><td>@PostPersist</td><td>persist 后</td><td>通知 / 索引</td></tr>
+<tr><td>@PreUpdate</td><td>flush 前(脏检查后)</td><td>审计 / 校验</td></tr>
+<tr><td>@PostUpdate</td><td>UPDATE 执行后</td><td>通知</td></tr>
+<tr><td>@PreRemove</td><td>remove 前</td><td>清理</td></tr>
+<tr><td>@PostRemove</td><td>DELETE 后</td><td>清理</td></tr>
+<tr><td>@PostLoad</td><td>find / query 后</td><td>数据补全</td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-java">@Entity
+public class Order {
+
+    @PrePersist
+    void prePersist() {
+        if (orderNo == null) orderNo = generateOrderNo();
+        if (createdAt == null) createdAt = LocalDateTime.now();
+    }
+
+    @PostLoad
+    void postLoad() {
+        // 加载后初始化派生字段
+        this.displayLabel = computeLabel();
+    }
+}</code></pre>
+
+<div class="warning"><p><strong>禁忌</strong>:不要在 Lifecycle 钩子中执行 JPA 查询/更新。当前正在 flush,再发 SQL 会触发 ConcurrentModificationException 或死锁。Lifecycle 仅用于修改自身字段。</p></div>
+
+<h2 id="s28-7">28.7 Stream 大结果集</h2>
+
+<pre><code class="language-java">public interface OrderRepository extends JpaRepository&lt;Order, Long&gt; {
+
+    @QueryHints(@QueryHint(name = HINT_FETCH_SIZE, value = "100"))
+    Stream&lt;Order&gt; findAllByStatus(OrderStatus status);
+}
+
+@Transactional(readOnly = true)
+public void processAll(OrderStatus status) {
+    try (Stream&lt;Order&gt; stream = repo.findAllByStatus(status)) {
+        stream.forEach(o -&gt; processSingle(o));
+    }
+}</code></pre>
+
+<div class="key-insight"><p><strong>Stream 处理百万行</strong>:① HINT_FETCH_SIZE 控制每次 JDBC fetch 多少行;② try-with-resources 保证 ResultSet 与 PersistenceContext 关闭;③ 处理完后用 <code>em.clear()</code> 防止 PC 内存溢出。</p></div>
+
+<h2 id="s28-8">28.8 通用 BaseRepository</h2>
+
+<pre><code class="language-java">@NoRepositoryBean
+public interface BaseRepository&lt;T, ID&gt; extends JpaRepository&lt;T, ID&gt; {
+
+    @Query("select e from #{#entityName} e where e.deleted = false")
+    List&lt;T&gt; findAllNotDeleted();
+
+    @Query("select count(e) from #{#entityName} e where e.deleted = false")
+    long countNotDeleted();
+
+    default Optional&lt;T&gt; findActiveById(ID id) {
+        return findById(id).filter(e -&gt; !((SoftDeletable) e).isDeleted());
+    }
+}
+
+// 子接口自动获得通用方法
+public interface OrderRepository extends BaseRepository&lt;Order, Long&gt; {}
+public interface CustomerRepository extends BaseRepository&lt;Customer, Long&gt; {}</code></pre>
+
+<h2 id="s28-9">28.9 陷阱与限制</h2>
+
+<table>
+<thead><tr><th>#</th><th>陷阱</th><th>现象</th><th>修复</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>派生查询超长</td><td>难读</td><td>改 @Query</td></tr>
+<tr><td>2</td><td>投影遗漏字段</td><td>NPE</td><td>接口必有 getter</td></tr>
+<tr><td>3</td><td>EntityGraph LOAD/FETCH 混用</td><td>多 SQL</td><td>区分类型</td></tr>
+<tr><td>4</td><td>SpEL 安全</td><td>注入风险</td><td>仅用 principal / fixed</td></tr>
+<tr><td>5</td><td>Custom Impl 后缀漏</td><td>找不到 Bean</td><td>Impl 后缀</td></tr>
+<tr><td>6</td><td>Stream 未关闭</td><td>连接泄漏</td><td>try-with-resources</td></tr>
+<tr><td>7</td><td>Bulk 不 clear PC</td><td>L1 缓存不一致</td><td>clearAutomatically=true</td></tr>
+<tr><td>8</td><td>Lifecycle 中发 SQL</td><td>死锁 / 并发异常</td><td>仅修改字段</td></tr>
+</tbody>
+</table>
+
+<h2 id="s28-summary">28.10 本章要点</h2>
+
+<div class="chapter-summary">
+<table>
+<thead><tr><th>要点</th><th>实现</th><th>易错点</th></tr></thead>
+<tbody>
+<tr><td>派生 / @Query / Spec / Custom 共存</td><td>Repository 接口</td><td>路由理解</td></tr>
+<tr><td>@EntityGraph 一次加载</td><td>NamedEntityGraph</td><td>LOAD vs FETCH</td></tr>
+<tr><td>Projection 减列</td><td>interface / record</td><td>性能差异</td></tr>
+<tr><td>SpEL 参数注入</td><td>:#{principal.x}</td><td>注入安全</td></tr>
+<tr><td>Stream 大结果</td><td>try-with-resources</td><td>漏关闭</td></tr>
+<tr><td>Lifecycle 钩子</td><td>@PrePersist</td><td>内发 SQL 死锁</td></tr>
+<tr><td>Custom Fragment</td><td>Impl 后缀</td><td>命名规范</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>下一章讨论多态与代理。本章覆盖了 Spring Data 高级,下一章进入 Hibernate 代理对象、HibernateProxy、equals/hashCode、序列化、JSON 处理。</p>
+
+<div class="chapter-nav">
+  <a href="27-multitenancy.html">&larr; 第 27 章 &middot; 多租户</a>
+  <a href="29-polymorphism-proxy.html">第 29 章 &middot; 多态与代理 &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 JPA &amp; Hibernate &middot; 第 28 章 &middot; Spring Data JPA 高级特性</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

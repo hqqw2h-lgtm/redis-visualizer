@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.22 Kafka Streams — 图解 Kafka</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Kafka</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="21-kafka-connect.html">上一章</a>
+  <a href="23-security.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s22-0">22.0 章首速览</a>
+  <a href="#s22-1">22.1 库 vs 集群</a>
+  <a href="#s22-2">22.2 DSL 与拓扑</a>
+  <a href="#s22-3">22.3 KStream vs KTable</a>
+  <a href="#s22-4">22.4 状态存储 RocksDB</a>
+  <a href="#s22-5">22.5 窗口</a>
+  <a href="#s22-6">22.6 Repartition</a>
+  <a href="#s22-7">22.7 EOS in Streams</a>
+  <a href="#s22-8">22.8 Standby & Restore</a>
+  <a href="#s22-9">22.9 监控</a>
+  <a href="#s22-10">22.10 取舍与陷阱</a>
+  <a href="#s22-summary">22.11 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 22 章 · Kafka Streams</h1>
+<p class="subtitle">DSL · Topology · StreamTask · RocksDBStore · changelog · repartition · EOS · Standby</p>
+
+<div class="chapter-intro">
+  <p class="lead">"<em>实时 join 订单和用户表</em>"、"<em>每 5 分钟窗口统计 GMV</em>"、"<em>检测连续 3 笔失败登录</em>" — 这类<strong>有状态流处理</strong>是 Kafka 之上最常见的应用形态。你可以用 Flink / Spark Streaming(独立集群),但如果你的 service mesh 已经是"<em>普通 JVM 应用</em>" 形态,引入新集群是个大决策。<strong>Kafka Streams</strong> 不是独立集群,而是嵌入 Java 应用的<em>原生库</em> — 你的 Spring Boot 应用启动时 <code>new KafkaStreams(topology, config).start()</code>,流处理就跑起来了,扩容靠多启动相同 <code>application.id</code> 实例,Consumer Group 协议自动分 task。</p>
+  <p>这种"<em>无集群</em>" 形态的代价是部分能力受限(没有跨 JVM 任务调度、没有专门的流处理 SQL 引擎),但对中小规模 / 微服务架构非常友好。本章按"运行时 → DSL → KStream/KTable → 状态存储 → 窗口 → Repartition → EOS → Standby"组织,对应 Apache Kafka 3.7 的 <code>org.apache.kafka.streams</code>。</p>
+  <ul class="will-learn">
+    <li>Streams 是 <em>库</em> 不是集群:扩容 = 多启动实例</li>
+    <li>DSL + Topology + StreamTask 三层抽象</li>
+    <li>KStream(事件流) vs KTable(实时物化表)</li>
+    <li>RocksDB 本地状态 + changelog topic 容灾</li>
+    <li>窗口:Tumbling / Hopping / Session / Sliding</li>
+    <li>Repartition topic 内部生成的时机</li>
+    <li>EOS in Streams = idempotent producer + read-process-write 事务</li>
+    <li>Standby 任务持续追平 changelog,加速 failover</li>
+  </ul>
+  <p class="prereq">第 8 章 Consumer Group;第 12 章 EOS;第 13 章 Log Compaction;RocksDB 基础;Java 8 Stream API。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s22-0">22.0 章首速览</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">图 22-0 · Streams 运行时全景</div>
+<svg viewBox="0 0 900 520" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="520" fill="#0f172a" rx="8"/>
+
+  <!-- DSL -->
+  <rect x="40" y="30" width="180" height="50" rx="6" fill="url(#g-purple)"/>
+  <text x="130" y="55" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">StreamsBuilder DSL</text>
+  <text x="130" y="72" text-anchor="middle" fill="#e9d5ff" font-size="10">stream().map().aggregate()</text>
+
+  <path d="M220 55 L260 55" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+  <rect x="260" y="30" width="150" height="50" rx="6" fill="url(#g-blue)"/>
+  <text x="335" y="55" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">Topology</text>
+  <text x="335" y="72" text-anchor="middle" fill="#dbeafe" font-size="10">processor DAG</text>
+
+  <path d="M410 55 L450 55" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+  <rect x="450" y="30" width="180" height="50" rx="6" fill="url(#g-orange)"/>
+  <text x="540" y="55" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">KafkaStreams runtime</text>
+  <text x="540" y="72" text-anchor="middle" fill="#fef3c7" font-size="10">state machine + threads</text>
+
+  <!-- Threads & Tasks -->
+  <rect x="40" y="120" width="820" height="180" rx="10" fill="#1e293b" stroke="#475569" stroke-width="2"/>
+  <text x="450" y="145" text-anchor="middle" fill="#cbd5e1" font-size="13" font-weight="700">StreamThread × num.stream.threads(默认 1)</text>
+
+  <g transform="translate(60, 165)">
+    <rect x="0" y="0" width="220" height="115" rx="8" fill="url(#g-green)"/>
+    <text x="110" y="22" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">StreamTask 0_0</text>
+    <text x="110" y="42" text-anchor="middle" fill="#dcfce7" font-size="10">input: P0</text>
+    <text x="110" y="58" text-anchor="middle" fill="#dcfce7" font-size="10">SourceNode → ProcessorNode</text>
+    <text x="110" y="74" text-anchor="middle" fill="#dcfce7" font-size="10">→ AggregateProcessor</text>
+    <text x="110" y="90" text-anchor="middle" fill="#dcfce7" font-size="10">→ SinkNode</text>
+    <text x="110" y="106" text-anchor="middle" fill="#86efac" font-size="10">+ RocksDBStore</text>
+  </g>
+
+  <g transform="translate(300, 165)">
+    <rect x="0" y="0" width="220" height="115" rx="8" fill="url(#g-green)"/>
+    <text x="110" y="22" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">StreamTask 0_1</text>
+    <text x="110" y="42" text-anchor="middle" fill="#dcfce7" font-size="10">input: P1</text>
+    <text x="110" y="58" text-anchor="middle" fill="#dcfce7" font-size="10">同上拓扑</text>
+    <text x="110" y="106" text-anchor="middle" fill="#86efac" font-size="10">+ RocksDBStore</text>
+  </g>
+
+  <g transform="translate(540, 165)">
+    <rect x="0" y="0" width="220" height="115" rx="8" fill="url(#g-green)"/>
+    <text x="110" y="22" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">StreamTask 0_2</text>
+    <text x="110" y="42" text-anchor="middle" fill="#dcfce7" font-size="10">input: P2</text>
+    <text x="110" y="106" text-anchor="middle" fill="#86efac" font-size="10">+ RocksDBStore</text>
+  </g>
+
+  <!-- topics -->
+  <rect x="40" y="320" width="820" height="180" rx="10" fill="#0d1117" stroke="#94a3b8"/>
+  <text x="450" y="345" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">Kafka Topics</text>
+
+  <rect x="60" y="365" width="180" height="50" rx="6" fill="url(#g-purple)"/>
+  <text x="150" y="390" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">input topic</text>
+  <text x="150" y="406" text-anchor="middle" fill="#e9d5ff" font-size="10">业务输入</text>
+
+  <rect x="260" y="365" width="180" height="50" rx="6" fill="url(#g-blue)"/>
+  <text x="350" y="390" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">repartition topic</text>
+  <text x="350" y="406" text-anchor="middle" fill="#dbeafe" font-size="10">key 改变后再分配</text>
+
+  <rect x="460" y="365" width="180" height="50" rx="6" fill="url(#g-orange)"/>
+  <text x="550" y="390" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">changelog topic</text>
+  <text x="550" y="406" text-anchor="middle" fill="#fef3c7" font-size="10">compacted, state 备份</text>
+
+  <rect x="660" y="365" width="180" height="50" rx="6" fill="url(#g-green)"/>
+  <text x="750" y="390" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">output topic</text>
+  <text x="750" y="406" text-anchor="middle" fill="#dcfce7" font-size="10">下游消费</text>
+
+  <text x="450" y="455" text-anchor="middle" fill="#cbd5e1" font-size="11">input → task.process() → (可选 repartition) → state.put + changelog → output</text>
+  <text x="450" y="475" text-anchor="middle" fill="#fbbf24" font-size="11">所有跨 task 通信必须经过 Kafka topic(没有内部 RPC)</text>
+
+  <path d="M150 280 L150 365" stroke="#a78bfa" stroke-width="2" fill="none" marker-end="url(#arr)" stroke-dasharray="3 3"/>
+</svg>
+</div>
+
+<table>
+  <thead><tr><th>源码入口</th><th>层</th><th>负责</th></tr></thead>
+  <tbody>
+    <tr><td><code>StreamsBuilder</code> / <code>KStreamImpl</code></td><td>DSL</td><td>登记 map / aggregate / join 节点</td></tr>
+    <tr><td><code>InternalTopologyBuilder</code></td><td>编译</td><td>生成 source/processor/sink/store/internal topic</td></tr>
+    <tr><td><code>KafkaStreams</code></td><td>runtime</td><td>状态机、线程、metadata</td></tr>
+    <tr><td><code>StreamsPartitionAssignor</code></td><td>分配</td><td>input partition → active/standby task</td></tr>
+    <tr><td><code>StreamThread</code></td><td>执行线程</td><td>poll / process / punctuate / commit</td></tr>
+    <tr><td><code>StreamTask</code></td><td>任务单元</td><td>运行拓扑节点、维护状态</td></tr>
+    <tr><td><code>RocksDBStore</code></td><td>状态层</td><td>本地 RocksDB + changelog 恢复</td></tr>
+    <tr><td><code>RecordCollector</code></td><td>节点上下文</td><td>转发 record、写内部 topic</td></tr>
+  </tbody>
+</table>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-0-1 · 三句话</div>
+<pre><code>1 Streams 是库不是集群
+  扩容 = 多启动同 application.id 实例
+  consumer group 协议自动分配 task
+  并行度上限 = 输入 topic 分区数
+
+2 状态由 RocksDB + changelog 共同维护
+  本地读写零延迟
+  崩溃后从 changelog 恢复
+  standby 持续追平 changelog 减少恢复时间
+
+3 EOS in Streams 不是魔法
+  EOS = 事务 producer + read-process-write 事务
+  changelog 与 output 在同一 txn
+  guarantees 仍是 Kafka 端到端 EOS</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s22-1">22.1 库 vs 集群</h2>
+<!-- ============================================================ -->
+
+<div class="compare-grid">
+  <div>
+    <h4>Streams(库)</h4>
+    <ul>
+      <li>嵌入普通 Java 应用</li>
+      <li>扩容靠多启动实例 + Consumer Group 协议</li>
+      <li>无独立集群,运维简单</li>
+      <li>仅 Java/Scala/Kotlin/Clojure</li>
+      <li>适合 ≤ 100 GB 状态</li>
+    </ul>
+  </div>
+  <div>
+    <h4>Flink / Spark Streaming(集群)</h4>
+    <ul>
+      <li>独立 JobManager / TaskManager 集群</li>
+      <li>跨语言(Python / Scala / Java)</li>
+      <li>需要单独运维集群</li>
+      <li>原生支持复杂窗口 / EventTime watermark</li>
+      <li>适合 TB+ 状态、复杂 SQL</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s22-2">22.2 DSL 与拓扑</h2>
+<!-- ============================================================ -->
+
+<pre><code class="language-java">// DSL 示例:统计每个用户的下单次数(每分钟)
+StreamsBuilder builder = new StreamsBuilder();
+
+KStream&lt;String, Order&gt; orders = builder.stream("orders");
+
+orders
+    .filter((key, order) -&gt; order.amount &gt; 100)
+    .groupBy((key, order) -&gt; order.userId)            // 重分组 → repartition topic
+    .windowedBy(TimeWindows.ofSizeWithNoGrace(Duration.ofMinutes(1)))
+    .count(Materialized.as("user-order-count-store"))  // state store
+    .toStream()
+    .map((wKey, count) -&gt; KeyValue.pair(wKey.key(), count))
+    .to("user-order-count-per-minute");                // output topic
+
+Topology topology = builder.build();
+System.out.println(topology.describe());  // 打印 DAG
+
+KafkaStreams streams = new KafkaStreams(topology, props);
+streams.start();</code></pre>
+
+<p>编译后会生成的内部 topic:</p>
+<ul>
+  <li><code>my-app-user-order-count-store-repartition</code> — repartition</li>
+  <li><code>my-app-user-order-count-store-changelog</code> — state 备份(compacted)</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="s22-3">22.3 KStream vs KTable</h2>
+<!-- ============================================================ -->
+
+<p>这是 Streams 最重要的抽象区分。<strong>KStream</strong>(事件流) ≠ <strong>KTable</strong>(实时物化表)。</p>
+
+<table>
+  <thead><tr><th>维度</th><th>KStream</th><th>KTable</th></tr></thead>
+  <tbody>
+    <tr><td>本质</td><td>无界事件流(append-only)</td><td>实时物化表(key 唯一,留最新)</td></tr>
+    <tr><td>语义</td><td>"<em>发生了什么</em>"</td><td>"<em>当前状态</em>"</td></tr>
+    <tr><td>同 key 多 record</td><td>各自独立保留</td><td>覆盖,只留最新</td></tr>
+    <tr><td>底层 topic</td><td>普通 topic</td><td>compacted topic(或本地 KTable)</td></tr>
+    <tr><td>join 行为</td><td>KStream-KStream:窗口 join</td><td>KStream-KTable:实时 lookup</td></tr>
+    <tr><td>典型来源</td><td>事件、点击日志</td><td>用户表、产品表(CDC)</td></tr>
+  </tbody>
+</table>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-3 · KStream-KTable join</div>
+<svg viewBox="0 0 900 280" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="280" fill="#0f172a" rx="8"/>
+
+  <rect x="40" y="40" width="200" height="80" rx="8" fill="url(#g-purple)"/>
+  <text x="140" y="65" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">KStream: clicks</text>
+  <text x="140" y="85" text-anchor="middle" fill="#e9d5ff" font-size="10">{userId, pageId, ts}</text>
+  <text x="140" y="103" text-anchor="middle" fill="#e9d5ff" font-size="10">高频事件</text>
+
+  <rect x="660" y="40" width="200" height="80" rx="8" fill="url(#g-orange)"/>
+  <text x="760" y="65" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">KTable: users</text>
+  <text x="760" y="85" text-anchor="middle" fill="#fef3c7" font-size="10">{userId → user info}</text>
+  <text x="760" y="103" text-anchor="middle" fill="#fef3c7" font-size="10">低频更新 (CDC)</text>
+
+  <rect x="340" y="40" width="200" height="80" rx="8" fill="url(#g-green)"/>
+  <text x="440" y="65" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">stream.join(table)</text>
+  <text x="440" y="85" text-anchor="middle" fill="#dcfce7" font-size="10">实时 lookup</text>
+  <text x="440" y="103" text-anchor="middle" fill="#dcfce7" font-size="10">无窗口,每个 click 即时富化</text>
+
+  <path d="M240 80 L340 80" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M660 80 L540 80" stroke="#fbbf24" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+  <rect x="340" y="170" width="200" height="60" rx="8" fill="url(#g-blue)"/>
+  <text x="440" y="195" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">EnrichedClick output</text>
+  <text x="440" y="215" text-anchor="middle" fill="#dbeafe" font-size="10">{click + userInfo}</text>
+
+  <path d="M440 120 L440 170" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s22-4">22.4 状态存储 RocksDB</h2>
+<!-- ============================================================ -->
+
+<p>每个 StreamTask 内的 stateful 操作(aggregate / count / reduce / join)都需要持久化状态。Streams 默认用<strong>嵌入式 RocksDB</strong>(LSM-tree KV store)做本地状态,同时把所有变更写到<strong>changelog topic</strong>(compacted)做容灾。</p>
+
+<pre><code>读路径:
+  task.aggregate() → store.get(key) → RocksDB (本地, sub-ms)
+
+写路径:
+  store.put(key, value)
+  → RocksDB write (本地)
+  → changelog topic 写(producer.send)
+  → 下次 task.commit() 才 producer.flush()
+
+崩溃恢复:
+  Streams 启动 → 看 changelog 与 RocksDB checkpoint 的差距
+  → replay changelog 上的 missing record → RocksDB
+  → restore 完成才进 RUNNING</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s22-5">22.5 窗口</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>类型</th><th>含义</th><th>典型场景</th></tr></thead>
+  <tbody>
+    <tr><td>Tumbling</td><td>不重叠,固定大小</td><td>每分钟 GMV</td></tr>
+    <tr><td>Hopping</td><td>固定大小,有 advance(可重叠)</td><td>每分钟看过去 5 分钟</td></tr>
+    <tr><td>Session</td><td>由"<em>不活跃间隔</em>"分隔</td><td>用户会话统计</td></tr>
+    <tr><td>Sliding (KIP-450)</td><td>固定大小,每条记录新窗口</td><td>实时风控</td></tr>
+  </tbody>
+</table>
+
+<p>每种窗口都有 <code>grace</code> 参数 — 处理乱序事件的"<em>宽限期</em>"。3.x 之后要求显式声明 <code>ofSizeAndGrace</code> 或 <code>ofSizeWithNoGrace</code>。</p>
+
+<!-- ============================================================ -->
+<h2 id="s22-6">22.6 Repartition</h2>
+<!-- ============================================================ -->
+
+<p>任何"<em>key 改变</em>" 的操作(groupBy、selectKey、through)都会触发 repartition — 因为 stateful 操作要求"<em>相同 key 路由到相同 task</em>",而 input topic 的分区可能与新 key 不一致。框架自动建一个 repartition topic 把数据重新路由:</p>
+
+<pre><code class="language-text">stream
+  .selectKey((k, v) -&gt; v.userId)        // ← key 改变, 标记 repartition needed
+  .groupByKey()                          // ← 这里触发 repartition topic 创建
+  .aggregate(...)</code></pre>
+
+<div class="warning">
+<strong>陷阱</strong>:repartition topic 是<em>未压缩 + 短 retention</em>(默认 retention.ms=Long.MAX_VALUE 直到 commit 后删除)— broker 重启或 stream 长时间停可能积累。监控 repartition topic 大小,必要时调 <code>repartition.purge.interval.ms</code>。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s22-7">22.7 EOS in Streams</h2>
+<!-- ============================================================ -->
+
+<pre><code class="language-java">props.put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, StreamsConfig.EXACTLY_ONCE_V2);
+// 自动:
+//  - producer.idempotence = true
+//  - producer.transactional.id = &lt;applicationId&gt;-&lt;taskId&gt;
+//  - consumer.isolation.level = read_committed
+//  - 每次 commit 是一个 Kafka transaction:
+//    * 写 output topic
+//    * 写 changelog topic
+//    * commit consumer offset
+//    都在同一事务内, 要么都成功要么都回滚</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s22-8">22.8 Standby & Restore</h2>
+<!-- ============================================================ -->
+
+<p>Streams 支持配置 <code>num.standby.replicas</code> — 让其他实例预先<em>追平</em> changelog 的本地 RocksDB(但不处理 input)。当 active task 所在实例挂了,standby 立刻接管,几乎无 restore 时间。</p>
+
+<pre><code>实例 A: ACTIVE task 0_0    实例 B: STANDBY task 0_0
+  RocksDB (local)           RocksDB (local, replicated from changelog)
+  poll input                no input processing
+  process                   只追 changelog topic
+  write output              -
+  commit (txn)              -
+
+A 挂了:
+  Rebalance → B 升级为 ACTIVE
+  B 已有 RocksDB, 仅需 catch-up 几秒 changelog
+  → P99 接管时间从几分钟 → 几秒</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s22-9">22.9 监控</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>JMX</th><th>含义</th></tr></thead>
+  <tbody>
+    <tr><td>stream-state.state</td><td>RUNNING/REBALANCING/ERROR</td></tr>
+    <tr><td>stream-thread-metrics.poll-latency-avg</td><td>poll 平均延迟</td></tr>
+    <tr><td>stream-task-metrics.process-rate</td><td>处理 QPS</td></tr>
+    <tr><td>stream-task-metrics.commit-latency-avg</td><td>commit 耗时</td></tr>
+    <tr><td>stream-state-metrics.put-latency-avg</td><td>RocksDB put</td></tr>
+    <tr><td>stream-state-metrics.flush-latency-avg</td><td>RocksDB flush</td></tr>
+    <tr><td>stream-task-metrics.restore-records-rate</td><td>恢复速率</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s22-10">22.10 取舍与陷阱</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>#</th><th>陷阱</th><th>现象</th><th>修复</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>把 KStream 当 KTable 用</td><td>同 key 多 record 全保留 → 内存爆</td><td>选对抽象</td></tr>
+    <tr><td>2</td><td>不配 standby</td><td>实例挂了 restore 几分钟</td><td>num.standby.replicas=1</td></tr>
+    <tr><td>3</td><td>repartition topic 没监控</td><td>broker 磁盘飙</td><td>盯 retention</td></tr>
+    <tr><td>4</td><td>RocksDB OOM</td><td>实例 OOMKilled</td><td>限 cache.bytes / write.buffer</td></tr>
+    <tr><td>5</td><td>commit.interval.ms 太小</td><td>commit 风暴 / 事务开销大</td><td>30s 起步</td></tr>
+    <tr><td>6</td><td>不开 EOS</td><td>有重复</td><td>EXACTLY_ONCE_V2</td></tr>
+    <tr><td>7</td><td>窗口 grace 太大</td><td>状态保留过久,RocksDB 涨</td><td>合理 grace</td></tr>
+    <tr><td>8</td><td>num.stream.threads 太多</td><td>线程超过 task 数,空转</td><td>= partition 数 / 实例数</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s22-summary">22.11 本章要点</h2>
+<!-- ============================================================ -->
+
+<div class="chapter-summary">
+  <h3>本章小结</h3>
+  <p>Kafka Streams 是 Kafka 自家的<strong>嵌入式</strong>流处理库 — 没有独立集群,扩容即多启动实例。它把"<em>事件流 ↔ 实时表 ↔ 状态存储</em>" 三者用 Consumer Group + Kafka topic + RocksDB 优雅地编排。生产用好要懂:① 选对 KStream / KTable 抽象;② 配 standby 加速 failover;③ 监控 RocksDB 与 repartition topic;④ 显式开 EOS_V2。下一章我们看 Kafka 的安全机制 — <strong>SASL/SSL 认证、ACL 授权、加密</strong>。</p>
+</div>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script>hljs.highlightAll();</script>
+
+</body>
+</html>

@@ -1,0 +1,2306 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.2 日志存储引擎 — 图解 Kafka</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Kafka</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="01-architecture.html">上一章</a>
+  <a href="03-message-format.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s2-0">2.0 章首速览</a>
+  <a href="#s2-1">2.1 Append-Only 设计动机</a>
+  <a href="#s2-2">2.2 TopicPartition 与磁盘目录</a>
+  <a href="#s2-3">2.3 Segment 生命周期与滚动</a>
+  <a href="#s2-4">2.4 三类索引文件协同</a>
+  <a href="#s2-5">2.5 写入路径:Produce → Page Cache</a>
+  <a href="#s2-6">2.6 Page Cache、刷盘与 Recovery</a>
+  <a href="#s2-7">2.7 Retention 与 Compaction</a>
+  <a href="#s2-8">2.8 Fetch 路径与并发模型</a>
+  <a href="#s2-9">2.9 配置基线与容量估算</a>
+  <a href="#s2-10">2.10 源码深潜</a>
+  <a href="#s2-11">2.11 陷阱与常见误解</a>
+  <a href="#s2-summary">2.12 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 2 章 · 日志存储引擎</h1>
+<p class="subtitle">Append-Only · Segment 滚动 · 稀疏索引 · Page Cache · Retention · Compaction · Fetch 并发 · Recovery Checkpoint · UnifiedLog 源码</p>
+
+<div class="chapter-intro">
+  <p class="lead">Kafka 的"日志"是分区在磁盘上那条<strong>追加写的字节序列</strong>,不是应用 logger.info 打的文本。Producer 把 RecordBatch 接在 active segment 的尾部,Consumer 按 offset 读取已提交位置之前的字节,Broker 用 segment、稀疏索引、page cache、保留策略与 recovery checkpoint 把吞吐、容量与恢复时间约束在可控范围内。整个存储引擎只做一件事:<strong>"按操作系统和磁盘最擅长的方式触达磁盘"</strong>——追加写让写路径短到能跟上 NVMe 的极限,稀疏索引让读路径可定位但不膨胀,page cache 在内核层面把热数据复用,副本协议代替单机 fsync 提供持久性,checkpoint 把异常重启的扫描区间砍到可承受的小窗口。</p>
+  <p>本章按 "追加写模型 → 物理布局 → segment 滚动 → 索引协同 → 写入路径 → 持久化与恢复 → 清理与水位 → fetch 并发 → 配置基线 → 源码主干 → 陷阱" 十一节铺陈,所有讨论锚定 <strong>Apache Kafka 3.7 + KRaft 模式</strong>。读完之后,你应该能在没有看源码的情况下:回答 "为什么 segment 会滚动"、"为什么 retention 不删 active 段"、"为什么 acks=all 是 ISR 等待而不是磁盘 fsync"、"为什么稀疏索引仍然 O(log) 但磁盘只占数据量的 0.2%"——并且在事故现场能用 <code>kafka-log-dirs.sh</code> + <code>kafka-dump-log.sh</code> + <code>vmstat</code> + checkpoint 文件直接定位故障点。</p>
+  <ul class="will-learn">
+    <li>Append-Only 的物理基础:顺序写在 HDD 上比随机写快近 3 个数量级,在 NVMe 上仍快 6 倍以上,page cache 与预读始终倾向顺序模式</li>
+    <li>TopicPartition 是真正的存储单位 — 不是 topic;3 分区的 topic 在 broker 上对应 3 个独立目录,每个目录由 segment 文件组合构成</li>
+    <li>segment 文件名前缀是 baseOffset,固定 20 位前导零;字典序与数值序一致,使得 floorKey 二分定位 offset 落在哪个 segment 是 O(log N) 内存操作</li>
+    <li>5 个条件触发 segment roll:bytes 满 / ms 到 / .index 满 / .timeindex 满 / relativeOffset 溢出 — 单看 .log 大小判断是错的</li>
+    <li>稀疏索引的密度由 <code>log.index.interval.bytes=4096</code> 控制,索引体积 ≈ 数据量 × 0.2%,查找代价 = O(log N) + 顺序扫描 ≤ 4 KiB</li>
+    <li>写入路径不调 fsync — FileChannel.write 进 page cache 立即返回,持久性由 <code>acks=all</code> + ISR 副本协议保证</li>
+    <li>Recovery checkpoint 的精确语义:崩溃后只扫描 recoveryPoint 之后的字节,干净停机 vs 非干净停机的恢复时间差几个数量级</li>
+    <li>Retention 与 Compaction 的两套独立路径:整段淘汰 vs 按 key 重写;LogCleaner 的 <code>.cleaned → .swap → .deleted</code> 三阶段原子可恢复 swap</li>
+    <li>Fetch 多读单写并发模型:closed segment 不可变性允许 consumer + follower 无锁并发读;HW / LSO / read_committed 决定可见上界</li>
+    <li>10 类生产陷阱实证:retention 不删 active、segment 太小爆 fd、fsync 每条拖死延迟、unclean 选主丢消息、THP 写放大、reassign 撞磁盘 — 含症状 / 根因 / 修复 / 监控四列对照</li>
+    <li>UnifiedLog → LogSegment → FileRecords → OffsetIndex / TimeIndex 的源码主干;<code>appendAsLeader</code> 与 <code>append</code> 简化代码与 4 个核心设计取舍</li>
+  </ul>
+  <p class="prereq">前置知识:第 1 章架构总览(Broker / Controller / Topic / Partition 概念);Linux 文件系统基础(FileChannel / mmap / fsync / page cache 的内核语义);二分查找复杂度。本章是 Kafka 写入与读取链路在<strong>单 broker 内</strong>的"最短闭环",后续第 3 章拆开 RecordBatch / Record 的二进制布局,第 4 章回到副本协议与 ISR 推进 HW 的细节,第 5 章讨论 Producer / Consumer 客户端如何把这些底层语义包装成 send / poll API。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s2-0">2.0 章首速览</h2>
+<!-- ============================================================ -->
+
+<p>把整个存储引擎压成一张图:四条路径(Leader append / Follower append / Consumer fetch / Crash recovery)走过相同的 segment 列表与索引文件,但<strong>关心的不变量不同</strong>。Leader 受 leader epoch 与 ISR 约束,Follower 只能追到 leader 已暴露的位置,Consumer 不能越过 HW(或 LSO),Recovery 不重复扫已刷盘段。这四条不变量是后续 11 节所有细节的"骨架"。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 2-0 · 日志存储引擎全景:11 节如何关联到 4 条运行时路径</div>
+  <svg viewBox="0 0 920 420" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+    <rect x="340" y="14" width="240" height="50" rx="10" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="460" y="36" text-anchor="middle" fill="#fff" font-size="14" font-weight="700">日志存储引擎</text>
+    <text x="460" y="54" text-anchor="middle" fill="#e9d5ff" font-size="11">UnifiedLog × LogSegment</text>
+
+    <rect x="20"  y="100" width="200" height="48" rx="9" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="120" y="121" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">§2.1-2.3</text>
+    <text x="120" y="138" text-anchor="middle" fill="#9bc4ff" font-size="11">追加写模型 + segment</text>
+
+    <rect x="240" y="100" width="200" height="48" rx="9" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="340" y="121" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">§2.4-2.6</text>
+    <text x="340" y="138" text-anchor="middle" fill="#a3e0aa" font-size="11">索引 + page cache + recovery</text>
+
+    <rect x="460" y="100" width="200" height="48" rx="9" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="560" y="121" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">§2.7-2.8</text>
+    <text x="560" y="138" text-anchor="middle" fill="#fce8a3" font-size="11">清理策略 + fetch 并发</text>
+
+    <rect x="680" y="100" width="220" height="48" rx="9" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="790" y="121" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">§2.9-2.11</text>
+    <text x="790" y="138" text-anchor="middle" fill="#fbe0e0" font-size="11">配置 + 源码 + 陷阱</text>
+
+    <path d="M440,64 L120,100" stroke="#58a6ff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,64 L340,100" stroke="#3fb950" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M480,64 L560,100" stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M500,64 L790,100" stroke="#f85149" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+
+    <g font-size="10">
+      <rect x="20"  y="170" width="200" height="36" rx="6" fill="#0a1628" stroke="#58a6ff"/>
+      <text x="120" y="184" text-anchor="middle" fill="#9bc4ff" font-weight="700">Append-only</text>
+      <text x="120" y="198" text-anchor="middle" fill="#7d8590">顺序 I/O + page cache</text>
+
+      <rect x="20"  y="214" width="200" height="36" rx="6" fill="#0a1628" stroke="#58a6ff"/>
+      <text x="120" y="228" text-anchor="middle" fill="#9bc4ff" font-weight="700">TopicPartition 目录</text>
+      <text x="120" y="242" text-anchor="middle" fill="#7d8590">baseOffset 命名</text>
+
+      <rect x="20"  y="258" width="200" height="36" rx="6" fill="#0a1628" stroke="#58a6ff"/>
+      <text x="120" y="272" text-anchor="middle" fill="#9bc4ff" font-weight="700">Segment roll</text>
+      <text x="120" y="286" text-anchor="middle" fill="#7d8590">5 条件触发</text>
+
+      <rect x="240" y="170" width="200" height="36" rx="6" fill="#0a2810" stroke="#3fb950"/>
+      <text x="340" y="184" text-anchor="middle" fill="#a3e0aa" font-weight="700">.index 稀疏 offset</text>
+      <text x="340" y="198" text-anchor="middle" fill="#7d8590">interval=4096B</text>
+
+      <rect x="240" y="214" width="200" height="36" rx="6" fill="#0a2810" stroke="#3fb950"/>
+      <text x="340" y="228" text-anchor="middle" fill="#a3e0aa" font-weight="700">.timeindex 稀疏 timestamp</text>
+      <text x="340" y="242" text-anchor="middle" fill="#7d8590">offsetsForTimes</text>
+
+      <rect x="240" y="258" width="200" height="36" rx="6" fill="#0a2810" stroke="#3fb950"/>
+      <text x="340" y="272" text-anchor="middle" fill="#a3e0aa" font-weight="700">recovery-point</text>
+      <text x="340" y="286" text-anchor="middle" fill="#7d8590">checkpoint</text>
+
+      <rect x="460" y="170" width="200" height="36" rx="6" fill="#1a1308" stroke="#d29922"/>
+      <text x="560" y="184" text-anchor="middle" fill="#fce8a3" font-weight="700">delete vs compact</text>
+      <text x="560" y="198" text-anchor="middle" fill="#7d8590">两套独立 cleaner</text>
+
+      <rect x="460" y="214" width="200" height="36" rx="6" fill="#1a1308" stroke="#d29922"/>
+      <text x="560" y="228" text-anchor="middle" fill="#fce8a3" font-weight="700">closed segment</text>
+      <text x="560" y="242" text-anchor="middle" fill="#7d8590">无锁并发读</text>
+
+      <rect x="460" y="258" width="200" height="36" rx="6" fill="#1a1308" stroke="#d29922"/>
+      <text x="560" y="272" text-anchor="middle" fill="#fce8a3" font-weight="700">HW / LSO</text>
+      <text x="560" y="286" text-anchor="middle" fill="#7d8590">可见性边界</text>
+
+      <rect x="680" y="170" width="220" height="36" rx="6" fill="#1f0f12" stroke="#f85149"/>
+      <text x="790" y="184" text-anchor="middle" fill="#fbe0e0" font-weight="700">UnifiedLog.appendAsLeader</text>
+      <text x="790" y="198" text-anchor="middle" fill="#7d8590">主干入口</text>
+
+      <rect x="680" y="214" width="220" height="36" rx="6" fill="#1f0f12" stroke="#f85149"/>
+      <text x="790" y="228" text-anchor="middle" fill="#fbe0e0" font-weight="700">LogSegment.append</text>
+      <text x="790" y="242" text-anchor="middle" fill="#7d8590">段级写入</text>
+
+      <rect x="680" y="258" width="220" height="36" rx="6" fill="#1f0f12" stroke="#f85149"/>
+      <text x="790" y="272" text-anchor="middle" fill="#fbe0e0" font-weight="700">10 类生产陷阱</text>
+      <text x="790" y="286" text-anchor="middle" fill="#7d8590">retention 不删 active 等</text>
+    </g>
+
+    <rect x="120" y="320" width="680" height="80" rx="10" fill="#161b22" stroke="#30363d"/>
+    <text x="460" y="344" text-anchor="middle" fill="#bc8cff" font-weight="800" font-size="13">4 条运行时路径</text>
+    <text x="460" y="366" text-anchor="middle" fill="#e6edf3" font-size="11">Leader append · Follower append · Consumer fetch · Crash recovery</text>
+    <text x="460" y="386" text-anchor="middle" fill="#7d8590" font-size="10">同一份 segment 列表 / 索引文件,但每条路径关心的不变量不同(leader epoch · ISR · HW · checkpoint)</text>
+  </svg>
+</div>
+
+<h3>四条运行时路径的不变量对照</h3>
+
+<table>
+  <thead>
+    <tr><th>路径</th><th>触发线程</th><th>关键结构</th><th>不可越界</th><th>主要观测点</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Leader append</td><td>request handler</td><td><code>UnifiedLog</code> + <code>LogSegment</code> active</td><td>leader epoch / ISR</td><td>Produce LocalTimeMs · LEO</td></tr>
+    <tr><td>Follower append</td><td>replica fetcher</td><td>同上 · 受 leader truncate 约束</td><td>仅追到 leader 已暴露</td><td>follower lag · UnderReplicatedPartitions</td></tr>
+    <tr><td>Consumer fetch</td><td>request handler</td><td><code>OffsetIndex</code> + <code>FileRecords</code></td><td>HW(read_uncommitted)或 LSO(read_committed)</td><td>FetchLatency · BytesOutPerSec</td></tr>
+    <tr><td>Crash recovery</td><td>broker startup</td><td><code>recovery-point-offset-checkpoint</code></td><td>不重复扫已刷盘段</td><td>启动耗时 · "Recovering unflushed" 日志</td></tr>
+  </tbody>
+</table>
+
+<div class="key-insight">
+  <strong>"按磁盘和操作系统最擅长的方式触达磁盘" — 5 条设计选择互为前提</strong>。Append-only 让写路径短(单次 FileChannel.write),稀疏索引让读路径可定位但不膨胀(0.2% 体积换 O(log N) 查找),page cache 减少用户态拷贝(内核自动 LRU + 预读),副本承担确认后的容灾(代替每条 fsync 的 disk IOPS 瓶颈),checkpoint 缩短异常重启的扫描区间(从全段扫到 recoveryPoint 之后)。这 5 条不是独立技巧,而是<strong>互相支撑的整体</strong>:去掉副本就必须加 fsync,去掉 page cache 就丢失零拷贝,去掉 checkpoint 就要每次重启全量扫描——任何一个被妥协,其他四个的收益都会同步坍塌。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s2-1">2.1 Append-Only 日志的设计动机</h2>
+<!-- ============================================================ -->
+
+<p>Kafka 选择 append-only 不是工程偏好,而是在 "顺序 I/O 比随机 I/O 快至少 6 倍" 这条物理事实上的最优解。要理解为什么 append-only 是<em>不得不选的最简方案</em>,先看 B-Tree 类原地更新结构的写路径,再看 Kafka 的写路径,差距就一目了然。</p>
+
+<h3>B-Tree 与 Append-Only 的写路径对比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 2-1-1 · 原地更新 vs 追加写的步骤数差异</div>
+  <svg viewBox="0 0 920 320" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+    <rect x="20" y="20" width="440" height="280" rx="10" fill="#0d1117" stroke="#f85149" stroke-dasharray="4 3"/>
+    <text x="240" y="44" text-anchor="middle" fill="#f85149" font-size="13" font-weight="700">B-Tree 原地更新 — 5 步含随机 I/O</text>
+
+    <rect x="40"  y="80"  width="160" height="44" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="120" y="98"  text-anchor="middle" fill="#fff" font-size="12" font-weight="700">① 查找叶子 page</text>
+    <text x="120" y="114" text-anchor="middle" fill="#fbe0e0" font-size="10">B-Tree 二分</text>
+
+    <rect x="40"  y="138" width="160" height="44" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="120" y="156" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">② 修改 page 内容</text>
+    <text x="120" y="172" text-anchor="middle" fill="#fbe0e0" font-size="10">原地写</text>
+
+    <rect x="40"  y="196" width="160" height="44" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="120" y="214" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">③ 写 WAL</text>
+    <text x="120" y="230" text-anchor="middle" fill="#fbe0e0" font-size="10">redo log</text>
+
+    <rect x="260" y="138" width="160" height="44" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="340" y="156" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">④ 可能 page split</text>
+    <text x="340" y="172" text-anchor="middle" fill="#fce8a3" font-size="10">超阈值时触发</text>
+
+    <rect x="260" y="196" width="160" height="44" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="340" y="214" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">⑤ 随机写多个 page</text>
+    <text x="340" y="230" text-anchor="middle" fill="#fbe0e0" font-size="10">随机 I/O ⚠️</text>
+
+    <path d="M120,124 L120,138" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M120,182 L120,196" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M200,160 L260,160" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M340,182 L340,196" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <text x="240" y="280" text-anchor="middle" fill="#7d8590" font-size="11">代价:每次写记录都可能引发多次磁盘寻道</text>
+
+    <rect x="480" y="20" width="420" height="280" rx="10" fill="#0d1117" stroke="#3fb950" stroke-dasharray="4 3"/>
+    <text x="690" y="44" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="700">Kafka Append-Only — 4 步纯顺序 I/O</text>
+
+    <rect x="500" y="80"  width="180" height="44" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="590" y="98"  text-anchor="middle" fill="#fff" font-size="12" font-weight="700">① RecordBatch</text>
+    <text x="590" y="114" text-anchor="middle" fill="#a3e0aa" font-size="10">Producer 序列化</text>
+
+    <rect x="700" y="80"  width="200" height="44" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="800" y="98"  text-anchor="middle" fill="#fff" font-size="12" font-weight="700">② FileChannel.write</text>
+    <text x="800" y="114" text-anchor="middle" fill="#9bc4ff" font-size="10">active 尾部追加</text>
+
+    <rect x="500" y="160" width="180" height="44" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="590" y="178" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">③ maybe sparse index</text>
+    <text x="590" y="194" text-anchor="middle" fill="#a3e0aa" font-size="10">满 4 KiB 才写</text>
+
+    <rect x="700" y="160" width="200" height="44" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="800" y="178" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">④ page cache</text>
+    <text x="800" y="194" text-anchor="middle" fill="#9bc4ff" font-size="10">立即返回,无 fsync</text>
+
+    <path d="M680,102 L700,102" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M590,124 L590,160" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M680,182 L700,182" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <text x="690" y="244" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="600">收益:全程顺序写,page cache 自动批量 + 预读</text>
+    <text x="690" y="262" text-anchor="middle" fill="#7d8590" font-size="11">代价:已写入字节不能修改 → compaction 与 retention 在更高层解决</text>
+    <text x="690" y="282" text-anchor="middle" fill="#7d8590" font-size="10">磁盘的"长板"被打到极致</text>
+  </svg>
+</div>
+
+<p>B-Tree 在更新一条记录时需要查找叶子页、写 WAL、维护页内顺序、在节点容量超过阈值时执行分裂——任意一步都涉及随机 I/O。Kafka 把 RecordBatch 直接追加到 active segment 尾部,放弃原地更新换取顺序 I/O、内核预读与简化的崩溃恢复路径。<strong>付出的代价是不能修改已写入数据</strong>,这一点由上层 compaction(§2.7)与应用层的事件溯源思路解决。</p>
+
+<h3>顺序写与随机写的实测吞吐差</h3>
+
+<pre><code>顺序写(7200 RPM SATA HDD):
+   ┌──────────────────────────────────────────┐
+   │  ████████████████████████████  ≈ 200 MiB/s │
+   └──────────────────────────────────────────┘
+
+随机写(同盘 4 KiB IOPS ≈ 100):
+   ┌─┐ ┌─┐ ┌─┐ ┌─┐ ┌─┐                      ≈ 0.4 MiB/s
+   └─┘ └─┘ └─┘ └─┘ └─┘
+
+NVMe SSD 顺序 vs 随机:
+   顺序写 ≈ 3 GiB/s
+   随机 4 KiB 写 ≈ 200-500 MiB/s
+   差距虽然缩小,但 page cache 与预读仍倾向顺序模式
+</code></pre>
+
+<p>顺序写在机械盘上对随机写有近三个数量级的吞吐差,在 NVMe SSD 上仍有 6 倍以上差异。这是 Kafka 选择 append-only 的物理基础——配合 page cache 与零拷贝,该模型在<strong>不依赖每条消息 fsync</strong> 的前提下提供高吞吐,而磁盘的"长板"被打到极致。</p>
+
+<h3>Active Segment 的最小写入生命</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 2-1-2 · Producer.send 到 page cache 的最短路径</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+    <g font-size="12" font-weight="700">
+      <text x="80"  y="30" text-anchor="middle" fill="#58a6ff">Producer</text>
+      <text x="220" y="30" text-anchor="middle" fill="#58a6ff">KafkaApis</text>
+      <text x="380" y="30" text-anchor="middle" fill="#58a6ff">UnifiedLog</text>
+      <text x="540" y="30" text-anchor="middle" fill="#58a6ff">LogSegment</text>
+      <text x="700" y="30" text-anchor="middle" fill="#58a6ff">FileRecords</text>
+      <text x="850" y="30" text-anchor="middle" fill="#58a6ff">Page Cache</text>
+    </g>
+    <g stroke="#30363d" stroke-width="1.2" stroke-dasharray="5 4">
+      <line x1="80"  y1="45" x2="80"  y2="360"/>
+      <line x1="220" y1="45" x2="220" y2="360"/>
+      <line x1="380" y1="45" x2="380" y2="360"/>
+      <line x1="540" y1="45" x2="540" y2="360"/>
+      <line x1="700" y1="45" x2="700" y2="360"/>
+      <line x1="850" y1="45" x2="850" y2="360"/>
+    </g>
+
+    <path d="M85,70 L215,70" stroke="#58a6ff" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <text x="150" y="64" text-anchor="middle" fill="#9bc4ff" font-size="11">① ProduceRequest(records, acks)</text>
+
+    <path d="M225,105 L375,105" stroke="#58a6ff" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <text x="300" y="99" text-anchor="middle" fill="#9bc4ff" font-size="11">② appendAsLeader(records, leaderEpoch)</text>
+
+    <rect x="350" y="125" width="60" height="20" rx="3" fill="url(#g-purple)"/>
+    <text x="380" y="139" text-anchor="middle" fill="#fff" font-size="10">校验</text>
+    <text x="380" y="155" text-anchor="middle" fill="#e9d5ff" font-size="10">③ 分配 baseOffset</text>
+
+    <path d="M385,175 L535,175" stroke="#58a6ff" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <text x="460" y="169" text-anchor="middle" fill="#9bc4ff" font-size="11">④ append(records)</text>
+
+    <path d="M545,205 L695,205" stroke="#58a6ff" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <text x="620" y="199" text-anchor="middle" fill="#9bc4ff" font-size="11">⑤ write(buffer)</text>
+
+    <path d="M705,235 L845,235" stroke="#3fb950" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <text x="775" y="229" text-anchor="middle" fill="#a3e0aa" font-size="11">⑥ 写入 dirty page</text>
+
+    <path d="M845,265 L705,265" stroke="#3fb950" stroke-width="1.6" stroke-dasharray="5 3" fill="none" marker-end="url(#arr)"/>
+    <text x="775" y="259" text-anchor="middle" fill="#a3e0aa" font-size="11">⑦ 立即返回 — 无 fsync</text>
+
+    <rect x="510" y="285" width="60" height="20" rx="3" fill="url(#g-green)"/>
+    <text x="540" y="299" text-anchor="middle" fill="#fff" font-size="10">累计</text>
+    <text x="540" y="315" text-anchor="middle" fill="#a3e0aa" font-size="10">⑧ bytesSinceLastIndexEntry</text>
+
+    <text x="460" y="355" text-anchor="middle" fill="#7d8590" font-size="11">关键不变量:写路径不调 fsync,持久性由副本协议保证(§2.6 + 第 9 章 ISR)</text>
+  </svg>
+</div>
+
+<p>Producer 调用 <code>send()</code> 后,记录最终通过 <code>FileChannel.write()</code> 进入 page cache。该调用不阻塞等待磁盘扇区写入,持久性由副本协议(下一节起反复出现)而非单机 fsync 保证。这是 Kafka 写入路径短到只有"校验 → 分配 offset → 写 page cache"的关键原因。</p>
+
+<h3>Segment 大小的取舍矩阵</h3>
+
+<table>
+  <thead>
+    <tr><th>选择</th><th>直接收益</th><th>隐含成本</th><th>适用场景</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>64 MiB</td><td>retention 删除粒度细</td><td>文件数与 mmap 数翻倍</td><td>低吞吐 + 精细过期</td></tr>
+    <tr><td>256 MiB</td><td>较平衡</td><td>削弱顺序读的批量优势</td><td>中等吞吐</td></tr>
+    <tr><td>1 GiB(默认)</td><td>文件数可控,顺序读稳定</td><td>retention 删除滞后</td><td>通用业务</td></tr>
+    <tr><td>4 GiB</td><td>I/O 批量优势最大</td><td>恢复扫描时间显著拉长</td><td>高吞吐 + 充足磁盘</td></tr>
+  </tbody>
+</table>
+
+<div class="warning">
+  <strong>segment.bytes 调小不只让 retention 反应敏感,更让文件描述符暴涨</strong> — 每个 segment 至少占 3 个文件(<code>.log</code> / <code>.index</code> / <code>.timeindex</code>)与 2 个 mmap 区域,1 万个 segment 即可消耗数千 fd。把 <code>segment.bytes</code> 调到 1 MiB 以"让 retention 更精确"是常见反模式——单分区 60 万 segment 直接撞 <code>ulimit -n</code> 上限,broker 拒绝新连接。生产里 <code>segment.bytes</code> 通常停在 256 MiB - 1 GiB,精度需求由 <code>segment.ms</code> 与 <code>log.roll.jitter.ms</code> 配合解决。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s2-2">2.2 TopicPartition 到磁盘目录</h2>
+<!-- ============================================================ -->
+
+<p>很多人第一次接触 Kafka 时以为 "topic = 一个文件",这是错的。<strong>存储单位是 TopicPartition,不是 topic</strong>。3 分区的 <code>order-created</code> topic 在 broker 磁盘上对应 3 个独立目录,目录内按 segment 切成 "数据文件 + 索引文件" 组合。理解了这一层,后面所有 retention、compaction、reassignment 的边界条件才有锚点。</p>
+
+<h3>目录树结构</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 2-2-1 · TopicPartition 目录树:topic → partition → segment</div>
+  <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+    <rect x="350" y="20" width="220" height="48" rx="10" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="460" y="42" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">Topic order-created</text>
+    <text x="460" y="58" text-anchor="middle" fill="#e9d5ff" font-size="11">3 个分区 · 副本因子 3</text>
+
+    <rect x="60"  y="110" width="220" height="44" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="170" y="130" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">order-created-0</text>
+    <text x="170" y="146" text-anchor="middle" fill="#9bc4ff" font-size="10">leader broker 1</text>
+
+    <rect x="350" y="110" width="220" height="44" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="460" y="130" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">order-created-1</text>
+    <text x="460" y="146" text-anchor="middle" fill="#9bc4ff" font-size="10">leader broker 2</text>
+
+    <rect x="640" y="110" width="220" height="44" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="750" y="130" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">order-created-2</text>
+    <text x="750" y="146" text-anchor="middle" fill="#9bc4ff" font-size="10">leader broker 0</text>
+
+    <path d="M440,68 L180,110" stroke="#58a6ff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,68 L460,110" stroke="#58a6ff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M480,68 L740,110" stroke="#58a6ff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="20"  y="180" width="170" height="38" rx="6" fill="#0a1628" stroke="#58a6ff"/>
+    <text x="105" y="196" text-anchor="middle" fill="#9bc4ff" font-size="11" font-weight="700">00000000000000000000</text>
+    <text x="105" y="210" text-anchor="middle" fill="#7d8590" font-size="10">closed segment 0</text>
+
+    <rect x="20"  y="226" width="170" height="38" rx="6" fill="#0a1628" stroke="#58a6ff"/>
+    <text x="105" y="242" text-anchor="middle" fill="#9bc4ff" font-size="11" font-weight="700">00000000000000073512</text>
+    <text x="105" y="256" text-anchor="middle" fill="#7d8590" font-size="10">closed segment 1</text>
+
+    <rect x="20"  y="272" width="170" height="38" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="105" y="288" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">00000000000000147026</text>
+    <text x="105" y="302" text-anchor="middle" fill="#a3e0aa" font-size="10">active segment</text>
+
+    <rect x="20"  y="324" width="170" height="34" rx="6" fill="#1a1308" stroke="#d29922"/>
+    <text x="105" y="345" text-anchor="middle" fill="#fce8a3" font-size="10">leader-epoch-checkpoint</text>
+
+    <rect x="20"  y="364" width="170" height="34" rx="6" fill="#1a1308" stroke="#d29922"/>
+    <text x="105" y="385" text-anchor="middle" fill="#fce8a3" font-size="10">partition.metadata</text>
+
+    <path d="M170,154 L105,180" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M170,154 L105,226" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M170,154 L105,272" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M170,154 L105,324" stroke="#58a6ff" stroke-width="1.2" stroke-dasharray="3 3" fill="none" marker-end="url(#arr)"/>
+    <path d="M170,154 L105,364" stroke="#58a6ff" stroke-width="1.2" stroke-dasharray="3 3" fill="none" marker-end="url(#arr)"/>
+
+    <text x="380" y="200" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="700">每个 segment 的 4 类文件 (以 73512 段为例)</text>
+
+    <rect x="240" y="220" width="160" height="36" rx="5" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="320" y="234" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">.log</text>
+    <text x="320" y="250" text-anchor="middle" fill="#9bc4ff" font-size="10">RecordBatch 字节流</text>
+
+    <rect x="420" y="220" width="160" height="36" rx="5" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="500" y="234" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">.index</text>
+    <text x="500" y="250" text-anchor="middle" fill="#a3e0aa" font-size="10">offset → position</text>
+
+    <rect x="240" y="266" width="160" height="36" rx="5" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="320" y="280" text-anchor="middle" fill="#fce8a3" font-size="11" font-weight="700">.timeindex</text>
+    <text x="320" y="296" text-anchor="middle" fill="#fce8a3" font-size="10">timestamp → offset</text>
+
+    <rect x="420" y="266" width="160" height="36" rx="5" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="500" y="280" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">.txnindex / .snapshot</text>
+    <text x="500" y="296" text-anchor="middle" fill="#e9d5ff" font-size="10">事务 + producer state</text>
+
+    <rect x="620" y="220" width="270" height="180" rx="10" fill="#0d1117" stroke="#39d2c0" stroke-dasharray="3 3"/>
+    <text x="755" y="240" text-anchor="middle" fill="#39d2c0" font-size="12" font-weight="700">命名约定</text>
+    <text x="755" y="262" text-anchor="middle" fill="#e6edf3" font-size="11">文件名前缀 = baseOffset</text>
+    <text x="755" y="280" text-anchor="middle" fill="#7d8590" font-size="10">固定 20 位前导零</text>
+    <text x="755" y="302" text-anchor="middle" fill="#e6edf3" font-size="11">字典序 = 数值序</text>
+    <text x="755" y="320" text-anchor="middle" fill="#7d8590" font-size="10">无需解析元数据即可有序列出</text>
+    <text x="755" y="342" text-anchor="middle" fill="#e6edf3" font-size="11">floorKey(target) 二分定位</text>
+    <text x="755" y="360" text-anchor="middle" fill="#7d8590" font-size="10">读取任意 offset 都是 O(log N)</text>
+    <text x="755" y="382" text-anchor="middle" fill="#fce8a3" font-size="10">同一段的 4 个文件共享前缀</text>
+
+    <text x="460" y="430" text-anchor="middle" fill="#7d8590" font-size="11">存储单位是 TopicPartition,不是 Topic — retention / compaction / reassignment 的边界条件都在分区目录这一层</text>
+  </svg>
+</div>
+
+<h3>目录内的真实文件清单</h3>
+
+<pre><code>/var/lib/kafka/data/order-created-0/
+├── 00000000000000000000.log         segment 0 数据(closed)
+├── 00000000000000000000.index       offset → file position
+├── 00000000000000000000.timeindex   timestamp → offset
+├── 00000000000000073512.log         segment 1 数据(closed)
+├── 00000000000000073512.index
+├── 00000000000000073512.timeindex
+├── 00000000000000147026.log         active segment 数据
+├── 00000000000000147026.index       active segment offset 索引
+├── 00000000000000147026.timeindex
+├── 00000000000000147026.snapshot    producer state 快照
+├── leader-epoch-checkpoint          epoch → start offset
+└── partition.metadata               topicId 与版本
+</code></pre>
+
+<p>文件名前缀为该 segment 第一条记录的 <code>baseOffset</code>,固定 20 位前导零,字典序与数值序一致。这个细节非常关键——它让 broker 启动时可以直接 <code>ls + sort</code> 拿到正确顺序的 segment 列表,无需解析文件元数据。读取 offset 73518 时,broker 在内存中维护的 segment 列表上执行 <code>floorKey(73518)</code>,定位到 73512 这一段,再进入段内继续二分。</p>
+
+<h3>offset 到 segment 的二分定位</h3>
+
+<pre><code>segments = [0, 73512, 147026]   (内存中按 baseOffset 排序)
+target   = 73518
+
+二分:
+  L=0, R=2
+  mid=1 → segments[1]=73512  ≤ target → L=1
+  mid=2 → segments[2]=147026 > target → R=1
+  循环结束 → 选 segments[1] = 73512
+
+进入 segment 73512 后,relativeOffset = 73518 - 73512 = 6
+继续在 .index 中二分查找 floor(6) → 得到物理 position
+</code></pre>
+
+<h3>5 类目录文件对照</h3>
+
+<table>
+  <thead>
+    <tr><th>文件</th><th>内容</th><th>读写特征</th><th>主要排查点</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>.log</code></td><td>RecordBatch 字节流</td><td>顺序追加,按 position 读</td><td>文件大小、roll 频率</td></tr>
+    <tr><td><code>.index</code></td><td>relativeOffset → position</td><td>mmap、二分查找</td><td>索引密度、是否撑满</td></tr>
+    <tr><td><code>.timeindex</code></td><td>timestamp → relativeOffset</td><td>mmap、按时间检索</td><td><code>offsetsForTimes</code> 慢</td></tr>
+    <tr><td><code>leader-epoch-checkpoint</code></td><td>epoch → startOffset</td><td>顺序追加文本</td><td>截断与 unclean 选主</td></tr>
+    <tr><td><code>partition.metadata</code></td><td>topicId 与版本</td><td>启动时校验</td><td>topic 重建后 ID 不一致</td></tr>
+  </tbody>
+</table>
+
+<h3>从 broker 视角观察分区分布</h3>
+
+<pre><code class="language-bash">kafka-log-dirs.sh --bootstrap-server kafka-0:9092 \
+  --describe --topic-list order-created
+</code></pre>
+
+<pre><code class="language-json">{
+  "brokers": [
+    {
+      "broker": 1,
+      "logDirs": [
+        {
+          "logDir": "/var/lib/kafka/data",
+          "partitions": [
+            {
+              "partition": "order-created-0",
+              "size": 3145728,
+              "offsetLag": 0,
+              "isFuture": false
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "version": 1
+}
+</code></pre>
+
+<p><code>size=3145728</code> 为该分区在该 broker 上的总字节数(包含所有 segment 与索引),<code>offsetLag=0</code> 表示该副本与 leader 完全同步,<code>isFuture=false</code> 表明该副本不是 reassignment 临时副本。日常容量监控、reassignment 进度查看、磁盘水位排障都从这一行 JSON 出发。</p>
+
+<div class="real-world">
+  <strong>3 节点集群上 order-created topic 的物理布局实测</strong> — 业务在 3 broker 集群上创建 12 分区 RF=3 的 <code>order-created</code> topic,每个 broker 上各自得到 12 个目录(每个分区 1 个 leader 副本 + 2 个 follower 副本均匀分布)。运维监控显示,broker-1 上 <code>order-created-0</code> / <code>order-created-3</code> / <code>order-created-6</code> / <code>order-created-9</code> 是 leader,其余是 follower;追加写流量按 leader 分布,fetch 流量按 follower 分布。这种 "目录数 = 分区数 × 副本数 / broker 数" 的精确对应关系是后续 reassignment 容量预估的基础——把一个分区从 broker-A 迁到 broker-B 时,broker-B 上需要预留至少一份 segment 总量的临时空间(因为新副本是 future replica,旧副本未删除)。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s2-3">2.3 Segment 生命周期与滚动</h2>
+<!-- ============================================================ -->
+
+<p>每个分区任意时刻只有一个 active segment 接受追加。roll 触发后,active 转变为 closed,新文件成为 active。closed segment 永久不可写但可读,直到被 retention 删除。把 segment 看成 "状态机" 是理解 retention / compaction / recovery 边界的关键。</p>
+
+<h3>Segment 状态机</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 2-3-1 · Segment 状态机:Created → Active → Closed → Retained → PendingDelete → PhysicalDelete</div>
+  <svg viewBox="0 0 920 220" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+    <circle cx="40"  cy="90" r="14" fill="#0d1117" stroke="#bc8cff" stroke-width="2"/>
+    <text x="40" y="94" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="700">●</text>
+
+    <rect x="80"  y="70" width="120" height="44" rx="22" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="140" y="89" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">Created</text>
+    <text x="140" y="106" text-anchor="middle" fill="#9bc4ff" font-size="10">分配 fd / mmap</text>
+
+    <rect x="240" y="70" width="120" height="44" rx="22" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="300" y="89" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">Active</text>
+    <text x="300" y="106" text-anchor="middle" fill="#a3e0aa" font-size="10">接受追加</text>
+
+    <rect x="400" y="70" width="120" height="44" rx="22" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="460" y="89" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">Closed</text>
+    <text x="460" y="106" text-anchor="middle" fill="#9bc4ff" font-size="10">不可写,可读</text>
+
+    <rect x="560" y="70" width="120" height="44" rx="22" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="620" y="89" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">Retained</text>
+    <text x="620" y="106" text-anchor="middle" fill="#fce8a3" font-size="10">满足 retention</text>
+
+    <rect x="720" y="70" width="160" height="44" rx="22" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="800" y="89" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">PendingDelete</text>
+    <text x="800" y="106" text-anchor="middle" fill="#fbe0e0" font-size="10">.deleted 标记</text>
+
+    <rect x="320" y="160" width="200" height="44" rx="22" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="420" y="179" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">PhysicalDelete</text>
+    <text x="420" y="196" text-anchor="middle" fill="#fbe0e0" font-size="10">unlink 文件</text>
+
+    <circle cx="600" cy="180" r="14" fill="#0d1117" stroke="#bc8cff" stroke-width="2"/>
+    <text x="600" y="184" text-anchor="middle" fill="#bc8cff" font-size="14" font-weight="700">⊙</text>
+
+    <path d="M55,90 L80,90"   stroke="#bc8cff" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <text x="68" y="84" text-anchor="middle" fill="#bc8cff" font-size="9">创建文件</text>
+
+    <path d="M200,92 L240,92" stroke="#58a6ff" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <text x="220" y="84" text-anchor="middle" fill="#9bc4ff" font-size="9">接受追加</text>
+
+    <path d="M360,92 L400,92" stroke="#58a6ff" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <text x="380" y="84" text-anchor="middle" fill="#9bc4ff" font-size="9">roll 触发</text>
+
+    <path d="M520,92 L560,92" stroke="#58a6ff" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <text x="540" y="84" text-anchor="middle" fill="#9bc4ff" font-size="9">仍可读</text>
+
+    <path d="M680,92 L720,92" stroke="#d29922" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <text x="700" y="84" text-anchor="middle" fill="#fce8a3" font-size="9">retention 命中</text>
+
+    <path d="M800,114 L520,160" stroke="#f85149" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <text x="690" y="146" text-anchor="middle" fill="#fbe0e0" font-size="10">file.delete.delay.ms</text>
+
+    <path d="M520,182 L586,182" stroke="#bc8cff" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<h3>Roll 判定的 5 个条件</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 2-3-2 · Roll 决策树 — 任一条件命中即 roll</div>
+  <svg viewBox="0 0 920 480" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+    <rect x="180" y="14" width="200" height="44" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="280" y="32" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">RecordBatch append</text>
+    <text x="280" y="48" text-anchor="middle" fill="#9bc4ff" font-size="10">每次写入触发判定</text>
+
+    <g font-size="11" font-weight="700">
+      <polygon points="180,90 380,90 410,116 380,142 180,142 150,116" fill="url(#g-orange)" stroke="#d29922"/>
+      <text x="280" y="112" text-anchor="middle" fill="#fce8a3">① size + batch &gt; segment.bytes?</text>
+      <text x="280" y="128" text-anchor="middle" fill="#fce8a3" font-size="10">默认 1 GiB</text>
+
+      <polygon points="180,170 380,170 410,196 380,222 180,222 150,196" fill="url(#g-orange)" stroke="#d29922"/>
+      <text x="280" y="192" text-anchor="middle" fill="#fce8a3">② now - createdAt &gt; segment.ms?</text>
+      <text x="280" y="208" text-anchor="middle" fill="#fce8a3" font-size="10">默认 168h(7天)</text>
+
+      <polygon points="180,250 380,250 410,276 380,302 180,302 150,276" fill="url(#g-orange)" stroke="#d29922"/>
+      <text x="280" y="272" text-anchor="middle" fill="#fce8a3">③ .index 写满 (10 MiB)?</text>
+      <text x="280" y="288" text-anchor="middle" fill="#fce8a3" font-size="10">小消息场景常见</text>
+
+      <polygon points="180,330 380,330 410,356 380,382 180,382 150,356" fill="url(#g-orange)" stroke="#d29922"/>
+      <text x="280" y="352" text-anchor="middle" fill="#fce8a3">④ .timeindex 写满?</text>
+      <text x="280" y="368" text-anchor="middle" fill="#fce8a3" font-size="10">同上 10 MiB</text>
+
+      <polygon points="180,410 380,410 410,436 380,462 180,462 150,436" fill="url(#g-orange)" stroke="#d29922"/>
+      <text x="280" y="432" text-anchor="middle" fill="#fce8a3">⑤ lastOffset - baseOffset &gt; Int.MAX?</text>
+      <text x="280" y="448" text-anchor="middle" fill="#fce8a3" font-size="10">relativeOffset 32 位溢出</text>
+    </g>
+
+    <path d="M280,58  L280,90"  stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M280,142 L280,170" stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="296" y="158" fill="#7d8590" font-size="10">否</text>
+    <path d="M280,222 L280,250" stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="296" y="238" fill="#7d8590" font-size="10">否</text>
+    <path d="M280,302 L280,330" stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="296" y="318" fill="#7d8590" font-size="10">否</text>
+    <path d="M280,382 L280,410" stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="296" y="398" fill="#7d8590" font-size="10">否</text>
+
+    <rect x="510" y="100" width="220" height="44" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="620" y="124" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">roll →</text>
+    <rect x="750" y="100" width="160" height="44" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="830" y="120" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">创建新 segment</text>
+    <text x="830" y="136" text-anchor="middle" fill="#e9d5ff" font-size="10">baseOffset = nextOffset</text>
+
+    <path d="M730,122 L750,122" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <path d="M410,116 L510,122" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="460" y="110" fill="#f85149" font-size="10">是</text>
+    <path d="M410,196 L510,140" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="460" y="172" fill="#f85149" font-size="10">是</text>
+    <path d="M410,276 L510,140" stroke="#f85149" stroke-width="1.3" stroke-dasharray="3 3" fill="none"/>
+    <text x="460" y="244" fill="#f85149" font-size="10">是</text>
+    <path d="M410,356 L510,144" stroke="#f85149" stroke-width="1.3" stroke-dasharray="3 3" fill="none"/>
+    <text x="460" y="324" fill="#f85149" font-size="10">是</text>
+    <path d="M410,436 L510,144" stroke="#f85149" stroke-width="1.3" stroke-dasharray="3 3" fill="none"/>
+    <text x="460" y="406" fill="#f85149" font-size="10">是</text>
+
+    <rect x="500" y="410" width="380" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="690" y="430" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">全部为否 → 原 active 继续追加</text>
+    <text x="690" y="448" text-anchor="middle" fill="#a3e0aa" font-size="10">无 roll · 写入 page cache 立即返回</text>
+    <path d="M410,436 L500,434" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<p>Roll 判定不只看 <code>.log</code> 大小。<code>.index</code> 与 <code>.timeindex</code> 默认上限 10 MiB,relativeOffset 使用 32 位整数表达——<strong>任一上限达到都会触发 roll</strong>。在小消息高频写入场景下,索引先于 <code>.log</code> 写满是常见 roll 触发原因。这一点是大量 "为什么 .log 还没满就滚动了" 提问的根源。</p>
+
+<h3>Roll 前后目录的真实变化</h3>
+
+<pre><code>roll 前:
+  00000000000000147026.log         (active, 1073700000 bytes)
+  00000000000000147026.index       (active, mmap)
+  00000000000000147026.timeindex   (active, mmap)
+
+roll 后:
+  00000000000000147026.log         (closed, 1073741000 bytes,接近 1 GiB)
+  00000000000000147026.index       (closed, mmap 释放后转只读)
+  00000000000000147026.timeindex   (closed)
+  00000000000000220538.log         (active, 0 bytes)
+  00000000000000220538.index       (active, 预分配 10 MiB)
+  00000000000000220538.timeindex   (active, 预分配 10 MiB)
+</code></pre>
+
+<p>新 segment 的 <code>baseOffset</code> 等于 roll 时刻的 next offset。索引文件在创建时按 <code>log.index.size.max.bytes</code> 预分配,roll 后再裁剪到实际使用大小——这个 "先预分配后裁剪" 的细节让 active segment 的 mmap 区域大小恒定,内核统计稳定;closed segment 才回到实际大小,被 retention 精确计量。</p>
+
+<h3>Segment 容量估算示例</h3>
+
+<table>
+  <thead>
+    <tr><th>写入量</th><th>retention</th><th>RF</th><th>目标 segment 数</th><th>segment.bytes</th><th>单 broker 文件数</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>240 GiB/天/分区</td><td>7 天</td><td>3</td><td>240</td><td>1 GiB</td><td>7 × 240 × 3 ≈ 5040</td></tr>
+    <tr><td>240 GiB/天/分区</td><td>7 天</td><td>3</td><td>3840</td><td>64 MiB</td><td>80640</td></tr>
+    <tr><td>24 GiB/天/分区</td><td>7 天</td><td>3</td><td>168</td><td>1 GiB</td><td>504</td></tr>
+    <tr><td>24 GiB/天/分区</td><td>7 天</td><td>3</td><td>26880</td><td>1 MiB</td><td>80640</td></tr>
+  </tbody>
+</table>
+
+<p>每分区每天的 segment 数应控制在数十到数百级别。每个 segment 占 3 个文件 + 2 个 mmap,文件总数过万时,fd 上限与 mmap <code>vm.max_map_count</code> 都需调高。表中第二行(64 MiB segment)与第四行(1 MiB segment)是常见反模式——以为 "段更小 retention 更准"。</p>
+
+<h3>Segment 滚动相关配置</h3>
+
+<table>
+  <thead>
+    <tr><th>参数</th><th>默认</th><th>推荐</th><th>含义</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>log.segment.bytes</code></td><td>1 GiB</td><td>1 GiB</td><td>单 segment 数据上限</td></tr>
+    <tr><td><code>log.roll.ms</code></td><td>168 h</td><td>168 h</td><td>强制 roll 时间</td></tr>
+    <tr><td><code>log.roll.jitter.ms</code></td><td>0</td><td>60000</td><td>roll 时间抖动,避免同时 roll</td></tr>
+    <tr><td><code>log.index.size.max.bytes</code></td><td>10 MiB</td><td>10 MiB</td><td>索引上限</td></tr>
+    <tr><td><code>log.index.interval.bytes</code></td><td>4 KiB</td><td>4 KiB</td><td>索引粒度</td></tr>
+    <tr><td><code>log.preallocate</code></td><td>false</td><td>false</td><td>Linux 上预分配收益小</td></tr>
+  </tbody>
+</table>
+
+<div class="key-insight">
+  <strong><code>log.roll.jitter.ms</code> 是多分区集中 roll 时分散 I/O 峰值的关键</strong> — 默认值 0 意味着所有分区在同一时刻一起 roll(因为它们都在 broker 启动时被打开,<code>segment.ms</code> 周期同步触发)。100 个分区同时 roll 会让 disk write IOPS 出现显著尖刺、page cache 大量脏页同步刷盘、Produce LocalTimeMs P99 短时跳到几百毫秒。设置 60 秒 jitter 可让 roll 时刻在 [now, now+60s] 内均匀分布,峰值平滑成连续小波动——这是大集群运维的"必修课"调参,默认值能跑起来,但生产建议显式设置。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s2-4">2.4 .log、.index、.timeindex 协同</h2>
+<!-- ============================================================ -->
+
+<p>读取一条记录的代价分三步,每一步都对应 segment 目录里的一个文件。理解这三步如何 O(log) 拼接,才能解释为什么 Kafka "稀疏索引体积只有数据量的 0.2% 但查找仍是 O(log)"。</p>
+
+<h3>三类文件协同的读路径</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 2-4-1 · fetch offset=73518 的三步定位</div>
+  <svg viewBox="0 0 920 200" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+    <rect x="20"  y="70" width="160" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="100" y="96" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">fetch</text>
+    <text x="100" y="116" text-anchor="middle" fill="#e9d5ff" font-size="11">offset = 73518</text>
+
+    <rect x="220" y="60" width="180" height="80" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="310" y="80" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">① segments 列表</text>
+    <text x="310" y="98" text-anchor="middle" fill="#9bc4ff" font-size="11">floor(73518)</text>
+    <text x="310" y="116" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">→ baseOffset 73512</text>
+    <text x="310" y="132" text-anchor="middle" fill="#9bc4ff" font-size="10">O(log N) 内存二分</text>
+
+    <rect x="440" y="60" width="180" height="80" rx="10" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="530" y="80" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">② .index 二分</text>
+    <text x="530" y="98" text-anchor="middle" fill="#a3e0aa" font-size="11">relOff = 73518 - 73512 = 6</text>
+    <text x="530" y="116" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">floor(6) → (4, 28672)</text>
+    <text x="530" y="132" text-anchor="middle" fill="#a3e0aa" font-size="10">mmap 内 O(log M) 查找</text>
+
+    <rect x="660" y="60" width="180" height="80" rx="10" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="750" y="80" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">③ .log 顺序扫描</text>
+    <text x="750" y="98" text-anchor="middle" fill="#fce8a3" font-size="11">从 position 28672 起</text>
+    <text x="750" y="116" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">逐 batch 检查直到 73518</text>
+    <text x="750" y="132" text-anchor="middle" fill="#fce8a3" font-size="10">≤ 4 KiB 顺序读</text>
+
+    <path d="M180,100 L220,100" stroke="#7d8590" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <path d="M400,100 L440,100" stroke="#7d8590" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <path d="M620,100 L660,100" stroke="#7d8590" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+
+    <text x="460" y="175" text-anchor="middle" fill="#7d8590" font-size="11">总开销 ≈ O(log N + log M + 4 KiB 扫描) · page cache 命中 P50 &lt; 1ms · miss 时 P99 5-10ms</text>
+  </svg>
+</div>
+
+<p>整体开销为 <code>O(log N + log M + 4 KiB 扫描)</code> — N 是 segment 数(几十到几百),M 是单 segment 内的索引条数(几万到几十万)。在 page cache 命中下,每一步均为内存操作,P50 fetch 延迟通常 < 1 毫秒;page cache miss 时,4 KiB 扫描变成 1 次 disk read,P99 跳到 5-10 毫秒。</p>
+
+<h3>稀疏索引的字段布局</h3>
+
+<pre><code>.index 单条 entry(8 字节):
+
+  字节 0  1  2  3   4  5  6  7
+        ┌──────────┬──────────┐
+        │ relOff   │ position │
+        └──────────┴──────────┘
+        int32 LE     int32 LE
+
+  relOff   = absoluteOffset - segment.baseOffset
+  position = 该 batch 在 .log 中的物理偏移
+
+.timeindex 单条 entry(12 字节):
+
+  字节 0  1  2  3  4  5  6  7   8  9 10 11
+        ┌────────────────────┬──────────┐
+        │      timestamp     │  relOff  │
+        └────────────────────┴──────────┘
+        int64 LE               int32 LE
+
+  timestamp 单调递增(基于 batch 的 maxTimestamp)
+</code></pre>
+
+<p><code>.index</code> entry 固定 8 字节,<code>.timeindex</code> entry 固定 12 字节,均直接用 mmap 暴露给 broker 进程。<strong>固定宽度让二分查找以 O(1) 时间访问每个 entry</strong>,无需解析变长格式——这是为什么稀疏索引在 mmap 上能跑出微秒级查找的根本原因。</p>
+
+<h3>稀疏度与 RecordBatch 的对应关系</h3>
+
+<pre><code>log.index.interval.bytes = 4096
+
+.log 段(节选):
+   position  size   firstOffset  lastOffset
+   0         800    73512         73515       ← RecordBatch 0
+   800       1200   73516         73523       ← RecordBatch 1
+   2000      900    73524         73529       ← RecordBatch 2
+   2900      1300   73530         73538       ← RecordBatch 3
+   4200      700    73539         73543       ← RecordBatch 4 (累计 4900 ≥ 4096)
+                                                 → 索引追加
+   4900      ...
+
+.index 内容:
+   (relOff=0,  position=0)
+   (relOff=27, position=4200)   ← 73539 - 73512 = 27
+   ...
+
+读取 offset=73525:
+   floor(13) = (relOff=0, position=0)
+   从 position=0 顺序扫到 73525,扫描距离 &lt; 4096 字节
+</code></pre>
+
+<p>每写满 4 KiB 数据追加一条索引,索引数量 ≈ 数据量 / 4 KiB。1 GiB segment 对应约 256 K 条索引,占 2 MiB,远小于 mmap 上限。这种 "索引体积 = 数据量 × 0.2%" 的密度让 broker 可以把所有热分区的索引常驻 page cache。</p>
+
+<h3>稀疏 vs 完整索引对比</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4>反例:完整索引</h4>
+    <ul>
+      <li>每条消息追加一条 index entry</li>
+      <li>索引体积 ≈ 消息数 × 8-12 B,可达数据量的 30%-100%</li>
+      <li>mmap 压力高,需要更大的 <code>vm.max_map_count</code></li>
+      <li>查找 O(log M),省 4 KiB 扫描</li>
+      <li>写入端每条都要追加,消耗写入带宽</li>
+    </ul>
+    <p style="margin-top:8px;font-size:12px;color:#f85149;">在 Kafka 的范围扫描访问模式下,这种 "省 4 KiB 顺序扫描" 完全不值得 — page cache 命中时 4 KiB 扫描 < 1 微秒,网络传输才是瓶颈。</p>
+  </div>
+  <div class="compare-good">
+    <h4>正例:稀疏索引(Kafka)</h4>
+    <ul>
+      <li>每写满 4 KiB 追加一条 index entry</li>
+      <li>索引体积 ≈ 数据量 × 0.2%</li>
+      <li>mmap 压力低</li>
+      <li>查找 O(log M) + 顺序扫 ≤ 4 KiB</li>
+      <li>范围扫描天然命中(顺序读 page cache)</li>
+    </ul>
+    <p style="margin-top:8px;font-size:12px;color:#3fb950;">Kafka 的 90% 访问是 "fetch offset 之后连续 N MB",这种模式下稀疏索引的 4 KiB 扫描代价摊薄到几乎为零,而索引体积省下的 100 倍空间换来更稳定的 page cache 命中率。</p>
+  </div>
+</div>
+
+<h3>DumpLogSegments 工具输出</h3>
+
+<pre><code class="language-bash">kafka-dump-log.sh \
+  --files /var/lib/kafka/data/order-created-0/00000000000000073512.index
+</code></pre>
+
+<pre><code>Dumping /var/lib/kafka/data/order-created-0/00000000000000073512.index
+offset: 73516 position: 28672
+offset: 73544 position: 32768
+offset: 73571 position: 36864
+offset: 73598 position: 40960
+offset: 73625 position: 45056
+</code></pre>
+
+<p>输出展示稀疏索引的实际间距:每两条 entry 之间约 27 个 offset,对应 ≈ 4 KiB 数据。该粒度在 broker 侧成为 "查找成本与索引存储" 的折中点。事故现场用这个工具验证 "索引是否被正常追加" 是排查 fetch 延迟突增的常见手段。</p>
+
+<h3>按时间检索的两段式查找</h3>
+
+<pre><code class="language-bash">kafka-run-class.sh kafka.tools.GetOffsetShell \
+  --bootstrap-server kafka-0:9092 \
+  --topic order-created \
+  --time 1714550400000
+</code></pre>
+
+<pre><code>order-created:0:73512
+</code></pre>
+
+<p>按时间检索分两步:在 <code>.timeindex</code> 上二分定位 <code>floor(timestamp) → relativeOffset</code>,再以该 relativeOffset 进入 <code>.index</code> 路径定位物理位置。timestamp 索引允许 batch 的 <code>maxTimestamp</code> 不严格单调,在乱序写入场景下查找返回的 offset 可能略早于真实时间——这是 <code>offsetsForTimes</code> 在乱序流中 "时间不精确" 的来源。</p>
+
+<!-- ============================================================ -->
+<h2 id="s2-5">2.5 写入路径:从 Produce 到 Page Cache</h2>
+<!-- ============================================================ -->
+
+<p>写入路径是事故现场最常追踪的链路。Producer.send 之后到底走了哪些线程、做了哪些校验、什么时候返回客户端——这些细节决定了 P99 延迟的分解与异常诊断方向。</p>
+
+<h3>Produce 请求全链路</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 2-5-1 · Producer.send → ISR 推进 HW 的完整时序</div>
+  <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+    <g font-size="11" font-weight="700">
+      <text x="60"  y="26" text-anchor="middle" fill="#58a6ff">Producer</text>
+      <text x="170" y="26" text-anchor="middle" fill="#58a6ff">NetworkThread</text>
+      <text x="290" y="26" text-anchor="middle" fill="#58a6ff">KafkaApis</text>
+      <text x="410" y="26" text-anchor="middle" fill="#58a6ff">ReplicaManager</text>
+      <text x="530" y="26" text-anchor="middle" fill="#58a6ff">Partition</text>
+      <text x="640" y="26" text-anchor="middle" fill="#58a6ff">UnifiedLog</text>
+      <text x="760" y="26" text-anchor="middle" fill="#58a6ff">LogSegment</text>
+      <text x="870" y="26" text-anchor="middle" fill="#58a6ff">PageCache</text>
+    </g>
+    <g stroke="#30363d" stroke-width="1.2" stroke-dasharray="5 4">
+      <line x1="60"  y1="40" x2="60"  y2="440"/>
+      <line x1="170" y1="40" x2="170" y2="440"/>
+      <line x1="290" y1="40" x2="290" y2="440"/>
+      <line x1="410" y1="40" x2="410" y2="440"/>
+      <line x1="530" y1="40" x2="530" y2="440"/>
+      <line x1="640" y1="40" x2="640" y2="440"/>
+      <line x1="760" y1="40" x2="760" y2="440"/>
+      <line x1="870" y1="40" x2="870" y2="440"/>
+    </g>
+
+    <path d="M65,60 L165,60"   stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="115" y="54" text-anchor="middle" fill="#9bc4ff" font-size="10">① ProduceRequest(acks=all)</text>
+
+    <path d="M175,85 L285,85"  stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="230" y="79" text-anchor="middle" fill="#9bc4ff" font-size="10">② handleProduceRequest</text>
+
+    <path d="M295,110 L405,110" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="350" y="104" text-anchor="middle" fill="#9bc4ff" font-size="10">③ appendRecords(acks=-1)</text>
+
+    <path d="M415,135 L525,135" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="470" y="129" text-anchor="middle" fill="#9bc4ff" font-size="10">④ appendRecordsToLeader</text>
+
+    <rect x="510" y="150" width="40" height="22" rx="3" fill="url(#g-purple)"/>
+    <text x="530" y="166" text-anchor="middle" fill="#fff" font-size="10">校验</text>
+    <text x="530" y="180" text-anchor="middle" fill="#e9d5ff" font-size="9">⑤ leaderEpoch + ISR</text>
+
+    <path d="M535,200 L635,200" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="585" y="194" text-anchor="middle" fill="#9bc4ff" font-size="10">⑥ appendAsLeader</text>
+
+    <rect x="620" y="216" width="40" height="22" rx="3" fill="url(#g-purple)"/>
+    <text x="640" y="232" text-anchor="middle" fill="#fff" font-size="10">校验</text>
+    <text x="640" y="246" text-anchor="middle" fill="#e9d5ff" font-size="9">⑦ pid / sequence</text>
+    <text x="640" y="260" text-anchor="middle" fill="#e9d5ff" font-size="9">⑧ 分配 baseOffset</text>
+
+    <path d="M645,280 L755,280" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="700" y="274" text-anchor="middle" fill="#9bc4ff" font-size="10">⑨ maybeRoll + append</text>
+
+    <path d="M765,302 L865,302" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="815" y="296" text-anchor="middle" fill="#a3e0aa" font-size="10">⑩ FileChannel.write</text>
+
+    <path d="M755,322 L645,322" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5 3" fill="none" marker-end="url(#arr)"/>
+    <text x="700" y="316" text-anchor="middle" fill="#a3e0aa" font-size="10">⑪ appendInfo</text>
+
+    <path d="M635,344 L535,344" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5 3" fill="none" marker-end="url(#arr)"/>
+    <text x="585" y="338" text-anchor="middle" fill="#a3e0aa" font-size="10">⑫ LogAppendInfo</text>
+
+    <rect x="510" y="358" width="40" height="22" rx="3" fill="url(#g-orange)"/>
+    <text x="530" y="374" text-anchor="middle" fill="#fce8a3" font-size="10">等</text>
+    <text x="530" y="388" text-anchor="middle" fill="#fce8a3" font-size="9">⑬ purgatory 等 ISR fetch</text>
+
+    <path d="M525,408 L65,408" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5 3" fill="none" marker-end="url(#arr)"/>
+    <text x="290" y="402" text-anchor="middle" fill="#a3e0aa" font-size="10">⑭ response 仅在 ISR 推进 HW 后返回</text>
+
+    <text x="460" y="438" text-anchor="middle" fill="#7d8590" font-size="11">acks=all 时 T(remote) = ISR 全员 fetch 该 offset 的等待时间(典型 5-20ms)</text>
+  </svg>
+</div>
+
+<p>请求经过网络线程解码、<code>KafkaApis</code> 分派、<code>ReplicaManager</code> 路由、<code>Partition</code> 校验,最终在 <code>UnifiedLog.appendAsLeader()</code> 中完成 offset 分配与磁盘写入。<code>acks=all</code> 时,响应在 ISR 全员 fetch 到该 offset 后才返回客户端——这是 Kafka 持久性保证的实现入口。</p>
+
+<h3>Append 内部步骤</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 2-5-2 · UnifiedLog.appendAsLeader 内部 8 步</div>
+  <svg viewBox="0 0 920 420" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+    <rect x="340" y="14" width="240" height="50" rx="10" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="460" y="34" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">UnifiedLog.appendAsLeader</text>
+    <text x="460" y="52" text-anchor="middle" fill="#e9d5ff" font-size="10">单分区的写入主干</text>
+
+    <rect x="60"  y="90" width="200" height="50" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="160" y="110" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">① validateRecords</text>
+    <text x="160" y="126" text-anchor="middle" fill="#9bc4ff" font-size="10">magic, CRC, batch size</text>
+
+    <rect x="360" y="90" width="200" height="50" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="460" y="110" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">② validateProducerState</text>
+    <text x="460" y="126" text-anchor="middle" fill="#9bc4ff" font-size="10">idempotent / transactional</text>
+
+    <rect x="660" y="90" width="200" height="50" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="760" y="110" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">③ 分配 baseOffset</text>
+    <text x="760" y="126" text-anchor="middle" fill="#9bc4ff" font-size="10">= nextOffset</text>
+
+    <polygon points="380,170 540,170 570,196 540,222 380,222 350,196" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="460" y="192" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">④ shouldRoll?</text>
+    <text x="460" y="208" text-anchor="middle" fill="#fce8a3" font-size="10">5 条件之一(见 §2.3)</text>
+
+    <rect x="660" y="170" width="200" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="760" y="190" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">⑤ 创建新 segment</text>
+    <text x="760" y="206" text-anchor="middle" fill="#e9d5ff" font-size="10">是 → roll · 否 → 用当前 active</text>
+
+    <rect x="360" y="248" width="200" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="460" y="268" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">⑥ LogSegment.append</text>
+    <text x="460" y="284" text-anchor="middle" fill="#a3e0aa" font-size="10">FileRecords.append → page cache</text>
+
+    <polygon points="60,322 230,322 260,348 230,374 60,374 30,348" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="145" y="344" text-anchor="middle" fill="#fce8a3" font-size="11" font-weight="700">⑦ bytesSinceLastIdx</text>
+    <text x="145" y="360" text-anchor="middle" fill="#fce8a3" font-size="10">&gt;= 4 KiB?</text>
+
+    <rect x="290" y="328" width="200" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="390" y="348" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">是 → OffsetIndex.append</text>
+    <text x="390" y="362" text-anchor="middle" fill="#a3e0aa" font-size="10">+ TimeIndex.maybeAppend</text>
+
+    <rect x="520" y="328" width="200" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="620" y="350" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">否 → 跳过索引追加</text>
+
+    <rect x="740" y="320" width="160" height="40" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="820" y="338" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">⑧ updateLEO</text>
+    <text x="820" y="354" text-anchor="middle" fill="#e9d5ff" font-size="10">nextOffset += N</text>
+
+    <rect x="350" y="390" width="220" height="22" rx="5" fill="#0d1117" stroke="#58a6ff"/>
+    <text x="460" y="405" text-anchor="middle" fill="#9bc4ff" font-size="11" font-weight="700">通知 fetch purgatory · 唤醒 follower</text>
+
+    <path d="M260,115 L360,115" stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M560,115 L660,115" stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M760,140 L460,170" stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M570,196 L660,196" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="610" y="188" fill="#f85149" font-size="10">是</text>
+    <path d="M460,222 L460,248" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="478" y="240" fill="#3fb950" font-size="10">否</text>
+    <path d="M760,220 L500,248" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="3 3" fill="none" marker-end="url(#arr)"/>
+    <path d="M360,275 L145,322" stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M260,348 L290,348" stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M260,348 L520,348" stroke="#7d8590" stroke-width="1.5" stroke-dasharray="3 3" fill="none" marker-end="url(#arr)"/>
+    <path d="M720,348 L740,340" stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M820,360 L460,390" stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<div class="key-insight">
+  <strong>写入路径不调用 fsync — 持久性靠副本而非单机磁盘</strong>。数据通过 <code>FileChannel.write()</code> 写入 page cache,内核根据 <code>vm.dirty_ratio</code> 与 <code>vm.dirty_writeback_centisecs</code> 异步刷盘。Kafka 通过副本冗余而非单机 fsync 提供持久性 — 这是它能在 NVMe 上跑出 GB/s 级写入的根本原因。每条消息 fsync 在 NVMe 上需 50-200 微秒,在 HDD 上需 5-20 毫秒,写入吞吐受限于 disk IOPS;而 3 副本协议 + acks=all 在异步刷盘下可承受单机故障,P99 延迟降至 5-20 毫秒。<strong>生产配置中 <code>log.flush.interval.messages</code> 应保持默认 <code>Long.MAX</code></strong>,任何把它调小的尝试都会让吞吐下降 5-10 倍。
+</div>
+
+<h3>写入耗时的精确分解</h3>
+
+<pre><code>ProduceRequest 总耗时 = T(queue) + T(local) + T(remote) + T(throttle) + T(response)
+
+T(queue)    : 在 RequestChannel 中等待 io thread
+T(local)    : 校验 + 分配 offset + 写 page cache + 索引
+T(remote)   : ISR 全员 fetch 到该 offset 的等待时间
+              (acks=all 时存在,acks=1 为 0)
+T(throttle) : 客户端 quota 节流
+T(response) : 等待 network thread 发回客户端
+
+典型分布(P99):
+  queue   &lt;  5 ms
+  local   &lt;  5 ms   (page cache 命中,无 fsync)
+  remote  &lt; 20 ms   (ISR 跨可用区)
+  throttle = 0
+  response &lt;  2 ms
+</code></pre>
+
+<h3>Producer / Topic / Broker 三层基线配置</h3>
+
+<pre><code class="language-properties"># Topic 层(创建时配置)
+replication.factor=3
+min.insync.replicas=2
+segment.bytes=1073741824
+retention.ms=604800000
+
+# Producer 层
+acks=all
+enable.idempotence=true
+linger.ms=5
+batch.size=65536
+compression.type=zstd
+
+# Broker 层
+log.flush.interval.messages=9223372036854775807
+log.flush.offset.checkpoint.interval.ms=60000
+unclean.leader.election.enable=false
+</code></pre>
+
+<table>
+  <thead>
+    <tr><th>层级</th><th>关键参数</th><th>作用</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Topic</td><td><code>min.insync.replicas</code></td><td>acks=all 写入的最小 ISR</td></tr>
+    <tr><td>Topic</td><td><code>segment.bytes</code></td><td>控制文件粒度</td></tr>
+    <tr><td>Producer</td><td><code>linger.ms</code></td><td>批次延迟换吞吐</td></tr>
+    <tr><td>Producer</td><td><code>acks</code></td><td>持久性级别(0 / 1 / all)</td></tr>
+    <tr><td>Broker</td><td><code>log.flush.interval.messages</code></td><td>默认 Long.MAX,不主动 fsync</td></tr>
+  </tbody>
+</table>
+
+<h3>写入相关的核心 JMX 指标</h3>
+
+<table>
+  <thead>
+    <tr><th>指标</th><th>含义</th><th>异常阈值</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>RequestMetrics.TotalTimeMs(Produce)</code></td><td>Produce 总耗时 P99</td><td>&gt; 100 ms</td></tr>
+    <tr><td><code>RequestMetrics.LocalTimeMs(Produce)</code></td><td>本地处理耗时</td><td>&gt; 20 ms</td></tr>
+    <tr><td><code>RequestMetrics.RemoteTimeMs(Produce)</code></td><td>ISR 等待耗时</td><td>&gt; 50 ms</td></tr>
+    <tr><td><code>ReplicaManager.UnderReplicatedPartitions</code></td><td>ISR 不足的分区数</td><td>&gt; 0</td></tr>
+    <tr><td><code>LogFlushStats.LogFlushRateAndTimeMs</code></td><td>主动 fsync 频率</td><td>持续 &gt; 0 是反模式</td></tr>
+  </tbody>
+</table>
+
+<div class="warning">
+  <strong>LogFlushRateAndTimeMs 持续 &gt; 0 = 误调了 fsync 配置</strong> — 该指标在默认配置下应接近 0。持续大于 0 通常意味着误调了 <code>log.flush.interval.messages</code> 或 <code>log.flush.interval.ms</code>,导致每条或周期性同步刷盘。事故现场看到 LocalTimeMs P99 飙升到几十毫秒、LogFlushRateAndTimeMs 同步飙到 5-15 毫秒,几乎可以确诊是这两个配置被误改了。修复办法是把它们恢复成默认 Long.MAX / null,依靠 RF=3 + min.insync.replicas=2 + acks=all 的副本协议保证持久性。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s2-6">2.6 Page Cache、刷盘与 Recovery</h2>
+<!-- ============================================================ -->
+
+<p>Kafka 的写入路径不显式 fsync,但磁盘上的数据最终由 Linux 的 writeback 机制刷入持久存储。当 broker 崩溃后,如何在重启时知道 "哪些数据已经落盘、哪些可能丢失"?答案是 <code>recovery-point-offset-checkpoint</code> 文件——它记录每个分区已经被显式刷盘的 offset 上界。</p>
+
+<h3>Page Cache 与刷盘的协同</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 2-6-1 · 写入 → page cache → writeback 的内核路径</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+    <rect x="40"  y="20" width="200" height="50" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="140" y="40" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">FileChannel.write</text>
+    <text x="140" y="56" text-anchor="middle" fill="#9bc4ff" font-size="10">Kafka 应用线程</text>
+
+    <rect x="320" y="20" width="240" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="440" y="40" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">Page Cache</text>
+    <text x="440" y="56" text-anchor="middle" fill="#e9d5ff" font-size="10">dirty pages 在内核内存中</text>
+
+    <rect x="640" y="20" width="240" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="760" y="40" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">Kafka checkpoint</text>
+    <text x="760" y="56" text-anchor="middle" fill="#a3e0aa" font-size="10">recovery-point-offset 文件</text>
+
+    <rect x="280" y="120" width="220" height="50" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="390" y="140" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">pdflush / writeback</text>
+    <text x="390" y="156" text-anchor="middle" fill="#fce8a3" font-size="10">vm.dirty_writeback_centisecs(默认 5s)</text>
+
+    <rect x="520" y="120" width="220" height="50" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="630" y="140" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">dirty_ratio 触发同步刷盘</text>
+    <text x="630" y="156" text-anchor="middle" fill="#fbe0e0" font-size="10">超过 20% 时应用线程阻塞</text>
+
+    <rect x="380" y="220" width="200" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="480" y="240" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">Disk</text>
+    <text x="480" y="256" text-anchor="middle" fill="#e9d5ff" font-size="10">NVMe / SAS / SATA</text>
+
+    <rect x="40"  y="220" width="200" height="50" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="140" y="240" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">broker crash</text>
+    <text x="140" y="256" text-anchor="middle" fill="#fbe0e0" font-size="10">kill -9 / OOM / 断电</text>
+
+    <rect x="40"  y="310" width="200" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="140" y="328" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">Log recovery</text>
+    <text x="140" y="346" text-anchor="middle" fill="#a3e0aa" font-size="10">仅扫 recoveryPoint 之后</text>
+
+    <rect x="320" y="310" width="200" height="50" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="420" y="328" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">校验 batch CRC</text>
+    <text x="420" y="346" text-anchor="middle" fill="#9bc4ff" font-size="10">截断损坏 tail</text>
+
+    <rect x="600" y="310" width="260" height="50" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="730" y="328" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">重建索引 + producer state</text>
+    <text x="730" y="346" text-anchor="middle" fill="#9bc4ff" font-size="10">从 .snapshot 加载 PID/sequence</text>
+
+    <path d="M240,45  L320,45"  stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M560,45  L640,45"  stroke="#3fb950" stroke-width="1.5" stroke-dasharray="3 3" fill="none" marker-end="url(#arr)"/>
+    <path d="M400,70  L390,120" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M480,70  L620,120" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M390,170 L460,220" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M630,170 L500,220" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M140,270 L140,310" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M760,70  L760,290 L730,310" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="3 3" fill="none" marker-end="url(#arr)"/>
+    <path d="M240,335 L320,335" stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M520,335 L600,335" stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<p>Linux 在 <code>vm.dirty_writeback_centisecs</code>(默认 5 秒)周期内启动 writeback 线程,将 dirty page 写回磁盘。当 dirty page 比例超过 <code>vm.dirty_ratio</code>(默认 20%)时,写入线程同步参与刷盘,产生写延迟。<strong>这就是为什么 dirty_ratio 被打满时 broker 写入会出现毛刺</strong>——大量脏页被同步刷盘阻塞了应用线程。</p>
+
+<h3>Recovery checkpoint 的文本格式</h3>
+
+<pre><code># /var/lib/kafka/data/recovery-point-offset-checkpoint
+0
+2
+order-created 0 73512
+order-created 1 81209
+
+行 1: 版本号(0)
+行 2: 条目总数(2)
+后续每行: &lt;topic&gt; &lt;partition&gt; &lt;recoveryPoint&gt;
+</code></pre>
+
+<p><code>recovery-point-offset-checkpoint</code> 由 <code>LogManager</code> 周期性写入(默认每 60 秒一次),记录每个分区的已刷盘上界。broker 崩溃后只需扫描该 offset 之后的 <code>.log</code>,跳过已确认刷盘的部分——这是 Kafka 异常重启能在分钟级完成的关键。</p>
+
+<h3>崩溃恢复的完整时序</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 2-6-2 · broker 启动 → LogLoader 加载 → ReplicaManager 启动</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+    <g font-size="12" font-weight="700">
+      <text x="100" y="26" text-anchor="middle" fill="#58a6ff">broker startup</text>
+      <text x="290" y="26" text-anchor="middle" fill="#58a6ff">LogManager</text>
+      <text x="480" y="26" text-anchor="middle" fill="#58a6ff">UnifiedLog</text>
+      <text x="670" y="26" text-anchor="middle" fill="#58a6ff">LogLoader</text>
+      <text x="850" y="26" text-anchor="middle" fill="#58a6ff">磁盘</text>
+    </g>
+    <g stroke="#30363d" stroke-width="1.2" stroke-dasharray="5 4">
+      <line x1="100" y1="40" x2="100" y2="360"/>
+      <line x1="290" y1="40" x2="290" y2="360"/>
+      <line x1="480" y1="40" x2="480" y2="360"/>
+      <line x1="670" y1="40" x2="670" y2="360"/>
+      <line x1="850" y1="40" x2="850" y2="360"/>
+    </g>
+
+    <path d="M105,60 L285,60" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="195" y="54" text-anchor="middle" fill="#9bc4ff" font-size="11">① startup()</text>
+
+    <rect x="270" y="80" width="40" height="22" rx="3" fill="url(#g-purple)"/>
+    <text x="290" y="96" text-anchor="middle" fill="#fff" font-size="10">读</text>
+    <text x="290" y="110" text-anchor="middle" fill="#e9d5ff" font-size="9">② recovery-point-offset-checkpoint</text>
+
+    <path d="M295,130 L475,130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="385" y="124" text-anchor="middle" fill="#9bc4ff" font-size="11">③ 为每分区构造 UnifiedLog</text>
+
+    <path d="M485,155 L665,155" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="575" y="149" text-anchor="middle" fill="#9bc4ff" font-size="11">④ 加载 segments</text>
+
+    <path d="M675,180 L845,180" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="760" y="174" text-anchor="middle" fill="#fce8a3" font-size="11">⑤ 列出目录 + 字典序排序</text>
+
+    <path d="M845,205 L675,205" stroke="#d29922" stroke-width="1.5" stroke-dasharray="3 3" fill="none" marker-end="url(#arr)"/>
+    <text x="760" y="199" text-anchor="middle" fill="#fce8a3" font-size="11">⑥ segments[]</text>
+
+    <path d="M665,230 L485,230" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="575" y="224" text-anchor="middle" fill="#9bc4ff" font-size="11">⑦ 从 recoveryPoint 起扫描</text>
+
+    <rect x="460" y="248" width="40" height="22" rx="3" fill="url(#g-green)"/>
+    <text x="480" y="264" text-anchor="middle" fill="#fff" font-size="10">恢复</text>
+    <text x="480" y="278" text-anchor="middle" fill="#a3e0aa" font-size="9">⑧ 校验 batch CRC</text>
+    <text x="480" y="290" text-anchor="middle" fill="#a3e0aa" font-size="9">⑨ 重建 .index / .timeindex</text>
+    <text x="480" y="302" text-anchor="middle" fill="#a3e0aa" font-size="9">⑩ 重建 producer state</text>
+
+    <path d="M475,318 L295,318" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="3 3" fill="none" marker-end="url(#arr)"/>
+    <text x="385" y="312" text-anchor="middle" fill="#a3e0aa" font-size="11">⑪ 加载完成</text>
+
+    <path d="M285,344 L105,344" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="3 3" fill="none" marker-end="url(#arr)"/>
+    <text x="195" y="338" text-anchor="middle" fill="#a3e0aa" font-size="11">⑫ 启动 ReplicaManager</text>
+  </svg>
+</div>
+
+<p>恢复扫描的代价正比于未刷盘字节数。<strong>干净停机</strong>(<code>controlled.shutdown.enable=true</code>)会先刷盘并写最新 checkpoint,启动时几乎零扫描;<strong>非干净停机</strong>后,broker 需要从 checkpoint 后逐 batch 校验 CRC,1 GiB 扫描在 NVMe 上约 0.3 秒,在 HDD 上约 5 秒——这就是为什么 OOM Kill 重启的 broker 有时要花几分钟才能上线。</p>
+
+<h3>Linux 侧脏页观测</h3>
+
+<pre><code class="language-bash">vmstat 1 3
+grep -E "Cached|Dirty|Writeback" /proc/meminfo
+</code></pre>
+
+<pre><code>procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 2  0      0 812000 131072 8421376   0    0     0 18432 3410 7021 18  7 74  1  0
+
+Cached:          8421376 kB
+Dirty:            124928 kB
+Writeback:          8192 kB
+</code></pre>
+
+<p><code>Cached</code> 表示 page cache 总量(包含干净 + 脏页),<code>Dirty</code> 表示尚未写回磁盘的脏页,<code>Writeback</code> 表示正在写回的页。<code>Dirty</code> 持续接近 <code>vm.dirty_ratio</code> 阈值时,broker 写入会出现毛刺——这是判断 "I/O 抖动是不是 dirty_ratio 打满" 的最直接指标。</p>
+
+<h3>推荐内核参数</h3>
+
+<table>
+  <thead>
+    <tr><th>参数</th><th>默认</th><th>推荐</th><th>影响</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>vm.dirty_ratio</code></td><td>20</td><td>60-80</td><td>容忍更多脏页,避免突发 fsync</td></tr>
+    <tr><td><code>vm.dirty_background_ratio</code></td><td>10</td><td>5</td><td>更早启动后台 writeback</td></tr>
+    <tr><td><code>vm.dirty_expire_centisecs</code></td><td>3000</td><td>12000</td><td>脏页存活时间</td></tr>
+    <tr><td><code>vm.swappiness</code></td><td>60</td><td>1</td><td>避免 swap 影响延迟</td></tr>
+    <tr><td><code>vm.max_map_count</code></td><td>65530</td><td>262144</td><td>mmap 数量上限</td></tr>
+  </tbody>
+</table>
+
+<p><code>vm.dirty_ratio</code> 调高的前提是有足够的副本冗余。该值决定单机故障后可能丢失的字节数上界,在 64 GiB 内存机上 60% 即约 38 GiB,需依赖副本协议覆盖。<strong>没有 RF=3 的集群把 dirty_ratio 调到 80% 是灾难做法</strong>——单机断电会丢失数十 GiB 数据。</p>
+
+<h3>错误的 fsync 配置反例</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4>反模式:每条消息同步 fsync</h4>
+<pre><code class="language-properties">log.flush.interval.messages=1
+log.flush.interval.ms=1000</code></pre>
+    <p style="margin-top:8px;font-size:12px;color:#f85149;">
+    现象:<br/>
+    LogFlushRateAndTimeMs.Mean = 持续 5-15 ms<br/>
+    Produce LocalTimeMs P99 = 50-200 ms<br/>
+    吞吐相比默认配置下降 5-10 倍
+    </p>
+  </div>
+  <div class="compare-good">
+    <h4>正模式:依赖副本</h4>
+<pre><code class="language-properties">log.flush.interval.messages=9223372036854775807
+log.flush.interval.ms=null
+default.replication.factor=3
+min.insync.replicas=2
+unclean.leader.election.enable=false</code></pre>
+    <p style="margin-top:8px;font-size:12px;color:#3fb950;">
+    现象:<br/>
+    LogFlushRateAndTimeMs ≈ 0<br/>
+    Produce LocalTimeMs P99 &lt; 5 ms<br/>
+    单机故障由副本协议覆盖
+    </p>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s2-7">2.7 Retention 与 Compaction</h2>
+<!-- ============================================================ -->
+
+<p>"消息怎么过期" 在 Kafka 里有两套独立路径:<code>cleanup.policy=delete</code> 整段淘汰,<code>cleanup.policy=compact</code> 按 key 重写。两者可同时启用(<code>delete,compact</code>),但触发逻辑独立。混淆这两套路径是 "为什么 retention 不删 active segment / 为什么 compact topic 写 null key 报错" 这类常见问题的根源。</p>
+
+<h3>两类 cleanup policy 路径</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 2-7-1 · delete vs compact 的执行路径</div>
+  <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+    <rect x="370" y="14" width="180" height="44" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="460" y="32" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">cleanup.policy</text>
+    <text x="460" y="48" text-anchor="middle" fill="#e9d5ff" font-size="10">delete · compact · 两者并存</text>
+
+    <polygon points="100,90 260,90 290,116 260,142 100,142 70,116" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="180" y="112" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">delete?</text>
+    <text x="180" y="128" text-anchor="middle" fill="#9bc4ff" font-size="10">按时间或字节淘汰</text>
+
+    <polygon points="630,90 800,90 830,116 800,142 630,142 600,116" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="715" y="112" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">compact?</text>
+    <text x="715" y="128" text-anchor="middle" fill="#fce8a3" font-size="10">按 key 重写</text>
+
+    <path d="M420,58 L180,90"  stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M500,58 L715,90" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="60"  y="170" width="240" height="42" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="180" y="187" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">① retention.ms / retention.bytes</text>
+    <text x="180" y="203" text-anchor="middle" fill="#9bc4ff" font-size="10">规则匹配 closed segment</text>
+
+    <rect x="60"  y="220" width="240" height="42" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="180" y="237" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">② 仅作用于 closed segment</text>
+    <text x="180" y="253" text-anchor="middle" fill="#9bc4ff" font-size="10">active 不被 delete 触碰</text>
+
+    <rect x="60"  y="270" width="240" height="42" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="180" y="287" text-anchor="middle" fill="#fce8a3" font-size="11" font-weight="700">③ rename → .deleted</text>
+    <text x="180" y="303" text-anchor="middle" fill="#fce8a3" font-size="10">从 segments[] 中摘除</text>
+
+    <rect x="60"  y="320" width="240" height="42" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="180" y="337" text-anchor="middle" fill="#fce8a3" font-size="11" font-weight="700">④ 等待 file.delete.delay.ms</text>
+    <text x="180" y="353" text-anchor="middle" fill="#fce8a3" font-size="10">默认 60 秒,给读者宽限</text>
+
+    <rect x="60"  y="370" width="240" height="42" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="180" y="387" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">⑤ 物理 unlink</text>
+    <text x="180" y="403" text-anchor="middle" fill="#fbe0e0" font-size="10">磁盘空间释放</text>
+
+    <path d="M180,142 L180,170" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M180,212 L180,220" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M180,262 L180,270" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M180,312 L180,320" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M180,362 L180,370" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="600" y="170" width="280" height="42" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="740" y="187" text-anchor="middle" fill="#fce8a3" font-size="11" font-weight="700">① dirtyRatio ≥ min.cleanable.dirty.ratio</text>
+    <text x="740" y="203" text-anchor="middle" fill="#fce8a3" font-size="10">默认 0.5</text>
+
+    <rect x="600" y="220" width="280" height="42" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="740" y="237" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">② LogCleaner 构建 offset map</text>
+    <text x="740" y="253" text-anchor="middle" fill="#a3e0aa" font-size="10">每 key 保留最新 offset</text>
+
+    <rect x="600" y="270" width="280" height="42" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="740" y="287" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">③ 逐 segment 重写到 .cleaned</text>
+    <text x="740" y="303" text-anchor="middle" fill="#a3e0aa" font-size="10">仅保留 map 中 offset 的 record</text>
+
+    <rect x="600" y="320" width="280" height="42" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="740" y="337" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">④ .cleaned → .swap</text>
+    <text x="740" y="353" text-anchor="middle" fill="#e9d5ff" font-size="10">原子 rename 保证可恢复</text>
+
+    <rect x="600" y="370" width="280" height="42" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="740" y="387" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">⑤ .swap → 替换原 segment</text>
+    <text x="740" y="403" text-anchor="middle" fill="#e9d5ff" font-size="10">旧文件 → .deleted</text>
+
+    <path d="M715,142 L740,170" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M740,212 L740,220" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M740,262 L740,270" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M740,312 L740,320" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M740,362 L740,370" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <text x="460" y="440" text-anchor="middle" fill="#7d8590" font-size="11">两条独立路径 — retention 不依赖 dirty ratio,compact 不依赖时间</text>
+  </svg>
+</div>
+
+<p><code>cleanup.policy=delete</code> 是事件流默认策略,按整个 segment 淘汰。<code>cleanup.policy=compact</code> 是状态表策略,为每个 key 保留最新 value。两条路径完全独立——retention 不依赖 dirty ratio,compact 不依赖时间。</p>
+
+<h3>Compaction 前后的字节布局</h3>
+
+<pre><code>compact 前(.log):
+  offset=0  key=A  value=v1
+  offset=1  key=B  value=v1
+  offset=2  key=A  value=v2
+  offset=3  key=C  value=v1
+  offset=4  key=B  value=v2
+
+LogCleaner offset map:
+  hash(A) → 2
+  hash(B) → 4
+  hash(C) → 3
+
+compact 后(.log):
+  offset=2  key=A  value=v2
+  offset=3  key=C  value=v1
+  offset=4  key=B  value=v2
+
+注意:
+  - offset 数值不重新编号
+  - 中间 offset(0, 1)永久消失
+  - Consumer 按 offset 前进时跳过 gap
+  - tombstone(value=null)在 delete.retention.ms 后被移除
+</code></pre>
+
+<p><code>offset</code> 在 compaction 后仍保持原始值,中间 gap 不会让 consumer 出错——因为 fetch 协议允许返回空批次,consumer 会自动跳过 gap 继续前进到下一个真实 offset。</p>
+
+<h3>LogCleaner 的工作流</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 2-7-2 · LogCleaner 的 offset map 构建 + .cleaned/.swap/.deleted 三阶段</div>
+  <svg viewBox="0 0 920 420" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+    <g font-size="12" font-weight="700">
+      <text x="80"  y="26" text-anchor="middle" fill="#58a6ff">Scheduler</text>
+      <text x="240" y="26" text-anchor="middle" fill="#58a6ff">LogCleaner</text>
+      <text x="420" y="26" text-anchor="middle" fill="#58a6ff">旧 segment</text>
+      <text x="600" y="26" text-anchor="middle" fill="#58a6ff">.cleaned 文件</text>
+      <text x="800" y="26" text-anchor="middle" fill="#58a6ff">OffsetMap</text>
+    </g>
+    <g stroke="#30363d" stroke-width="1.2" stroke-dasharray="5 4">
+      <line x1="80"  y1="40" x2="80"  y2="400"/>
+      <line x1="240" y1="40" x2="240" y2="400"/>
+      <line x1="420" y1="40" x2="420" y2="400"/>
+      <line x1="600" y1="40" x2="600" y2="400"/>
+      <line x1="800" y1="40" x2="800" y2="400"/>
+    </g>
+
+    <path d="M85,60 L235,60" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="160" y="54" text-anchor="middle" fill="#9bc4ff" font-size="11">① 选择 dirty ratio 最高分区</text>
+
+    <path d="M245,88 L415,88" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="330" y="82" text-anchor="middle" fill="#9bc4ff" font-size="11">② 扫描 dirty 区域</text>
+
+    <path d="M245,116 L795,116" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="520" y="110" text-anchor="middle" fill="#9bc4ff" font-size="11">③ 构建 hash(key) → offset</text>
+
+    <path d="M245,144 L415,144" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="330" y="138" text-anchor="middle" fill="#9bc4ff" font-size="11">④ 第二遍扫描</text>
+
+    <path d="M245,172 L595,172" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="420" y="166" text-anchor="middle" fill="#a3e0aa" font-size="11">⑤ 仅保留 OffsetMap 中最新 offset 的 record</text>
+
+    <rect x="580" y="190" width="40" height="22" rx="3" fill="url(#g-green)"/>
+    <text x="600" y="206" text-anchor="middle" fill="#fff" font-size="10">关闭</text>
+    <text x="600" y="220" text-anchor="middle" fill="#a3e0aa" font-size="9">⑥ 关闭 .cleaned</text>
+
+    <path d="M245,242 L595,242" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="420" y="236" text-anchor="middle" fill="#e9d5ff" font-size="11">⑦ rename .cleaned → .swap</text>
+
+    <path d="M245,272 L415,272" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="330" y="266" text-anchor="middle" fill="#fbe0e0" font-size="11">⑧ rename 旧 → .deleted</text>
+
+    <path d="M245,302 L595,302" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="420" y="296" text-anchor="middle" fill="#a3e0aa" font-size="11">⑨ rename .swap → 正式文件名</text>
+
+    <rect x="40" y="334" width="840" height="60" rx="10" fill="#0a1628" stroke="#bc8cff" stroke-dasharray="3 3"/>
+    <text x="460" y="356" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="700">"用 rename 实现两阶段提交" — 中间状态可恢复</text>
+    <text x="460" y="376" text-anchor="middle" fill="#e9d5ff" font-size="11">看到 .cleaned → 中间状态,删除 · 看到 .swap → 已构建,替换上去 · 看到 .deleted → 物理 unlink</text>
+    <text x="460" y="390" text-anchor="middle" fill="#7d8590" font-size="10">完全没有事务日志,纯文件系统语义即可恢复</text>
+  </svg>
+</div>
+
+<div class="key-insight">
+  <strong>LogCleaner 的 swap 流程通过文件名后缀实现"原子可恢复"</strong> — <code>.cleaned</code> 是构建中,<code>.swap</code> 是已构建待替换,<code>.deleted</code> 是待删除。任意阶段崩溃后,broker 启动时根据后缀决定继续或回滚:看到 <code>.cleaned</code> → 删除(中间状态);看到 <code>.swap</code> + 旧文件 → 把 .swap 替换上去(已完成主体工作);看到 <code>.deleted</code> → 物理删除(尾声)。这种"用 rename 实现两阶段提交"的技巧让 compaction 完全没有事务日志,纯文件系统语义即可恢复——是 Linux 文件系统 atomic rename 语义的优雅利用。
+</div>
+
+<h3>Retention 与 Compaction 配置</h3>
+
+<table>
+  <thead>
+    <tr><th>配置</th><th>默认</th><th>含义</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>cleanup.policy</code></td><td>delete</td><td>delete / compact / delete,compact</td></tr>
+    <tr><td><code>retention.ms</code></td><td>168 h</td><td>时间保留上限</td></tr>
+    <tr><td><code>retention.bytes</code></td><td>-1(无限)</td><td>字节保留上限</td></tr>
+    <tr><td><code>log.retention.check.interval.ms</code></td><td>5 min</td><td>retention 扫描周期</td></tr>
+    <tr><td><code>min.cleanable.dirty.ratio</code></td><td>0.5</td><td>触发 compact 的 dirty 比例</td></tr>
+    <tr><td><code>delete.retention.ms</code></td><td>24 h</td><td>tombstone 保留时长</td></tr>
+    <tr><td><code>min.compaction.lag.ms</code></td><td>0</td><td>最小 compact 延迟</td></tr>
+    <tr><td><code>file.delete.delay.ms</code></td><td>60000</td><td>物理删除前的延迟</td></tr>
+  </tbody>
+</table>
+
+<h3>磁盘水位监控</h3>
+
+<pre><code class="language-bash">df -h /var/lib/kafka/data
+kafka-log-dirs.sh --bootstrap-server kafka-0:9092 --describe
+</code></pre>
+
+<pre><code>Filesystem      Size  Used Avail Use% Mounted on
+/dev/nvme0n1p1  1.8T  1.4T  280G  84% /var/lib/kafka/data
+
+"logDir":"/var/lib/kafka/data",
+"partitions":[
+  {"partition":"order-created-0","size":53687091200,"offsetLag":0,"isFuture":false}
+]
+</code></pre>
+
+<h3>磁盘水位响应矩阵</h3>
+
+<table>
+  <thead>
+    <tr><th>水位</th><th>状态</th><th>推荐动作</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>&lt; 70%</td><td>健康</td><td>趋势监控</td></tr>
+    <tr><td>70%-80%</td><td>预警</td><td>检查增长最快 topic,确认 retention 是否生效</td></tr>
+    <tr><td>80%-90%</td><td>高风险</td><td>扩容 / 降低 retention / 暂停非必要 reassign</td></tr>
+    <tr><td>&gt; 90%</td><td>事故边缘</td><td>立即扩容或迁移副本</td></tr>
+  </tbody>
+</table>
+
+<div class="warning">
+  <strong>磁盘满引发的 broker 崩溃 + unclean.leader.election 是常见次生灾难</strong> — broker 写满磁盘 → IOException → 副本被踢出 ISR → 如果配置了 <code>unclean.leader.election.enable=true</code> 且其他副本也同步停滞,可能选出 out-of-sync 副本作为新 leader,丢失最近未复制的消息。预防性配置 <code>disk.usage.ratio</code> 监控 + 预留 reassignment 缓冲(通常 20%)是稳态运维的基本要求。<strong>磁盘水位 &gt; 80% 时不要做任何 reassignment</strong> — future replica 与旧副本会临时共存,需要双倍空间。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s2-8">2.8 Fetch 路径与并发模型</h2>
+<!-- ============================================================ -->
+
+<p>Kafka 在并发模型上是 "多读单写":closed segment 的不可变性允许多个 consumer 与 follower 同时读取同一文件,内核 page cache 自动去重;active segment 的写入则受单分区锁串行化。理解这一点是回答 "为什么 Kafka 的 consumer 几乎不影响 broker CPU" 的关键。</p>
+
+<h3>多读单写的并发模型</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 2-8-1 · closed segment 无锁并发读 + active segment 单写</div>
+  <svg viewBox="0 0 920 320" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+    <rect x="20"  y="20" width="420" height="280" rx="10" fill="#0d1117" stroke="#3fb950" stroke-dasharray="4 3"/>
+    <text x="230" y="44" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="700">多读 · closed segment(不可变)</text>
+
+    <rect x="50"  y="70"  width="130" height="44" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="115" y="90"  text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Consumer A</text>
+    <text x="115" y="106" text-anchor="middle" fill="#9bc4ff" font-size="10">poll</text>
+
+    <rect x="50"  y="130" width="130" height="44" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="115" y="150" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Consumer B</text>
+    <text x="115" y="166" text-anchor="middle" fill="#9bc4ff" font-size="10">poll(不同 offset)</text>
+
+    <rect x="50"  y="190" width="130" height="44" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="115" y="210" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Follower fetcher</text>
+    <text x="115" y="226" text-anchor="middle" fill="#9bc4ff" font-size="10">replica.fetch</text>
+
+    <rect x="240" y="120" width="180" height="74" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="330" y="142" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">closed segment</text>
+    <text x="330" y="160" text-anchor="middle" fill="#a3e0aa" font-size="11">.log + .index + .timeindex</text>
+    <text x="330" y="178" text-anchor="middle" fill="#a3e0aa" font-size="10">page cache 自动去重</text>
+
+    <path d="M180,92  L240,140" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M180,152 L240,155" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M180,212 L240,180" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <text x="230" y="265" text-anchor="middle" fill="#7d8590" font-size="11">不可变 → 无锁并发读 → 完全水平扩展</text>
+    <text x="230" y="285" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="600">读路径不持锁 · 多 consumer / follower 共享</text>
+
+    <rect x="480" y="20" width="420" height="280" rx="10" fill="#0d1117" stroke="#d29922" stroke-dasharray="4 3"/>
+    <text x="690" y="44" text-anchor="middle" fill="#d29922" font-size="13" font-weight="700">单写 · 单分区串行</text>
+
+    <rect x="500" y="80" width="160" height="44" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="580" y="100" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">Producer append</text>
+    <text x="580" y="116" text-anchor="middle" fill="#9bc4ff" font-size="10">acks=1 / all</text>
+
+    <rect x="500" y="150" width="160" height="44" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="580" y="170" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">UnifiedLog 分区锁</text>
+    <text x="580" y="186" text-anchor="middle" fill="#fce8a3" font-size="10">仅串行同分区写</text>
+
+    <rect x="500" y="220" width="160" height="44" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="580" y="240" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">active segment</text>
+    <text x="580" y="256" text-anchor="middle" fill="#a3e0aa" font-size="10">追加 + 索引 + LEO</text>
+
+    <rect x="710" y="150" width="160" height="44" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="790" y="170" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">HW 限制可见</text>
+    <text x="790" y="186" text-anchor="middle" fill="#e9d5ff" font-size="10">consumer 不能越 HW</text>
+
+    <path d="M580,124 L580,150" stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M580,194 L580,220" stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M660,242 L710,172" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="3 3" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<p>closed segment 的不可变性是并发读的关键:多个 consumer 与 follower 可以同时按 position 读取同一文件,内核 page cache 自动去重。<strong>写路径只串行化单个分区的 append 与 segment 列表变更,跨分区无全局锁</strong>——这让 Kafka 在多分区下水平扩展。</p>
+
+<h3>Fetch 内部分支</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 2-8-2 · ReplicaManager.fetchMessages 的 isolation level 分支</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+    <rect x="320" y="20" width="280" height="44" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="460" y="40" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">ReplicaManager.fetchMessages</text>
+    <text x="460" y="56" text-anchor="middle" fill="#e9d5ff" font-size="10">consumer + follower 共用入口</text>
+
+    <polygon points="360,90 560,90 590,118 560,146 360,146 330,118" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="460" y="116" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">isolation level?</text>
+    <text x="460" y="132" text-anchor="middle" fill="#fce8a3" font-size="10">FetchRequest 携带</text>
+
+    <path d="M460,64 L460,90" stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="60"  y="160" width="240" height="50" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="180" y="180" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">read_uncommitted</text>
+    <text x="180" y="196" text-anchor="middle" fill="#9bc4ff" font-size="11">maxOffset = HW</text>
+
+    <rect x="620" y="160" width="240" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="740" y="180" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">read_committed</text>
+    <text x="740" y="196" text-anchor="middle" fill="#e9d5ff" font-size="11">maxOffset = LSO(last stable offset)</text>
+
+    <path d="M380,146 L240,160" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M540,146 L680,160" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="320" y="234" width="280" height="44" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="460" y="254" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">定位 segment + position</text>
+    <text x="460" y="270" text-anchor="middle" fill="#9bc4ff" font-size="10">§2.4 三步定位</text>
+
+    <path d="M180,210 L380,234" stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M740,210 L540,234" stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="320" y="294" width="280" height="44" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="460" y="314" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">FileRecords.slice(position, maxBytes)</text>
+    <text x="460" y="330" text-anchor="middle" fill="#a3e0aa" font-size="10">零拷贝 sendfile / transferTo</text>
+
+    <path d="M460,278 L460,294" stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="640" y="294" width="220" height="44" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="750" y="314" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">read_committed → 过滤 aborted txn</text>
+    <text x="750" y="330" text-anchor="middle" fill="#e9d5ff" font-size="10">查 .txnindex</text>
+
+    <path d="M600,316 L640,316" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="3 3" fill="none" marker-end="url(#arr)"/>
+
+    <text x="460" y="362" text-anchor="middle" fill="#7d8590" font-size="11">→ FetchResponse · acks=all 时 follower fetch 同样走这条路径(无 LSO 过滤)</text>
+  </svg>
+</div>
+
+<p><code>read_uncommitted</code> 直接读到 HW,<code>read_committed</code> 仅读到 LSO(last stable offset),后者额外查询 transaction index 以过滤已 abort 的事务记录。这两条路径在 fetch 入口分叉后再汇合到 sendfile 出口——性能差异主要来自 transaction index 的查询代价。</p>
+
+<h3>HW 与可见性</h3>
+
+<pre><code>Leader Partition Log:
+
+  offset:  ... 95   96   97   98   99   100  101  102  103  104
+                                          ↑                   ↑
+                                          HW=100              LEO=104
+
+  read_uncommitted consumer 可见: [..., 99]
+  read_committed   consumer 可见: 取决于 LSO &le; HW
+
+  Follower 1 LEO=104 → 全部已复制
+  Follower 2 LEO=102 → 已复制到 102
+  Follower 3 LEO=87  → 落后,可能被移出 ISR
+
+  HW = min(LEO of all replicas in current ISR) = min(104, 102) = 102
+  下一轮 fetch 后,leader 推进 HW=102
+</code></pre>
+
+<p>HW 的推进是 leader 在收到 follower fetch 时计算的。客户端只能读到 HW 以下的数据,<strong>该约束保证 leader 切换后新 leader 可至少恢复到原 HW</strong>——这是 Kafka "副本协议保证持久性" 的核心数学约束。</p>
+
+<h3>Fetch 相关配置</h3>
+
+<table>
+  <thead>
+    <tr><th>参数</th><th>默认</th><th>含义</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>fetch.min.bytes</code></td><td>1</td><td>broker 端等待数据的最小字节</td></tr>
+    <tr><td><code>fetch.max.wait.ms</code></td><td>500</td><td>broker 端 long-poll 超时</td></tr>
+    <tr><td><code>fetch.max.bytes</code></td><td>50 MiB</td><td>单次 fetch 总字节上限</td></tr>
+    <tr><td><code>max.partition.fetch.bytes</code></td><td>1 MiB</td><td>单分区 fetch 字节上限</td></tr>
+    <tr><td><code>replica.fetch.max.bytes</code></td><td>1 MiB</td><td>follower 单分区 fetch 上限</td></tr>
+    <tr><td><code>replica.fetch.wait.max.ms</code></td><td>500</td><td>follower long-poll 超时</td></tr>
+  </tbody>
+</table>
+
+<h3>Fetch 排障矩阵</h3>
+
+<table>
+  <thead>
+    <tr><th>现象</th><th>候选根因</th><th>验证</th><th>修复</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Consumer lag 持续增长</td><td>单 consumer 处理慢</td><td>看 <code>records-consumed-rate</code></td><td>调 <code>max.poll.records</code> 或扩 consumer</td></tr>
+    <tr><td>Fetch P99 高</td><td>broker 磁盘 / page cache miss</td><td><code>iostat -x</code>,<code>sar -B</code></td><td>增大 page cache 或 SSD</td></tr>
+    <tr><td>BytesOutPerSec 抖动</td><td>follower fetch 不稳</td><td><code>UnderReplicatedPartitions</code></td><td>检查副本网络</td></tr>
+    <tr><td>read_committed 突慢</td><td>大量 aborted txn 累积</td><td><code>txnindex</code> 大小</td><td>检查 producer 事务</td></tr>
+  </tbody>
+</table>
+
+<div class="real-world">
+  <strong>大集群里 Fetch P99 抖动 90% 是 page cache miss</strong> — 我们排查过一个生产故障:订单消费组的 Fetch P99 从 5 ms 突然跳到 80 ms。第一反应是检查 broker CPU / 磁盘 IO,都正常。最后用 <code>sar -B</code> 看到 <code>pgmajfault</code>(major page fault)从 0 跳到 1000+/秒——broker 内存被另一个 topic 的大量历史 fetch 吃掉,热分区的索引被换出 page cache,每次 fetch 都触发 disk read。修复办法是给该 broker 加内存 + 调整 <code>vm.swappiness=1</code> + 把不常用的归档 topic 单独放到独立 broker。这个案例说明:Kafka 的 fetch 性能 90% 是 page cache 命中率的函数——broker 内存不是越大越好,但小到 page cache 装不下热数据的索引时,P99 立刻翻 10 倍。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s2-9">2.9 配置基线与容量估算</h2>
+<!-- ============================================================ -->
+
+<p>容量估算与配置基线是从 "原理" 落到 "上线参数" 的最后一步。一个常见误区是只考虑日均字节数,忽略了副本因子、retention 删除滞后、reassignment 临时叠加。一个完整的容量公式必须把这些因子全部纳入。</p>
+
+<h3>容量估算公式</h3>
+
+<pre><code>日均字节 = 单分区日写入量 × 分区数
+留存字节 = 日均字节 × 保留天数
+副本字节 = 留存字节 × 副本因子
+推荐容量 = 副本字节 × 安全系数(1.3 - 1.5)
+
+示例:
+  单分区日写 240 GiB
+  分区数 12
+  保留 7 天
+  RF = 3
+  安全系数 1.3
+
+  推荐容量 = 240 × 12 × 7 × 3 × 1.3
+          ≈ 78624 GiB
+          ≈ 76.8 TiB
+
+  按 12 broker 平均分布,每 broker 约 6.4 TiB
+</code></pre>
+
+<div class="metric-row">
+  <div class="metric"><div class="value">240 GiB</div><div class="label">单分区日写</div></div>
+  <div class="metric"><div class="value">×12</div><div class="label">分区数</div></div>
+  <div class="metric"><div class="value">×7</div><div class="label">保留天数</div></div>
+  <div class="metric"><div class="value">×3</div><div class="label">副本因子</div></div>
+  <div class="metric"><div class="value">×1.3</div><div class="label">安全系数</div></div>
+  <div class="metric"><div class="value">76.8 TiB</div><div class="label">总容量</div></div>
+</div>
+
+<p>容量估算必须包含副本因子与安全系数。安全系数覆盖 reassignment 期间的双副本叠加(20%-30%)、压缩比波动(10%)、retention 删除滞后(数 GiB)——把这些因子省略后线上磁盘水位会比预期高 20-30%。</p>
+
+<h3>Broker 层基线配置</h3>
+
+<pre><code class="language-properties">log.dirs=/var/lib/kafka/data1,/var/lib/kafka/data2
+num.recovery.threads.per.data.dir=2
+log.segment.bytes=1073741824
+log.retention.hours=168
+log.retention.check.interval.ms=300000
+log.index.size.max.bytes=10485760
+log.index.interval.bytes=4096
+log.flush.offset.checkpoint.interval.ms=60000
+unclean.leader.election.enable=false
+min.insync.replicas=2
+</code></pre>
+
+<table>
+  <thead>
+    <tr><th>参数</th><th>推荐</th><th>作用</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>log.dirs</code></td><td>多目录</td><td>分散 I/O 到多块 SSD</td></tr>
+    <tr><td><code>num.recovery.threads.per.data.dir</code></td><td>2-4</td><td>并行恢复加速启动</td></tr>
+    <tr><td><code>log.segment.bytes</code></td><td>1 GiB</td><td>平衡文件数与恢复时间</td></tr>
+    <tr><td><code>log.retention.check.interval.ms</code></td><td>5 min</td><td>retention 扫描周期</td></tr>
+    <tr><td><code>unclean.leader.election.enable</code></td><td>false</td><td>防止数据丢失</td></tr>
+  </tbody>
+</table>
+
+<h3>Topic 层差异化配置</h3>
+
+<pre><code class="language-bash"># 事件流:按时间 + 字节保留
+kafka-configs.sh --bootstrap-server kafka-0:9092 \
+  --alter --entity-type topics --entity-name order-created \
+  --add-config cleanup.policy=delete,retention.ms=604800000,retention.bytes=53687091200,segment.bytes=1073741824
+
+# 状态表:按 key compact
+kafka-configs.sh --bootstrap-server kafka-0:9092 \
+  --alter --entity-type topics --entity-name order-state \
+  --add-config cleanup.policy=compact,min.cleanable.dirty.ratio=0.3,delete.retention.ms=86400000
+</code></pre>
+
+<table>
+  <thead>
+    <tr><th>业务类型</th><th>cleanup.policy</th><th>retention 策略</th><th>segment 大小</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>事件流</td><td>delete</td><td>时间 + 字节</td><td>1 GiB</td></tr>
+    <tr><td>状态表</td><td>compact</td><td>永久 + 容量限</td><td>256 MiB</td></tr>
+    <tr><td>临时计算</td><td>delete</td><td>1 小时</td><td>64 MiB</td></tr>
+    <tr><td>审计日志</td><td>delete</td><td>90 天 + 大容量</td><td>1 GiB</td></tr>
+  </tbody>
+</table>
+
+<h3>观测护栏</h3>
+
+<table>
+  <thead>
+    <tr><th>维度</th><th>指标 / 命令</th><th>绿色区间</th><th>立即关注</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>磁盘水位</td><td><code>df -h</code></td><td>&lt; 70%</td><td>&gt; 80% 仍增长</td></tr>
+    <tr><td>Segment 数量</td><td><code>*.log</code> 文件数</td><td>与预期一致</td><td>单分区 &gt; 5000</td></tr>
+    <tr><td>写入本地耗时</td><td>Produce LocalTimeMs</td><td>历史基线</td><td>P99 &gt; 50 ms</td></tr>
+    <tr><td>复制安全</td><td>UnderReplicatedPartitions</td><td>长期 0</td><td>持续 &gt; 0</td></tr>
+    <tr><td>恢复时间</td><td>"Completed load of log ... in X ms"</td><td>启动可预测</td><td>单分区分钟级</td></tr>
+    <tr><td>清理进度</td><td>"Deleting segment" 日志</td><td>按 segment 推进</td><td>长期不出现</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s2-10">2.10 源码深潜</h2>
+<!-- ============================================================ -->
+
+<p>把前面所有逻辑落到源码主干。Apache Kafka 3.7 KRaft 模式下,存储引擎的核心类已经从 Scala 迁移到 Java(<code>storage/</code> 模块),但顶层 <code>UnifiedLog</code> / <code>ReplicaManager</code> 仍是 Scala。下面给出真正参与写入路径的 8 个关键类,以及简化版 <code>appendAsLeader</code> / <code>append</code> 代码。</p>
+
+<h3>UnifiedLog 写入调用链</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 2-10-1 · KafkaApis → ReplicaManager → Partition → UnifiedLog → LogSegment 的完整调用链</div>
+  <svg viewBox="0 0 920 480" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+    <rect x="280" y="14" width="360" height="44" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="460" y="34" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">KafkaApis.handleProduceRequest</text>
+    <text x="460" y="50" text-anchor="middle" fill="#e9d5ff" font-size="10">scala/kafka/server/KafkaApis.scala</text>
+
+    <rect x="280" y="80" width="360" height="44" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="460" y="100" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">ReplicaManager.appendRecords</text>
+    <text x="460" y="116" text-anchor="middle" fill="#9bc4ff" font-size="10">分派到目标 Partition</text>
+
+    <rect x="280" y="144" width="360" height="44" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="460" y="164" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">Partition.appendRecordsToLeader</text>
+    <text x="460" y="180" text-anchor="middle" fill="#9bc4ff" font-size="10">校验 leaderEpoch + ISR</text>
+
+    <rect x="280" y="208" width="360" height="44" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="460" y="228" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">UnifiedLog.appendAsLeader</text>
+    <text x="460" y="244" text-anchor="middle" fill="#a3e0aa" font-size="10">写入主干入口</text>
+
+    <rect x="280" y="270" width="360" height="44" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="460" y="290" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">LogValidator.validateMessagesAndAssignOffsets</text>
+    <text x="460" y="306" text-anchor="middle" fill="#a3e0aa" font-size="10">CRC + magic + 分配 offset</text>
+
+    <polygon points="360,332 560,332 590,358 560,384 360,384 330,358" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="460" y="356" text-anchor="middle" fill="#fce8a3" font-size="12" font-weight="700">shouldRoll?</text>
+    <text x="460" y="372" text-anchor="middle" fill="#fce8a3" font-size="10">见 §2.3</text>
+
+    <rect x="60"  y="338" width="220" height="44" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="170" y="358" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">是 → LocalLog.roll</text>
+    <text x="170" y="374" text-anchor="middle" fill="#e9d5ff" font-size="10">new LogSegment(baseOffset)</text>
+
+    <rect x="640" y="338" width="220" height="44" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="750" y="358" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">否 → 用当前 active</text>
+    <text x="750" y="374" text-anchor="middle" fill="#a3e0aa" font-size="10">LogSegment.append</text>
+
+    <path d="M460,58  L460,80"  stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,124 L460,144" stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,188 L460,208" stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,252 L460,270" stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,314 L460,332" stroke="#7d8590" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M330,358 L280,358" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M590,358 L640,358" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <g font-size="10">
+      <rect x="40"  y="410" width="160" height="34" rx="5" fill="#0a1628" stroke="#58a6ff"/>
+      <text x="120" y="425" text-anchor="middle" fill="#9bc4ff" font-weight="700">FileRecords.append</text>
+      <text x="120" y="438" text-anchor="middle" fill="#7d8590">写 .log</text>
+
+      <rect x="210" y="410" width="160" height="34" rx="5" fill="#0a2810" stroke="#3fb950"/>
+      <text x="290" y="425" text-anchor="middle" fill="#a3e0aa" font-weight="700">OffsetIndex.append</text>
+      <text x="290" y="438" text-anchor="middle" fill="#7d8590">写 .index</text>
+
+      <rect x="380" y="410" width="160" height="34" rx="5" fill="#1a1308" stroke="#d29922"/>
+      <text x="460" y="425" text-anchor="middle" fill="#fce8a3" font-weight="700">TimeIndex.maybeAppend</text>
+      <text x="460" y="438" text-anchor="middle" fill="#7d8590">写 .timeindex</text>
+
+      <rect x="550" y="410" width="160" height="34" rx="5" fill="#1a0b14" stroke="#bc8cff"/>
+      <text x="630" y="425" text-anchor="middle" fill="#e9d5ff" font-weight="700">ProducerStateManager</text>
+      <text x="630" y="438" text-anchor="middle" fill="#7d8590">update PID seq</text>
+
+      <rect x="720" y="410" width="160" height="34" rx="5" fill="#1f0f12" stroke="#f85149"/>
+      <text x="800" y="425" text-anchor="middle" fill="#fbe0e0" font-weight="700">updateLogEndOffset</text>
+      <text x="800" y="438" text-anchor="middle" fill="#7d8590">LEO += N</text>
+    </g>
+    <path d="M460,384 L460,470" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="3 3" fill="none"/>
+    <path d="M460,470 L120,444" stroke="#7d8590" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,470 L290,444" stroke="#7d8590" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,470 L460,444" stroke="#7d8590" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,470 L630,444" stroke="#7d8590" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,470 L800,444" stroke="#7d8590" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<h3>核心源码入口</h3>
+
+<table>
+  <thead>
+    <tr><th>文件</th><th>关键类</th><th>职责</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>core/src/main/scala/kafka/server/ReplicaManager.scala</code></td><td><code>ReplicaManager</code></td><td>Produce / Fetch 入口</td></tr>
+    <tr><td><code>core/src/main/scala/kafka/cluster/Partition.scala</code></td><td><code>Partition</code></td><td>leader 校验、HW 推进</td></tr>
+    <tr><td><code>core/src/main/scala/kafka/log/UnifiedLog.scala</code></td><td><code>UnifiedLog</code></td><td>append / read / roll / retention</td></tr>
+    <tr><td><code>storage/src/main/java/.../LogSegment.java</code></td><td><code>LogSegment</code></td><td>单 segment 数据 + 索引</td></tr>
+    <tr><td><code>storage/src/main/java/.../LocalLog.java</code></td><td><code>LocalLog</code></td><td>segment 集合管理</td></tr>
+    <tr><td><code>storage/src/main/java/.../OffsetIndex.java</code></td><td><code>OffsetIndex</code></td><td>offset 稀疏索引</td></tr>
+    <tr><td><code>storage/src/main/java/.../TimeIndex.java</code></td><td><code>TimeIndex</code></td><td>timestamp 稀疏索引</td></tr>
+    <tr><td><code>clients/src/main/java/.../FileRecords.java</code></td><td><code>FileRecords</code></td><td>FileChannel 封装</td></tr>
+  </tbody>
+</table>
+
+<h3>UnifiedLog.appendAsLeader 简化代码</h3>
+
+<pre><code class="language-scala">def appendAsLeader(records: MemoryRecords,
+                   leaderEpoch: Int,
+                   origin: AppendOrigin): LogAppendInfo = {
+  val validateResult = LogValidator.validateMessagesAndAssignOffsets(
+    records, topicPartition, offsetCounter, time,
+    now, appendInfo.sourceCompression, targetCompression,
+    config.compact, magicValue, timestampType)
+
+  val segment = maybeRoll(validateResult.validatedRecords.sizeInBytes,
+                          validateResult.maxTimestamp,
+                          validateResult.shallowOffsetOfMaxTimestamp)
+
+  segment.append(largestOffset = appendInfo.lastOffset,
+                 largestTimestamp = appendInfo.maxTimestamp,
+                 shallowOffsetOfMaxTimestamp = appendInfo.shallowOffsetOfMaxTimestamp,
+                 records = validateResult.validatedRecords)
+
+  updateLogEndOffset(appendInfo.lastOffset + 1)
+  appendInfo
+}
+</code></pre>
+
+<h3>LogSegment.append 简化代码</h3>
+
+<pre><code class="language-scala">def append(largestOffset: Long,
+           largestTimestamp: Long,
+           shallowOffsetOfMaxTimestamp: Long,
+           records: MemoryRecords): Unit = {
+  val physicalPosition = log.sizeInBytes()
+  log.append(records)
+  if (largestTimestamp > maxTimestampSoFar) {
+    maxTimestampSoFar = largestTimestamp
+    offsetOfMaxTimestampSoFar = shallowOffsetOfMaxTimestamp
+  }
+  if (bytesSinceLastIndexEntry > indexIntervalBytes) {
+    offsetIndex.append(largestOffset, physicalPosition)
+    timeIndex.maybeAppend(maxTimestampSoFar, offsetOfMaxTimestampSoFar)
+    bytesSinceLastIndexEntry = 0
+  }
+  bytesSinceLastIndexEntry += records.sizeInBytes
+}
+</code></pre>
+
+<h3>设计取舍 1:append-only vs 原地更新</h3>
+
+<p>原地更新需要 B-Tree 或 LSM 类结构维护索引,在崩溃恢复时需要重放 WAL 与回滚未提交事务。Kafka 的消息语义只需 "已确认的写入不丢",append-only + 副本协议是该语义下最简实现。代价是不支持原地修改,该需求由 compaction 与上层应用合并解决。</p>
+
+<h3>设计取舍 2:sparse index vs full index</h3>
+
+<p>Full index 让点查询省去最后 4 KiB 扫描,但 mmap 体积增长 100 倍,索引追加频率与数据写入持平。在 Kafka 的范围扫描为主的访问模式下,4 KiB 顺序扫描在 page cache 命中时 < 1 微秒,远小于网络传输开销。Sparse index 是该访问模式下的最优解。</p>
+
+<h3>设计取舍 3:副本冗余 vs 单机 fsync</h3>
+
+<p>每条消息 fsync 在 NVMe 上需 50-200 微秒,在 HDD 上需 5-20 毫秒,写入吞吐受限于 disk IOPS。3 副本协议 + <code>acks=all</code> 在异步刷盘下可承受单机故障,P99 延迟降至 5-20 毫秒。Kafka 选择前者,生产配置中 <code>log.flush.interval.messages</code> 应保持默认 Long.MAX。</p>
+
+<h3>设计取舍 4:整段 retention vs 逐条删除</h3>
+
+<p>逐条删除会破坏 <code>.log</code> 的顺序追加性质,引入读放大。整段 retention 让删除变为 <code>unlink</code> + <code>mmap</code> 释放,O(1) 操作。代价是 retention 精度受 segment 大小限制——通常 <code>segment.bytes / 写入速率 = retention 精度</code>,1 GiB segment 在 100 MiB/s 写入下精度约 10 秒。</p>
+
+<div class="key-insight">
+  <strong>4 个设计取舍互为前提,不能单独评估</strong>。Append-only 让 retention 整段做才可行(不破坏顺序追加),sparse index 让 page cache 装得下(否则索引就成了瓶颈),副本协议让 fsync 不必每条做(否则吞吐崩),整段 retention 让 unlink 是 O(1)(否则删除成了 IO 瓶颈)。这 4 个选择是<strong>同一个工程哲学的 4 个面</strong>:把磁盘当顺序流来用,把内核当一级缓存来用,把网络副本当持久化来用,把 segment 当资源单位来管理。理解这一层后,Kafka 的所有 "奇怪默认配置" 都变成必然——<code>log.flush.interval.messages=Long.MAX</code> 不是 "懒",是 "整套架构的一致性约束"。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s2-11">2.11 陷阱与常见误解</h2>
+<!-- ============================================================ -->
+
+<p>所有上面的原理都是 "好状态下的 Kafka"。生产里 90% 的事故都是配置反模式 + 内核参数没调 + 容量预估错误的叠加。本节给出 10 类高频陷阱,每条含 "症状 / 根因 / 修复 / 监控" 四列对照——遇到事故时按图索骥。</p>
+
+<h3>存储引擎陷阱分类</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 2-11-1 · 10 类陷阱按 "容量 / 延迟 / 持久性 / 运维" 四象限</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+    <rect x="370" y="14" width="180" height="44" rx="10" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="460" y="34" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">存储引擎陷阱</text>
+    <text x="460" y="50" text-anchor="middle" fill="#e9d5ff" font-size="10">10 类生产高频问题</text>
+
+    <rect x="40"  y="90" width="200" height="44" rx="9" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="140" y="110" text-anchor="middle" fill="#fce8a3" font-size="13" font-weight="700">容量类</text>
+    <text x="140" y="126" text-anchor="middle" fill="#fce8a3" font-size="10">磁盘水位 / 文件数</text>
+
+    <rect x="260" y="90" width="200" height="44" rx="9" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="360" y="110" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">延迟类</text>
+    <text x="360" y="126" text-anchor="middle" fill="#9bc4ff" font-size="10">P99 跳变</text>
+
+    <rect x="480" y="90" width="200" height="44" rx="9" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="580" y="110" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">持久性类</text>
+    <text x="580" y="126" text-anchor="middle" fill="#fbe0e0" font-size="10">数据丢失风险</text>
+
+    <rect x="700" y="90" width="200" height="44" rx="9" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="800" y="110" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">运维类</text>
+    <text x="800" y="126" text-anchor="middle" fill="#a3e0aa" font-size="10">启动 / 资源上限</text>
+
+    <path d="M420,58 L140,90" stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M450,58 L360,90" stroke="#58a6ff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M470,58 L580,90" stroke="#f85149" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M500,58 L800,90" stroke="#3fb950" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+
+    <g font-size="11">
+      <rect x="40"  y="160" width="200" height="34" rx="5" fill="#1a1308" stroke="#d29922"/>
+      <text x="140" y="180" text-anchor="middle" fill="#fce8a3" font-weight="700">① retention 不删 active</text>
+      <rect x="40"  y="200" width="200" height="34" rx="5" fill="#1a1308" stroke="#d29922"/>
+      <text x="140" y="220" text-anchor="middle" fill="#fce8a3" font-weight="700">② 仅设 retention.ms</text>
+      <rect x="40"  y="240" width="200" height="34" rx="5" fill="#1a1308" stroke="#d29922"/>
+      <text x="140" y="260" text-anchor="middle" fill="#fce8a3" font-weight="700">③ reassign 撞磁盘</text>
+
+      <rect x="260" y="160" width="200" height="34" rx="5" fill="#0a1628" stroke="#58a6ff"/>
+      <text x="360" y="180" text-anchor="middle" fill="#9bc4ff" font-weight="700">④ fsync 每条</text>
+      <rect x="260" y="200" width="200" height="34" rx="5" fill="#0a1628" stroke="#58a6ff"/>
+      <text x="360" y="220" text-anchor="middle" fill="#9bc4ff" font-weight="700">⑤ segment 太小</text>
+      <rect x="260" y="240" width="200" height="34" rx="5" fill="#0a1628" stroke="#58a6ff"/>
+      <text x="360" y="260" text-anchor="middle" fill="#9bc4ff" font-weight="700">⑥ THP 写放大</text>
+
+      <rect x="480" y="160" width="200" height="34" rx="5" fill="#1f0f12" stroke="#f85149"/>
+      <text x="580" y="180" text-anchor="middle" fill="#fbe0e0" font-weight="700">⑦ compact + null key</text>
+      <rect x="480" y="200" width="200" height="34" rx="5" fill="#1f0f12" stroke="#f85149"/>
+      <text x="580" y="220" text-anchor="middle" fill="#fbe0e0" font-weight="700">⑧ unclean.leader=true</text>
+
+      <rect x="700" y="160" width="200" height="34" rx="5" fill="#0a2810" stroke="#3fb950"/>
+      <text x="800" y="180" text-anchor="middle" fill="#a3e0aa" font-weight="700">⑨ recovery 时间长</text>
+      <rect x="700" y="200" width="200" height="34" rx="5" fill="#0a2810" stroke="#3fb950"/>
+      <text x="800" y="220" text-anchor="middle" fill="#a3e0aa" font-weight="700">⑩ fd 上限耗尽</text>
+    </g>
+
+    <rect x="40" y="300" width="840" height="60" rx="10" fill="#0d1117" stroke="#bc8cff" stroke-dasharray="3 3"/>
+    <text x="460" y="320" text-anchor="middle" fill="#bc8cff" font-weight="700" font-size="12">每条陷阱在下文 "症状 / 根因 / 修复 / 监控" 四列对照表中详细展开</text>
+    <text x="460" y="340" text-anchor="middle" fill="#e6edf3" font-size="11">遇到事故时:先按现象定位象限 → 再按编号查表 → 拿监控指标确认</text>
+  </svg>
+</div>
+
+<h3>10 条陷阱明细</h3>
+
+<table>
+  <thead>
+    <tr><th>#</th><th>陷阱</th><th>症状</th><th>根因</th><th>修复</th><th>监控</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td>retention 不删 active segment</td><td>配置正确但磁盘仍涨</td><td>active 永远不会被删除</td><td>缩 <code>segment.ms</code> 让 active 尽快 roll</td><td>LogStartOffset</td></tr>
+    <tr><td>2</td><td>仅设 <code>retention.ms</code></td><td>突发流量后磁盘满</td><td>时间维度无法约束峰值</td><td>同时配 <code>retention.bytes</code></td><td>df 水位</td></tr>
+    <tr><td>3</td><td>Reassignment 期间撞磁盘</td><td><code>No space left on device</code></td><td>future replica 与旧副本共存</td><td>水位 &gt; 80% 暂停 reassign</td><td>LogDirSize</td></tr>
+    <tr><td>4</td><td><code>log.flush.interval.messages=1</code></td><td>Produce LocalTimeMs 飙升</td><td>每条消息同步刷盘</td><td>改用 RF=3 + min.ISR=2 + acks=all</td><td>LogFlushRateAndTimeMs</td></tr>
+    <tr><td>5</td><td><code>segment.bytes=1 MiB</code></td><td>文件数暴涨</td><td>每分区数千 segment</td><td>调大到 64 MiB+</td><td><code>*.log</code> 数量</td></tr>
+    <tr><td>6</td><td>THP 开启</td><td>CoW 写放大 + page cache 抖动</td><td>2 MiB 大页</td><td><code>transparent_hugepage=never</code></td><td>内核日志</td></tr>
+    <tr><td>7</td><td>Compact topic 写 null key</td><td>LogCleaner 报错</td><td>compact 要求非空 key</td><td>应用层强制 key 校验</td><td>cleaner 日志</td></tr>
+    <tr><td>8</td><td><code>unclean.leader.election=true</code></td><td>leader 切换后丢消息</td><td>out-of-sync 副本被选为 leader</td><td>设为 false</td><td>OfflinePartitionsCount</td></tr>
+    <tr><td>9</td><td>Broker 启动卡 recovery</td><td>启动数分钟</td><td>非干净停机 + 大 segment</td><td>干净停机 + 调小 segment</td><td>"Recovering unflushed segment" 日志</td></tr>
+    <tr><td>10</td><td><code>Too many open files</code></td><td>broker 拒绝新连接</td><td>分区 × segment × 3</td><td><code>ulimit -n 1048576</code></td><td><code>lsof | wc -l</code></td></tr>
+  </tbody>
+</table>
+
+<h3>反模式 vs 正模式对照</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4>反模式</h4>
+<pre><code class="language-properties">segment.bytes=1048576              # 1 MiB
+cleanup.policy=delete
+retention.ms=604800000             # 7 天
+retention.bytes=-1                 # 无限制
+log.flush.interval.messages=1000   # 误以为更安全
+unclean.leader.election.enable=true
+vm.swappiness=60                   # 默认</code></pre>
+    <p style="margin-top:8px;font-size:12px;color:#f85149;">
+    现象:<br/>
+    单分区 60 万 segment,fd 用尽<br/>
+    突发流量打满磁盘<br/>
+    主备切换后丢消息<br/>
+    Produce P99 100-500 ms
+    </p>
+  </div>
+  <div class="compare-good">
+    <h4>正模式</h4>
+<pre><code class="language-properties">segment.bytes=1073741824           # 1 GiB
+cleanup.policy=delete
+retention.ms=604800000
+retention.bytes=53687091200        # 50 GiB
+log.flush.interval.messages=Long.MAX
+unclean.leader.election.enable=false
+default.replication.factor=3
+min.insync.replicas=2
+
+# 系统层
+vm.swappiness=1
+transparent_hugepage=never
+ulimit -n 1048576</code></pre>
+    <p style="margin-top:8px;font-size:12px;color:#3fb950;">
+    期望:<br/>
+    UnderReplicatedPartitions=0<br/>
+    OfflinePartitionsCount=0<br/>
+    LogFlushRateAndTimeMs ≈ 0<br/>
+    Produce P99 &lt; 20 ms
+    </p>
+  </div>
+</div>
+
+<h3>事故现场首轮检查命令</h3>
+
+<table>
+  <thead>
+    <tr><th>命令</th><th>用途</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>df -h /var/lib/kafka/data</code></td><td>磁盘水位</td></tr>
+    <tr><td><code>kafka-log-dirs.sh --describe</code></td><td>分区分布与大小</td></tr>
+    <tr><td><code>kafka-configs.sh --describe --entity-type topics</code></td><td>topic 当前生效配置</td></tr>
+    <tr><td><code>grep "Recovering unflushed" server.log</code></td><td>异常恢复痕迹</td></tr>
+    <tr><td><code>lsof -p &lt;kafka-pid&gt; | wc -l</code></td><td>fd 占用</td></tr>
+    <tr><td><code>cat /proc/&lt;pid&gt;/limits</code></td><td>进程级 limit</td></tr>
+  </tbody>
+</table>
+
+<div class="warning">
+  <strong>unclean.leader.election.enable=true 是数据丢失的最大单点风险</strong> — 在某些"高可用胜过一致性"的早期教程里,这个开关被建议设为 true,理由是 "ISR 全挂时也能选主继续服务"。问题是:被选为 leader 的副本可能比原 leader 落后几秒到几分钟,新 leader 上线后 truncate 掉超出自己 LEO 的部分,这部分数据从此丢失。生产里这个开关应永远是 <code>false</code> — 宁可分区暂时不可用,也不能让 acks=all 已经确认的消息丢失。监控 <code>OfflinePartitionsCount &gt; 0</code> 时立刻人工介入,不要靠 unclean 选主自动 "恢复"。
+</div>
+
+<!-- ============================================================ -->
+<!-- Chapter Summary -->
+<!-- ============================================================ -->
+
+<div class="chapter-summary" id="s2-summary">
+  <h2>2.12 本章要点</h2>
+  <table>
+    <thead>
+      <tr><th>关注点</th><th>核心 API / 设计</th><th>关键建议</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>存储单位</td><td>TopicPartition 目录 · <code>log.dirs/&lt;topic&gt;-&lt;partition&gt;/</code></td><td>仅看 topic 配置不够 · 监控 / 备份都要落到 partition</td></tr>
+      <tr><td>追加写模型</td><td><code>UnifiedLog.appendAsLeader</code> · <code>FileChannel.write</code></td><td>active segment 尾部接受追加 · 无 fsync · 持久性靠副本</td></tr>
+      <tr><td>Segment 滚动</td><td><code>shouldRoll()</code> 5 条件</td><td>bytes / ms / .index 满 / .timeindex 满 / relativeOffset 溢出 任一即 roll</td></tr>
+      <tr><td>稀疏索引</td><td><code>log.index.interval.bytes=4096</code></td><td>体积 ≈ 数据量 × 0.2% · 查找 O(log) + 顺序扫 ≤ 4 KiB</td></tr>
+      <tr><td>写入路径</td><td>FileChannel.write → page cache</td><td>不显式 fsync · 内核异步刷盘 · ISR 推进 HW 后才返回客户端</td></tr>
+      <tr><td>Recovery</td><td><code>recovery-point-offset-checkpoint</code></td><td>从 checkpoint 之后扫描 · 干净停机 vs 非干净停机差几个数量级</td></tr>
+      <tr><td>Cleanup</td><td><code>cleanup.policy=delete | compact</code></td><td>delete 整段淘汰 · compact 按 key 重写 · LogCleaner .cleaned/.swap/.deleted 三阶段</td></tr>
+      <tr><td>并发模型</td><td>closed segment 不可变 + active 单写</td><td>多 consumer + follower 无锁并发读 · 单分区 append 串行</td></tr>
+      <tr><td>可见性</td><td>HW(read_uncommitted)· LSO(read_committed)</td><td>HW = min(LEO of ISR)· 副本切换后保证至少恢复到原 HW</td></tr>
+      <tr><td>容量估算</td><td>日均 × 保留 × RF × 安全系数</td><td>必须含副本因子 + 1.3 安全系数 · 覆盖 reassign 临时叠加</td></tr>
+      <tr><td>关键内核参数</td><td>vm.dirty_ratio · vm.swappiness · vm.max_map_count · THP</td><td>dirty_ratio 60-80 + swappiness=1 + THP=never · 必须配齐</td></tr>
+      <tr><td>10 类陷阱</td><td>retention 不删 active · fsync 每条 · segment 太小 · unclean=true · ...</td><td>按容量 / 延迟 / 持久性 / 运维 四象限对照</td></tr>
+    </tbody>
+  </table>
+
+  <h3 style="color:#3fb950;border-bottom:none;font-size:16px;margin-top:18px;">最小回归验证</h3>
+
+<pre><code class="language-bash">kafka-topics.sh --bootstrap-server kafka-0:9092 \
+  --create --topic ch02-verify --partitions 1 --replication-factor 3 \
+  --config segment.bytes=1048576
+
+for i in $(seq 1 10000); do
+  echo "k$i:v$i"
+done | kafka-console-producer.sh \
+  --bootstrap-server kafka-0:9092 \
+  --topic ch02-verify \
+  --property parse.key=true \
+  --property key.separator=:
+
+ls /var/lib/kafka/data/ch02-verify-0/
+kafka-dump-log.sh \
+  --files /var/lib/kafka/data/ch02-verify-0/00000000000000000000.index | head
+</code></pre>
+
+<pre><code>00000000000000000000.log
+00000000000000000000.index
+00000000000000000000.timeindex
+00000000000000005120.log
+00000000000000005120.index
+00000000000000005120.timeindex
+leader-epoch-checkpoint
+partition.metadata
+</code></pre>
+
+<pre><code>offset: 511 position: 4096
+offset: 1023 position: 8192
+offset: 1535 position: 12288
+</code></pre>
+
+  <p class="next-hint">下一章 <a href="03-record-format.html">第 3 章 · 消息格式</a> 把 <code>.log</code> 内部拆开:RecordBatch 头部的 64 字节固定布局、单条 Record 的 varint 编码、producer 幂等字段(producerId / producerEpoch / sequence)、事务标记(isTransactional / controlBatch),以及 magic v0 / v1 / v2 三个版本的兼容策略。本章把分区日志看成 segment 文件序列,下一章则进入 segment 内的字节流——你会看到 batch 级压缩、CRC、attribute 字段是如何在 32 位整数与 varint 编码之间精打细算地省下每一字节的。</p>
+</div>
+
+<!-- ============================================================ -->
+<!-- Chapter navigation -->
+<!-- ============================================================ -->
+<div class="chapter-nav">
+  <a href="01-architecture-overview.html">&larr; 第 1 章 &middot; 架构总览</a>
+  <a href="03-record-format.html">第 3 章 &middot; 消息格式 &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 Kafka &middot; 第 2 章 &middot; 日志存储引擎</p>
+
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+mermaid.initialize({startOnLoad:true,theme:'dark',themeVariables:{primaryColor:'#58a6ff',primaryTextColor:'#e6edf3',primaryBorderColor:'#30363d',lineColor:'#8b949e',secondaryColor:'#161b22',tertiaryColor:'#0d1117',background:'#161b22',mainBkg:'#161b22',nodeBorder:'#30363d',clusterBkg:'rgba(22,27,34,.5)',clusterBorder:'#30363d',titleColor:'#e6edf3',edgeLabelBackground:'#161b22',fontSize:'13px'},flowchart:{curve:'basis',padding:8,nodeSpacing:20,rankSpacing:30,useMaxWidth:true,htmlLabels:true},sequence:{useMaxWidth:true,actorMargin:30},state:{useMaxWidth:true}});
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/scala.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){setTimeout(function(){document.querySelectorAll('.mermaid svg,.diagram svg').forEach(function(svg){var h=parseInt(svg.getAttribute('height')||svg.getBoundingClientRect().height);if(h>500){svg.style.maxHeight='500px';svg.style.width='auto';var p=svg.closest('.diagram');if(p)p.style.overflowX='auto';}});},1500);});</script>
+</body>
+</html>

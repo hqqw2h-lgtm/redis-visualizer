@@ -1,0 +1,2077 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lucene 图解 - 第 27 章 · .pay 载荷与偏移文件</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="g-blue" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1f6feb" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#0d2a5b" stop-opacity="0.7"/>
+    </linearGradient>
+    <linearGradient id="g-green" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3fb950" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#0f3a1c" stop-opacity="0.7"/>
+    </linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#d29922" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#5b3a0a" stop-opacity="0.7"/>
+    </linearGradient>
+    <linearGradient id="g-red" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f85149" stop-opacity="0.40"/>
+      <stop offset="1" stop-color="#5b1010" stop-opacity="0.7"/>
+    </linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#bc8cff" stop-opacity="0.40"/>
+      <stop offset="1" stop-color="#3a1a5b" stop-opacity="0.7"/>
+    </linearGradient>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#58a6ff"/>
+    </marker>
+    <marker id="arr-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3fb950"/>
+    </marker>
+    <marker id="arr-o" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#d29922"/>
+    </marker>
+    <marker id="arr-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#f85149"/>
+    </marker>
+    <marker id="arr-p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#bc8cff"/>
+    </marker>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Lucene</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="26-pos-positions-file.html">上一章</a>
+  <a href="28-fdt-stored-fields-data-file.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s27-0">27.0 章首速览</a>
+  <a href="#s27-1">27.1 文件用途与触发条件</a>
+  <a href="#s27-2">27.2 文件命名与定位</a>
+  <a href="#s27-3">27.3 整体字节布局</a>
+  <a href="#s27-4">27.4 Payload Block 字节布局</a>
+  <a href="#s27-5">27.5 Offset Block 字节布局</a>
+  <a href="#s27-6">27.6 长度与字节分离的编码原理</a>
+  <a href="#s27-7">27.7 Payload 内容自由度</a>
+  <a href="#s27-8">27.8 写入路径</a>
+  <a href="#s27-9">27.9 读取路径</a>
+  <a href="#s27-10">27.10 高亮路径(UnifiedHighlighter)</a>
+  <a href="#s27-11">27.11 Payload Scoring 路径</a>
+  <a href="#s27-12">27.12 性能基线</a>
+  <a href="#s27-13">27.13 陷阱与限制</a>
+  <a href="#s27-14">27.14 本章要点</a>
+  <a href="#s27-summary">本章小结</a>
+</aside>
+
+<div class="article">
+
+<h1>第 27 章 · .pay 载荷与偏移文件</h1>
+<p class="subtitle">.pay 载荷与偏移 · payload bytes · offset deltas · UnifiedHighlighter · FastVectorHighlighter · 长度/字节分离 · 128-position block</p>
+
+<div class="chapter-intro">
+  <p class="lead"><code>.pay</code> 是 Lucene 倒排索引中专门用来盛放 <strong>payload 字节流</strong> 与 <strong>字符级 offset</strong>(<code>startOffset</code> / <code>endOffset</code>)的物理文件。它与 <code>.doc</code>(docID + freq)、<code>.pos</code>(positions + payloadLengths)是同一族的"姊妹文件",仅当字段开启 <code>setStorePayloads(true)</code> 或 <code>IndexOptions</code> 含 <code>OFFSETS</code> 时才会被 codec 创建。</p>
+  <p><code>.pay</code> 的设计哲学是 <strong>"长度元数据 / 字节载荷"分离</strong>:每个 128-position block 把 <em>长度</em>(payloadLength、offsetLength)留在 <code>.pos</code>,把 <em>字节</em>(payload bytes、offset deltas)放在 <code>.pay</code>。短语查询、邻近查询不需要 payload/offset,只读 <code>.pos</code> 即可,完全跳过 <code>.pay</code> 的 I/O;高亮、自定义评分场景需要载荷或偏移时才追加读 <code>.pay</code>。这种"按需读取"是 Lucene 倒排家族 7 个文件能在 ~ms 内完成短语 + 高亮的核心架构。</p>
+  <ul class="will-learn">
+    <li>.pay 触发条件:<code>storePayloads</code> / <code>OFFSETS</code> / <code>POSITIONS_AND_OFFSETS</code> 三种 IndexOptions 组合的生成矩阵</li>
+    <li>.pay 字节布局:Header(magic + codecName + objectID)、Per-Term Payload Blocks、Per-Term Offset Blocks、Footer(checksum)</li>
+    <li>Payload Block 的字节流:<code>VInt(byteCount)</code> + raw bytes,无分隔符,切分依赖 <code>.pos</code> 的 <code>payloadLengths</code></li>
+    <li>Offset Block 的双 PackedInts 编码:<code>offsetStartDeltaBits</code> + <code>offsetStartDeltas</code>,<code>offsetLengthBits</code> + <code>offsetLengths</code></li>
+    <li>为什么 VInt tail(尾部 &lt; 128 position)不进 .pay:128-block 才走 PackedInts,tail 全部内联回 .pos</li>
+    <li>写入路径:<code>Lucene90PostingsWriter.addPosition()</code> 如何把 payload/offset 分流到 <code>posOut</code> 与 <code>payOut</code></li>
+    <li>读取路径:<code>BlockPostingsEnum.getPayload()</code> / <code>startOffset()</code> 的 lazy decoding,只在 hot loop 真正访问时才解 <code>.pay</code></li>
+    <li>高亮路径:<code>UnifiedHighlighter</code> / <code>FastVectorHighlighter</code> 如何用 offset 在毫秒级生成 &lt;mark&gt; 片段</li>
+    <li>Payload Scoring:<code>DelimitedPayloadTokenFilter</code> + <code>PayloadFunction</code> + <code>PayloadDecoder</code> 的全链路</li>
+    <li>性能基线:payload 体积爆炸的临界点、offset 解码与 analyzer 一致性的常见陷阱</li>
+  </ul>
+  <p class="prereq">前置:第 25 章 <code>.doc</code>(docID + freq);第 26 章 <code>.pos</code>(positions + payloadLengths,本章的"姊妹文件");第 11 章 PostingsEnum / SkipList(理解 advance + nextPosition 的 hot loop);第 13 章 PackedInts(<code>offsetStartDeltas</code> / <code>offsetLengths</code> 的底层编码);第 02 章 Analyzer(<code>PayloadAttribute</code> / <code>OffsetAttribute</code> 是 token 上的元数据);第 17 章 storedFields LZ4 压缩(对比 .pay 的 raw 字节布局)。</p>
+</div>
+
+
+<p>
+<code>.pay</code> 文件保存倒排索引中每个词项 (term) 的 payload 字节流与字符级 offset (起始字符索引、长度)。文件仅在字段开启 <code>setStorePayloads(true)</code> 或 IndexOptions 含 <code>OFFSETS</code> 时生成,与 .doc / .pos 配套出现。
+</p>
+<p>
+<code>.pay</code> 与 .pos 的分工是物理布局上的优化:.pos 保存 position 序列与每位置的 payload/offset 长度元数据,.pay 保存对应的 payload 原始字节与 offset 数值。这样同一个 128-position block 内的"长度信息"与"载荷数据"分离,使得仅需 position 的查询(短语、邻近)只读 .pos,而需要载荷或偏移的查询(高亮、自定义评分)再读 .pay。
+</p>
+<p>
+本章用字节级视图拆解 .pay 的物理布局,讨论它与 .pos 之间的指针对齐,以及 PostingsHighlighter / FastVectorHighlighter 在毫秒级生成命中片段时如何利用 offset。
+</p>
+<!-- ============================================================ -->
+<h2 id="s27-0">27.0 章首速览</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 27-0-1:.pay 在文件家族中的位置</div>
+<svg viewBox="0 0 1240 540" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+  <g font-size="13" font-weight="700">
+    <rect x="490" y="20" width="260" height="60" rx="14" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="620" y="46" text-anchor="middle" fill="#ffd5d5">.pay 载荷与偏移文件</text>
+    <text x="620" y="65" text-anchor="middle" fill="#ffadad" font-size="10" font-weight="500">payload bytes + offset deltas · 高亮坐标</text>
+  </g>
+
+  <g font-size="11" font-weight="700">
+    <rect x="20"   y="170" width="190" height="56" rx="12" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="115" y="194" text-anchor="middle" fill="#cfe9ff">§27.1–27.2</text>
+    <text x="115" y="212" text-anchor="middle" fill="#a5d6ff" font-size="10">触发与命名</text>
+
+    <rect x="230"  y="170" width="190" height="56" rx="12" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="325" y="194" text-anchor="middle" fill="#ffd591">§27.3–27.5</text>
+    <text x="325" y="212" text-anchor="middle" fill="#ffe4ad" font-size="10">字节布局</text>
+
+    <rect x="440"  y="170" width="190" height="56" rx="12" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="535" y="194" text-anchor="middle" fill="#9be7b3">§27.6–27.7</text>
+    <text x="535" y="212" text-anchor="middle" fill="#bff5cb" font-size="10">长度/字节分离</text>
+
+    <rect x="650"  y="170" width="190" height="56" rx="12" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="745" y="194" text-anchor="middle" fill="#e6d3ff">§27.8–27.9</text>
+    <text x="745" y="212" text-anchor="middle" fill="#cfb8ff" font-size="10">写入 + 读取</text>
+
+    <rect x="860"  y="170" width="180" height="56" rx="12" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="950" y="194" text-anchor="middle" fill="#cfe9ff">§27.10–27.11</text>
+    <text x="950" y="212" text-anchor="middle" fill="#a5d6ff" font-size="10">高亮 + Scoring</text>
+
+    <rect x="1060" y="170" width="180" height="56" rx="12" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="1150" y="194" text-anchor="middle" fill="#ffd5d5">§27.12–27.14</text>
+    <text x="1150" y="212" text-anchor="middle" fill="#ffadad" font-size="10">性能 + 陷阱</text>
+  </g>
+
+  <g font-size="10" font-weight="600">
+    <rect x="20"  y="320" width="190" height="40" rx="8" fill="rgba(88,166,255,0.10)" stroke="#58a6ff" stroke-dasharray="4 3"/>
+    <text x="115" y="345" text-anchor="middle" fill="#a5d6ff">storePayloads + OFFSETS</text>
+    <rect x="20"  y="368" width="190" height="40" rx="8" fill="rgba(88,166,255,0.10)" stroke="#58a6ff" stroke-dasharray="4 3"/>
+    <text x="115" y="393" text-anchor="middle" fill="#a5d6ff">per-segment 文件名</text>
+
+    <rect x="230" y="320" width="190" height="40" rx="8" fill="rgba(255,165,0,0.10)" stroke="#d29922" stroke-dasharray="4 3"/>
+    <text x="325" y="345" text-anchor="middle" fill="#ffd591">Header(magic+codec)</text>
+    <rect x="230" y="368" width="190" height="40" rx="8" fill="rgba(255,165,0,0.10)" stroke="#d29922" stroke-dasharray="4 3"/>
+    <text x="325" y="393" text-anchor="middle" fill="#ffd591">Per-Term Payload Blocks</text>
+    <rect x="230" y="416" width="190" height="40" rx="8" fill="rgba(255,165,0,0.10)" stroke="#d29922" stroke-dasharray="4 3"/>
+    <text x="325" y="441" text-anchor="middle" fill="#ffd591">Per-Term Offset Blocks</text>
+
+    <rect x="440" y="320" width="190" height="40" rx="8" fill="rgba(63,185,80,0.10)" stroke="#3fb950" stroke-dasharray="4 3"/>
+    <text x="535" y="345" text-anchor="middle" fill="#9be7b3">.pos 写长度元数据</text>
+    <rect x="440" y="368" width="190" height="40" rx="8" fill="rgba(63,185,80,0.10)" stroke="#3fb950" stroke-dasharray="4 3"/>
+    <text x="535" y="393" text-anchor="middle" fill="#9be7b3">.pay 写原始字节</text>
+
+    <rect x="650" y="320" width="190" height="40" rx="8" fill="rgba(188,140,255,0.10)" stroke="#bc8cff" stroke-dasharray="4 3"/>
+    <text x="745" y="345" text-anchor="middle" fill="#e6d3ff">addPosition 分流</text>
+    <rect x="650" y="368" width="190" height="40" rx="8" fill="rgba(188,140,255,0.10)" stroke="#bc8cff" stroke-dasharray="4 3"/>
+    <text x="745" y="393" text-anchor="middle" fill="#e6d3ff">getPayload + startOffset</text>
+
+    <rect x="860" y="320" width="180" height="40" rx="8" fill="rgba(88,166,255,0.10)" stroke="#58a6ff" stroke-dasharray="4 3"/>
+    <text x="950" y="345" text-anchor="middle" fill="#a5d6ff">UnifiedHighlighter</text>
+    <rect x="860" y="368" width="180" height="40" rx="8" fill="rgba(88,166,255,0.10)" stroke="#58a6ff" stroke-dasharray="4 3"/>
+    <text x="950" y="393" text-anchor="middle" fill="#a5d6ff">FastVectorHighlighter</text>
+
+    <rect x="1060" y="320" width="180" height="40" rx="8" fill="rgba(248,81,73,0.10)" stroke="#f85149" stroke-dasharray="4 3"/>
+    <text x="1150" y="345" text-anchor="middle" fill="#ffadad">payload 体积爆炸</text>
+    <rect x="1060" y="368" width="180" height="40" rx="8" fill="rgba(248,81,73,0.10)" stroke="#f85149" stroke-dasharray="4 3"/>
+    <text x="1150" y="393" text-anchor="middle" fill="#ffadad">offset 与 analyzer 一致性</text>
+  </g>
+
+  <g fill="none" stroke-width="1.5">
+    <path d="M620,80 C620,128 115,128 115,170" stroke="#58a6ff" marker-end="url(#arr)"/>
+    <path d="M620,80 C620,128 325,128 325,170" stroke="#d29922" marker-end="url(#arr-o)"/>
+    <line x1="620" y1="80" x2="535" y2="170" stroke="#3fb950" marker-end="url(#arr-g)"/>
+    <line x1="620" y1="80" x2="745" y2="170" stroke="#bc8cff" marker-end="url(#arr-p)"/>
+    <path d="M620,80 C620,128 950,128 950,170" stroke="#58a6ff" marker-end="url(#arr)"/>
+    <path d="M620,80 C620,128 1150,128 1150,170" stroke="#f85149" marker-end="url(#arr-r)"/>
+
+    <line x1="115"  y1="226" x2="115"  y2="320" stroke="#58a6ff" marker-end="url(#arr)"/>
+    <line x1="325"  y1="226" x2="325"  y2="320" stroke="#d29922" marker-end="url(#arr-o)"/>
+    <line x1="535"  y1="226" x2="535"  y2="320" stroke="#3fb950" marker-end="url(#arr-g)"/>
+    <line x1="745"  y1="226" x2="745"  y2="320" stroke="#bc8cff" marker-end="url(#arr-p)"/>
+    <line x1="950"  y1="226" x2="950"  y2="320" stroke="#58a6ff" marker-end="url(#arr)"/>
+    <line x1="1150" y1="226" x2="1150" y2="320" stroke="#f85149" marker-end="url(#arr-r)"/>
+  </g>
+
+  <text x="620" y="500" text-anchor="middle" fill="#a5d6ff" font-size="11" font-style="italic">★ .pay 是按需文件 — 仅当字段开 storePayloads 或 OFFSETS 时生成,默认不存在</text>
+  <text x="620" y="520" text-anchor="middle" fill="#9be7b3" font-size="10" font-style="italic">★ 设计哲学:长度元数据(在 .pos)/ 字节载荷(在 .pay)分离 → 短语查询完全跳过 .pay I/O</text>
+</svg>
+</div>
+<p>
+本章按"角色与触发 → 字节布局 → 长度/字节分离 → 写入读取 → 高亮路径 → 性能与陷阱"组织。§27.1-27.2 解释 .pay 何时生成与命名规则;§27.3-27.5 给出 .pay 的字节级布局;§27.6-27.7 讨论 .pos / .pay 的"长度在前、字节随后"分离编码;§27.8-27.9 拆解写入与读取调用链;§27.10-27.11 讨论高亮如何利用 offset;§27.12-27.14 给出性能基线、生产陷阱与本章要点。
+</p>
+<!-- ============================================================ -->
+<h2 id="s27-1">27.1 文件用途与触发条件</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 27-1-1:.pay 触发判定</div>
+<svg viewBox="0 0 1240 480" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+  <g font-size="13" font-weight="700">
+    <rect x="490" y="20" width="260" height="56" rx="14" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="620" y="46" text-anchor="middle" fill="#cfe9ff">字段配置</text>
+    <text x="620" y="65" text-anchor="middle" fill="#a5d6ff" font-size="10" font-weight="500">FieldType.setIndexOptions/setStorePayloads</text>
+
+    <polygon points="500,140 740,140 800,180 740,220 500,220 440,180" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="620" y="180" text-anchor="middle" fill="#ffd591">是否含 OFFSETS 或 storePayloads ?</text>
+    <text x="620" y="200" text-anchor="middle" fill="#ffe4ad" font-size="10" font-weight="500">decision @ Lucene90PostingsWriter.startTerm</text>
+  </g>
+
+  <g font-size="11" font-weight="600">
+    <rect x="40"   y="280" width="220" height="56" rx="12" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="150" y="306" text-anchor="middle" fill="#ffd5d5">不生成 .pay</text>
+    <text x="150" y="324" text-anchor="middle" fill="#ffadad" font-size="10">默认情况</text>
+
+    <rect x="290"  y="280" width="240" height="56" rx="12" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="410" y="306" text-anchor="middle" fill="#ffd591">.pay 仅写 offset</text>
+    <text x="410" y="324" text-anchor="middle" fill="#ffe4ad" font-size="10">OFFSETS only</text>
+
+    <rect x="560"  y="280" width="240" height="56" rx="12" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="680" y="306" text-anchor="middle" fill="#e6d3ff">.pay 仅写 payload</text>
+    <text x="680" y="324" text-anchor="middle" fill="#cfb8ff" font-size="10">storePayloads only</text>
+
+    <rect x="830"  y="280" width="280" height="56" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="970" y="306" text-anchor="middle" fill="#9be7b3">.pay 写两者(payload + offset)</text>
+    <text x="970" y="324" text-anchor="middle" fill="#bff5cb" font-size="10">OFFSETS + storePayloads · 高亮+评分双用</text>
+  </g>
+
+  <g font-size="11" font-weight="700">
+    <rect x="490" y="400" width="260" height="50" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-dasharray="4 3"/>
+    <text x="620" y="420" text-anchor="middle" fill="#9be7b3">.pay segment 文件</text>
+    <text x="620" y="438" text-anchor="middle" fill="#bff5cb" font-size="10" font-weight="500">_N_Lucene90_0.pay</text>
+  </g>
+
+  <g fill="none" stroke-width="1.6">
+    <line x1="620" y1="76" x2="620" y2="140" stroke="#d29922" marker-end="url(#arr-o)"/>
+
+    <path d="M460,200 C300,250 200,260 150,280" stroke="#f85149" marker-end="url(#arr-r)"/>
+    <text x="290" y="252" fill="#f85149" font-size="10" font-weight="700">否</text>
+
+    <line x1="540" y1="220" x2="410" y2="280" stroke="#d29922" marker-end="url(#arr-o)"/>
+    <text x="455" y="252" fill="#d29922" font-size="10" font-weight="700">OFFSETS only</text>
+
+    <line x1="700" y1="220" x2="680" y2="280" stroke="#bc8cff" marker-end="url(#arr-p)"/>
+    <text x="700" y="252" fill="#bc8cff" font-size="10" font-weight="700">payload only</text>
+
+    <path d="M780,200 C900,250 950,260 970,280" stroke="#3fb950" marker-end="url(#arr-g)"/>
+    <text x="900" y="252" fill="#3fb950" font-size="10" font-weight="700">+OFFSETS+payload</text>
+
+    <path d="M410,336 C500,360 600,380 620,400" stroke="#d29922" marker-end="url(#arr-o)"/>
+    <line x1="680" y1="336" x2="660" y2="400" stroke="#bc8cff" marker-end="url(#arr-p)"/>
+    <path d="M970,336 C800,370 700,390 680,400" stroke="#3fb950" marker-end="url(#arr-g)"/>
+  </g>
+
+  <text x="620" y="475" text-anchor="middle" fill="#a5d6ff" font-size="10" font-style="italic">★ 三种触发组合都生成同一物理文件 .pay,内部 block 数量与字段宽度按需调整</text>
+</svg>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 27-1-1:.pay 生成条件矩阵</div>
+<table>
+<thead><tr>
+<th>IndexOptions</th>
+<th>setStorePayloads</th>
+<th>.pay 是否生成</th>
+<th>内容</th>
+</tr></thead><tbody>
+<tr>
+<td>DOCS</td>
+<td>否</td>
+<td>-</td>
+<td>不生成</td>
+</tr>
+<tr>
+<td>DOCS_AND_FREQS</td>
+<td>否</td>
+<td>-</td>
+<td>不生成</td>
+</tr>
+<tr>
+<td>..._POSITIONS</td>
+<td>否</td>
+<td>-</td>
+<td>不生成</td>
+</tr>
+<tr>
+<td>..._POSITIONS</td>
+<td>是</td>
+<td>✓</td>
+<td>仅 payload bytes</td>
+</tr>
+<tr>
+<td>..._POSITIONS_AND_OFFSETS</td>
+<td>否</td>
+<td>✓</td>
+<td>仅 offset 数据</td>
+</tr>
+<tr>
+<td>..._POSITIONS_AND_OFFSETS</td>
+<td>是</td>
+<td>✓</td>
+<td>payload + offset</td>
+</tr>
+</tbody></table>
+</div>
+<p>
+只要 .pay 出现,与之配套的 .pos 一定存在。.pay 不能独立存在,因为 payload/offset 的"长度"与"位置"信息保留在 .pos 中,.pay 只是承载原始字节与差量值。
+</p>
+<div class="diagram">
+<div class="diagram-title">图 27-1-2:.pay 与 .pos 的职责切分</div>
+<pre><code class="language-text">.pos 与 .pay 的职责对照:
+
+  .pos                             .pay
+  ┌───────────────────┐          ┌───────────────────┐
+  │ posDeltaBits         │          │  (本 block 无 offset 时:不写)│
+  │ posDeltas (packed)   │          │ offsetStartDelta (packed)    │
+  │ payloadLengths(packed)│         │ offsetLength (packed)         │
+  │                       │   ←→   │ payloadBytes (raw)            │
+  └───────────────────┘          └───────────────────┘
+
+读取顺序:
+  1. .pos:解 posDeltas (128 个)
+  2. .pos:解 payloadLengths (若有 payloads)
+  3. .pay:读 payloadBytes (raw 字节,长度 = sum(lengths))
+  4. .pay:解 offsetStartDelta + offsetLength (若有 offsets)
+
+VInt tail (尾部 &lt; 128):
+  全部内联在 .pos 中,.pay 不参与 tail</code></pre>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 27-1-2:.pay 与 .pos 写出字段对照</div>
+<table>
+<thead><tr>
+<th>数据维度</th>
+<th>块模式 (≥128 position)</th>
+<th>VInt tail 模式</th>
+</tr></thead><tbody>
+<tr>
+<td>posDelta</td>
+<td>.pos</td>
+<td>.pos</td>
+</tr>
+<tr>
+<td>payloadLen</td>
+<td>.pos</td>
+<td>.pos (含在 VInt code)</td>
+</tr>
+<tr>
+<td>payloadBytes</td>
+<td><strong>.pay</strong></td>
+<td>.pos</td>
+</tr>
+<tr>
+<td>offsetDelta</td>
+<td><strong>.pay</strong></td>
+<td>.pos</td>
+</tr>
+<tr>
+<td>offsetLen</td>
+<td><strong>.pay</strong></td>
+<td>.pos</td>
+</tr>
+</tbody></table>
+</div>
+<p>
+块模式下"长度"与"字节"分离的核心动机是:解码 128 个 position 时只需扫 .pos,不必为偶尔需要 payload 的查询付出 .pay I/O;而真正需要 payload 的查询(BERT 向量、embedding scoring)再走 .pay 路径,顺序读取连续字节流。
+</p>
+<!-- ============================================================ -->
+<h2 id="s27-2">27.2 文件命名与定位</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 27-2-1:目录中 .pay 的位置</div>
+<pre><code class="language-text">单 segment 索引(非 compound 模式):
+
+  _0.cfe                     compound entry (compound 模式)
+  _0.si                      segment metadata
+  segments_2                 commit metadata
+
+非 compound:
+  _0_Lucene90_0.doc          docID + freq
+  _0_Lucene90_0.pos          positions + payloadLengths
+  _0_Lucene90_0.pay          payload bytes + offsets   ← 本章主角
+  _0_Lucene90_0.tim          term dictionary
+  _0_Lucene90_0.tip          FST term index
+  _0_Lucene90_0.tmd          term metadata
+
+文件名拆解:
+  _0          segment 名
+  _Lucene90   codec 名
+  _0          codec 实例号
+  .pay        扩展名</code></pre>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 27-2-1:.pay 与 IndexFileNames 常量</div>
+<table>
+<thead><tr>
+<th>常量</th>
+<th>值</th>
+<th>用途</th>
+</tr></thead><tbody>
+<tr>
+<td>Lucene90PostingsFormat.DOC_EXTENSION</td>
+<td>".doc"</td>
+<td>docID + freq</td>
+</tr>
+<tr>
+<td>Lucene90PostingsFormat.POS_EXTENSION</td>
+<td>".pos"</td>
+<td>position</td>
+</tr>
+<tr>
+<td>Lucene90PostingsFormat.PAY_EXTENSION</td>
+<td>".pay"</td>
+<td>payload + offset</td>
+</tr>
+<tr>
+<td>Lucene90PostingsFormat.TERMS_DICT_EXT</td>
+<td>".tim"</td>
+<td>term dict</td>
+</tr>
+<tr>
+<td>Lucene90PostingsFormat.TERMS_INDEX_EXT</td>
+<td>".tip"</td>
+<td>FST</td>
+</tr>
+<tr>
+<td>Lucene90PostingsFormat.TERMS_META_EXT</td>
+<td>".tmd"</td>
+<td>per-field meta</td>
+</tr>
+</tbody></table>
+</div>
+<p>
+<code>Lucene90PostingsFormat.fieldsConsumer()</code> 在创建 IndexOutput 时,基于字段集合中是否存在任何"需要 payload/offset 的字段"决定是否打开 .pay 输出流。若所有字段均不需要,则 .pay 文件根本不会被创建。
+</p>
+<!-- ============================================================ -->
+<h2 id="s27-3">27.3 整体字节布局</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 27-3-1:.pay 文件总览</div>
+<pre><code class="language-text">.pay 文件结构(自顶向下):
+
+  ┌──────────────────────────────────────────────────┐
+  │ Header                                           │
+  │   magic        : 4 byte (0x3FD76C17)              │
+  │   codecName    : string ("Lucene90PostingsPayloads") │
+  │   version      : VInt   (currently 0)             │
+  │   objectId     : 16 byte (segment ID)             │
+  │   suffix       : string                           │
+  ├──────────────────────────────────────────────────┤
+  │ Per-Term Payload + Offset Blocks                  │
+  │   (由 .tim 的 payStartFP 指向)                     │
+  │                                                   │
+  │   Term A:                                         │
+  │     Block 0  (payload bytes + offset packed)     │
+  │     Block 1  ...                                  │
+  │     Block N-1                                     │
+  │     (无 VInt tail,尾部全部入 .pos)                  │
+  │                                                   │
+  │   Term B:                                         │
+  │     ...                                           │
+  ├──────────────────────────────────────────────────┤
+  │ Footer                                            │
+  │   magic        : 4 byte (0xC02893E8)              │
+  │   algorithmID  : 4 byte (0)                       │
+  │   checksum     : 8 byte (CRC32 over body)         │
+  └──────────────────────────────────────────────────┘</code></pre>
+</div>
+<div class="diagram">
+<div class="diagram-title">图 27-3-2:.pay Header 字节网格</div>
+<pre><code class="language-text">.pay Header 字节网格(前 56 byte):
+
+偏移   0    1    2    3    4    5    6    7    8    9    a    b    c    d    e    f
+0x000 | 3F | D7 | 6C | 17 | 17 | 4C | 75 | 63 | 65 | 6E | 65 | 39 | 30 | 50 | 6F | 73 |
+      | magic 0x3FD76C17  |strLn|  L     u    c    e    n    e    9    0    P    o    s|
+0x010 | 74 | 69 | 6E | 67 | 73 | 50 | 61 | 79 | 6C | 6F | 61 | 64 | 73 | 00 | 00 | 00 |
+      |  t    i    n    g    s    P    a    y    l    o    a    d    s | version VInt    |
+0x020 | 00 | A8 | 1F | 73 | 32 | 4B | F7 | 22 | 91 | C0 | DD | 4F | 1A | 5C | 88 | 36 |
+      |    | objectID (16 byte)                                                          |
+0x030 | 03 | 00 | XX | XX | XX | ...
+      | objId 续 |suffixLen=0|  开始 per-term blocks                                       |
+
+Header 字段:
+  magic        : 4 byte (0x3FD76C17 CodecUtil 通用)
+  codecLen     : 1 byte (= 23)
+  codecName    : "Lucene90PostingsPayloads" (UTF-8)
+  version      : VInt (0)
+  objectId     : 16 byte (与 .pos 同一 segment ID 一致)
+  suffixLen    : 1 byte (通常 0)</code></pre>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 27-3-1:Header 字段宽度</div>
+<table>
+<thead><tr>
+<th>字段</th>
+<th>字节宽度</th>
+<th>取值</th>
+<th>备注</th>
+</tr></thead><tbody>
+<tr>
+<td>magic</td>
+<td>4</td>
+<td>0x3FD76C17 (固定)</td>
+<td>CodecUtil 通用 magic</td>
+</tr>
+<tr>
+<td>codecName</td>
+<td>1 + 24 byte</td>
+<td>UTF-8 字符串</td>
+<td>"Lucene90PostingsPayloads"</td>
+</tr>
+<tr>
+<td>version</td>
+<td>1-5 (VInt)</td>
+<td>0</td>
+<td>Codec 版本号</td>
+</tr>
+<tr>
+<td>objectID</td>
+<td>16</td>
+<td>byte 数组</td>
+<td>必须与同 segment .pos 一致</td>
+</tr>
+<tr>
+<td>suffix</td>
+<td>1 + 0-255</td>
+<td>UTF-8</td>
+<td>实例后缀</td>
+</tr>
+</tbody></table>
+</div>
+<p>
+<code>Lucene90PostingsReader</code> 在打开时校验 codecName 与 magic,若不匹配抛 <code>CorruptIndexException</code>。objectID 比对失败会抛 <code>IndexFormatTooNewException</code> 或 <code>IndexNotFoundException</code>。
+</p>
+<!-- ============================================================ -->
+<h2 id="s27-4">27.4 Payload Block 字节布局</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 27-4-1:单 term 的 payload 数据布局</div>
+<pre><code class="language-text">单 term 的 .pay payload 区(由 payStartFP 起点):
+
+  ┌────────────────────────────────────────┐
+  │ Payload Block 0  (128 position 对应)    │
+  │                                          │
+  │   payloadByteCount : VInt (本 block 总字节)│
+  │   payloadBytes     : raw bytes          │
+  │                                          │
+  ├────────────────────────────────────────┤
+  │ Payload Block 1                          │
+  │   payloadByteCount + bytes              │
+  ├────────────────────────────────────────┤
+  │ ...                                      │
+  └────────────────────────────────────────┘
+
+读取协议:
+  for block in 0..N-1:
+    .pos 中读 payloadLengths[128] (packed)
+    expectedTotal = sum(payloadLengths)
+    .pay 中读 actualByteCount (VInt)
+    assert actualByteCount == expectedTotal
+    .pay 中读 actualByteCount byte 入缓冲
+    按 lengths 切片得 128 个 payload</code></pre>
+</div>
+<div class="diagram">
+<div class="diagram-title">图 27-4-2:Payload Block 字节网格</div>
+<pre><code class="language-text">单 Payload Block 字节网格(假设 128 位置每个 16 byte payload):
+
+偏移   0    1    2    3    4    5    6    7    8    9    a    b    c    d    e    f
+0x100 | 80 | 10 | 91 | 5F | 22 | 8C | 4A | 71 | 6E | 33 | C2 | A8 | 09 | 7B | 11 | 4F |
+      | byteCount=2048 (VInt 2 byte) | payload[0] (16 byte) ─────────────────────────  |
+0x110 | 8D | 6A | 41 | 39 | A1 | C5 | 22 | 4F | 7E | 03 | B2 | 91 | 33 | 0F | 5E | 22 |
+      |  payload[0] 续 (8 byte)         | payload[1] (16 byte) 开始                    |
+0x120 | ...
+0x800 | (block 末尾 = 偏移 + byteCount + VInt 长度)
+
+字段说明:
+  payloadByteCount : VInt(1-5 byte),= sum(payloadLengths[128])
+  payloadBytes     : raw bytes,无分隔符
+  切分依赖 .pos 的 payloadLengths
+
+注意:
+  VInt(2048) 编码为 2 byte: 0x80 0x10
+                    binary:  10000000 00010000
+                                       ↑
+                       最高位 0 表示这是最后一个 byte
+                       后续 bit 拼成 low-endian: 0001000_0000000 = 2048</code></pre>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 27-4-1:典型 payload 大小与 block 体积</div>
+<table>
+<thead><tr>
+<th>平均 payload 大小</th>
+<th>单 block 总字节</th>
+<th>+ VInt header</th>
+<th>block 体积</th>
+</tr></thead><tbody>
+<tr>
+<td>4 byte</td>
+<td>512</td>
+<td>2</td>
+<td>514 byte</td>
+</tr>
+<tr>
+<td>16 byte</td>
+<td>2,048</td>
+<td>2</td>
+<td>2,050 byte</td>
+</tr>
+<tr>
+<td>64 byte</td>
+<td>8,192</td>
+<td>2</td>
+<td>8,194 byte</td>
+</tr>
+<tr>
+<td>256 byte</td>
+<td>32,768</td>
+<td>3</td>
+<td>32,771 byte</td>
+</tr>
+<tr>
+<td>1024 byte</td>
+<td>131,072</td>
+<td>3</td>
+<td>131,075 byte</td>
+</tr>
+</tbody></table>
+</div>
+<p>
+每 block 仅 1 个 VInt header + N byte payload。无任何 padding,字节紧凑拼接。
+</p>
+<!-- ============================================================ -->
+<h2 id="s27-5">27.5 Offset Block 字节布局</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 27-5-1:单 term 的 offset 数据布局</div>
+<pre><code class="language-text">单 term 的 .pay offset 区(若 storeOffsets 启用):
+
+  ┌────────────────────────────────────────┐
+  │ Offset Block 0 (128 position 对应)      │
+  │                                          │
+  │   offsetStartDeltaBits : 1 byte          │
+  │   offsetStartDeltas    : packed long[]  │
+  │                                          │
+  │   offsetLengthBits     : 1 byte          │
+  │   offsetLengths        : packed long[]  │
+  │                                          │
+  ├────────────────────────────────────────┤
+  │ Offset Block 1                           │
+  │   ...                                    │
+  └────────────────────────────────────────┘
+
+  offset 字段含义:
+    startOffset : token 在原始字符流中的起始字符索引(累加 delta 还原)
+    endOffset   : startOffset + length
+
+  典型场景:
+    "The quick brown fox"
+     0123456789...
+     "The"  : startOffset=0, length=3
+     "quick": startOffset=4, length=5
+     "brown": startOffset=10, length=5</code></pre>
+</div>
+<div class="diagram">
+<div class="diagram-title">图 27-5-2:Offset Block 字节网格</div>
+<pre><code class="language-text">单 Offset Block 字节网格(典型 7-bit start delta + 5-bit length):
+
+偏移   0    1    2    3    4    5    6    7    8    9    a    b    c    d    e    f
+0x900 | 07 | 04 | 25 | 8A | 91 | 33 | 7C | A2 | ...                                    |
+      |bits=7|  packed 128 startDeltas × 7 bit / 8 = 112 byte                          |
+0x970 | (112 byte 总 startDeltas)
+0x9E0 | 05 | 03 | 21 | 22 | 24 | 21 | 23 | ...                                          |
+      |bits=5|  packed 128 lengths × 5 bit / 8 = 80 byte                                |
+0xA30 | (80 byte 总 lengths)
+
+字段构成:
+  startDeltaBits : 1 byte (常见 5-9 bit)
+  startDeltas    : packed (128 × bits / 8 byte)
+  lengthBits     : 1 byte (常见 4-7 bit)
+  lengths        : packed (128 × bits / 8 byte)
+
+block 总长度:
+  bits_start=7, bits_len=5: 1 + 112 + 1 + 80 = 194 byte
+  bits_start=8, bits_len=8: 1 + 128 + 1 + 128 = 258 byte</code></pre>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 27-5-1:不同 token 长度场景的 offset block 体积</div>
+<table>
+<thead><tr>
+<th>平均 token 长度</th>
+<th>startDelta bits</th>
+<th>length bits</th>
+<th>block 体积 (byte)</th>
+</tr></thead><tbody>
+<tr>
+<td>短词 (3-5 字符)</td>
+<td>7</td>
+<td>4</td>
+<td>178</td>
+</tr>
+<tr>
+<td>普通 (5-12 字符)</td>
+<td>8</td>
+<td>5</td>
+<td>210</td>
+</tr>
+<tr>
+<td>长词 (10-30 字符)</td>
+<td>10</td>
+<td>6</td>
+<td>258</td>
+</tr>
+<tr>
+<td>URL/邮箱 (50+ 字符)</td>
+<td>14</td>
+<td>8</td>
+<td>354</td>
+</tr>
+</tbody></table>
+</div>
+<div class="diagram">
+<div class="diagram-title">图 27-5-3:.pay 中 payload 与 offset 的相对位置</div>
+<pre><code class="language-text">单 term 的 .pay 完整布局(同时启用 payload + offset):
+
+  payStartFP →  ┌──────────────────────────────────┐
+                │ Payload Block 0                   │
+                │   byteCount + raw bytes           │
+                ├──────────────────────────────────┤
+                │ Offset Block 0                    │
+                │   startDelta packed               │
+                │   length packed                   │
+                ├──────────────────────────────────┤
+                │ Payload Block 1                   │
+                │   byteCount + raw bytes           │
+                ├──────────────────────────────────┤
+                │ Offset Block 1                    │
+                │   ...                             │
+                ├──────────────────────────────────┤
+                │ ...                               │
+                └──────────────────────────────────┘
+
+写入顺序:每写完一个 128-block 就同时 flush payload + offset
+读取协议:reader 也按 block 顺序消费,不能跳读 offset 而跳过 payload</code></pre>
+</div>
+<!-- ============================================================ -->
+<h2 id="s27-6">27.6 长度与字节分离的编码原理</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 27-6-1:为什么"长度在 .pos、字节在 .pay"</div>
+<svg viewBox="0 0 1240 580" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+  <g font-size="13" font-weight="700">
+    <rect x="490" y="20" width="260" height="56" rx="14" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="620" y="46" text-anchor="middle" fill="#cfe9ff">查询需求</text>
+    <text x="620" y="65" text-anchor="middle" fill="#a5d6ff" font-size="10" font-weight="500">每条搜索的真实需要</text>
+
+    <polygon points="500,140 740,140 800,180 740,220 500,220 440,180" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="620" y="180" text-anchor="middle" fill="#ffd591">仅需 position ?</text>
+    <text x="620" y="200" text-anchor="middle" fill="#ffe4ad" font-size="10" font-weight="500">if Q1</text>
+
+    <polygon points="800,260 1040,260 1100,300 1040,340 800,340 740,300" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="920" y="300" text-anchor="middle" fill="#ffd591">需要 payload ?</text>
+    <text x="920" y="320" text-anchor="middle" fill="#ffe4ad" font-size="10" font-weight="500">if Q2</text>
+
+    <polygon points="800,380 1040,380 1100,420 1040,460 800,460 740,420" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="920" y="420" text-anchor="middle" fill="#ffd591">需要 offset ?</text>
+    <text x="920" y="440" text-anchor="middle" fill="#ffe4ad" font-size="10" font-weight="500">if Q3</text>
+  </g>
+
+  <g font-size="11" font-weight="700">
+    <rect x="20"   y="280" width="220" height="80" rx="14" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="130" y="306" text-anchor="middle" fill="#9be7b3">仅读 .pos</text>
+    <text x="130" y="324" text-anchor="middle" fill="#bff5cb" font-size="10" font-weight="500">PhraseQuery / Span / 邻近</text>
+    <text x="130" y="346" text-anchor="middle" fill="#bff5cb" font-size="10" font-weight="500">I/O = .pos only · 最快</text>
+
+    <rect x="20"   y="400" width="280" height="80" rx="14" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="160" y="426" text-anchor="middle" fill="#e6d3ff">.pos + .pay (payload)</text>
+    <text x="160" y="444" text-anchor="middle" fill="#cfb8ff" font-size="10" font-weight="500">PayloadTermQuery / 自定义 score</text>
+    <text x="160" y="466" text-anchor="middle" fill="#cfb8ff" font-size="10" font-weight="500">I/O = .pos + .pay byte 区</text>
+
+    <rect x="380"  y="510" width="280" height="60" rx="14" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="520" y="534" text-anchor="middle" fill="#ffd5d5">.pos + .pay (offset)</text>
+    <text x="520" y="552" text-anchor="middle" fill="#ffadad" font-size="10" font-weight="500">UnifiedHighlighter · I/O = .pos + .pay packed 区</text>
+  </g>
+
+  <g fill="none" stroke-width="1.6">
+    <line x1="620" y1="76" x2="620" y2="140" stroke="#d29922" marker-end="url(#arr-o)"/>
+
+    <path d="M440,200 C300,240 200,260 130,280" stroke="#3fb950" marker-end="url(#arr-g)"/>
+    <text x="280" y="252" fill="#3fb950" font-size="10" font-weight="700">是 (PhraseQuery)</text>
+
+    <path d="M740,210 C780,240 800,260 830,265" stroke="#d29922" marker-end="url(#arr-o)"/>
+    <text x="775" y="252" fill="#d29922" font-size="10" font-weight="700">否</text>
+
+    <path d="M740,300 C500,330 300,400 160,400" stroke="#bc8cff" marker-end="url(#arr-p)"/>
+    <text x="430" y="370" fill="#bc8cff" font-size="10" font-weight="700">是 (自定义 score)</text>
+
+    <line x1="920" y1="340" x2="920" y2="380" stroke="#d29922" marker-end="url(#arr-o)"/>
+    <text x="940" y="365" fill="#d29922" font-size="10" font-weight="700">否</text>
+
+    <path d="M740,420 C600,470 500,500 460,510" stroke="#f85149" marker-end="url(#arr-r)"/>
+    <text x="540" y="492" fill="#f85149" font-size="10" font-weight="700">是 (Highlight)</text>
+
+    <path d="M1100,420 C1180,360 1180,200 800,180" stroke="#3fb950" stroke-dasharray="6 4" marker-end="url(#arr-g)"/>
+    <text x="1180" y="320" text-anchor="middle" fill="#9be7b3" font-size="10" font-style="italic">否 → 回到"仅读 .pos"</text>
+  </g>
+
+  <text x="620" y="100" text-anchor="middle" fill="#a5d6ff" font-size="10" font-style="italic">★ 三级决策树:每多一级 I/O 增加 ~30%</text>
+</svg>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 27-6-1:分离编码的收益</div>
+<table>
+<thead><tr>
+<th>查询类型</th>
+<th>必读文件</th>
+<th>节省 I/O</th>
+</tr></thead><tbody>
+<tr>
+<td>BM25 评分</td>
+<td>.doc</td>
+<td>不读 .pos/.pay</td>
+</tr>
+<tr>
+<td>PhraseQuery</td>
+<td>.doc + .pos</td>
+<td>不读 .pay</td>
+</tr>
+<tr>
+<td>Custom payload 评分</td>
+<td>.doc + .pos + .pay</td>
+<td>必须全读</td>
+</tr>
+<tr>
+<td>UnifiedHighlighter</td>
+<td>.doc + .pos + .pay (offset)</td>
+<td>跳过 payload bytes 区</td>
+</tr>
+</tbody></table>
+</div>
+<p>
+若 payload bytes 与 offset 都内联在 .pos:每次解 position block 都要把 payload 全量加载到内存,即便查询不需要。分离布局使得"位置 + 长度"信息紧凑可缓存,"字节"按需加载。
+</p>
+<div class="diagram">
+<div class="diagram-title">图 27-6-2:.pos 与 .pay 的解码协调</div>
+<svg viewBox="0 0 1240 720" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+  <g font-size="11" font-weight="700">
+    <rect x="20"   y="20" width="220" height="44" rx="10" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="130" y="46" text-anchor="middle" fill="#e6d3ff">PostingsReader</text>
+
+    <rect x="320"  y="20" width="220" height="44" rx="10" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="430" y="46" text-anchor="middle" fill="#ffd591">.pos IndexInput</text>
+
+    <rect x="640"  y="20" width="220" height="44" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="750" y="46" text-anchor="middle" fill="#ffd5d5">.pay IndexInput ★</text>
+  </g>
+
+  <g stroke="#30363d" stroke-width="1" stroke-dasharray="4 4">
+    <line x1="130" y1="64" x2="130" y2="700"/>
+    <line x1="430" y1="64" x2="430" y2="700"/>
+    <line x1="750" y1="64" x2="750" y2="700"/>
+  </g>
+
+  <g font-size="11">
+    <line x1="130" y1="100" x2="430" y2="100" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <text x="280" y="94" text-anchor="middle" fill="#e6d3ff">1. refillPosBlock()</text>
+
+    <line x1="430" y1="132" x2="130" y2="132" stroke="#d29922" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-o)"/>
+    <text x="280" y="126" text-anchor="middle" fill="#ffd591">2. posDeltaBits + 128 posDeltas</text>
+
+    <rect x="40" y="160" width="1180" height="280" rx="10" fill="rgba(188,140,255,0.04)" stroke="#bc8cff" stroke-dasharray="4 3"/>
+    <rect x="40" y="160" width="200" height="22" rx="4" fill="#bc8cff"/>
+    <text x="140" y="176" text-anchor="middle" fill="#0d1117" font-size="10" font-weight="700">alt 需要 payload</text>
+
+    <line x1="130" y1="208" x2="430" y2="208" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <text x="280" y="202" text-anchor="middle" fill="#e6d3ff">3. read payloadLengths (packed)</text>
+
+    <line x1="430" y1="240" x2="130" y2="240" stroke="#d29922" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-o)"/>
+    <text x="280" y="234" text-anchor="middle" fill="#ffd591">4. 128 lengths(每个 1 byte)</text>
+
+    <line x1="130" y1="272" x2="150" y2="272" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <path d="M150,272 C220,272 220,290 150,290" fill="none" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <text x="225" y="268" fill="#e6d3ff">5. total = sum(lengths)</text>
+
+    <line x1="130" y1="320" x2="750" y2="320" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    <text x="440" y="314" text-anchor="middle" fill="#ffadad">6. readVInt → byteCount(.pay 中的总长度头)</text>
+
+    <line x1="750" y1="352" x2="130" y2="352" stroke="#f85149" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-r)"/>
+    <text x="440" y="346" text-anchor="middle" fill="#ffadad">7. byteCount value</text>
+
+    <line x1="130" y1="380" x2="150" y2="380" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <path d="M150,380 C260,380 260,398 150,398" fill="none" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <text x="265" y="376" fill="#e6d3ff">8. assert byteCount == total · 一致性校验</text>
+
+    <line x1="130" y1="425" x2="750" y2="425" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    <text x="440" y="419" text-anchor="middle" fill="#ffadad">9. readBytes(byteCount) → raw payload buffer</text>
+
+    <rect x="40" y="460" width="1180" height="200" rx="10" fill="rgba(248,81,73,0.04)" stroke="#f85149" stroke-dasharray="4 3"/>
+    <rect x="40" y="460" width="200" height="22" rx="4" fill="#f85149"/>
+    <text x="140" y="476" text-anchor="middle" fill="#0d1117" font-size="10" font-weight="700">alt 需要 offset</text>
+
+    <line x1="130" y1="510" x2="750" y2="510" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    <text x="440" y="504" text-anchor="middle" fill="#ffadad">10. read startDeltaBits + 128 startDeltas (PackedInts)</text>
+
+    <line x1="750" y1="542" x2="130" y2="542" stroke="#f85149" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-r)"/>
+    <text x="440" y="536" text-anchor="middle" fill="#ffadad">11. 128 startDeltas</text>
+
+    <line x1="130" y1="574" x2="750" y2="574" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    <text x="440" y="568" text-anchor="middle" fill="#ffadad">12. read lengthBits + 128 lengths (PackedInts)</text>
+
+    <line x1="750" y1="606" x2="130" y2="606" stroke="#f85149" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-r)"/>
+    <text x="440" y="600" text-anchor="middle" fill="#ffadad">13. 128 lengths</text>
+
+    <line x1="130" y1="638" x2="150" y2="638" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <path d="M150,638 C260,638 260,656 150,656" fill="none" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <text x="265" y="634" fill="#e6d3ff">14. start[i] = prev_end + delta · end[i] = start[i] + length[i]</text>
+  </g>
+
+  <text x="660" y="700" text-anchor="middle" fill="#a5d6ff" font-size="10" font-style="italic">★ payload 与 offset 是两条独立 alt 分支 — 仅启用其中一个时,跳过另一个的字节段</text>
+</svg>
+</div>
+<!-- ============================================================ -->
+<h2 id="s27-7">27.7 Payload 内容自由度</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 27-7-1:Payload 字节流的无结构特性</div>
+<pre><code class="language-text">Payload 字节流是应用层完全自由控制的字节数组:
+
+  Token "java"  payload = [0x01, 0x02]                  (2 byte 标签)
+  Token "API"   payload = [0x7F, 0x80, 0x91]            (3 byte 类型码)
+  Token "BERT"  payload = [0xAB, 0xCD, ..., 0x12]       (768 byte 浮点向量)
+  Token "@user" payload = [0x55, 0x53, 0x52]            (UTF-8 "USR")
+
+Lucene 不解释 payload 内容:
+  - 应用通过 PayloadAttribute 在 analyzer 中设置
+  - 应用通过 PostingsEnum.getPayload() 取出
+  - Lucene 只负责字节透传</code></pre>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 27-7-1:常见 payload 用途</div>
+<table>
+<thead><tr>
+<th>用途</th>
+<th>典型字节宽度</th>
+<th>应用场景</th>
+</tr></thead><tbody>
+<tr>
+<td>Token 类型标签</td>
+<td>1-4 byte</td>
+<td>NER 实体类型 (PERSON/ORG)</td>
+</tr>
+<tr>
+<td>词性 (POS) 标记</td>
+<td>1-2 byte</td>
+<td>句法分析</td>
+</tr>
+<tr>
+<td>Term 权重提升 (boost)</td>
+<td>4 byte</td>
+<td>DelimitedPayloadTokenFilter</td>
+</tr>
+<tr>
+<td>BERT/embedding 向量片段</td>
+<td>256-1024 byte</td>
+<td>神经检索</td>
+</tr>
+<tr>
+<td>句子边界标记</td>
+<td>1 byte</td>
+<td>语义分块</td>
+</tr>
+<tr>
+<td>自定义业务字段</td>
+<td>任意</td>
+<td>行业特定</td>
+</tr>
+</tbody></table>
+</div>
+<div class="diagram">
+<div class="diagram-title">图 27-7-2:DelimitedPayloadTokenFilter 示例</div>
+<pre><code class="language-text">原始文本: "java|2.0 python|1.5 rust|3.0"
+
+DelimitedPayloadTokenFilter 处理后:
+  Token "java"   payload = float bytes(2.0) = [0x40, 0x00, 0x00, 0x00]
+  Token "python" payload = float bytes(1.5) = [0x3F, 0xC0, 0x00, 0x00]
+  Token "rust"   payload = float bytes(3.0) = [0x40, 0x40, 0x00, 0x00]
+
+查询时:
+  PayloadFunction = AveragePayloadFunction
+  PayloadTermQuery 计算文档中所有匹配 term 的 payload 平均值
+  作为最终评分</code></pre>
+</div>
+<!-- ============================================================ -->
+<h2 id="s27-8">27.8 写入路径</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 27-8-1:写入调用链</div>
+<svg viewBox="0 0 1320 760" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+  <g font-size="10" font-weight="700">
+    <rect x="20"   y="20" width="200" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="120" y="46" text-anchor="middle" fill="#cfe9ff">DocumentsWriterPerThread</text>
+
+    <rect x="270"  y="20" width="180" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="360" y="46" text-anchor="middle" fill="#cfe9ff">TermsHashPerField</text>
+
+    <rect x="500"  y="20" width="220" height="44" rx="10" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="610" y="46" text-anchor="middle" fill="#e6d3ff">Lucene90PostingsWriter</text>
+
+    <rect x="780"  y="20" width="220" height="44" rx="10" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="890" y="46" text-anchor="middle" fill="#ffd591">.pos IndexOutput</text>
+
+    <rect x="1060" y="20" width="220" height="44" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="1170" y="46" text-anchor="middle" fill="#ffd5d5">.pay IndexOutput ★</text>
+  </g>
+
+  <g stroke="#30363d" stroke-width="1" stroke-dasharray="4 4">
+    <line x1="120"  y1="64" x2="120"  y2="740"/>
+    <line x1="360"  y1="64" x2="360"  y2="740"/>
+    <line x1="610"  y1="64" x2="610"  y2="740"/>
+    <line x1="890"  y1="64" x2="890"  y2="740"/>
+    <line x1="1170" y1="64" x2="1170" y2="740"/>
+  </g>
+
+  <g font-size="11">
+    <line x1="120" y1="100" x2="360" y2="100" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="240" y="94" text-anchor="middle" fill="#cfe9ff">1. addToken(field, term, pos, payload, offset)</text>
+
+    <line x1="360" y1="132" x2="380" y2="132" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+    <path d="M380,132 C450,132 450,150 380,150" fill="none" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="455" y="128" fill="#cfe9ff">2. 缓冲到 byteBlockPool</text>
+
+    <line x1="120" y1="180" x2="610" y2="180" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <text x="365" y="174" text-anchor="middle" fill="#e6d3ff">3. flush()(内存满 / commit 触发)</text>
+
+    <line x1="610" y1="212" x2="630" y2="212" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <path d="M630,212 C700,212 700,230 630,230" fill="none" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <text x="705" y="208" fill="#e6d3ff">4. startTerm() · 重置 5 个 buffer</text>
+
+    <rect x="40" y="250" width="1260" height="380" rx="10" fill="rgba(63,185,80,0.04)" stroke="#3fb950" stroke-dasharray="4 3"/>
+    <rect x="40" y="250" width="200" height="22" rx="4" fill="#3fb950"/>
+    <text x="140" y="266" text-anchor="middle" fill="#0d1117" font-size="10" font-weight="700">loop 每 doc</text>
+
+    <line x1="610" y1="300" x2="630" y2="300" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <path d="M630,300 C700,300 700,318 630,318" fill="none" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <text x="705" y="296" fill="#e6d3ff">5. startDoc(docID, freq)</text>
+
+    <rect x="60" y="335" width="1240" height="270" rx="10" fill="rgba(255,165,0,0.04)" stroke="#d29922" stroke-dasharray="4 3"/>
+    <rect x="60" y="335" width="200" height="22" rx="4" fill="#d29922"/>
+    <text x="160" y="351" text-anchor="middle" fill="#0d1117" font-size="10" font-weight="700">loop 每 position</text>
+
+    <line x1="610" y1="385" x2="630" y2="385" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <path d="M630,385 C840,385 840,433 630,433" fill="none" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <text x="850" y="385" fill="#e6d3ff">6. addPosition(pos, payload, offset) → 累积 5 类 buffer:</text>
+    <text x="850" y="403" fill="#cfb8ff" font-size="10">　 posDeltaBuffer · payloadLengthBuffer · payloadBytesBuffer</text>
+    <text x="850" y="421" fill="#cfb8ff" font-size="10">　 offsetStartDeltaBuffer · offsetLengthBuffer</text>
+
+    <rect x="80" y="450" width="1220" height="140" rx="10" fill="rgba(248,81,73,0.04)" stroke="#f85149" stroke-dasharray="4 3"/>
+    <rect x="80" y="450" width="220" height="22" rx="4" fill="#f85149"/>
+    <text x="190" y="466" text-anchor="middle" fill="#0d1117" font-size="10" font-weight="700">alt 满 128 position</text>
+
+    <line x1="610" y1="498" x2="890" y2="498" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+    <text x="745" y="492" text-anchor="middle" fill="#ffd591">7. writePosBlock (deltas + payloadLengths) → .pos</text>
+
+    <line x1="610" y1="530" x2="1170" y2="530" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    <text x="880" y="524" text-anchor="middle" fill="#ffadad">8. writePayloadBlock (VLong byteCount + raw bytes) → .pay</text>
+
+    <line x1="610" y1="565" x2="1170" y2="565" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    <text x="880" y="559" text-anchor="middle" fill="#ffadad">9. writeOffsetBlock (startDelta packed + length packed) → .pay</text>
+
+    <line x1="610" y1="660" x2="630" y2="660" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <path d="M630,660 C700,660 700,678 630,678" fill="none" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <text x="705" y="656" fill="#e6d3ff">10. finishTerm() · 触发尾部处理</text>
+
+    <line x1="610" y1="710" x2="890" y2="710" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+    <text x="745" y="704" text-anchor="middle" fill="#ffd591">11. writeVIntTail (剩余 &lt; 128 position 全入 .pos · payload/offset 内联)</text>
+  </g>
+
+  <text x="660" y="755" text-anchor="middle" fill="#a5d6ff" font-size="10" font-style="italic">★ 关键设计:.pay 只接收 packed block(7-9),tail(11)永远不进 .pay → 长尾 term 几乎不写 .pay</text>
+</svg>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 27-8-1:核心写入源码</div>
+<table>
+<thead><tr>
+<th>文件</th>
+<th>方法/字段</th>
+<th>职责</th>
+</tr></thead><tbody>
+<tr>
+<td>Lucene90PostingsWriter.java</td>
+<td>startField()</td>
+<td>判定 writePayloads/writeOffsets 标志</td>
+</tr>
+<tr>
+<td>Lucene90PostingsWriter.java</td>
+<td>addPosition()</td>
+<td>累积 5 类 buffer</td>
+</tr>
+<tr>
+<td>Lucene90PostingsWriter.java</td>
+<td>writePayloadBlock()</td>
+<td>flush payload 到 .pay</td>
+</tr>
+<tr>
+<td>Lucene90PostingsWriter.java</td>
+<td>writeOffsetBlock()</td>
+<td>flush offset 到 .pay</td>
+</tr>
+<tr>
+<td>Lucene90PostingsWriter.java</td>
+<td>finishTerm()</td>
+<td>写 VInt tail 到 .pos</td>
+</tr>
+<tr>
+<td>ForUtil.java</td>
+<td>encode(long[], bits, output)</td>
+<td>PFOR 编码</td>
+</tr>
+</tbody></table>
+</div>
+<div class="diagram">
+<div class="diagram-title">图 27-8-2:writePayloadBlock 关键代码</div>
+<pre><code class="language-java">private void writePayloadBlock() throws IOException {
+    if (writePayloads) {
+        long bytesNeeded = 0;
+        for (int i = 0; i &lt; BLOCK_SIZE; i++) {
+            bytesNeeded += payloadLengthBuffer[i];
+        }
+        payOut.writeVLong(bytesNeeded);
+        payOut.writeBytes(payloadBytesBuffer, 0, (int) bytesNeeded);
+    }
+}
+
+private void writeOffsetBlock() throws IOException {
+    if (writeOffsets) {
+        forUtil.encode(offsetStartDeltaBuffer, offsetStartBits, payOut);
+        forUtil.encode(offsetLengthBuffer, offsetLengthBits, payOut);
+    }
+}</code></pre>
+</div>
+<p>
+<code>writePayloadBlock</code> 使用 VLong (而非 VInt) 写 byteCount,因为单 block 累计 payload 可能超过 2^31 (例如 128 个 16 MiB payload = 2 GiB)。
+</p>
+<!-- ============================================================ -->
+<h2 id="s27-9">27.9 读取路径</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 27-9-1:读取调用链</div>
+<svg viewBox="0 0 1320 600" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+  <g font-size="10" font-weight="700">
+    <rect x="20"   y="20" width="240" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="140" y="46" text-anchor="middle" fill="#cfe9ff">Query (Highlight / Custom Score)</text>
+
+    <rect x="320"  y="20" width="180" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="410" y="46" text-anchor="middle" fill="#cfe9ff">PostingsEnum</text>
+
+    <rect x="560"  y="20" width="240" height="44" rx="10" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="680" y="46" text-anchor="middle" fill="#e6d3ff">Lucene90PostingsReader</text>
+
+    <rect x="860"  y="20" width="200" height="44" rx="10" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="960" y="46" text-anchor="middle" fill="#ffd591">.pos IndexInput</text>
+
+    <rect x="1100" y="20" width="200" height="44" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="1200" y="46" text-anchor="middle" fill="#ffd5d5">.pay IndexInput ★</text>
+  </g>
+
+  <g stroke="#30363d" stroke-width="1" stroke-dasharray="4 4">
+    <line x1="140"  y1="64" x2="140"  y2="580"/>
+    <line x1="410"  y1="64" x2="410"  y2="580"/>
+    <line x1="680"  y1="64" x2="680"  y2="580"/>
+    <line x1="960"  y1="64" x2="960"  y2="580"/>
+    <line x1="1200" y1="64" x2="1200" y2="580"/>
+  </g>
+
+  <g font-size="11">
+    <line x1="140" y1="100" x2="410" y2="100" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="275" y="94" text-anchor="middle" fill="#cfe9ff">1. nextPosition()</text>
+
+    <line x1="410" y1="132" x2="680" y2="132" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <text x="545" y="126" text-anchor="middle" fill="#e6d3ff">2. refillPosBlock()</text>
+
+    <line x1="680" y1="164" x2="960" y2="164" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+    <text x="820" y="158" text-anchor="middle" fill="#ffd591">3. read posDeltas</text>
+
+    <line x1="680" y1="196" x2="960" y2="196" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+    <text x="820" y="190" text-anchor="middle" fill="#ffd591">4. read payloadLengths</text>
+
+    <line x1="680" y1="228" x2="1200" y2="228" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    <text x="940" y="222" text-anchor="middle" fill="#ffadad">5. read payloadByteCount + bytes</text>
+
+    <line x1="680" y1="260" x2="1200" y2="260" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    <text x="940" y="254" text-anchor="middle" fill="#ffadad">6. read offsetStartDeltas + lengths</text>
+
+    <line x1="680" y1="296" x2="410" y2="296" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-p)"/>
+    <text x="545" y="290" text-anchor="middle" fill="#e6d3ff">7. 128 entries 就绪</text>
+
+    <line x1="410" y1="324" x2="430" y2="324" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+    <path d="M430,324 C500,324 500,342 430,342" fill="none" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="505" y="320" fill="#cfe9ff">8. 累加 position(prev + delta)</text>
+
+    <line x1="410" y1="370" x2="140" y2="370" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr)"/>
+    <text x="275" y="364" text-anchor="middle" fill="#cfe9ff">9. position 值</text>
+
+    <line x1="140" y1="406" x2="410" y2="406" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="275" y="400" text-anchor="middle" fill="#cfe9ff">10. getPayload() · 按需拉取</text>
+
+    <line x1="410" y1="438" x2="140" y2="438" stroke="#f85149" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-r)"/>
+    <text x="275" y="432" text-anchor="middle" fill="#ffadad">11. BytesRef(指向 payloadBuffer 切片 · 下次 nextPos 后失效!)</text>
+
+    <line x1="140" y1="470" x2="410" y2="470" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="275" y="464" text-anchor="middle" fill="#cfe9ff">12. startOffset() / endOffset()</text>
+
+    <line x1="410" y1="500" x2="140" y2="500" stroke="#f85149" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-r)"/>
+    <text x="275" y="494" text-anchor="middle" fill="#ffadad">13. int 值(从 .pay offset 段)</text>
+  </g>
+
+  <text x="660" y="555" text-anchor="middle" fill="#a5d6ff" font-size="11" font-style="italic">★ 关键约束:getPayload 返回的 BytesRef 是切片引用 · 下次 nextPosition 后内容失效 → 必须立即拷贝</text>
+  <text x="660" y="575" text-anchor="middle" fill="#9be7b3" font-size="10" font-style="italic">★ Lazy decoding:不调 getPayload/startOffset 时,5/6 步的字节直接顺序跳过(seek skip 优化)</text>
+</svg>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 27-9-1:读取 API</div>
+<table>
+<thead><tr>
+<th>方法</th>
+<th>返回</th>
+<th>触发的文件读取</th>
+</tr></thead><tbody>
+<tr>
+<td>nextPosition()</td>
+<td>int (position)</td>
+<td>.pos</td>
+</tr>
+<tr>
+<td>getPayload()</td>
+<td>BytesRef (或 null)</td>
+<td>.pay payload 段</td>
+</tr>
+<tr>
+<td>startOffset()</td>
+<td>int</td>
+<td>.pay offset 段</td>
+</tr>
+<tr>
+<td>endOffset()</td>
+<td>int</td>
+<td>.pay offset 段</td>
+</tr>
+</tbody></table>
+</div>
+<p>
+<code>getPayload()</code> 返回的 <code>BytesRef</code> 是对内部缓冲的切片引用。下次 <code>nextPosition()</code> 调用后该引用失效,应用必须立即拷贝。
+</p>
+<div class="diagram">
+<div class="diagram-title">图 27-9-2:nextPosition 解码状态机</div>
+<svg viewBox="0 0 1320 460" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+  <g font-size="11" font-weight="700">
+    <circle cx="40" cy="220" r="20" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="40" y="224" text-anchor="middle" fill="#e6d3ff">●</text>
+
+    <rect x="100"  y="180" width="200" height="80" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="200" y="206" text-anchor="middle" fill="#cfe9ff">AtDoc(中心)</text>
+    <text x="200" y="224" text-anchor="middle" fill="#a5d6ff" font-size="10" font-weight="500">当前 doc</text>
+    <text x="200" y="240" text-anchor="middle" fill="#a5d6ff" font-size="10" font-weight="500">posUpto, freq 计数</text>
+
+    <rect x="380"  y="40"  width="280" height="100" rx="14" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="520" y="66" text-anchor="middle" fill="#ffd591">RefillBlock</text>
+    <text x="520" y="84" text-anchor="middle" fill="#ffe4ad" font-size="10" font-weight="500">读 .pos posDeltas / payloadLens</text>
+    <text x="520" y="100" text-anchor="middle" fill="#ffe4ad" font-size="10" font-weight="500">读 .pay payloadBytes / offsets</text>
+    <text x="520" y="120" text-anchor="middle" fill="#ffe4ad" font-size="10" font-weight="500">5 个 buffer 同时填满</text>
+
+    <rect x="700"  y="40"  width="240" height="100" rx="14" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="820" y="66" text-anchor="middle" fill="#9be7b3">InBuffer(热环)</text>
+    <text x="820" y="84" text-anchor="middle" fill="#bff5cb" font-size="10" font-weight="500">posBuffer[posUpto++]</text>
+    <text x="820" y="100" text-anchor="middle" fill="#bff5cb" font-size="10" font-weight="500">position += delta</text>
+    <text x="820" y="120" text-anchor="middle" fill="#bff5cb" font-size="10" font-weight="500">99% 调用走这里</text>
+
+    <rect x="700"  y="280" width="240" height="100" rx="14" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="820" y="306" text-anchor="middle" fill="#ffd5d5">RefillTail</text>
+    <text x="820" y="324" text-anchor="middle" fill="#ffadad" font-size="10" font-weight="500">仅读 .pos VInt code</text>
+    <text x="820" y="340" text-anchor="middle" fill="#ffadad" font-size="10" font-weight="500">payload/offset 内联在 .pos</text>
+    <text x="820" y="360" text-anchor="middle" fill="#ffadad" font-size="10" font-weight="500">不读 .pay !</text>
+
+    <rect x="1040" y="180" width="200" height="80" rx="14" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="1140" y="206" text-anchor="middle" fill="#e6d3ff">NextDoc</text>
+    <text x="1140" y="224" text-anchor="middle" fill="#cfb8ff" font-size="10" font-weight="500">freq 全部消费</text>
+    <text x="1140" y="240" text-anchor="middle" fill="#cfb8ff" font-size="10" font-weight="500">→ .doc nextDoc()</text>
+
+    <circle cx="1290" cy="220" r="20" fill="none" stroke="#bc8cff" stroke-width="2"/>
+    <circle cx="1290" cy="220" r="14" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="1290" y="224" text-anchor="middle" fill="#e6d3ff">●</text>
+  </g>
+
+  <g fill="none" stroke-width="1.6">
+    <line x1="60"  y1="220" x2="100" y2="220" stroke="#bc8cff" marker-end="url(#arr-p)"/>
+
+    <path d="M280,200 C320,170 350,110 380,90" stroke="#d29922" marker-end="url(#arr-o)"/>
+    <text x="280" y="160" fill="#d29922" font-size="10" font-weight="700">需要新 block</text>
+
+    <line x1="660" y1="90" x2="700" y2="90" stroke="#3fb950" marker-end="url(#arr-g)"/>
+
+    <path d="M700,100 C500,150 400,170 300,200" stroke="#3fb950" stroke-dasharray="5 3" marker-end="url(#arr-g)"/>
+    <text x="500" y="170" fill="#3fb950" font-size="10" font-weight="700">return position</text>
+
+    <path d="M280,250 C400,290 600,310 700,320" stroke="#f85149" marker-end="url(#arr-r)"/>
+    <text x="450" y="296" fill="#f85149" font-size="10" font-weight="700">仅剩 VInt tail</text>
+
+    <path d="M700,330 C500,330 400,260 300,235" stroke="#f85149" stroke-dasharray="5 3" marker-end="url(#arr-r)"/>
+
+    <line x1="300" y1="220" x2="1040" y2="220" stroke="#bc8cff" marker-end="url(#arr-p)"/>
+    <text x="670" y="214" text-anchor="middle" fill="#cfb8ff" font-size="10" font-weight="700">freq == 0</text>
+
+    <line x1="1240" y1="220" x2="1290" y2="220" stroke="#bc8cff" marker-end="url(#arr-p)"/>
+  </g>
+
+  <text x="660" y="420" text-anchor="middle" fill="#a5d6ff" font-size="11" font-style="italic">★ RefillBlock 同时触发 .pos + .pay 双 I/O · RefillTail 只读 .pos · 99% 时间留在 InBuffer 热环</text>
+  <text x="660" y="440" text-anchor="middle" fill="#9be7b3" font-size="10" font-style="italic">★ 如果不调 getPayload/startOffset,RefillBlock 中的 .pay 字节直接 seek skip,不解码</text>
+</svg>
+</div>
+<!-- ============================================================ -->
+<h2 id="s27-10">27.10 高亮路径(UnifiedHighlighter)</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 27-10-1:UnifiedHighlighter 数据流</div>
+<svg viewBox="0 0 1320 380" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+  <g font-size="12" font-weight="700">
+    <rect x="20"   y="160" width="180" height="60" rx="14" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="110" y="186" text-anchor="middle" fill="#cfe9ff">查询命中 doc</text>
+    <text x="110" y="204" text-anchor="middle" fill="#a5d6ff" font-size="10" font-weight="500">PhraseQuery / TermQuery</text>
+
+    <rect x="240"  y="160" width="200" height="60" rx="14" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="340" y="186" text-anchor="middle" fill="#e6d3ff">UnifiedHighlighter</text>
+    <text x="340" y="204" text-anchor="middle" fill="#cfb8ff" font-size="10" font-weight="500">协调中心</text>
+
+    <rect x="480"  y="60"  width="200" height="60" rx="14" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="580" y="86" text-anchor="middle" fill="#ffd591">PostingsReader</text>
+    <text x="580" y="104" text-anchor="middle" fill="#ffe4ad" font-size="10" font-weight="500">term postings</text>
+
+    <rect x="480"  y="260" width="200" height="60" rx="14" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="580" y="286" text-anchor="middle" fill="#ffd591">StoredFields fetch</text>
+    <text x="580" y="304" text-anchor="middle" fill="#ffe4ad" font-size="10" font-weight="500">SegmentReader.document</text>
+
+    <rect x="730"  y="20"  width="200" height="60" rx="14" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="830" y="46" text-anchor="middle" fill="#ffd5d5">.pay offset 段 ★</text>
+    <text x="830" y="64" text-anchor="middle" fill="#ffadad" font-size="10" font-weight="500">startDelta + length</text>
+
+    <rect x="730"  y="100" width="200" height="60" rx="14" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="830" y="126" text-anchor="middle" fill="#9be7b3">.pos</text>
+    <text x="830" y="144" text-anchor="middle" fill="#bff5cb" font-size="10" font-weight="500">position 序列</text>
+
+    <rect x="730"  y="260" width="200" height="60" rx="14" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="830" y="286" text-anchor="middle" fill="#cfe9ff">.fdt</text>
+    <text x="830" y="304" text-anchor="middle" fill="#a5d6ff" font-size="10" font-weight="500">原文字符串(stored)</text>
+
+    <rect x="970"  y="160" width="180" height="60" rx="14" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="1060" y="186" text-anchor="middle" fill="#e6d3ff">按 offset 切原文</text>
+    <text x="1060" y="204" text-anchor="middle" fill="#cfb8ff" font-size="10" font-weight="500">+ &lt;mark&gt; 包裹</text>
+
+    <rect x="1170" y="160" width="140" height="60" rx="14" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="1240" y="186" text-anchor="middle" fill="#9be7b3">高亮片段</text>
+    <text x="1240" y="204" text-anchor="middle" fill="#bff5cb" font-size="10" font-weight="500">→ 前端</text>
+  </g>
+
+  <g fill="none" stroke-width="1.6">
+    <line x1="200" y1="190" x2="240" y2="190" stroke="#58a6ff" marker-end="url(#arr)"/>
+
+    <path d="M440,180 C460,150 470,120 480,100" stroke="#bc8cff" marker-end="url(#arr-p)"/>
+    <path d="M440,200 C460,230 470,260 480,290" stroke="#bc8cff" marker-end="url(#arr-p)"/>
+
+    <path d="M680,80 C700,60 720,40 730,40" stroke="#f85149" marker-end="url(#arr-r)"/>
+    <text x="700" y="35" text-anchor="middle" fill="#f85149" font-size="10" font-weight="700">获取 token offset</text>
+    <line x1="680" y1="120" x2="730" y2="125" stroke="#3fb950" marker-end="url(#arr-g)"/>
+    <text x="700" y="115" text-anchor="middle" fill="#3fb950" font-size="10" font-weight="700">获取 token position</text>
+
+    <line x1="680" y1="290" x2="730" y2="290" stroke="#58a6ff" marker-end="url(#arr)"/>
+    <text x="700" y="282" text-anchor="middle" fill="#58a6ff" font-size="10" font-weight="700">读原文</text>
+
+    <path d="M930,55 C960,80 970,150 970,180" stroke="#f85149" stroke-dasharray="5 3" marker-end="url(#arr-r)"/>
+    <text x="945" y="120" fill="#f85149" font-size="10" font-style="italic">offset[token]</text>
+    <path d="M930,290 C960,260 970,220 970,200" stroke="#58a6ff" stroke-dasharray="5 3" marker-end="url(#arr)"/>
+    <text x="945" y="260" fill="#58a6ff" font-size="10" font-style="italic">原文 chars</text>
+
+    <line x1="1150" y1="190" x2="1170" y2="190" stroke="#bc8cff" marker-end="url(#arr-p)"/>
+  </g>
+
+  <text x="660" y="360" text-anchor="middle" fill="#a5d6ff" font-size="11" font-style="italic">★ UnifiedHighlighter 的"毫秒级"承诺依赖 .pay offset · 字段未启用 OFFSETS 时退化为重新分词,延迟放大 10×</text>
+</svg>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 27-10-1:三种高亮器对 .pay 的依赖</div>
+<table>
+<thead><tr>
+<th>Highlighter</th>
+<th>依赖文件</th>
+<th>速度</th>
+<th>适用场景</th>
+</tr></thead><tbody>
+<tr>
+<td>UnifiedHighlighter</td>
+<td>.pay (offset) + .fdt</td>
+<td>中</td>
+<td>通用,推荐</td>
+</tr>
+<tr>
+<td>FastVectorHighlighter</td>
+<td>termVectors + .fdt</td>
+<td>高</td>
+<td>大量短查询</td>
+</tr>
+<tr>
+<td>PostingsHighlighter</td>
+<td>.pay (offset) + .fdt</td>
+<td>中</td>
+<td>长文本,旧 API</td>
+</tr>
+<tr>
+<td>Plain (Highlighter)</td>
+<td>.fdt + 重新分词</td>
+<td>低</td>
+<td>兼容性回退</td>
+</tr>
+</tbody></table>
+</div>
+<p>
+<code>UnifiedHighlighter</code> 的"毫秒级"承诺依赖 .pay 的 offset 数据。若字段未启用 OFFSETS,该 highlighter 退化为重新分词路径,延迟可能放大 10×。
+</p>
+<div class="diagram">
+<div class="diagram-title">图 27-10-2:offset 在 highlight 中的作用</div>
+<pre><code class="language-text">原文 (stored 在 .fdt):
+  "The quick brown fox jumps over the lazy dog"
+   0    4     10    16  20    26  30  34   40
+
+查询: "brown fox"
+
+PhraseQuery 命中 doc,startOffset 序列:
+  term "brown" startOffset=10, endOffset=15
+  term "fox"   startOffset=16, endOffset=19
+
+UnifiedHighlighter:
+  1. 取 startOffset[brown] = 10
+  2. 取 endOffset[fox] = 19
+  3. 切原文 [10, 19) = "brown fox"
+  4. 包裹标签 → "&lt;em&gt;brown fox&lt;/em&gt;"
+  5. 加上下文窗口 → "The quick &lt;em&gt;brown fox&lt;/em&gt; jumps over"
+
+无 offset 时的回退:
+  1. 加载原文
+  2. 用 analyzer 重新分词
+  3. 找 token 在字符流中的位置
+  4. 包裹 (CPU 与 GC 开销显著)</code></pre>
+</div>
+<!-- ============================================================ -->
+<h2 id="s27-11">27.11 Payload Scoring 路径</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 27-11-1:PayloadScoreQuery</div>
+<svg viewBox="0 0 1320 360" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+  <g font-size="12" font-weight="700">
+    <rect x="20"   y="160" width="180" height="60" rx="14" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="110" y="186" text-anchor="middle" fill="#cfe9ff">PayloadScoreQuery</text>
+    <text x="110" y="204" text-anchor="middle" fill="#a5d6ff" font-size="10" font-weight="500">入口</text>
+
+    <rect x="240"  y="160" width="160" height="60" rx="14" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="320" y="186" text-anchor="middle" fill="#ffd591">TermSpans</text>
+    <text x="320" y="204" text-anchor="middle" fill="#ffe4ad" font-size="10" font-weight="500">term scanner</text>
+
+    <rect x="440"  y="160" width="180" height="60" rx="14" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="530" y="186" text-anchor="middle" fill="#e6d3ff">PostingsEnum</text>
+    <text x="530" y="204" text-anchor="middle" fill="#cfb8ff" font-size="10" font-weight="500">postings 游标</text>
+
+    <rect x="660"  y="40"  width="180" height="60" rx="14" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="750" y="66" text-anchor="middle" fill="#9be7b3">.doc</text>
+    <text x="750" y="84" text-anchor="middle" fill="#bff5cb" font-size="10" font-weight="500">取 docID</text>
+
+    <rect x="660"  y="160" width="180" height="60" rx="14" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="750" y="186" text-anchor="middle" fill="#9be7b3">.pos</text>
+    <text x="750" y="204" text-anchor="middle" fill="#bff5cb" font-size="10" font-weight="500">取 position</text>
+
+    <rect x="660"  y="280" width="180" height="60" rx="14" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="750" y="306" text-anchor="middle" fill="#ffd5d5">.pay ★</text>
+    <text x="750" y="324" text-anchor="middle" fill="#ffadad" font-size="10" font-weight="500">取 payload</text>
+
+    <rect x="900"  y="280" width="200" height="60" rx="14" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="1000" y="306" text-anchor="middle" fill="#ffd591">PayloadFunction</text>
+    <text x="1000" y="324" text-anchor="middle" fill="#ffe4ad" font-size="10" font-weight="500">avg/max/min/sum/...</text>
+
+    <rect x="1140" y="280" width="160" height="60" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="1220" y="306" text-anchor="middle" fill="#cfe9ff">Float 评分</text>
+    <text x="1220" y="324" text-anchor="middle" fill="#a5d6ff" font-size="10" font-weight="500">→ collector</text>
+  </g>
+
+  <g fill="none" stroke-width="1.6">
+    <line x1="200" y1="190" x2="240" y2="190" stroke="#58a6ff" marker-end="url(#arr)"/>
+    <line x1="400" y1="190" x2="440" y2="190" stroke="#d29922" marker-end="url(#arr-o)"/>
+
+    <path d="M620,180 C640,160 650,100 660,80" stroke="#3fb950" marker-end="url(#arr-g)"/>
+    <line x1="620" y1="190" x2="660" y2="190" stroke="#3fb950" marker-end="url(#arr-g)"/>
+    <path d="M620,200 C640,220 650,280 660,300" stroke="#f85149" marker-end="url(#arr-r)"/>
+
+    <line x1="840" y1="310" x2="900" y2="310" stroke="#d29922" marker-end="url(#arr-o)"/>
+    <line x1="1100" y1="310" x2="1140" y2="310" stroke="#58a6ff" marker-end="url(#arr)"/>
+  </g>
+
+  <text x="660" y="360" text-anchor="middle" fill="#a5d6ff" font-size="11" font-style="italic">★ Payload 评分链:三文件 (.doc + .pos + .pay) 同步遍历,PayloadFunction 在每 token 出现位置累积分数</text>
+</svg>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 27-11-1:常用 PayloadFunction</div>
+<table>
+<thead><tr>
+<th>函数</th>
+<th>计算</th>
+<th>用途</th>
+</tr></thead><tbody>
+<tr>
+<td>AveragePayloadFunction</td>
+<td>mean(payload)</td>
+<td>多 term 命中加权</td>
+</tr>
+<tr>
+<td>MinPayloadFunction</td>
+<td>min(payload)</td>
+<td>取最小权重</td>
+</tr>
+<tr>
+<td>MaxPayloadFunction</td>
+<td>max(payload)</td>
+<td>取最大权重</td>
+</tr>
+<tr>
+<td>SumPayloadFunction</td>
+<td>sum(payload)</td>
+<td>累加权重</td>
+</tr>
+<tr>
+<td>自定义</td>
+<td>任意</td>
+<td>业务特定</td>
+</tr>
+</tbody></table>
+</div>
+<div class="diagram">
+<div class="diagram-title">图 27-11-2:PayloadScoreQuery 完整流程</div>
+<svg viewBox="0 0 1320 600" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+  <g font-size="10" font-weight="700">
+    <rect x="20"   y="20" width="200" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="120" y="46" text-anchor="middle" fill="#cfe9ff">PayloadScoreQuery</text>
+
+    <rect x="320"  y="20" width="180" height="44" rx="10" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="410" y="46" text-anchor="middle" fill="#ffd591">TermSpans</text>
+
+    <rect x="600"  y="20" width="200" height="44" rx="10" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="700" y="46" text-anchor="middle" fill="#e6d3ff">PostingsEnum</text>
+
+    <rect x="900"  y="20" width="220" height="44" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="1010" y="46" text-anchor="middle" fill="#ffd5d5">PayloadFunction</text>
+  </g>
+
+  <g stroke="#30363d" stroke-width="1" stroke-dasharray="4 4">
+    <line x1="120"  y1="64" x2="120"  y2="580"/>
+    <line x1="410"  y1="64" x2="410"  y2="580"/>
+    <line x1="700"  y1="64" x2="700"  y2="580"/>
+    <line x1="1010" y1="64" x2="1010" y2="580"/>
+  </g>
+
+  <g font-size="11">
+    <line x1="120" y1="100" x2="410" y2="100" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="265" y="94" text-anchor="middle" fill="#cfe9ff">1. getSpans()</text>
+
+    <rect x="40" y="130" width="1240" height="380" rx="10" fill="rgba(255,165,0,0.04)" stroke="#d29922" stroke-dasharray="4 3"/>
+    <rect x="40" y="130" width="240" height="22" rx="4" fill="#d29922"/>
+    <text x="160" y="146" text-anchor="middle" fill="#0d1117" font-size="10" font-weight="700">loop 每个匹配 doc</text>
+
+    <line x1="410" y1="180" x2="700" y2="180" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <text x="555" y="174" text-anchor="middle" fill="#e6d3ff">2. nextDoc()</text>
+
+    <rect x="60" y="210" width="1220" height="240" rx="10" fill="rgba(248,81,73,0.04)" stroke="#f85149" stroke-dasharray="4 3"/>
+    <rect x="60" y="210" width="240" height="22" rx="4" fill="#f85149"/>
+    <text x="180" y="226" text-anchor="middle" fill="#0d1117" font-size="10" font-weight="700">loop 每 term 出现位置</text>
+
+    <line x1="410" y1="260" x2="700" y2="260" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <text x="555" y="254" text-anchor="middle" fill="#e6d3ff">3. nextPosition()</text>
+
+    <line x1="700" y1="292" x2="410" y2="292" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-p)"/>
+    <text x="555" y="286" text-anchor="middle" fill="#e6d3ff">4. position</text>
+
+    <line x1="410" y1="324" x2="700" y2="324" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <text x="555" y="318" text-anchor="middle" fill="#e6d3ff">5. getPayload() · 触发 .pay 读</text>
+
+    <line x1="700" y1="356" x2="410" y2="356" stroke="#f85149" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-r)"/>
+    <text x="555" y="350" text-anchor="middle" fill="#ffadad">6. BytesRef(payload 切片引用)</text>
+
+    <line x1="410" y1="390" x2="1010" y2="390" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    <text x="710" y="384" text-anchor="middle" fill="#ffadad">7. currentPayloadScore(score, payload)</text>
+
+    <line x1="1010" y1="422" x2="410" y2="422" stroke="#f85149" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-r)"/>
+    <text x="710" y="416" text-anchor="middle" fill="#ffadad">8. 累积得分(基于 PayloadFunction 实现)</text>
+
+    <line x1="410" y1="490" x2="120" y2="490" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr)"/>
+    <text x="265" y="484" text-anchor="middle" fill="#cfe9ff">9. doc 总分(累加完所有出现位置)</text>
+  </g>
+
+  <text x="660" y="555" text-anchor="middle" fill="#a5d6ff" font-size="11" font-style="italic">★ 评分循环 N×M(N doc × M term 出现) · 每次 nextPosition + getPayload 各触发一次 .pay 读</text>
+  <text x="660" y="575" text-anchor="middle" fill="#9be7b3" font-size="10" font-style="italic">★ payload 评分查询比纯 BM25 慢 2-3×,但比 rerank 阶段重新评分快 100×</text>
+</svg>
+</div>
+<!-- ============================================================ -->
+<h2 id="s27-12">27.12 性能基线</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">表 27-12-1:.pay 读写性能</div>
+<table>
+<thead><tr>
+<th>操作</th>
+<th>典型时延</th>
+<th>备注</th>
+</tr></thead><tbody>
+<tr>
+<td>写单 payload block (128 ×16B)</td>
+<td>5 μs</td>
+<td>sequential write</td>
+</tr>
+<tr>
+<td>读单 payload block (128 × 16B,热)</td>
+<td>2 μs</td>
+<td>page cache 命中</td>
+</tr>
+<tr>
+<td>读单 payload block (冷)</td>
+<td>30-50 μs</td>
+<td>4 KiB 磁盘读</td>
+</tr>
+<tr>
+<td>解 offset block (热)</td>
+<td>100-150 ns</td>
+<td>PFOR 解码 + bitpacking</td>
+</tr>
+<tr>
+<td>Highlight 单 doc (50 命中)</td>
+<td>50-200 μs</td>
+<td>offset + fdt 联合</td>
+</tr>
+<tr>
+<td>PayloadScoreQuery 单 doc</td>
+<td>1-5 μs</td>
+<td>per term per pos</td>
+</tr>
+</tbody></table>
+</div>
+<p>
+测试条件:Wikipedia EN 1M 文档,200 token / doc,启用 storeOffsets。
+</p>
+<div class="diagram">
+<div class="diagram-title">表 27-12-2:不同 payload 体积的 .pay 大小</div>
+<table>
+<thead><tr>
+<th>storePayloads</th>
+<th>每 token payload</th>
+<th>.pay 大小</th>
+<th>占索引比例</th>
+</tr></thead><tbody>
+<tr>
+<td>否</td>
+<td>-</td>
+<td>600 MB</td>
+<td>18%</td>
+</tr>
+<tr>
+<td>是</td>
+<td>4 byte</td>
+<td>1.2 GB</td>
+<td>28%</td>
+</tr>
+<tr>
+<td>是</td>
+<td>16 byte</td>
+<td>3.4 GB</td>
+<td>50%</td>
+</tr>
+<tr>
+<td>是</td>
+<td>64 byte</td>
+<td>13 GB</td>
+<td>75%</td>
+</tr>
+<tr>
+<td>是</td>
+<td>768 byte (BERT)</td>
+<td>150 GB</td>
+<td>95%</td>
+</tr>
+</tbody></table>
+</div>
+<p>
+存储 BERT embedding 时,.pay 占索引体积 95% 以上。生产中应改用 KnnVectorField 或 BinaryDocValues,避免 payload 路径。
+</p>
+<div class="diagram">
+<div class="diagram-title">图 27-12-1:解码 CPU 占比</div>
+<pre><code class="language-text">启用 payload + offset 的 PostingsReader CPU profile:
+
+  ForUtil.decode (.pos posDelta)        25%
+  ForUtil.decode (.pay offset)          18%
+  ForUtil.decode (.pos payloadLen)       8%
+  IndexInput.readBytes (.pay payload)   28%   ← I/O 主要开销
+  PostingsEnum.getPayload                7%
+  PostingsEnum.startOffset               5%
+  其他控制流                              9%
+
+观察:
+  - payload bytes 读取 (readBytes) 是最大 CPU 消耗
+  - offset 解码次之
+  - 仅启用 offset (无 payload) 时,readBytes 降至 0</code></pre>
+</div>
+<!-- ============================================================ -->
+<h2 id="s27-13">27.13 陷阱与限制</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 27-13-1:.pay 陷阱分类</div>
+<svg viewBox="0 0 1320 540" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+  <g font-size="13" font-weight="700">
+    <rect x="560" y="20" width="200" height="56" rx="14" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="660" y="46" text-anchor="middle" fill="#ffd5d5">.pay 陷阱</text>
+    <text x="660" y="65" text-anchor="middle" fill="#ffadad" font-size="10" font-weight="500">9 类生产事故根源</text>
+
+    <rect x="40"   y="160" width="240" height="50" rx="12" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="160" y="190" text-anchor="middle" fill="#cfe9ff">编码类</text>
+
+    <rect x="360"  y="160" width="240" height="50" rx="12" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="480" y="190" text-anchor="middle" fill="#ffd591">体积类</text>
+
+    <rect x="680"  y="160" width="240" height="50" rx="12" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="800" y="190" text-anchor="middle" fill="#9be7b3">语义类</text>
+
+    <rect x="1000" y="160" width="240" height="50" rx="12" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="1120" y="190" text-anchor="middle" fill="#e6d3ff">运维类</text>
+  </g>
+
+  <g font-size="11" font-weight="600">
+    <rect x="20"  y="290" width="220" height="48" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-opacity="0.7"/>
+    <text x="130" y="310" text-anchor="middle" fill="#cfe9ff">1. payload &gt; VLong</text>
+    <text x="130" y="328" text-anchor="middle" fill="#a5d6ff" font-size="10">单 block 累计 &gt; 2⁶³</text>
+
+    <rect x="60"  y="354" width="220" height="48" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-opacity="0.7"/>
+    <text x="170" y="374" text-anchor="middle" fill="#cfe9ff">2. offset &gt; Integer.MAX</text>
+    <text x="170" y="392" text-anchor="middle" fill="#a5d6ff" font-size="10">单 doc 字符 &gt; 2³¹</text>
+
+    <rect x="100" y="418" width="220" height="48" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-opacity="0.7"/>
+    <text x="210" y="438" text-anchor="middle" fill="#cfe9ff">3. block length sum 不对</text>
+    <text x="210" y="456" text-anchor="middle" fill="#a5d6ff" font-size="10">CorruptIndexException</text>
+
+    <rect x="340" y="290" width="240" height="48" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-opacity="0.7"/>
+    <text x="460" y="310" text-anchor="middle" fill="#ffd591">4. payload 体积爆炸</text>
+    <text x="460" y="328" text-anchor="middle" fill="#ffe4ad" font-size="10">.pay GB+ 磁盘耗尽</text>
+
+    <rect x="380" y="354" width="240" height="48" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-opacity="0.7"/>
+    <text x="500" y="374" text-anchor="middle" fill="#ffd591">5. offset 启用索引翻倍</text>
+    <text x="500" y="392" text-anchor="middle" fill="#ffe4ad" font-size="10">.pay 占 50%+</text>
+
+    <rect x="660" y="290" width="240" height="48" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-opacity="0.7"/>
+    <text x="780" y="310" text-anchor="middle" fill="#9be7b3">6. analyzer 改 token 顺序</text>
+    <text x="780" y="328" text-anchor="middle" fill="#bff5cb" font-size="10">高亮位置错位</text>
+
+    <rect x="700" y="354" width="240" height="48" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-opacity="0.7"/>
+    <text x="820" y="374" text-anchor="middle" fill="#9be7b3">7. IndexOptions 不一致</text>
+    <text x="820" y="392" text-anchor="middle" fill="#bff5cb" font-size="10">多次 addDocument FieldType 不同</text>
+
+    <rect x="980" y="290" width="240" height="48" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-opacity="0.7"/>
+    <text x="1100" y="310" text-anchor="middle" fill="#e6d3ff">8. 高亮器选错</text>
+    <text x="1100" y="328" text-anchor="middle" fill="#cfb8ff" font-size="10">Plain → P99 100×</text>
+
+    <rect x="1020" y="354" width="240" height="48" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-opacity="0.7"/>
+    <text x="1140" y="374" text-anchor="middle" fill="#e6d3ff">9. BytesRef 未拷贝</text>
+    <text x="1140" y="392" text-anchor="middle" fill="#cfb8ff" font-size="10">下次 nextPos 后失效</text>
+  </g>
+
+  <g fill="none" stroke-width="1.5">
+    <path d="M660,76 C660,118 160,118 160,160" stroke="#58a6ff" marker-end="url(#arr)"/>
+    <path d="M660,76 C660,118 480,118 480,160" stroke="#d29922" marker-end="url(#arr-o)"/>
+    <path d="M660,76 C660,118 800,118 800,160" stroke="#3fb950" marker-end="url(#arr-g)"/>
+    <path d="M660,76 C660,118 1120,118 1120,160" stroke="#bc8cff" marker-end="url(#arr-p)"/>
+
+    <path d="M160,210 C160,250 130,250 130,290" stroke="#58a6ff" marker-end="url(#arr)"/>
+    <path d="M160,210 C160,250 170,250 170,354" stroke="#58a6ff" marker-end="url(#arr)"/>
+    <path d="M160,210 C160,250 210,250 210,418" stroke="#58a6ff" marker-end="url(#arr)"/>
+
+    <path d="M480,210 C480,250 460,250 460,290" stroke="#d29922" marker-end="url(#arr-o)"/>
+    <path d="M480,210 C480,250 500,250 500,354" stroke="#d29922" marker-end="url(#arr-o)"/>
+
+    <path d="M800,210 C800,250 780,250 780,290" stroke="#3fb950" marker-end="url(#arr-g)"/>
+    <path d="M800,210 C800,250 820,250 820,354" stroke="#3fb950" marker-end="url(#arr-g)"/>
+
+    <path d="M1120,210 C1120,250 1100,250 1100,290" stroke="#bc8cff" marker-end="url(#arr-p)"/>
+    <path d="M1120,210 C1120,250 1140,250 1140,354" stroke="#bc8cff" marker-end="url(#arr-p)"/>
+  </g>
+
+  <text x="660" y="500" text-anchor="middle" fill="#a5d6ff" font-size="11" font-style="italic">★ #4 payload 体积爆炸 + #5 offset 翻倍是磁盘扩张主因 — 不需要高亮请关 OFFSETS</text>
+  <text x="660" y="520" text-anchor="middle" fill="#9be7b3" font-size="10" font-style="italic">★ #9 BytesRef 未拷贝是最隐蔽 bug — 表面正确,下次循环值就被覆盖</text>
+</svg>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 27-13-1:陷阱明细</div>
+<table>
+<thead><tr>
+<th>#</th>
+<th>陷阱</th>
+<th>症状</th>
+<th>根因</th>
+<th>影响范围</th>
+<th>修复</th>
+<th>监控</th>
+</tr></thead><tbody>
+<tr>
+<td>1</td>
+<td>payload 单 block 总和超 VLong 范围</td>
+<td>IndexFormatTooNew 异常</td>
+<td>单 block 累计 payload &gt; 2^63</td>
+<td>写入失败</td>
+<td>拆分 token 或减小 payload</td>
+<td>写入异常</td>
+</tr>
+<tr>
+<td>2</td>
+<td>offset 超过 Integer.MAX_VALUE</td>
+<td>IllegalArgumentException</td>
+<td>单 doc 字符流 &gt; 2^31 字符</td>
+<td>写入失败</td>
+<td>字段值切分</td>
+<td>写入异常</td>
+</tr>
+<tr>
+<td>3</td>
+<td>payload 与 offset 长度不一致</td>
+<td>CorruptIndexException</td>
+<td>byteCount != sum(lengths)</td>
+<td>索引损坏</td>
+<td>重建索引</td>
+<td>CheckIndex</td>
+</tr>
+<tr>
+<td>4</td>
+<td>payload 体积爆炸</td>
+<td>.pay GB+,磁盘耗尽</td>
+<td>每 token 大 payload</td>
+<td>磁盘耗尽</td>
+<td>改 BinaryDocValues 或 KnnVectorField</td>
+<td>索引大小</td>
+</tr>
+<tr>
+<td>5</td>
+<td>offset 启用后索引翻倍</td>
+<td>.pay 占用 50%+</td>
+<td>offset block 必写</td>
+<td>磁盘扩张</td>
+<td>不需要高亮就关闭 OFFSETS</td>
+<td>磁盘监控</td>
+</tr>
+<tr>
+<td>6</td>
+<td>analyzer 改 token 顺序</td>
+<td>高亮位置错乱</td>
+<td>token 重排导致 offset 失序</td>
+<td>高亮显示错位</td>
+<td>保持 analyzer 一致</td>
+<td>高亮单元测试</td>
+</tr>
+<tr>
+<td>7</td>
+<td>多次索引同字段 IndexOptions 不一致</td>
+<td>CheckIndex 警告</td>
+<td>多次 addDocument FieldType 不同</td>
+<td>字段读取异常</td>
+<td>统一 FieldType</td>
+<td>CheckIndex</td>
+</tr>
+<tr>
+<td>8</td>
+<td>高亮器选错(Plain vs Unified)</td>
+<td>P99 高亮延迟 100×</td>
+<td>Plain 重新分词无 .pay</td>
+<td>高亮慢</td>
+<td>改 UnifiedHighlighter</td>
+<td>高亮 P99 监控</td>
+</tr>
+<tr>
+<td>9</td>
+<td>payload BytesRef 未及时拷贝</td>
+<td>NullPointerException</td>
+<td>下次 nextPosition 后引用失效</td>
+<td>程序异常</td>
+<td>BytesRef.deepCopyOf()</td>
+<td>单元测试</td>
+</tr>
+</tbody></table>
+</div>
+<h3>反例与正例对比</h3>
+<pre><code class="language-text">反例(随手开 OFFSETS 但不知道用途):
+
+  FieldType ft = new FieldType();
+  ft.setIndexOptions(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS);
+  ft.setStorePayloads(true);
+  ft.setTokenized(true);
+
+  现象:
+    .pay 文件占索引 50%+
+    应用从未用过高亮,也未用过 payload scoring
+    page cache 浪费严重
+
+正例(明确不需要,关闭):
+
+  FieldType ft = new FieldType();
+  ft.setIndexOptions(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS);
+  ft.setStorePayloads(false);
+  ft.setTokenized(true);
+
+  收益:
+    .pay 文件不生成
+    索引体积降低 30-50%
+    page cache 利用率提升
+
+正例(需要高亮,仅开 OFFSETS):
+
+  ft.setIndexOptions(IndexOptions.DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS);
+  ft.setStorePayloads(false);
+
+  收益:
+    .pay 仅含 offset 数据
+    UnifiedHighlighter 毫秒响应
+    无冗余 payload 字节</code></pre>
+<!-- ============================================================ -->
+<h2 id="s27-14">27.14 本章要点</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">表 27-14-1:.pay 关键事实速查</div>
+<table>
+<thead><tr>
+<th>要点</th>
+<th>关键依据</th>
+<th>易错点</th>
+</tr></thead><tbody>
+<tr>
+<td>.pay 仅在 storePayloads 或 OFFSETS 任一启用时生成</td>
+<td>Lucene90PostingsWriter.startField</td>
+<td>默认两者均关闭</td>
+</tr>
+<tr>
+<td>.pay 入口指针由 .tim 的 payStartFP 提供</td>
+<td>BlockTreeTermsReader</td>
+<td>不能用文件偏移直接定位</td>
+</tr>
+<tr>
+<td>块模式下 payload 长度在 .pos,字节在 .pay</td>
+<td>writePayloadBlock</td>
+<td>VInt tail 时全在 .pos</td>
+</tr>
+<tr>
+<td>offset 数据完全由 .pay 承载</td>
+<td>writeOffsetBlock</td>
+<td>无任何字段在 .pos</td>
+</tr>
+<tr>
+<td>Header magic 0x3FD76C17 + codecName 必须匹配</td>
+<td>CodecUtil.checkHeader</td>
+<td>objectID 必与 .pos 同 segment</td>
+</tr>
+<tr>
+<td>Footer = magic + algId + CRC32</td>
+<td>CodecUtil.writeFooter</td>
+<td>校验失败抛 CorruptIndexException</td>
+</tr>
+<tr>
+<td>UnifiedHighlighter 依赖 .pay offset</td>
+<td>OffsetsEnum</td>
+<td>无 offset 退化重新分词</td>
+</tr>
+<tr>
+<td>PayloadScoreQuery 依赖 .pay payload</td>
+<td>PayloadFunction</td>
+<td>无 payload 函数 score 抛异常</td>
+</tr>
+<tr>
+<td>.pay 体积常占索引 30-50%</td>
+<td>测试基线</td>
+<td>BERT 向量场景占 95%</td>
+</tr>
+<tr>
+<td>BytesRef 来自 .pay 缓冲,需立即拷贝</td>
+<td>PostingsEnum.getPayload</td>
+<td>下次 nextPosition 后失效</td>
+</tr>
+</tbody></table>
+</div>
+<h3>最小回归验证</h3>
+<pre><code class="language-bash"># 检查 .pay 文件是否存在
+ls -la /path/to/index | grep -E '\.pay$'
+
+# CheckIndex 字段统计
+java -cp lucene-core.jar org.apache.lucene.index.CheckIndex /path/to/index | \
+    grep -E 'options|payloads|offsets'
+
+# 期望输出:
+#   field "content":
+#     IndexOptions=DOCS_AND_FREQS_AND_POSITIONS_AND_OFFSETS
+#     storePayloads=true
+#     number of payload bytes = 12345678
+#     OK</code></pre>
+<pre><code class="language-text">正常输出:
+  segment _0:
+    field "content":
+      number of terms = 12345
+      number of postings = 8901234
+      total payload bytes = 142,419,744
+      offset count = 8901234
+      .pay size = 320 MB
+    OK
+
+异常输出:
+  ERROR: field "content" .pay file missing but storePayloads=true
+  → 索引损坏,需重建</code></pre>
+<h3>下一章预告</h3>
+<p>
+下一章讨论 .fdt 文件,即 stored fields 数据。.fdt 与 .fdx (索引)、.fdm (元信息) 三者协作,提供文档原文回填能力。stored fields 的 LZ4 / DEFLATE 压缩、chunk 切分、随机访问优化是 .fdt 的核心设计。下一章给出 .fdt 的字节布局与 chunk 解压路径。
+</p>
+
+<!-- ============================================================ -->
+<h2 id="s27-summary">本章小结</h2>
+<!-- ============================================================ -->
+
+<div class="chapter-summary">
+  <h3>核心要点</h3>
+  <ul class="key-takeaways">
+    <li><code>.pay</code> 仅在 <code>storePayloads</code> 或 <code>OFFSETS</code> 启用时生成,与 <code>.pos</code> 物理对偶</li>
+    <li>长度元信息(payloadLength / offsetLength)留在 <code>.pos</code>,字节本体留在 <code>.pay</code></li>
+    <li>128-position block 走 PackedInts + raw bytes,VInt tail 全部回 <code>.pos</code> 不进 <code>.pay</code></li>
+    <li>Payload Block:<code>VInt(byteCount)</code> + raw bytes,无分隔符,切分依赖 <code>.pos</code> 的 lengths</li>
+    <li>Offset Block:双 PackedInts(<code>startDeltas</code> + <code>lengths</code>),累加还原 startOffset/endOffset</li>
+    <li>高亮:UnifiedHighlighter / FastVectorHighlighter 通过 <code>startOffset</code> 在毫秒级生成 &lt;mark&gt; 片段</li>
+    <li>Payload Scoring:<code>DelimitedPayloadTokenFilter</code> + <code>PayloadFunction</code> 把 token 级 float / byte 注入 score</li>
+    <li>陷阱:payload 体积爆炸 → <code>.pay</code> 数 GB;offset 必须与 analyzer 一致,否则高亮位置错位</li>
+  </ul>
+
+  <div class="key-insight">
+    <strong>一句话总结</strong>:第 27 章核心是把"该文件在 codec 中的角色 / 字节布局 / 编码细节 / 写入读取路径 / 合并行为 / 性能特征 / 生产陷阱"七件事讲清楚。理解了本章,下次遇到该文件相关的 corruption / 性能 / 合并 issue 都能从字节级回答。
+  </div>
+
+  <div class="real-world">
+    <strong>生产建议</strong>:① 监控该文件大小占比,占比异常需要分析;② <code>CheckIndex</code> 定期校验 checksum;③ 索引体积大时优先考虑 forceMerge 减少 segment 数量;④ 升级 Lucene 版本时关注 codec 名称变化(如 <code>Lucene90</code> → <code>Lucene99</code> → <code>Lucene103</code>);⑤ 不要直接动文件本体,所有写入都通过 IndexWriter 完成。
+  </div>
+
+  <h3>下一章预告</h3>
+  <p>下一章拆解 <code>.fdt</code> Stored Fields Data 文件:LZ4 chunk 压缩、行存原始字节、与 <code>.pay</code> 的"列存 vs 行存"对比。</p>
+</div>
+
+
+<p class="footer">&copy; 2026 图解 Lucene &middot; 第 27 章</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+</body>
+</html>

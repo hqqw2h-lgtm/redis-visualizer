@@ -1,0 +1,2330 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lucene 图解 - 第16章 HNSW 向量检索</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr"   markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    <marker id="arr-g" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#3fb950"/></marker>
+    <marker id="arr-o" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#d29922"/></marker>
+    <marker id="arr-r" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#f85149"/></marker>
+    <marker id="arr-p" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#bc8cff"/></marker>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Lucene</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="15-topk-wand-collector.html">上一章</a>
+  <a href="17-compression-stored-fields.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s16-1">16.1 向量检索的痛点</a>
+  <a href="#s16-2">16.2 HNSW 算法本质</a>
+  <a href="#s16-3">16.3 距离度量与相似度</a>
+  <a href="#s16-4">16.4 多层图与 log(N) 跳数</a>
+  <a href="#s16-5">16.5 构造算法:插入与连边</a>
+  <a href="#s16-6">16.6 搜索算法:贪心下降</a>
+  <a href="#s16-7">16.7 VectorValues 与 KnnVectorsFormat</a>
+  <a href="#s16-8">16.8 Lucene99HnswVectorsFormat 文件</a>
+  <a href="#s16-9">16.9 KnnFloatVectorField 写入与查询</a>
+  <a href="#s16-10">16.10 标量量化 SQ7/SQ4</a>
+  <a href="#s16-11">16.11 Product Quantization 进阶</a>
+  <a href="#s16-12">16.12 段合并:多 graph 合并</a>
+  <a href="#s16-13">16.13 内存与磁盘估算</a>
+  <a href="#s16-14">16.14 召回评估与 efSearch 调参</a>
+  <a href="#s16-15">16.15 filter 混合查询退化</a>
+  <a href="#s16-16">16.16 生产陷阱清单</a>
+  <a href="#s16-summary">16.17 本章小结</a>
+</aside>
+
+<div class="article">
+
+<h1>第 16 章 · HNSW 向量检索</h1>
+<p class="subtitle">Embedding · 多层小世界图 · 贪心下降 · efSearch / M · KnnFloatVectorField · Lucene99HnswVectorsFormat · 标量量化 · PQ · 召回 vs 延迟</p>
+
+<div class="chapter-intro">
+  <p class="lead">用户在搜索框打"昨天那个上海客户的紧急订单"——倒排索引彻底失效。这种自然语言查询没有具体 term,只有<strong>语义</strong>,需要把句子先编码成 768 维 float 向量,再在 1 亿个订单向量里找最相似的 Top-100。Lucene 9.x 引入 <code>KnnFloatVectorField</code> 与 <code>Lucene99HnswVectorsFormat</code>,通过 <strong>HNSW(Hierarchical Navigable Small World)</strong> 多层图索引把这个查询从 O(N×dim) 暴搜降到 O(log N × dim),1 亿向量 1 ms 出 Top-100,recall@10 ≥ 0.95。这是 ANN(Approximate Nearest Neighbor)的工业标准。</p>
+  <p>HNSW 的核心是<strong>"分层小世界图"</strong>:每个向量在图里是一个节点,节点连若干邻居形成图,把图拆成多层(顶层稀疏,底层全部节点),查询从顶层进入贪心找最近邻,逐层下降到底层取出 Top-K。本章拆解 HNSW 的层级结构、构造算法(随机分配 layer + heuristic 选邻居)、搜索算法(贪心 + 候选堆)、Lucene 实现(<code>OnHeapHnswGraph</code> + <code>HnswGraphBuilder</code> + <code>HnswGraphSearcher</code>)、<code>.vec</code>/<code>.vem</code>/<code>.vex</code> 三文件物理布局、标量量化(SQ7 内存省 4×)与 Product Quantization、段合并算法、与 filter 混合查询的退化与修复——全部对应 Lucene 9.x。</p>
+  <ul class="will-learn">
+    <li>为什么倒排不能解决向量检索:每个浮点是独立 term, 词典爆炸 + 无相似度概念</li>
+    <li>HNSW 多层图原理:Layer 0 全部节点, 上层节点数指数衰减(每层 1/e), 顶层 2-3 个</li>
+    <li>构造时<strong>随机分配层级</strong>: <code>level = floor(-ln(rand) × M_L)</code>, M_L = 1/ln(M)</li>
+    <li>邻居选择的 <strong>heuristic 多样性策略</strong>: 不让邻居都聚在 q 同方向, 避免局部极小</li>
+    <li>搜索时<strong>贪心下降 + 候选堆</strong>: 顶层找入口 → 逐层精细化 → 底层取 efSearch 候选 → 排序返回 Top-K</li>
+    <li>Lucene <code>VectorValues</code> / <code>FloatVectorValues</code> / <code>HnswGraph</code> 三层抽象的职责拆分</li>
+    <li>三文件物理布局: <code>.vec</code>(原始向量) + <code>.vem</code>(元数据 + 图) + <code>.vex</code>(图扩展)</li>
+    <li>标量量化 SQ7/SQ4: float32 → byte, 内存 4× 缩减, recall 损失 &lt; 1%; PQ: 子向量+码书, 8× 缩减</li>
+    <li>段合并: 多个 segment 的 HNSW 图通过 <code>merge()</code> 重建, 不是简单拼接</li>
+    <li>内存估算: M=16, dim=768, N=1e8 → 全 fp32 ≈ 480 GB, SQ7 后 ≈ 120 GB, PQ 后 ≈ 60 GB</li>
+    <li>召回 vs 延迟权衡: efSearch=16 → recall 0.85 / 1 ms, efSearch=200 → recall 0.97 / 10 ms</li>
+    <li>filter 混合查询的<strong>静默退化</strong>: filter 命中率 &lt; 10% 时 recall 跌到 0.3, 默认配置不易察觉</li>
+  </ul>
+  <p class="prereq">前置知识: 第 1 章字段建模(知道 KnnFloatVectorField 是 5 种字段类型之一); 第 4 章 BooleanQuery 与 filter; 第 7 章段合并(本章合并算法是其特殊化); 第 9 章 Codec 体系(KnnVectorsFormat 是 Codec 的一员)。读者需要对图算法(BFS / 优先队列)有基本认识——但不熟悉也没关系, 16.2-16.6 会从零讲起。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s16-1">16.1 向量检索的痛点:为什么倒排不行</h2>
+<!-- ============================================================ -->
+
+<p>倒排索引是 Lucene 的灵魂,但它有一个根本前提: <strong>"匹配 = term 相等"</strong>。一个 term 出现在 doc 里就命中,否则不命中。这个二元判断对全文搜索完美——用户搜 "iphone", 你看 .tim 词典里有没有 "iphone" 这个 term, 然后用 PostingsEnum 取出 doc 列表。但向量检索是<em>连续相似度</em>: 用户的 query embedding 和每个 doc embedding 的余弦相似度是 0 到 1 之间的 float, 没有"相等不相等",只有"多接近"。</p>
+
+<h3>把 float 当 term 索引会怎样</h3>
+
+<pre><code class="language-text">假设把 768 维 float[] 强行拆成 768 个 term(每个维度一个值):
+
+  doc 1: [0.12, -0.45, 0.78, ..., 0.03]
+         → term: "dim0:0.12", "dim1:-0.45", "dim2:0.78", ..., "dim767:0.03"
+
+  doc 2: [0.13, -0.44, 0.79, ..., 0.04]   (语义几乎一样)
+         → term: "dim0:0.13", "dim1:-0.44", "dim2:0.79", ..., "dim767:0.04"
+
+问题:
+  1. 词典爆炸: float 精度无穷, 1 亿向量 × 768 维 = 768 亿独立 term
+                .tim 文件直接 TB 级
+  2. 没有相似度: doc 1 和 doc 2 在每个维度上都不完全相等
+                查询无法找到"接近的"
+  3. 距离不能用 BooleanQuery 表达
+                cosine / L2 是连续函数, 不是 AND/OR 组合
+
+倒排索引的世界里, 0.12 和 0.13 是<em>完全不同的两个 term</em>,
+没有任何机制告诉它们"很接近"。</code></pre>
+
+<h3>暴搜的不可行</h3>
+
+<p>退一步,直接对每个查询暴力计算与所有 doc 向量的距离呢?数学上无懈可击,工程上是灾难——<strong>O(N × dim)</strong> 浮点运算,1 亿 × 768 维 = 7.68 × 10¹⁰ FLOPs,在线查询不可接受。</p>
+
+<div class="diagram">
+  <div class="diagram-title">表 16-1-1 · 暴搜 Brute Force vs HNSW 复杂度</div>
+  <table>
+    <thead>
+      <tr><th>规模</th><th>暴搜 FLOPs</th><th>暴搜延迟</th><th>HNSW FLOPs</th><th>HNSW 延迟</th><th>加速比</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>10K 向量 768D</td><td>7.7 × 10⁶</td><td>3 ms</td><td>~10K</td><td>0.3 ms</td><td>10×</td></tr>
+      <tr><td>100K 向量 768D</td><td>7.7 × 10⁷</td><td>30 ms</td><td>~15K</td><td>0.5 ms</td><td>60×</td></tr>
+      <tr><td>1M 向量 768D</td><td>7.7 × 10⁸</td><td>300 ms</td><td>~20K</td><td>0.8 ms</td><td>375×</td></tr>
+      <tr><td>10M 向量 768D</td><td>7.7 × 10⁹</td><td>3 秒</td><td>~30K</td><td>1.5 ms</td><td>2000×</td></tr>
+      <tr><td>100M 向量 768D</td><td>7.7 × 10¹⁰</td><td>30 秒</td><td>~50K</td><td>3 ms</td><td>10000×</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key-insight">
+  <strong>"近似" 是工程上的必需妥协</strong>。HNSW 不保证返回的 Top-K 是数学上真实的 Top-K——这是 "Approximate" 的含义。代价是 recall 损失(典型 0.95-0.99)、收益是 1000-10000× 加速。生产里追求 recall ≥ 0.95——能用语义找到 95 个真实最近邻就够了, 没人为了那 5 个扛 30 秒延迟。<em>recall 是 ANN 的灵魂指标, 必须有暴力 KNN 基线对比, 不能凭感觉。</em>
+</div>
+
+<h3>章节地图</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 16-1-1 · 本章组织</div>
+  <svg viewBox="0 0 1240 600" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 中心 Root -->
+    <rect x="500" y="270" width="240" height="60" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.8"/>
+    <text x="620" y="296" text-anchor="middle" fill="#cfe9ff" font-size="14" font-weight="700">HNSW + 向量检索</text>
+    <text x="620" y="316" text-anchor="middle" fill="#a5d6ff" font-size="11">5 大模块 · 16 节</text>
+
+    <!-- 5 大主分支 -->
+    <!-- S1 上 -->
+    <rect x="500" y="20" width="240" height="60" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="620" y="46" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">16.1-16.3 基础</text>
+    <text x="620" y="66" text-anchor="middle" fill="#a5d6ff" font-size="11">痛点 / 算法本质 / 距离</text>
+    <line x1="620" y1="270" x2="620" y2="82" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)" transform="rotate(180 620 176)"/>
+    <line x1="620" y1="80" x2="620" y2="268" stroke="#bc8cff" stroke-width="1.5"/>
+
+    <!-- S1 三孩子 -->
+    <rect x="20"  y="20" width="200" height="44" rx="8" fill="rgba(189,140,255,0.10)" stroke="#bc8cff" stroke-width="1.1"/>
+    <text x="120" y="40" text-anchor="middle" fill="#a5d6ff" font-size="11">为什么不能用倒排</text>
+    <text x="120" y="56" text-anchor="middle" fill="#a5d6ff" font-size="10">向量稠密非离散</text>
+    <rect x="240" y="20" width="200" height="44" rx="8" fill="rgba(189,140,255,0.10)" stroke="#bc8cff" stroke-width="1.1"/>
+    <text x="340" y="40" text-anchor="middle" fill="#a5d6ff" font-size="11">分层小世界图思想</text>
+    <text x="340" y="56" text-anchor="middle" fill="#a5d6ff" font-size="10">log(N) 跳数</text>
+    <rect x="460" y="100" width="80" height="44" rx="8" fill="rgba(189,140,255,0.10)" stroke="#bc8cff" stroke-width="1.1"/>
+    <text x="500" y="120" text-anchor="middle" fill="#a5d6ff" font-size="10">cosine</text>
+    <text x="500" y="135" text-anchor="middle" fill="#a5d6ff" font-size="10">dot / L2</text>
+
+    <!-- S2 左 -->
+    <rect x="40" y="270" width="220" height="60" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="150" y="296" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">16.4-16.6 算法</text>
+    <text x="150" y="316" text-anchor="middle" fill="#a5d6ff" font-size="11">多层图 / 构造 / 搜索</text>
+    <line x1="500" y1="300" x2="262" y2="300" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+
+    <rect x="20"  y="350" width="240" height="44" rx="8" fill="rgba(63,185,80,0.10)" stroke="#3fb950" stroke-width="1.1"/>
+    <text x="140" y="370" text-anchor="middle" fill="#a5d6ff" font-size="11">log(N) 跳数 · heuristic 选邻居</text>
+    <text x="140" y="386" text-anchor="middle" fill="#a5d6ff" font-size="10">贪心 + 候选堆 (efConstruction)</text>
+
+    <!-- S3 右 -->
+    <rect x="980" y="270" width="220" height="60" rx="12" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="1090" y="296" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">16.7-16.9 Lucene</text>
+    <text x="1090" y="316" text-anchor="middle" fill="#a5d6ff" font-size="11">VectorValues / Format / Field</text>
+    <line x1="740" y1="300" x2="978" y2="300" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+
+    <rect x="980" y="350" width="240" height="44" rx="8" fill="rgba(212,153,34,0.10)" stroke="#d29922" stroke-width="1.1"/>
+    <text x="1100" y="370" text-anchor="middle" fill="#a5d6ff" font-size="11">FloatVectorValues · .vec/.vem/.vex</text>
+    <text x="1100" y="386" text-anchor="middle" fill="#a5d6ff" font-size="10">KnnFloatVectorQuery</text>
+
+    <!-- S4 下左 -->
+    <rect x="200" y="430" width="220" height="60" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="310" y="456" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">16.10-16.12 优化</text>
+    <text x="310" y="476" text-anchor="middle" fill="#a5d6ff" font-size="11">SQ / PQ / merge</text>
+    <line x1="540" y1="330" x2="370" y2="428" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+
+    <rect x="200" y="510" width="220" height="44" rx="8" fill="rgba(189,140,255,0.10)" stroke="#bc8cff" stroke-width="1.1"/>
+    <text x="310" y="530" text-anchor="middle" fill="#a5d6ff" font-size="11">SQ7 4× / PQ 8× 缩减</text>
+    <text x="310" y="546" text-anchor="middle" fill="#a5d6ff" font-size="10">multi-segment merge</text>
+
+    <!-- S5 下右 -->
+    <rect x="820" y="430" width="240" height="60" rx="12" fill="url(#g-red)" stroke="#f85149" stroke-width="1.5"/>
+    <text x="940" y="456" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">16.13-16.16 生产</text>
+    <text x="940" y="476" text-anchor="middle" fill="#a5d6ff" font-size="11">内存 / 调参 / filter / 陷阱</text>
+    <line x1="700" y1="330" x2="880" y2="428" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+
+    <rect x="820" y="510" width="240" height="44" rx="8" fill="rgba(248,81,73,0.10)" stroke="#f85149" stroke-width="1.1"/>
+    <text x="940" y="530" text-anchor="middle" fill="#a5d6ff" font-size="11">1e8 向量内存 · efSearch 调参</text>
+    <text x="940" y="546" text-anchor="middle" fill="#a5d6ff" font-size="10">filter 退化诊断</text>
+
+    <text x="620" y="588" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">学习路径: 基础 → 算法 → Lucene 实现 → 优化 → 生产</text>
+  </svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s16-2">16.2 HNSW 算法本质:分层小世界图</h2>
+<!-- ============================================================ -->
+
+<p>HNSW 是 <strong>Hierarchical Navigable Small World</strong> 的缩写, 由 Yu A. Malkov 和 D. A. Yashunin 在 2016 年的论文里提出。三个关键词: Hierarchical(分层) + Navigable(可导航) + Small World(小世界)。理解这三个词, 就理解了整个算法的灵魂。</p>
+
+<h3>Small World 图的核心性质</h3>
+
+<p>"小世界"是 Watts 和 Strogatz 1998 年的概念: 一个图, 每个节点连若干邻居, 满足三个性质——<strong>(1) 任意两点距离 O(log N)</strong>(短链), <strong>(2) 局部聚集</strong>(近邻点连在一起), <strong>(3) 少量长边</strong>(提供跨区域导航)。社交网络是典型: 你和地球上任何人之间平均只隔 6 个人(短链), 你的朋友们大多互相认识(局部聚集), 偶尔有个朋友在地球另一端(长边)。</p>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4 style="margin-top:0;">规则图(全连接 / 网格)</h4>
+    <ul style="margin:8px 0;font-size:13.5px;">
+      <li>每节点连固定 K 个邻居(规则结构)</li>
+      <li>导航需要 O(N) 步遍历(没有捷径)</li>
+      <li>无长边, 跨区域要走完所有中间节点</li>
+      <li>不适合 ANN: 贪心搜索容易陷入局部</li>
+    </ul>
+  </div>
+  <div class="compare-good">
+    <h4 style="margin-top:0;">小世界图(HNSW 用)</h4>
+    <ul style="margin:8px 0;font-size:13.5px;">
+      <li>每节点连 M 个邻居 + 部分远距离长边</li>
+      <li>任意两点 O(log N) 步可达</li>
+      <li>长边提供跨区域跳跃(关键)</li>
+      <li>贪心搜索从远到近高效收敛</li>
+    </ul>
+  </div>
+</div>
+
+<h3>"分层"是为什么</h3>
+
+<p>单层小世界图已经能 O(log N) 找到最近邻, 但 HNSW 把它<strong>分成多层</strong>: Layer 0 包含全部 N 个节点, Layer 1 约 N/e 节点, Layer 2 约 N/e² 节点, ..., 顶层只有 2-3 个节点。<em>顶层稀疏, 适合远距离粗略导航; 底层稠密, 适合近距离精细搜索。</em>查询从顶层进入贪心找入口, 找到后下降到下一层, 在下一层从这个入口继续贪心, 一直到 Layer 0 取出 Top-K——这个"逐层精细化"是 HNSW 比单层 NSW 快的根本原因。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 16-2-1 · HNSW 多层小世界图(手绘可视化)</div>
+  <svg viewBox="0 0 900 460" xmlns="http://www.w3.org/2000/svg" style="width:100%;max-width:900px;margin:0 auto;display:block" font-family="Inter,'Microsoft YaHei',system-ui,sans-serif">
+    <defs>
+      <marker id="arrL" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6Z" fill="#d29922"/></marker>
+      <marker id="arrD" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6Z" fill="#3fb950"/></marker>
+    </defs>
+
+    <rect x="0" y="0" width="900" height="460" fill="#0d1117"/>
+
+    <!-- Layer 3 (sparse, 2 nodes) -->
+    <text x="20" y="40" fill="#bc8cff" font-size="13" font-weight="bold">Layer 3 (顶层 · 2 节点)</text>
+    <line x1="0" y1="60" x2="900" y2="60" stroke="#30363d" stroke-dasharray="4 4"/>
+    <circle cx="280" cy="80" r="10" fill="#bc8cff" stroke="#e6edf3" stroke-width="1.5"/>
+    <circle cx="640" cy="80" r="10" fill="#bc8cff" stroke="#e6edf3" stroke-width="1.5"/>
+    <line x1="290" y1="80" x2="630" y2="80" stroke="#bc8cff" stroke-width="1.2"/>
+
+    <!-- Layer 2 (sparse, 5 nodes) -->
+    <text x="20" y="135" fill="#39d2c0" font-size="13" font-weight="bold">Layer 2 (5 节点)</text>
+    <line x1="0" y1="155" x2="900" y2="155" stroke="#30363d" stroke-dasharray="4 4"/>
+    <circle cx="180" cy="180" r="8" fill="#39d2c0"/>
+    <circle cx="280" cy="180" r="8" fill="#39d2c0"/>
+    <circle cx="430" cy="180" r="8" fill="#39d2c0"/>
+    <circle cx="640" cy="180" r="8" fill="#39d2c0"/>
+    <circle cx="780" cy="180" r="8" fill="#39d2c0"/>
+    <line x1="180" y1="180" x2="280" y2="180" stroke="#39d2c0" stroke-width="1.2"/>
+    <line x1="280" y1="180" x2="430" y2="180" stroke="#39d2c0" stroke-width="1.2"/>
+    <line x1="430" y1="180" x2="640" y2="180" stroke="#39d2c0" stroke-width="1.2"/>
+    <line x1="640" y1="180" x2="780" y2="180" stroke="#39d2c0" stroke-width="1.2"/>
+    <line x1="180" y1="180" x2="640" y2="180" stroke="#39d2c0" stroke-width="0.6" stroke-dasharray="3 2"/>
+
+    <!-- Layer 1 (medium, 10 nodes) -->
+    <text x="20" y="235" fill="#58a6ff" font-size="13" font-weight="bold">Layer 1 (10 节点)</text>
+    <line x1="0" y1="255" x2="900" y2="255" stroke="#30363d" stroke-dasharray="4 4"/>
+    <g fill="#58a6ff">
+      <circle cx="100" cy="285" r="6"/>
+      <circle cx="180" cy="285" r="6"/>
+      <circle cx="260" cy="285" r="6"/>
+      <circle cx="340" cy="285" r="6"/>
+      <circle cx="430" cy="285" r="6"/>
+      <circle cx="500" cy="285" r="6"/>
+      <circle cx="580" cy="285" r="6"/>
+      <circle cx="640" cy="285" r="6"/>
+      <circle cx="720" cy="285" r="6"/>
+      <circle cx="800" cy="285" r="6"/>
+    </g>
+    <g stroke="#58a6ff" stroke-width="1">
+      <line x1="100" y1="285" x2="180" y2="285"/>
+      <line x1="180" y1="285" x2="260" y2="285"/>
+      <line x1="260" y1="285" x2="340" y2="285"/>
+      <line x1="340" y1="285" x2="430" y2="285"/>
+      <line x1="430" y1="285" x2="500" y2="285"/>
+      <line x1="500" y1="285" x2="580" y2="285"/>
+      <line x1="580" y1="285" x2="640" y2="285"/>
+      <line x1="640" y1="285" x2="720" y2="285"/>
+      <line x1="720" y1="285" x2="800" y2="285"/>
+      <line x1="100" y1="285" x2="430" y2="285" stroke-dasharray="3 2" stroke-width="0.6"/>
+      <line x1="430" y1="285" x2="800" y2="285" stroke-dasharray="3 2" stroke-width="0.6"/>
+    </g>
+
+    <!-- Layer 0 (dense, full) -->
+    <text x="20" y="335" fill="#f0883e" font-size="13" font-weight="bold">Layer 0 (全部 N 节点)</text>
+    <line x1="0" y1="355" x2="900" y2="355" stroke="#30363d" stroke-dasharray="4 4"/>
+    <g fill="#f0883e">
+      <circle cx="60" cy="395" r="4"/><circle cx="100" cy="395" r="4"/><circle cx="140" cy="395" r="4"/>
+      <circle cx="180" cy="395" r="4"/><circle cx="220" cy="395" r="4"/><circle cx="260" cy="395" r="4"/>
+      <circle cx="300" cy="395" r="4"/><circle cx="340" cy="395" r="4"/><circle cx="380" cy="395" r="4"/>
+      <circle cx="430" cy="395" r="4"/><circle cx="470" cy="395" r="4"/><circle cx="500" cy="395" r="4"/>
+      <circle cx="540" cy="395" r="4"/><circle cx="580" cy="395" r="4"/><circle cx="620" cy="395" r="4"/>
+      <circle cx="640" cy="395" r="4"/><circle cx="680" cy="395" r="4"/><circle cx="720" cy="395" r="4"/>
+      <circle cx="760" cy="395" r="4"/><circle cx="800" cy="395" r="4"/><circle cx="840" cy="395" r="4"/>
+      <circle cx="60" cy="425" r="4"/><circle cx="100" cy="425" r="4"/><circle cx="140" cy="425" r="4"/>
+      <circle cx="180" cy="425" r="4"/><circle cx="220" cy="425" r="4"/><circle cx="260" cy="425" r="4"/>
+      <circle cx="300" cy="425" r="4"/><circle cx="340" cy="425" r="4"/><circle cx="380" cy="425" r="4"/>
+      <circle cx="430" cy="425" r="4"/><circle cx="470" cy="425" r="4"/><circle cx="500" cy="425" r="4"/>
+      <circle cx="540" cy="425" r="4"/><circle cx="580" cy="425" r="4"/><circle cx="620" cy="425" r="4"/>
+      <circle cx="640" cy="425" r="4"/><circle cx="680" cy="425" r="4"/><circle cx="720" cy="425" r="4"/>
+      <circle cx="760" cy="425" r="4"/><circle cx="800" cy="425" r="4"/><circle cx="840" cy="425" r="4"/>
+    </g>
+
+    <!-- Vertical link arrows: Layer 3 -> 2 -> 1 -> 0 -->
+    <line x1="280" y1="92" x2="280" y2="170" stroke="#d29922" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrL)"/>
+    <line x1="280" y1="190" x2="260" y2="275" stroke="#d29922" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrL)"/>
+    <line x1="260" y1="295" x2="260" y2="385" stroke="#d29922" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arrL)"/>
+
+    <!-- Query entry arrow -->
+    <text x="20" y="80" fill="#3fb950" font-size="12" font-weight="bold">Query →</text>
+    <line x1="55" y1="78" x2="265" y2="78" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arrD)"/>
+  </svg>
+</div>
+
+<div class="key-insight">
+  <strong>"上稀下密" 是 HNSW 的几何精髓</strong>。顶层只有 2-3 个节点, 节点之间彼此长距离相连, 形成一个"区域索引"——查询从顶层进入, 第一步贪心就能定位到大致区域。每往下一层, 节点数 × e ≈ 2.7 倍密度, 同时引入更多近距离的邻居; 到 Layer 0 全部 N 节点都在, 邻居完全是局部的——精细化 Top-K。<em>没有分层, 单层 NSW 也能找到最近邻, 但贪心搜索的步数会从 log(N) 退化到 √N 级。</em>
+</div>
+
+<h3>"Navigable" 的含义</h3>
+
+<p>Navigable 在论文里是个数学术语: 给定一个图和起点, 贪心搜索(每步选当前节点的邻居中最接近 q 的)能在 polylogarithmic 步数内收敛到全局最近邻。Navigable 的关键是 <strong>邻居选择策略</strong>——选 M 个邻居时, 不能贪心地选最近的 M 个(那样邻居都聚在一团, 没有长边), 必须用 <em>heuristic</em>: 既要近, 又要互相分散, 保证有跨区域的长边。这点在 16.5 详细讲。</p>
+
+<!-- ============================================================ -->
+<h2 id="s16-3">16.3 距离度量与相似度函数</h2>
+<!-- ============================================================ -->
+
+<p>HNSW 是<strong>距离不可知</strong>的——算法本身只需要"两个向量之间的距离"这个抽象操作, 不限定 L2 / cosine / dot。Lucene 提供了 4 种内置 <code>VectorSimilarityFunction</code>, 每种对应一个具体的数学函数和典型业务。</p>
+
+<div class="diagram">
+  <div class="diagram-title">表 16-3-1 · Lucene VectorSimilarityFunction 4 种</div>
+  <table>
+    <thead>
+      <tr><th>常量</th><th>数学公式</th><th>范围</th><th>语义</th><th>典型业务</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>EUCLIDEAN</code></td><td>‖a - b‖²(L2 平方)</td><td>[0, +∞)</td><td>距离, 越小越相似</td><td>图像哈希</td></tr>
+      <tr><td><code>COSINE</code></td><td>(a · b) / (‖a‖ × ‖b‖)</td><td>[-1, 1]</td><td>角度相似度, 越大越相似</td><td>BERT / OpenAI embedding</td></tr>
+      <tr><td><code>DOT_PRODUCT</code></td><td>a · b</td><td>(-∞, +∞)</td><td>需归一化向量, 等价 cosine</td><td>性能优于 cosine</td></tr>
+      <tr><td><code>MAXIMUM_INNER_PRODUCT</code></td><td>argmax(a · b)</td><td>(-∞, +∞)</td><td>不要求归一化的内积</td><td>推荐系统(MIPS)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>为什么 cosine 是文本检索的默认</h3>
+
+<p>BERT / Sentence-BERT / OpenAI text-embedding 等语义模型输出的向量, 模长(‖v‖)与语义无关——同一句话用不同长度的输入(全句 vs 关键词)会得到不同模长的向量, 但它们语义相同, 应该判定为高度相似。<strong>Cosine 只看角度, 自动消除模长差异</strong>。这是文本检索默认 COSINE 的根本原因。</p>
+
+<pre><code class="language-text">cosine 公式拆解:
+
+  cos(a, b) = (a · b) / (‖a‖ × ‖b‖)
+            = Σ a_i × b_i / (sqrt(Σ a_i²) × sqrt(Σ b_i²))
+
+  例子:
+    a = [1, 0]                   ‖a‖ = 1
+    b = [3, 0]                   ‖b‖ = 3        ← 模长不同
+    cos(a, b) = (1×3 + 0×0) / (1 × 3) = 1.0    ← 角度 0°, 完全相似
+
+  vs L2:
+    ‖a - b‖² = (1-3)² + 0² = 4   ← L2 觉得它们很远
+
+cosine 把 a 和 b 视为方向向量, 模长被归一化掉。
+对于"语义相同, 表达不同"的文本场景, cosine 是正解。</code></pre>
+
+<h3>归一化后的 dot 等价 cosine 但更快</h3>
+
+<p>若所有 doc 向量都先归一化(‖v‖ = 1), 那么 cos(a, b) = a · b——两者数学上等价, 但 dot 省掉了运行时的除法 + sqrt 计算, <strong>典型快 2-3 倍</strong>。生产里推荐流程: 写入时 <code>VectorUtil.l2normalize(v)</code> 归一化, 索引设 <code>DOT_PRODUCT</code>, 查询时 query embedding 同样归一化。</p>
+
+<div class="warning">
+  <strong>归一化必须双侧</strong>。如果 doc 向量归一化了但 query 没归一化, dot 与 cosine 不等价, recall 会暴跌(典型从 0.95 → 0.6)。常见 bug: 训练时用 cosine loss(模型自动归一化输出), 但推理时调用方忘了对 query embedding 调 <code>l2normalize</code>——线上跑了几天发现召回莫名其妙差。<em>修复: 在 encode pipeline 入口加强制归一化, 不依赖调用方自觉。</em>
+</div>
+
+<h3>距离 → 相似度 → 评分</h3>
+
+<p>Lucene 内部把"距离 / 相似度"统一转换为 <strong>score</strong>(0-∞ 之间的浮点, 越大越好)。EUCLIDEAN 距离 d 转换成 <code>1 / (1 + d)</code>(距离越小, score 越接近 1); COSINE 直接 <code>(1 + cos) / 2</code>(把 [-1, 1] 线性映射到 [0, 1]); DOT 走 <code>(1 + dot) / 2</code> 但要求归一化。这套转换让所有 KNN query 与其他 BooleanQuery 拼接时 score 是可比的。</p>
+
+<!-- ============================================================ -->
+<h2 id="s16-4">16.4 多层图与 log(N) 跳数</h2>
+<!-- ============================================================ -->
+
+<p>16.2 概念性提到了多层结构, 这一节给出具体数字。理解层级分配的概率分布与 log(N) 跳数的来源, 是后面调参 M 的基础。</p>
+
+<h3>层级随机分配</h3>
+
+<p>HNSW 给每个新节点<strong>随机抽取一个 layer</strong>, 抽法是指数分布: <code>level = floor(-ln(uniform(0, 1)) × M_L)</code>, 其中 <code>M_L = 1 / ln(M)</code>(M 是每节点邻居数, 默认 16, 所以 M_L ≈ 0.36)。这个公式让节点数随层数指数衰减——Layer 0 全部, 上一层 1/e ≈ 37%, 再上 14%, 5%, 2%, ...</p>
+
+<div class="diagram">
+  <div class="diagram-title">表 16-4-1 · 1M 向量在各层的节点数(M=16)</div>
+  <table>
+    <thead>
+      <tr><th>Layer</th><th>概率(理论)</th><th>1M 数据节点数</th><th>邻居链表大小</th><th>用途</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>0</td><td>100%</td><td>1,000,000</td><td>2M(Layer 0 加倍 = 32)</td><td>底层全部 / 精细搜索</td></tr>
+      <tr><td>1</td><td>~37%</td><td>368,000</td><td>M = 16</td><td>中间层精细化</td></tr>
+      <tr><td>2</td><td>~14%</td><td>135,000</td><td>16</td><td>区域定位</td></tr>
+      <tr><td>3</td><td>~5%</td><td>50,000</td><td>16</td><td>区域定位</td></tr>
+      <tr><td>4</td><td>~2%</td><td>18,000</td><td>16</td><td>粗略导航</td></tr>
+      <tr><td>5</td><td>~0.7%</td><td>6,700</td><td>16</td><td>粗略导航</td></tr>
+      <tr><td>6</td><td>~0.25%</td><td>2,500</td><td>16</td><td>顶层入口候选</td></tr>
+      <tr><td>7</td><td>~0.09%</td><td>~900</td><td>16</td><td>顶层</td></tr>
+      <tr><td>8</td><td>~0.03%</td><td>~330</td><td>16</td><td>顶层</td></tr>
+      <tr><td>9</td><td>~0.012%</td><td>~120</td><td>16</td><td>顶层</td></tr>
+      <tr><td>10+</td><td>&lt; 0.005%</td><td>&lt; 50</td><td>16</td><td>极顶</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>log(N) 跳数的几何直观</h3>
+
+<p>HNSW 查询从顶层进入, 在每一层贪心走若干步找到该层最近邻, 然后下降到下一层。<strong>每层贪心步数是常数级(2-5 步)</strong>——因为该层节点稀疏, 贪心几步就到了局部最近; 总层数是 log(N) 级别(1M 数据约 7 层, 1e8 数据约 11 层); 所以总跳数 = O(log N) × O(1) = <strong>O(log N)</strong>。这就是 HNSW 1 ms 找 100 万向量最近邻的来源。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 16-4-2 · HNSW 搜索路径下降(贪心 + 下降的 zig-zag)</div>
+  <svg viewBox="0 0 1240 660" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- Query -->
+    <rect x="40" y="20" width="220" height="60" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="150" y="46" text-anchor="middle" fill="#cfe9ff" font-size="14" font-weight="700">Query — 768D 向量</text>
+    <text x="150" y="66" text-anchor="middle" fill="#a5d6ff" font-size="11">从顶层入口开始</text>
+
+    <!-- 5 层金字塔 -->
+    <!-- Layer 4 (最稀疏) -->
+    <rect x="320" y="20" width="240" height="60" rx="10" fill="rgba(189,140,255,0.10)" stroke="#bc8cff" stroke-width="1.4" stroke-dasharray="4 3"/>
+    <text x="440" y="44" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">Layer 4 — 最稀疏</text>
+    <text x="440" y="64" text-anchor="middle" fill="#a5d6ff" font-size="11">~18 节点 · 长程跳跃</text>
+    <line x1="260" y1="50" x2="318" y2="50" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+
+    <rect x="640" y="20" width="200" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="740" y="46" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">v_a (局部最近)</text>
+    <text x="740" y="64" text-anchor="middle" fill="#a5d6ff" font-size="10">贪心 3 步</text>
+    <line x1="560" y1="50" x2="638" y2="50" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+
+    <line x1="740" y1="80" x2="440" y2="125" stroke="#d29922" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-o)"/>
+    <text x="600" y="100" fill="#d29922" font-size="11" font-weight="700">↓ 下降到 Layer 3</text>
+
+    <!-- Layer 3 -->
+    <rect x="320" y="125" width="240" height="60" rx="10" fill="rgba(189,140,255,0.10)" stroke="#bc8cff" stroke-width="1.4" stroke-dasharray="4 3"/>
+    <text x="440" y="149" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">Layer 3</text>
+    <text x="440" y="169" text-anchor="middle" fill="#a5d6ff" font-size="11">~50 节点</text>
+
+    <rect x="640" y="125" width="200" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="740" y="151" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">v_b</text>
+    <text x="740" y="169" text-anchor="middle" fill="#a5d6ff" font-size="10">从 v_a 入口 · 贪心 4 步</text>
+    <line x1="560" y1="155" x2="638" y2="155" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+
+    <line x1="740" y1="185" x2="440" y2="225" stroke="#d29922" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-o)"/>
+
+    <!-- Layer 2 -->
+    <rect x="320" y="225" width="240" height="60" rx="10" fill="rgba(189,140,255,0.10)" stroke="#bc8cff" stroke-width="1.4" stroke-dasharray="4 3"/>
+    <text x="440" y="249" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">Layer 2</text>
+    <text x="440" y="269" text-anchor="middle" fill="#a5d6ff" font-size="11">~250 节点</text>
+
+    <rect x="640" y="225" width="200" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="740" y="251" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">v_c</text>
+    <text x="740" y="269" text-anchor="middle" fill="#a5d6ff" font-size="10">贪心 4 步</text>
+    <line x1="560" y1="255" x2="638" y2="255" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+
+    <line x1="740" y1="285" x2="440" y2="325" stroke="#d29922" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-o)"/>
+
+    <!-- Layer 1 -->
+    <rect x="320" y="325" width="240" height="60" rx="10" fill="rgba(189,140,255,0.10)" stroke="#bc8cff" stroke-width="1.4" stroke-dasharray="4 3"/>
+    <text x="440" y="349" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">Layer 1</text>
+    <text x="440" y="369" text-anchor="middle" fill="#a5d6ff" font-size="11">~5000 节点</text>
+
+    <rect x="640" y="325" width="200" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="740" y="351" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">v_d</text>
+    <text x="740" y="369" text-anchor="middle" fill="#a5d6ff" font-size="10">贪心 5 步</text>
+    <line x1="560" y1="355" x2="638" y2="355" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+
+    <line x1="740" y1="385" x2="440" y2="425" stroke="#d29922" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arr-o)"/>
+
+    <!-- Layer 0 (最密) -->
+    <rect x="320" y="425" width="240" height="60" rx="10" fill="rgba(63,185,80,0.12)" stroke="#3fb950" stroke-width="1.6"/>
+    <text x="440" y="449" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">Layer 0 ★ 全量层</text>
+    <text x="440" y="469" text-anchor="middle" fill="#a5d6ff" font-size="11">1M 节点 · 包含所有 doc</text>
+
+    <rect x="640" y="425" width="320" height="80" rx="12" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.6"/>
+    <text x="800" y="453" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">候选堆 — efSearch = 100</text>
+    <text x="800" y="473" text-anchor="middle" fill="#a5d6ff" font-size="11">从 v_d 入口扩展邻居</text>
+    <text x="800" y="491" text-anchor="middle" fill="#a5d6ff" font-size="11">维护当前 100 个最近候选</text>
+    <line x1="560" y1="455" x2="638" y2="455" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+
+    <rect x="1000" y="425" width="220" height="80" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.8"/>
+    <text x="1110" y="453" text-anchor="middle" fill="#9be7b3" font-size="14" font-weight="700">Top-10 邻居 ★</text>
+    <text x="1110" y="473" text-anchor="middle" fill="#a5d6ff" font-size="11">从堆中取最近 K 个</text>
+    <text x="1110" y="491" text-anchor="middle" fill="#a5d6ff" font-size="11">返回 docID + score</text>
+    <line x1="960" y1="465" x2="998" y2="465" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+
+    <!-- 注释面板 -->
+    <rect x="40" y="540" width="1180" height="100" rx="12" fill="rgba(57,210,192,0.05)" stroke="#39d2c0" stroke-width="1.4" stroke-dasharray="6 3"/>
+    <text x="630" y="568" text-anchor="middle" fill="#39d2c0" font-size="13" font-weight="700">为什么是 zig-zag? — 上层稀疏快速逼近, 下层密集精确搜索</text>
+    <text x="60" y="595" fill="#a5d6ff" font-size="11">· 高层节点稀疏 (指数级递减) → 每层只有几个候选, 长程跳跃</text>
+    <text x="60" y="613" fill="#a5d6ff" font-size="11">· 低层节点密集 → 局部精细搜索, 候选堆扩展邻居</text>
+    <text x="60" y="630" fill="#39d2c0" font-size="11" font-weight="700">总跳数 ≈ M × log(N) — 1M doc 仅需 ~20 步贪心 → 1ms 完成 KNN</text>
+  </svg>
+</div>
+
+<h3>HNSW 的关键参数 M / efConstruction / efSearch</h3>
+
+<p>三个参数控制 HNSW 的全部行为, 必须深入理解每个的几何含义。</p>
+
+<div class="diagram">
+  <div class="diagram-title">表 16-4-2 · 三个核心参数的几何含义</div>
+  <table>
+    <thead>
+      <tr><th>参数</th><th>默认</th><th>典型范围</th><th>几何含义</th><th>调大效果</th><th>调小效果</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>M</code></td><td>16</td><td>8-64</td><td>每节点邻居数(Layer 0 是 2M)</td><td>recall ↑ 内存 ↑ 构造慢</td><td>recall ↓ 内存省</td></tr>
+      <tr><td><code>efConstruction</code></td><td>100</td><td>100-500</td><td>构造时候选堆大小</td><td>建图慢但图质量高</td><td>建图快但图质量差</td></tr>
+      <tr><td><code>efSearch</code></td><td>100</td><td>16-500</td><td>查询时候选堆大小</td><td>recall ↑ 查询慢</td><td>recall ↓ 查询快</td></tr>
+      <tr><td><code>maxLayers</code></td><td>auto</td><td>由 M 推导</td><td>最大层数 ≈ log_M(N)</td><td>—</td><td>—</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">卡片 16-4 · 邻居数 M 的取舍 (内存 + 召回 + 速度三角)</div>
+  <div style="background:#0d1117;border:1.5px solid #d29922;border-radius:10px;padding:18px;">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;">
+      <div style="background:#161b22;border:1px solid #f85149;border-radius:8px;padding:14px;">
+        <div style="color:#f85149;font-weight:700;font-size:13px;margin-bottom:8px;">M = 8 (省内存)</div>
+        <ul style="margin:0;padding-left:18px;font-size:12.5px;line-height:1.7;">
+          <li>每节点 8 邻居链</li>
+          <li>recall@10 ~ 0.85</li>
+          <li>内存基线 1×</li>
+          <li>建图最快</li>
+          <li><span style="color:#f85149;">⚠ 召回不达标</span></li>
+        </ul>
+      </div>
+      <div style="background:#161b22;border:1px solid #3fb950;border-radius:8px;padding:14px;">
+        <div style="color:#3fb950;font-weight:700;font-size:13px;margin-bottom:8px;">M = 16 (默认)</div>
+        <ul style="margin:0;padding-left:18px;font-size:12.5px;line-height:1.7;">
+          <li>每节点 16 邻居链</li>
+          <li>recall@10 ~ 0.95</li>
+          <li>内存 2×(vs M=8)</li>
+          <li>建图中等</li>
+          <li><span style="color:#3fb950;">★ 生产推荐</span></li>
+        </ul>
+      </div>
+      <div style="background:#161b22;border:1px solid #58a6ff;border-radius:8px;padding:14px;">
+        <div style="color:#58a6ff;font-weight:700;font-size:13px;margin-bottom:8px;">M = 32 (高召回)</div>
+        <ul style="margin:0;padding-left:18px;font-size:12.5px;line-height:1.7;">
+          <li>每节点 32 邻居链</li>
+          <li>recall@10 ~ 0.97</li>
+          <li>内存 4×</li>
+          <li>建图慢</li>
+          <li><span style="color:#58a6ff;">关键业务用</span></li>
+        </ul>
+      </div>
+      <div style="background:#161b22;border:1px solid #bc8cff;border-radius:8px;padding:14px;">
+        <div style="color:#bc8cff;font-weight:700;font-size:13px;margin-bottom:8px;">M = 64 (极致)</div>
+        <ul style="margin:0;padding-left:18px;font-size:12.5px;line-height:1.7;">
+          <li>每节点 64 邻居链</li>
+          <li>recall@10 ~ 0.98</li>
+          <li>内存 8×</li>
+          <li>建图极慢</li>
+          <li><span style="color:#bc8cff;">⚠ 边际收益小</span></li>
+        </ul>
+      </div>
+    </div>
+    <div style="margin-top:12px;text-align:center;color:#8b949e;font-size:12px;">
+      内存增长 = M × N × 4 (邻居链每节点 4 byte 存 ord), 1e8 节点 M=16 = 6.4 GB 仅图
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s16-5">16.5 构造算法:插入与连边</h2>
+<!-- ============================================================ -->
+
+<p>HNSW 是<strong>增量构造</strong>的: 每个向量逐个 add 到图里, 不需要预知全部数据。这与 IVF(需要先 k-means 聚类)截然不同, 特别适合 Lucene 的 segment 模型(段是只追加的)。</p>
+
+<h3>insert(v) 的 5 阶段</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 16-5-1 · HnswGraphBuilder.addNode 的 5 阶段</div>
+  <svg viewBox="0 0 1240 740" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 5 个泳道 -->
+    <rect x="20"   y="20" width="200" height="50" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="1.4"/>
+    <text x="120"  y="48" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">addNode(v)</text>
+
+    <rect x="260"  y="20" width="200" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.4"/>
+    <text x="360"  y="48" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">抽 level (Lvl)</text>
+
+    <rect x="500"  y="20" width="200" height="50" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.4"/>
+    <text x="600"  y="48" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">顶层入口 ep</text>
+
+    <rect x="740"  y="20" width="220" height="50" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="1.4"/>
+    <text x="850"  y="48" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">searchLayer (Greedy)</text>
+
+    <rect x="1000" y="20" width="220" height="50" rx="8" fill="url(#g-red)"    stroke="#f85149" stroke-width="1.4"/>
+    <text x="1110" y="48" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">双向连边 (Conn)</text>
+
+    <line x1="120"  y1="70" x2="120"  y2="720" stroke="#58a6ff" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="360"  y1="70" x2="360"  y2="720" stroke="#bc8cff" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="600"  y1="70" x2="600"  y2="720" stroke="#d29922" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="850"  y1="70" x2="850"  y2="720" stroke="#3fb950" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="1110" y1="70" x2="1110" y2="720" stroke="#f85149" stroke-width="1" stroke-dasharray="4 4"/>
+
+    <!-- 1 Add → Lvl random level -->
+    <line x1="120" y1="105" x2="358" y2="105" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+    <text x="239" y="98" text-anchor="middle" fill="#e6d3ff" font-size="11">① random level: ⌊−ln(rand) × M_L⌋</text>
+
+    <!-- 2 Lvl → Add l=2 -->
+    <line x1="360" y1="135" x2="122" y2="135" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arr-p)"/>
+    <text x="239" y="128" text-anchor="middle" fill="#e6d3ff" font-size="11">② l = 2 (例)</text>
+
+    <!-- 3 Add → TopE 取 entryNode -->
+    <line x1="120" y1="170" x2="598" y2="170" stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+    <text x="359" y="163" text-anchor="middle" fill="#ffd591" font-size="11">③ 取当前图的 entryNode (顶层节点 ord)</text>
+
+    <!-- Note 阶段1 顶向下贪心找入口 -->
+    <rect x="280" y="190" width="640" height="32" rx="6" fill="rgba(212,153,34,0.12)" stroke="#d29922" stroke-width="1"/>
+    <text x="600" y="210" text-anchor="middle" fill="#d29922" font-size="11" font-weight="700">— 阶段 ① 顶向下贪心找入口 (从 maxLayer 到 l+1) —</text>
+
+    <!-- loop 框 -->
+    <rect x="100" y="232" width="1080" height="100" rx="10" fill="rgba(63,185,80,0.05)" stroke="#3fb950" stroke-width="1.1" stroke-dasharray="4 3"/>
+    <text x="140" y="252" fill="#3fb950" font-size="11" font-weight="700">loop · 当前 maxLayer 到 l+1</text>
+
+    <!-- 4 Add → Greedy searchLayer ef=1 -->
+    <line x1="120" y1="282" x2="848" y2="282" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+    <text x="500" y="275" text-anchor="middle" fill="#9be7b3" font-size="11">④ searchLayer(v, ep, ef=1, layer) — 单点贪心</text>
+
+    <!-- 5 Greedy → Add ep' -->
+    <line x1="850" y1="312" x2="122" y2="312" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arr-g)"/>
+    <text x="500" y="305" text-anchor="middle" fill="#9be7b3" font-size="11">⑤ 该层最近邻 ep' → ep ← ep' (下一层入口)</text>
+
+    <!-- Note 阶段2 -->
+    <rect x="280" y="350" width="640" height="32" rx="6" fill="rgba(248,81,73,0.12)" stroke="#f85149" stroke-width="1"/>
+    <text x="600" y="370" text-anchor="middle" fill="#f85149" font-size="11" font-weight="700">— 阶段 ② 在 v 的层及以下扩展 (从 l 到 0) —</text>
+
+    <!-- loop 框 -->
+    <rect x="100" y="392" width="1080" height="220" rx="10" fill="rgba(248,81,73,0.05)" stroke="#f85149" stroke-width="1.1" stroke-dasharray="4 3"/>
+    <text x="140" y="412" fill="#f85149" font-size="11" font-weight="700">loop · 从 l 到 0 — 每层都建图</text>
+
+    <!-- 6 Add → Greedy searchLayer efConstruction -->
+    <line x1="120" y1="442" x2="848" y2="442" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+    <text x="500" y="435" text-anchor="middle" fill="#9be7b3" font-size="11">⑥ searchLayer(v, ep, efConstruction=100, layer) — 候选堆扩展</text>
+
+    <!-- 7 Greedy → Add 候选 -->
+    <line x1="850" y1="472" x2="122" y2="472" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arr-g)"/>
+    <text x="500" y="465" text-anchor="middle" fill="#9be7b3" font-size="11">⑦ 候选 ef=100 个邻居</text>
+
+    <!-- 8 Add → Conn heuristic 选 M -->
+    <line x1="120" y1="505" x2="1108" y2="505" stroke="#f85149" stroke-width="1.6" marker-end="url(#arr-r)"/>
+    <text x="615" y="498" text-anchor="middle" fill="#ffadad" font-size="11">⑧ heuristic 选 M=16 个邻居 (多样性 + 距离)</text>
+
+    <!-- 9 Conn self 双向连边 -->
+    <path d="M 1110 535 Q 1180 535 1180 555 Q 1180 575 1112 575" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr-r)"/>
+    <text x="1170" y="558" text-anchor="end" fill="#ffadad" font-size="11">⑨ 双向连边 v ↔ neighbor</text>
+
+    <!-- 10 Conn self 修剪 -->
+    <path d="M 1110 590 Q 1180 590 1180 605 Q 1180 622 1112 622" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr-r)"/>
+    <text x="1170" y="608" text-anchor="end" fill="#f85149" font-size="11" font-weight="700">⑩ 邻居超 M 时修剪 (heuristic)</text>
+
+    <!-- Note 阶段3 -->
+    <rect x="280" y="640" width="640" height="32" rx="6" fill="rgba(63,185,80,0.12)" stroke="#3fb950" stroke-width="1"/>
+    <text x="600" y="660" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="700">— 阶段 ③ 若 l &gt; 当前 maxLayer → 设 v 为新顶层入口 —</text>
+
+    <text x="620" y="710" text-anchor="middle" fill="#39d2c0" font-size="12" font-weight="700">复杂度: O(M × log N) per insert · 1M doc 建图 ~10 min (单线程, M=16)</text>
+  </svg>
+</div>
+
+<h3>Heuristic 邻居选择(关键)</h3>
+
+<p>从 efConstruction 个候选里选 M 个邻居, 简单做法是取距离最近的 M 个——但这导致邻居全聚在 q 同一方向, 没有跨区域长边, 图退化。<strong>Heuristic 策略</strong>: 按距离排序候选; 依次考虑每个候选 v, 当且仅当 v 离 q 比离任何已选邻居都近, 才把 v 加入选中列表; 直到选满 M。</p>
+
+<pre><code class="language-text">Heuristic 选邻居伪代码:
+
+  function selectNeighborsHeuristic(q, candidates, M):
+      sort candidates by dist(q, c) ascending
+      selected = []
+      for c in candidates:
+          # 条件: c 离 q 比离任何已选邻居都近
+          if all(dist(q, c) < dist(c, s) for s in selected):
+              selected.append(c)
+              if len(selected) == M:
+                  break
+      return selected
+
+  几何含义: 不要让邻居们都"挤"在 q 同一边
+            选 c 的条件是 q 是 c 当前最近的"中心"
+            这保证邻居分散在 q 周围不同方向
+            形成跨区域长边, 维持 Navigable 性质</code></pre>
+
+<div class="key-insight">
+  <strong>Heuristic 是 HNSW 比早期 NSW 强的关键</strong>。Malkov 在论文里明确指出: 简单选邻居(top M closest)在低维数据(D &lt; 10)上工作得不错, 但在高维数据(D ≥ 100, BERT 是 768)上 recall 显著下降, 因为高维空间里"近邻"会聚在一团失去导航性。Heuristic 的"分散选择"本质上是模拟小世界图的"长边", 在高维空间里至关重要——这也是为什么 Lucene 默认用 heuristic, 不暴露简单策略的开关。
+</div>
+
+<h3>构造代价</h3>
+
+<p>每个 insert 调用 <code>searchLayer(efConstruction)</code> 平均 log(N) 次, 每次扩展 efConstruction 个候选(每个候选要算一次距离)。所以单次 insert ≈ <strong>O(efConstruction × M × log N)</strong> 次距离计算。1M 向量 768 维 + efConstruction=100 + M=16 → 总建图时间约 <strong>5-10 分钟</strong>(单线程, SSD)。</p>
+
+<pre><code class="language-java">import org.apache.lucene.util.hnsw.OnHeapHnswGraph;
+import org.apache.lucene.util.hnsw.HnswGraphBuilder;
+import org.apache.lucene.codecs.hnsw.HnswGraphProvider;
+import org.apache.lucene.index.FloatVectorValues;
+import org.apache.lucene.index.VectorSimilarityFunction;
+import java.util.Random;
+
+public class HnswBuildDemo {
+
+    public static OnHeapHnswGraph buildGraph(FloatVectorValues vectors,
+                                              int M,
+                                              int beamWidth) throws IOException {
+        HnswGraphBuilder builder = HnswGraphBuilder.create(
+            vectors,
+            VectorSimilarityFunction.COSINE,
+            M,
+            beamWidth,
+            new Random(42).nextLong());
+
+        long start = System.currentTimeMillis();
+        OnHeapHnswGraph graph = builder.build(vectors.size());
+        long elapsed = System.currentTimeMillis() - start;
+
+        System.out.printf("Built %d nodes, %d layers, took %d ms%n",
+            graph.size(), graph.numLevels(), elapsed);
+        return graph;
+    }
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s16-6">16.6 搜索算法:贪心下降 + 候选堆</h2>
+<!-- ============================================================ -->
+
+<p>构造完成后, 查询路径异常清晰: 顶层贪心下降到 Layer 0 入口, 然后在 Layer 0 用 efSearch 候选堆扩展, 取 Top-K。本节给出 <code>searchLayer</code> 的完整伪代码与 Lucene 实现。</p>
+
+<h3>searchLayer 伪代码</h3>
+
+<pre><code class="language-text">function searchLayer(q, ep, ef, layer):
+    # ep: 入口节点 ord
+    # ef: 候选堆大小(查询时 = efSearch, 构造时 = efConstruction)
+    # layer: 当前层
+
+    candidates = MinHeap()        # 按 dist(q, n) 升序, 弹出最近的
+    results    = MaxHeap()        # 按 dist(q, n) 降序, 弹出最远的, 保留 Top-ef
+    visited    = BitSet()
+
+    candidates.push(ep, dist(q, ep))
+    results.push(ep, dist(q, ep))
+    visited.add(ep)
+
+    while not candidates.empty():
+        c = candidates.pop()        # 当前最近的候选
+        # 终止条件: c 已经比 results 里最远的还远
+        # → 继续探索不可能产生更好的结果
+        if dist(q, c) > results.top():
+            break
+
+        for n in graph.neighbors(c, layer):
+            if visited.contains(n):
+                continue
+            visited.add(n)
+            d = dist(q, n)
+            # n 比 results 最远的更近, 或 results 还没满
+            if d < results.top() or len(results) < ef:
+                candidates.push(n, d)
+                results.push(n, d)
+                if len(results) > ef:
+                    results.popMax()    # 维持 ef 大小
+
+    return results    # 返回 ef 个候选</code></pre>
+
+<h3>查询整体流程</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 16-6-1 · KnnFloatVectorQuery 完整搜索流程</div>
+  <svg viewBox="0 0 1240 720" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 5 个泳道 -->
+    <rect x="20"   y="20" width="200" height="50" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="1.4"/>
+    <text x="120"  y="48" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">Query (Q)</text>
+
+    <rect x="260"  y="20" width="220" height="50" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.4"/>
+    <text x="370"  y="48" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">HnswGraphSearcher</text>
+
+    <rect x="520"  y="20" width="200" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.4"/>
+    <text x="620"  y="48" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">HnswGraph</text>
+
+    <rect x="760"  y="20" width="220" height="50" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="1.4"/>
+    <text x="870"  y="48" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">FloatVectorValues</text>
+
+    <rect x="1020" y="20" width="200" height="50" rx="8" fill="url(#g-red)"    stroke="#f85149" stroke-width="1.4"/>
+    <text x="1120" y="48" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">Candidate Heap</text>
+
+    <line x1="120"  y1="70" x2="120"  y2="700" stroke="#58a6ff" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="370"  y1="70" x2="370"  y2="700" stroke="#d29922" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="620"  y1="70" x2="620"  y2="700" stroke="#bc8cff" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="870"  y1="70" x2="870"  y2="700" stroke="#3fb950" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="1120" y1="70" x2="1120" y2="700" stroke="#f85149" stroke-width="1" stroke-dasharray="4 4"/>
+
+    <!-- 1 Q→Searcher search -->
+    <line x1="120" y1="105" x2="368" y2="105" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+    <text x="244" y="98" text-anchor="middle" fill="#cfe9ff" font-size="11">① search(q, k=10, ef=100)</text>
+
+    <!-- 2 Searcher→Graph getEntryNode -->
+    <line x1="370" y1="140" x2="618" y2="140" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+    <text x="494" y="133" text-anchor="middle" fill="#e6d3ff" font-size="11">② getEntryNode() → ep₀</text>
+
+    <!-- Note 阶段 1 -->
+    <rect x="280" y="160" width="500" height="32" rx="6" fill="rgba(212,153,34,0.12)" stroke="#d29922" stroke-width="1"/>
+    <text x="530" y="180" text-anchor="middle" fill="#d29922" font-size="11" font-weight="700">— 阶段 ① 顶层贪心下降 (ef=1) —</text>
+
+    <!-- loop 框 -->
+    <rect x="100" y="200" width="1080" height="190" rx="10" fill="rgba(189,140,255,0.05)" stroke="#bc8cff" stroke-width="1.1" stroke-dasharray="4 3"/>
+    <text x="140" y="220" fill="#bc8cff" font-size="11" font-weight="700">loop · 从 maxLevel 到 1</text>
+
+    <!-- 3 Searcher→Graph neighbors -->
+    <line x1="370" y1="250" x2="618" y2="250" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+    <text x="494" y="243" text-anchor="middle" fill="#e6d3ff" font-size="11">③ neighbors(ep, level)</text>
+
+    <!-- 4 Graph→Searcher 邻居列表 -->
+    <line x1="620" y1="280" x2="372" y2="280" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arr-p)"/>
+    <text x="494" y="273" text-anchor="middle" fill="#e6d3ff" font-size="11">④ 邻居 ord 列表</text>
+
+    <!-- 5 Searcher→Vec vectorValue -->
+    <line x1="370" y1="315" x2="868" y2="315" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+    <text x="619" y="308" text-anchor="middle" fill="#9be7b3" font-size="11">⑤ vectorValue(neighbor)</text>
+
+    <!-- 6 Vec→Searcher float[] -->
+    <line x1="870" y1="345" x2="372" y2="345" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arr-g)"/>
+    <text x="619" y="338" text-anchor="middle" fill="#9be7b3" font-size="11">⑥ float[768] (从 .vec mmap)</text>
+
+    <!-- 7 Searcher self dist -->
+    <path d="M 370 372 Q 440 372 440 380 Q 440 388 372 388" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr-o)"/>
+    <text x="460" y="385" fill="#ffd591" font-size="11">⑦ dist(q, n) [SIMD] · ep ← argmin dist</text>
+
+    <!-- Note 阶段 2 -->
+    <rect x="280" y="410" width="500" height="32" rx="6" fill="rgba(248,81,73,0.12)" stroke="#f85149" stroke-width="1"/>
+    <text x="530" y="430" text-anchor="middle" fill="#f85149" font-size="11" font-weight="700">— 阶段 ② Layer 0 扩展 (ef=100) —</text>
+
+    <!-- 8 Searcher→Heap searchLayer -->
+    <line x1="370" y1="465" x2="1118" y2="465" stroke="#f85149" stroke-width="1.6" marker-end="url(#arr-r)"/>
+    <text x="744" y="458" text-anchor="middle" fill="#ffadad" font-size="11">⑧ searchLayer(q, ep, ef=100, layer=0) — 候选堆扩展</text>
+
+    <!-- 9 Heap→Searcher 候选 -->
+    <line x1="1120" y1="498" x2="372" y2="498" stroke="#f85149" stroke-width="1.5" stroke-dasharray="6 3" marker-end="url(#arr-r)"/>
+    <text x="746" y="491" text-anchor="middle" fill="#ffadad" font-size="11">⑨ 100 个候选 (按 dist 排序)</text>
+
+    <!-- Note 阶段 3 -->
+    <rect x="280" y="525" width="500" height="32" rx="6" fill="rgba(63,185,80,0.12)" stroke="#3fb950" stroke-width="1"/>
+    <text x="530" y="545" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="700">— 阶段 ③ 取 Top-K —</text>
+
+    <!-- 10 Searcher→Q TopDocs -->
+    <line x1="370" y1="585" x2="122" y2="585" stroke="#3fb950" stroke-width="1.6" stroke-dasharray="6 3" marker-end="url(#arr-g)"/>
+    <text x="244" y="578" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">⑩ TopDocs[10] (docID + score)</text>
+
+    <text x="620" y="660" text-anchor="middle" fill="#39d2c0" font-size="13" font-weight="700">总跳数 ≈ M × log(N) — 1M 向量 ~20 步贪心 + 100 候选堆扩展 → 1-2 ms (in-cache)</text>
+    <text x="620" y="685" text-anchor="middle" fill="#a5d6ff" font-size="11">关键热点: ⑤⑥⑦ — vectorValue 读 mmap + SIMD dist 计算</text>
+  </svg>
+</div>
+
+<h3>距离计算流水线(SIMD 优化)</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 16-6-2 · 距离计算的 SIMD 流水线</div>
+  <svg viewBox="0 0 1240 380" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 输入: 两个向量 -->
+    <rect x="40"  y="40"  width="200" height="64" rx="12" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="140" y="68" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">query 向量</text>
+    <text x="140" y="88" text-anchor="middle" fill="#a5d6ff" font-size="11">float[768] · 常驻</text>
+
+    <rect x="40"  y="170" width="200" height="64" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="140" y="198" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">doc 向量</text>
+    <text x="140" y="218" text-anchor="middle" fill="#a5d6ff" font-size="11">float[768] · mmap 读</text>
+
+    <!-- VectorUtil.dotProduct -->
+    <rect x="320" y="100" width="240" height="80" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="440" y="128" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">VectorUtil.dotProduct()</text>
+    <text x="440" y="148" text-anchor="middle" fill="#a5d6ff" font-size="11">调用 VectorScorer</text>
+    <text x="440" y="168" text-anchor="middle" fill="#a5d6ff" font-size="10">入口 — 切到 SIMD 路径</text>
+    <line x1="240" y1="72" x2="318" y2="125" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+    <line x1="240" y1="200" x2="318" y2="155" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+
+    <!-- JDK Vector API -->
+    <rect x="620" y="100" width="240" height="80" rx="14" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.6"/>
+    <text x="740" y="128" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">JDK Vector API</text>
+    <text x="740" y="148" text-anchor="middle" fill="#a5d6ff" font-size="11">jdk.incubator.vector</text>
+    <text x="740" y="168" text-anchor="middle" fill="#a5d6ff" font-size="10">FloatVector.fromArray + ADD</text>
+    <line x1="560" y1="140" x2="618" y2="140" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+
+    <!-- CPU SIMD -->
+    <rect x="920" y="100" width="280" height="80" rx="14" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.8"/>
+    <text x="1060" y="128" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">CPU AVX2 / AVX-512 ★</text>
+    <text x="1060" y="148" text-anchor="middle" fill="#a5d6ff" font-size="11">AVX2: 每周期 8 floats</text>
+    <text x="1060" y="168" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">AVX-512: 每周期 16 floats</text>
+    <line x1="860" y1="140" x2="918" y2="140" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+
+    <!-- Sum -->
+    <rect x="320" y="240" width="240" height="60" rx="12" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="440" y="266" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">sum : float</text>
+    <text x="440" y="286" text-anchor="middle" fill="#a5d6ff" font-size="11">96/48 步累加完成</text>
+
+    <!-- Score -->
+    <rect x="620" y="240" width="240" height="60" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="740" y="266" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">score = (1 + sum) / 2</text>
+    <text x="740" y="286" text-anchor="middle" fill="#a5d6ff" font-size="11">cosine 归一化到 [0, 1]</text>
+
+    <line x1="1060" y1="180" x2="560" y2="240" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+    <line x1="560" y1="270" x2="618" y2="270" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+
+    <!-- 结果 -->
+    <rect x="920" y="240" width="280" height="60" rx="12" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="1060" y="266" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">→ 候选堆比较使用</text>
+    <text x="1060" y="286" text-anchor="middle" fill="#a5d6ff" font-size="11">decide visit / prune</text>
+    <line x1="860" y1="270" x2="918" y2="270" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+
+    <!-- 注释 -->
+    <text x="620" y="340" text-anchor="middle" fill="#39d2c0" font-size="13" font-weight="700">实测加速: 标量 768D dot ≈ 3 µs · AVX2 ≈ 0.4 µs (7-8×) · AVX-512 ≈ 0.2 µs (15×)</text>
+    <text x="620" y="360" text-anchor="middle" fill="#d29922" font-size="11" font-weight="700">前提: JDK 17+ + jdk.incubator.vector + 启动加 --add-modules</text>
+  </svg>
+</div>
+
+<p>Lucene 9.x 通过 <code>jdk.incubator.vector</code> 模块实现 SIMD 距离计算, 在 AVX2 CPU 上每周期处理 8 个 float, AVX-512 上 16 个。768 维 dot product 从标量的 ~3 µs 降到 ~0.4 µs, <strong>加速 7-8 倍</strong>。这是 Lucene HNSW 比纯 Java 实现快得多的关键。</p>
+
+<pre><code class="language-java">import org.apache.lucene.util.hnsw.HnswGraphSearcher;
+import org.apache.lucene.util.hnsw.NeighborQueue;
+import org.apache.lucene.search.KnnCollector;
+import org.apache.lucene.search.TopKnnCollector;
+import org.apache.lucene.util.Bits;
+
+public class HnswSearchDemo {
+
+    public static int[] searchTopK(OnHeapHnswGraph graph,
+                                    FloatVectorValues vectors,
+                                    float[] queryVec,
+                                    int k,
+                                    int efSearch,
+                                    Bits acceptDocs) throws IOException {
+        TopKnnCollector collector = new TopKnnCollector(k, Integer.MAX_VALUE);
+
+        HnswGraphSearcher.search(
+            new RandomVectorScorer.Default(vectors, queryVec, VectorSimilarityFunction.COSINE),
+            collector,
+            graph,
+            acceptDocs);
+
+        TopDocs hits = collector.topDocs();
+        int[] docs = new int[hits.scoreDocs.length];
+        for (int i = 0; i < hits.scoreDocs.length; i++) {
+            docs[i] = hits.scoreDocs[i].doc;
+        }
+        return docs;
+    }
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s16-7">16.7 VectorValues 与 KnnVectorsFormat</h2>
+<!-- ============================================================ -->
+
+<p>Lucene 9.x 把"向量字段"完全独立于倒排, 引入了一套全新的 SPI 抽象: <code>FloatVectorValues</code> / <code>ByteVectorValues</code>(数据接口) + <code>HnswGraph</code>(图接口) + <code>KnnVectorsFormat</code>(Codec 工厂)。本节解构这四个抽象的职责。</p>
+
+<h3>四层抽象的关系</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 16-7-1 · KnnVectorsFormat 四层抽象</div>
+  <svg viewBox="0 0 1240 600" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 顶: Codec -->
+    <rect x="500" y="20" width="240" height="60" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="620" y="46" text-anchor="middle" fill="#cfe9ff" font-size="14" font-weight="700">Lucene99Codec</text>
+    <text x="620" y="66" text-anchor="middle" fill="#a5d6ff" font-size="11">总入口 — Codec 提供所有 Format</text>
+
+    <!-- 第二层 KVF SPI -->
+    <rect x="430" y="120" width="380" height="60" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.8"/>
+    <text x="620" y="146" text-anchor="middle" fill="#cfe9ff" font-size="14" font-weight="700">KnnVectorsFormat (SPI 工厂)</text>
+    <text x="620" y="166" text-anchor="middle" fill="#a5d6ff" font-size="11">抽象 — fieldsConsumer / fieldsReader</text>
+    <line x1="620" y1="80" x2="620" y2="118" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+
+    <!-- 三个具体实现 -->
+    <rect x="40"  y="220" width="320" height="80" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.6"/>
+    <text x="200" y="248" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">Lucene99HnswVectorsFormat ★</text>
+    <text x="200" y="268" text-anchor="middle" fill="#a5d6ff" font-size="11">HNSW 默认实现 (float32)</text>
+    <text x="200" y="286" text-anchor="middle" fill="#a5d6ff" font-size="10">M=16, efConstruction=100</text>
+
+    <rect x="380" y="220" width="380" height="80" rx="12" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="570" y="248" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">Lucene99HnswScalarQuantizedVectorsFormat</text>
+    <text x="570" y="268" text-anchor="middle" fill="#a5d6ff" font-size="11">SQ7 量化版 (4× 内存缩减)</text>
+    <text x="570" y="286" text-anchor="middle" fill="#a5d6ff" font-size="10">7-bit per dimension</text>
+
+    <rect x="780" y="220" width="320" height="80" rx="12" fill="rgba(189,140,255,0.08)" stroke="#bc8cff" stroke-width="1.4" stroke-dasharray="5 3"/>
+    <text x="940" y="248" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">未来: PQ / IVF 等</text>
+    <text x="940" y="268" text-anchor="middle" fill="#a5d6ff" font-size="11">Lucene 10+ 路线图</text>
+    <text x="940" y="286" text-anchor="middle" fill="#a5d6ff" font-size="10">扩展 SPI 即可</text>
+
+    <line x1="500" y1="180" x2="240" y2="218" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+    <line x1="620" y1="180" x2="600" y2="218" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+    <line x1="740" y1="180" x2="900" y2="218" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+
+    <!-- Hnsw 99 → Writer + Reader -->
+    <rect x="40"  y="350" width="220" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="150" y="376" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">KnnVectorsWriter</text>
+    <text x="150" y="396" text-anchor="middle" fill="#a5d6ff" font-size="11">写 .vec / .vem / .vex</text>
+
+    <rect x="280" y="350" width="220" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="390" y="376" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">KnnVectorsReader</text>
+    <text x="390" y="396" text-anchor="middle" fill="#a5d6ff" font-size="11">读 + 提供 search 入口</text>
+
+    <line x1="170" y1="300" x2="150" y2="348" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <line x1="230" y1="300" x2="390" y2="348" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+
+    <!-- Reader 三个孩子 -->
+    <rect x="40"  y="450" width="220" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.4"/>
+    <text x="150" y="476" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">FloatVectorValues</text>
+    <text x="150" y="496" text-anchor="middle" fill="#a5d6ff" font-size="11">遍历向量数据</text>
+
+    <rect x="280" y="450" width="220" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.4"/>
+    <text x="390" y="476" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">HnswGraph</text>
+    <text x="390" y="496" text-anchor="middle" fill="#a5d6ff" font-size="11">邻居列表 + 多层</text>
+
+    <rect x="520" y="450" width="280" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="660" y="476" text-anchor="middle" fill="#ffd591" font-size="12" font-weight="700">search(query, ef, acceptDocs) ★</text>
+    <text x="660" y="496" text-anchor="middle" fill="#a5d6ff" font-size="11">调 HnswGraphSearcher</text>
+
+    <g fill="none">
+      <line x1="350" y1="410" x2="150" y2="448" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+      <line x1="390" y1="410" x2="390" y2="448" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+      <line x1="430" y1="410" x2="640" y2="448" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+    </g>
+
+    <text x="620" y="555" text-anchor="middle" fill="#39d2c0" font-size="12" font-weight="700">设计要点: SPI 解耦 — 切量化 / 算法只换 Format, 不动业务代码</text>
+    <text x="620" y="578" text-anchor="middle" fill="#a5d6ff" font-size="11">.vec (raw) + .vem (meta) + .vex (graph) — 同一字段三个文件协作</text>
+  </svg>
+</div>
+
+<h3>FloatVectorValues 接口</h3>
+
+<p><code>FloatVectorValues</code> 是数据迭代器, 类似 <code>NumericDocValues</code> 但元素是 float[]。它给出 (docID, vector) 对, 支持顺序扫描或按 ord 随机访问。HNSW 图存的是 ord(图节点 id), 通过 ord ↔ docID 的映射实现"图节点指向具体 doc"。</p>
+
+<pre><code class="language-java">import org.apache.lucene.index.FloatVectorValues;
+import org.apache.lucene.search.DocIdSetIterator;
+
+public class FloatVectorIteration {
+
+    public static void scanAllVectors(LeafReader reader, String field) throws IOException {
+        FloatVectorValues vv = reader.getFloatVectorValues(field);
+        if (vv == null) {
+            System.out.println("No vector field: " + field);
+            return;
+        }
+
+        int dim = vv.dimension();
+        int size = vv.size();
+        System.out.printf("Field %s: dim=%d, count=%d%n", field, dim, size);
+
+        int doc;
+        while ((doc = vv.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+            float[] v = vv.vectorValue();
+            System.out.printf("doc=%d, v[0..3]=[%.3f, %.3f, %.3f, %.3f]%n",
+                doc, v[0], v[1], v[2], v[3]);
+        }
+    }
+}</code></pre>
+
+<h3>HnswGraph 接口</h3>
+
+<p><code>HnswGraph</code> 抽象了"多层图"的访问: <code>numLevels()</code> 给出层数, <code>entryNode()</code> 给出顶层入口, <code>seek(level, ord)</code> 定位节点, <code>nextNeighbor()</code> 遍历邻居。所有 KnnVectorsFormat 实现都返回这个接口的实例, 让 <code>HnswGraphSearcher</code> 可以在不同存储格式上复用。</p>
+
+<div class="diagram">
+  <div class="diagram-title">表 16-7-1 · HnswGraph 接口方法</div>
+  <table>
+    <thead>
+      <tr><th>方法</th><th>返回</th><th>用途</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>size()</code></td><td>int</td><td>Layer 0 节点总数(= 向量总数)</td></tr>
+      <tr><td><code>numLevels()</code></td><td>int</td><td>总层数(典型 4-12)</td></tr>
+      <tr><td><code>entryNode()</code></td><td>int</td><td>顶层入口节点 ord</td></tr>
+      <tr><td><code>seek(level, ord)</code></td><td>void</td><td>定位到 (level, ord) 的邻居列表</td></tr>
+      <tr><td><code>nextNeighbor()</code></td><td>int</td><td>下一个邻居 ord, 末尾返回 NO_MORE_DOCS</td></tr>
+      <tr><td><code>neighborCount()</code></td><td>int</td><td>当前节点邻居数</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="real-world">
+  <strong>真实场景: Elasticsearch 8.x 切换到 Lucene99HnswVectorsFormat</strong>。Elasticsearch 8.0 引入 <code>dense_vector</code> 字段时基于 Lucene 9.0 的 <code>Lucene90HnswVectorsFormat</code>, 但当时 ef 默认 100, 大段(&gt; 1M 向量)合并时 OOM 频发。Elasticsearch 8.7+ 升级到 Lucene 9.7 的 <code>Lucene94HnswVectorsFormat</code>(改进的图存储 + offheap mmap), 8.10+ 切换到 Lucene 9.9 的 <code>Lucene99HnswVectorsFormat</code>(支持 SQ7 标量量化), 内存占用减少 4 倍, 支持十亿级向量集群。生产升级时务必读 release note 关注 Codec 兼容性——旧段不会自动升级到新 Format, 需要 <code>forceMerge</code> 触发重写。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s16-8">16.8 Lucene99HnswVectorsFormat 物理布局</h2>
+<!-- ============================================================ -->
+
+<p>HNSW 在磁盘上的物理表示拆成 3 个文件: <code>.vec</code>(原始向量数据)、<code>.vem</code>(向量字段元数据)、<code>.vex</code>(图结构数据)。三文件协同, 让"扫描所有向量"和"按 ord 随机访问邻居"都高效。</p>
+
+<h3>三文件分工</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 16-8-1 · .vec / .vem / .vex 三文件分工</div>
+  <table>
+    <thead>
+      <tr><th>文件</th><th>内容</th><th>访问模式</th><th>大小级别</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>.vec</code></td><td>每 doc 的原始向量(float[dim])</td><td>顺序 / 按 ord 随机</td><td>N × dim × 4 bytes</td></tr>
+      <tr><td><code>.vem</code></td><td>字段元数据 + 字段→.vec/.vex 偏移</td><td>启动时全读</td><td>~100 KB / 字段</td></tr>
+      <tr><td><code>.vex</code></td><td>HNSW 图结构: 每层每节点的邻居链表</td><td>按 ord 随机, mmap</td><td>M × 4 × N × 1.1</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>.vec 文件内部布局</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 16-8-1 · .vec 文件物理布局</div>
+  <div style="background:#0d1117;border:1.5px solid #58a6ff;border-radius:10px;padding:18px;font-family:'Cascadia Code','SFMono-Regular',Consolas,monospace;font-size:12.5px;color:#a5d6ff;">
+<pre style="margin:0;color:#a5d6ff;line-height:1.6;font-size:12px;">
+.vec 文件物理布局:
+
+  ┌─────────────────────────────────────────────────────┐
+  │ Codec Header                                        │
+  │   magic = 0x3FD76C17                                │
+  │   codecName = "Lucene99HnswVectorsData"             │
+  │   version = 0                                       │
+  │   segmentID + segmentSuffix                         │
+  ├─────────────────────────────────────────────────────┤
+  │ Per-Field Vectors (按字段顺序追加)                    │
+  │                                                     │
+  │   field "orderEmbedding":                           │
+  │     vector[ord=0]   = float[768]   3072 bytes      │
+  │     vector[ord=1]   = float[768]   3072 bytes      │
+  │     vector[ord=2]   = float[768]   3072 bytes      │
+  │     ...                                             │
+  │     vector[ord=N-1] = float[768]   3072 bytes      │
+  │                                                     │
+  │   field "imageEmbedding":                           │
+  │     vector[ord=0]   = float[512]   2048 bytes      │
+  │     ...                                             │
+  ├─────────────────────────────────────────────────────┤
+  │ Codec Footer (CRC32)                                │
+  └─────────────────────────────────────────────────────┘
+
+每向量大小 = dim × 4 bytes (float32)
+顺序 mmap, 按 ord × dim × 4 计算偏移直接定位
+</pre>
+  </div>
+</div>
+
+<h3>.vex 文件(图结构)布局</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 16-8-2 · .vex 文件 HNSW 图存储</div>
+  <div style="background:#0d1117;border:1.5px solid #58a6ff;border-radius:10px;padding:18px;font-family:'Cascadia Code','SFMono-Regular',Consolas,monospace;font-size:12.5px;color:#a5d6ff;">
+<pre style="margin:0;color:#a5d6ff;line-height:1.6;font-size:12px;">
+.vex 文件物理布局(HNSW 图):
+
+  ┌─────────────────────────────────────────────────────┐
+  │ Codec Header                                        │
+  ├─────────────────────────────────────────────────────┤
+  │ Per-Field Graph                                     │
+  │                                                     │
+  │   field "orderEmbedding":                           │
+  │     numLevels = 7                                   │
+  │     entryNode = 12345 (顶层入口 ord)                 │
+  │                                                     │
+  │     ── Level 6 ──                                   │
+  │       numNodes = 50                                 │
+  │       node[0]: ord=12345                            │
+  │         numNeighbors = 16                           │
+  │         neighbor list: [42, 1024, 8917, ...]       │
+  │       node[1]: ord=99                               │
+  │         ...                                         │
+  │     ── Level 5 ──                                   │
+  │       numNodes = 320                                │
+  │       ...                                           │
+  │     ── ... ──                                       │
+  │     ── Level 0 ──                                   │
+  │       numNodes = 1000000 (全部)                     │
+  │       node[0..N-1] 邻居链(每节点 2M=32 邻居)         │
+  ├─────────────────────────────────────────────────────┤
+  │ Codec Footer (CRC32)                                │
+  └─────────────────────────────────────────────────────┘
+
+邻居 ord 用 VInt + delta encode 压缩
+mmap 后按 (level, ord) 偏移随机访问
+</pre>
+  </div>
+</div>
+
+<h3>字节级布局示例</h3>
+
+<pre><code class="language-text">.vex 文件 graph 字节网格(简化):
+
+偏移   0    1    2    3    4    5    6    7
+0x00 | 07 | 00 | 00 | 00 | 39 | 30 | 00 | 00 |
+     | numLevels=7 | entryNode=12345 (VInt)   |
+0x08 | 32 | 00 | 00 | 00 | 0F | 10 | 2A | 04 |
+     | layer6 numNodes=50  | node ord=15 | numN=16, neighbor[0]=42 |
+0x10 | 02 | 00 | 23 | F4 | 11 | 0A | 04 | 00 |
+     | neighbor list delta encoded continued                       |
+0x18 | ... layer5 starts here ...
+
+字段说明:
+  numLevels      : VInt 总层数
+  entryNode      : VInt 顶层入口 ord
+  per layer:
+    numNodes     : VInt 该层节点数
+    per node:
+      ord        : VInt 节点 ord (Layer 0 隐式 = 0..N-1)
+      numN       : VInt 邻居数
+      neighbors  : VInt[delta + ZigZag] 邻居 ord</code></pre>
+
+<div class="key-insight">
+  <strong>.vec 顺序 mmap, .vex 随机 mmap</strong>。这两个文件都用 mmap 让 OS page cache 接管, 但访问模式截然不同: .vec 是"按 ord 顺序大块读取"(向量计算时整段读 768 × 4 byte), 适合 OS readahead; .vex 是"按 ord 随机跳跃"(邻居链表), 需要保证文件留在 page cache 里。<em>生产配置: -XX:MaxDirectMemorySize 留够 mmap 空间, 监控 PageCache hit ratio &gt; 95%。</em>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s16-9">16.9 KnnFloatVectorField 写入与查询</h2>
+<!-- ============================================================ -->
+
+<p>API 层用户面对的就是两个类: <code>KnnFloatVectorField</code>(写入) + <code>KnnFloatVectorQuery</code>(查询)。背后的 HNSW 图、SIMD 距离、三文件布局都被这两个 API 完全封装。</p>
+
+<h3>写入: KnnFloatVectorField</h3>
+
+<pre><code class="language-java">import org.apache.lucene.document.Document;
+import org.apache.lucene.document.KnnFloatVectorField;
+import org.apache.lucene.document.StringField;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.index.IndexWriter;
+import org.apache.lucene.index.IndexWriterConfig;
+import org.apache.lucene.index.VectorSimilarityFunction;
+import org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsFormat;
+import org.apache.lucene.codecs.lucene99.Lucene99Codec;
+
+public class KnnVectorWriteDemo {
+
+    public static void writeOrders(IndexWriter writer, List&lt;Order&gt; orders,
+                                    Function&lt;String, float[]&gt; embedder) throws IOException {
+        for (Order o : orders) {
+            Document doc = new Document();
+            doc.add(new StringField("orderId", o.getId(), Field.Store.YES));
+            doc.add(new StringField("status", o.getStatus(), Field.Store.YES));
+            doc.add(new StringField("tenantId", o.getTenantId(), Field.Store.NO));
+
+            float[] embedding = embedder.apply(o.toSearchableText());
+            doc.add(new KnnFloatVectorField(
+                "orderEmbedding",
+                embedding,
+                VectorSimilarityFunction.COSINE));
+
+            writer.addDocument(doc);
+        }
+    }
+
+    public static IndexWriterConfig buildConfig() {
+        Lucene99HnswVectorsFormat fmt = new Lucene99HnswVectorsFormat(
+            16,        // M
+            100);      // beamWidth (= efConstruction)
+
+        Lucene99Codec codec = new Lucene99Codec() {
+            @Override
+            public KnnVectorsFormat getKnnVectorsFormatForField(String field) {
+                if ("orderEmbedding".equals(field)) return fmt;
+                return super.getKnnVectorsFormatForField(field);
+            }
+        };
+
+        IndexWriterConfig cfg = new IndexWriterConfig();
+        cfg.setCodec(codec);
+        cfg.setRAMBufferSizeMB(512);
+        return cfg;
+    }
+}</code></pre>
+
+<h3>查询: KnnFloatVectorQuery 与 filter 混合</h3>
+
+<pre><code class="language-java">import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.KnnFloatVectorQuery;
+import org.apache.lucene.search.BooleanQuery;
+import org.apache.lucene.search.BooleanClause;
+import org.apache.lucene.search.TermQuery;
+import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.index.Term;
+
+public class KnnQueryDemo {
+
+    public static TopDocs semanticSearch(IndexSearcher searcher,
+                                          String userQuery,
+                                          int k,
+                                          Function&lt;String, float[]&gt; embedder) throws IOException {
+        float[] queryVec = embedder.apply(userQuery);
+        Query knn = new KnnFloatVectorQuery("orderEmbedding", queryVec, k);
+        return searcher.search(knn, k);
+    }
+
+    public static TopDocs hybridSearch(IndexSearcher searcher,
+                                        String userQuery,
+                                        String tenantId,
+                                        String status,
+                                        int k,
+                                        Function&lt;String, float[]&gt; embedder) throws IOException {
+        BooleanQuery filter = new BooleanQuery.Builder()
+            .add(new TermQuery(new Term("tenantId", tenantId)), BooleanClause.Occur.FILTER)
+            .add(new TermQuery(new Term("status", status)),     BooleanClause.Occur.FILTER)
+            .build();
+
+        float[] queryVec = embedder.apply(userQuery);
+        Query knn = new KnnFloatVectorQuery(
+            "orderEmbedding",
+            queryVec,
+            k,
+            filter);
+
+        return searcher.search(knn, k);
+    }
+}</code></pre>
+
+<h3>查询执行细节</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 16-9-1 · KnnFloatVectorQuery 内部展开</div>
+  <svg viewBox="0 0 1240 720" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- Q -->
+    <rect x="420" y="20" width="400" height="60" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.8"/>
+    <text x="620" y="46" text-anchor="middle" fill="#cfe9ff" font-size="14" font-weight="700">new KnnFloatVectorQuery</text>
+    <text x="620" y="66" text-anchor="middle" fill="#a5d6ff" font-size="11">(field, queryVec, k=10, filter)</text>
+
+    <!-- createWeight -->
+    <rect x="450" y="120" width="340" height="54" rx="12" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.4"/>
+    <text x="620" y="144" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">createWeight()</text>
+    <text x="620" y="162" text-anchor="middle" fill="#a5d6ff" font-size="11">先 rewrite + filter 转 Bits</text>
+    <line x1="620" y1="80" x2="620" y2="118" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+
+    <!-- Per LeafReaderContext loop 框 -->
+    <rect x="120" y="200" width="1000" height="380" rx="12" fill="rgba(189,140,255,0.05)" stroke="#bc8cff" stroke-width="1.2" stroke-dasharray="5 3"/>
+    <text x="160" y="222" fill="#bc8cff" font-size="12" font-weight="700">loop · 每个 LeafReaderContext (segment)</text>
+
+    <rect x="450" y="240" width="340" height="48" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.4"/>
+    <text x="620" y="262" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">遍历每个 LeafReaderContext</text>
+    <text x="620" y="280" text-anchor="middle" fill="#a5d6ff" font-size="11">scorer / scorerSupplier per leaf</text>
+    <line x1="620" y1="174" x2="620" y2="238" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+
+    <rect x="380" y="320" width="480" height="54" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="620" y="344" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">LeafReader.searchNearestVectors()</text>
+    <text x="620" y="362" text-anchor="middle" fill="#a5d6ff" font-size="11">(field, queryVec, k, acceptDocs)</text>
+    <line x1="620" y1="288" x2="620" y2="318" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+
+    <rect x="380" y="396" width="480" height="48" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.4"/>
+    <text x="620" y="424" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">KnnVectorsReader.search()</text>
+    <line x1="620" y1="374" x2="620" y2="394" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+
+    <rect x="380" y="466" width="480" height="48" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.6"/>
+    <text x="620" y="494" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">HnswGraphSearcher.search() ★</text>
+    <line x1="620" y1="444" x2="620" y2="464" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+
+    <rect x="380" y="536" width="480" height="34" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.3"/>
+    <text x="620" y="558" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">TopKnnCollector — 返回 TopDocs(per leaf)</text>
+    <line x1="620" y1="514" x2="620" y2="534" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+
+    <!-- 合并 -->
+    <rect x="380" y="610" width="480" height="48" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="620" y="638" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">IndexSearcher 合并所有 leaf · 取整体 Top-K</text>
+    <line x1="620" y1="580" x2="620" y2="608" stroke="#58a6ff" stroke-width="1.4" marker-end="url(#arr)"/>
+
+    <!-- 最终结果 -->
+    <rect x="430" y="680" width="380" height="32" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.6"/>
+    <text x="620" y="700" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">最终 ScoreDocs[k]</text>
+    <line x1="620" y1="658" x2="620" y2="678" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+  </svg>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">表 16-9-1 · KnnFloatVectorQuery 4 个构造参数</div>
+  <table>
+    <thead>
+      <tr><th>参数</th><th>类型</th><th>默认</th><th>含义</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>field</code></td><td>String</td><td>必填</td><td>向量字段名</td></tr>
+      <tr><td><code>target</code></td><td>float[]</td><td>必填</td><td>查询向量, dim 必须与索引一致</td></tr>
+      <tr><td><code>k</code></td><td>int</td><td>必填</td><td>返回 Top-K (内部 ef = max(k, ef))</td></tr>
+      <tr><td><code>filter</code></td><td>Query</td><td>null</td><td>可选 filter, 限定候选 doc 集</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s16-10">16.10 标量量化 SQ7/SQ4: 内存 4× 缩减</h2>
+<!-- ============================================================ -->
+
+<p>HNSW 完美但有一个致命短板: <strong>内存占用</strong>。1 亿个 768 维 float32 向量 = 1e8 × 768 × 4 = <strong>307 GB</strong>, 加图结构 ~12 GB, 总计接近 320 GB——一台机器装不下。Lucene 9.9 引入 <code>Lucene99HnswScalarQuantizedVectorsFormat</code>, 把 float32 量化为 int7(SQ7)或 int4(SQ4), 内存直降 4-8 倍, recall 损失 &lt; 1%。</p>
+
+<h3>SQ7 量化原理</h3>
+
+<pre><code class="language-text">SQ7(7-bit Scalar Quantization)算法:
+
+  训练阶段(全局统计):
+    扫描所有向量, 计算每个维度的 min, max
+    或全局 quantile (1%, 99%) 防异常值
+
+  量化(写入时):
+    int7 = round((float - min) / (max - min) × 127)    // [0, 127]
+
+  反量化(查询时):
+    float ≈ int7 / 127 × (max - min) + min
+
+  距离计算优化:
+    cosine(a, b) ≈ Σ (q_a × scale + min) × (q_b × scale + min)
+                 = scale² × Σ q_a × q_b + 常数项
+    → 实际计算只需 byte × byte 内积, 比 float × float 快 4×
+
+  内存收益:
+    float32: 4 bytes/dim → byte: 1 byte/dim
+    768 dim = 3072 → 768 bytes
+    1e8 doc = 307 GB → 76 GB</code></pre>
+
+<h3>SQ7 vs SQ4 vs FP32 对比</h3>
+
+<div class="compare-grid">
+  <div>
+    <h4>FP32 (无量化)</h4>
+    <ul>
+      <li>4 byte / dim, 768 dim = 3072 bytes</li>
+      <li>1e8 向量 = 307 GB</li>
+      <li>recall@10 baseline = 0.95</li>
+      <li>查询 latency = 5 ms</li>
+      <li><strong>不适合 1e8+ 规模</strong></li>
+    </ul>
+  </div>
+  <div>
+    <h4>SQ7 (1 byte / dim, 7 bit 实际)</h4>
+    <ul>
+      <li>1 byte / dim, 768 dim = 768 bytes</li>
+      <li>1e8 向量 = <strong>76 GB</strong></li>
+      <li>recall@10 = 0.94 (损失 ~1%)</li>
+      <li>查询 latency = <strong>3 ms</strong>(SIMD byte 内积更快)</li>
+      <li><strong>生产推荐 1e7-1e9 规模</strong></li>
+    </ul>
+  </div>
+</div>
+
+<h3>FP32 vs SQ8 详细对比</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4 style="margin-top:0;">FP32 全精度 ❌ (1e8+ 规模)</h4>
+    <table style="margin:0;font-size:12.5px;">
+      <tr><td>向量大小</td><td>3072 B / 768D</td></tr>
+      <tr><td>1e8 内存</td><td>~307 GB</td></tr>
+      <tr><td>SIMD 单步</td><td>8 floats (AVX2)</td></tr>
+      <tr><td>距离 latency</td><td>~0.4 µs / pair</td></tr>
+      <tr><td>recall@10</td><td>0.950</td></tr>
+      <tr><td>Page cache</td><td>多机分片</td></tr>
+    </table>
+  </div>
+  <div class="compare-good">
+    <h4 style="margin-top:0;">SQ7 量化 ✓ (生产推荐)</h4>
+    <table style="margin:0;font-size:12.5px;">
+      <tr><td>向量大小</td><td>768 B / 768D</td></tr>
+      <tr><td>1e8 内存</td><td>~76 GB</td></tr>
+      <tr><td>SIMD 单步</td><td>32 bytes (AVX2)</td></tr>
+      <tr><td>距离 latency</td><td>~0.1 µs / pair</td></tr>
+      <tr><td>recall@10</td><td>0.940 (loss ~1%)</td></tr>
+      <tr><td>Page cache</td><td>单机可装下</td></tr>
+    </table>
+  </div>
+</div>
+
+<h3>启用 SQ7 的代码</h3>
+
+<pre><code class="language-java">import org.apache.lucene.codecs.lucene99.Lucene99HnswScalarQuantizedVectorsFormat;
+
+public class SQ7CodecConfig {
+
+    public static IndexWriterConfig configWithSQ7() {
+        Lucene99HnswScalarQuantizedVectorsFormat sq7Format =
+            new Lucene99HnswScalarQuantizedVectorsFormat(
+                16,        // M
+                100,       // beamWidth (efConstruction)
+                1,         // numMergeWorkers
+                7,         // bits (SQ7)
+                false,     // compress (true 时进一步打包)
+                null,      // confidenceInterval (null = auto)
+                null);     // executor
+
+        Lucene99Codec codec = new Lucene99Codec() {
+            @Override
+            public KnnVectorsFormat getKnnVectorsFormatForField(String field) {
+                return sq7Format;
+            }
+        };
+
+        IndexWriterConfig cfg = new IndexWriterConfig();
+        cfg.setCodec(codec);
+        return cfg;
+    }
+}</code></pre>
+
+<div class="warning">
+  <strong>SQ4 是激进选择</strong>。SQ4(4-bit)能再省 2 倍内存(1e8 = 38 GB), 但 recall 损失 ~3-5%, 通常只适合 (1) 推荐场景对召回不敏感, (2) 数据有明显聚类(向量分布有结构), (3) 配 Reranking pipeline(SQ4 取 Top-100 候选, 再用 FP32 精排 Top-10)。<em>盲目用 SQ4 会让用户搜索体验明显变差, 上线前必须做 A/B test。</em>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s16-11">16.11 Product Quantization 进阶</h2>
+<!-- ============================================================ -->
+
+<p>SQ 是<strong>逐维度</strong>独立量化, 假设各维度分布相似——这个假设在低维(D &lt; 100)成立, 在高维(D ≥ 768)就显得粗糙。<strong>Product Quantization (PQ)</strong> 把向量切成 m 个子向量, 每个子向量用 k-means 聚类, 用聚类中心 ID 替代子向量——这是 Faiss 的核心技术, Lucene 社区在路上。</p>
+
+<h3>PQ 算法核心</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 16-11-1 · Product Quantization 流程</div>
+  <svg viewBox="0 0 1240 540" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 顶部 原始向量 -->
+    <rect x="380" y="20" width="480" height="60" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.8"/>
+    <text x="620" y="46" text-anchor="middle" fill="#cfe9ff" font-size="14" font-weight="700">原始向量</text>
+    <text x="620" y="66" text-anchor="middle" fill="#a5d6ff" font-size="11">v = [v₁, v₂, …, v₇₆₈]</text>
+
+    <!-- Split -->
+    <rect x="430" y="120" width="380" height="50" rx="12" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="620" y="142" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">切成 m = 8 个子向量</text>
+    <text x="620" y="160" text-anchor="middle" fill="#a5d6ff" font-size="11">每个 96 维</text>
+    <line x1="620" y1="80" x2="620" y2="118" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+
+    <!-- 三个子向量 -->
+    <rect x="60"  y="210" width="320" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.4"/>
+    <text x="220" y="234" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">子向量 1</text>
+    <text x="220" y="254" text-anchor="middle" fill="#a5d6ff" font-size="11">v[0..95]</text>
+
+    <rect x="450" y="210" width="320" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.4"/>
+    <text x="610" y="234" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">子向量 2</text>
+    <text x="610" y="254" text-anchor="middle" fill="#a5d6ff" font-size="11">v[96..191]</text>
+
+    <rect x="850" y="210" width="320" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.4"/>
+    <text x="1010" y="234" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">… 子向量 8</text>
+    <text x="1010" y="254" text-anchor="middle" fill="#a5d6ff" font-size="11">v[672..767]</text>
+
+    <line x1="500" y1="170" x2="220" y2="208" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+    <line x1="620" y1="170" x2="610" y2="208" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+    <line x1="740" y1="170" x2="1000" y2="208" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+
+    <!-- k-means 聚类 -->
+    <rect x="60"  y="300" width="320" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="220" y="324" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">k-means 聚类</text>
+    <text x="220" y="344" text-anchor="middle" fill="#a5d6ff" font-size="11">K = 256 中心 (码书 1)</text>
+
+    <rect x="450" y="300" width="320" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="610" y="324" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">k-means 聚类</text>
+    <text x="610" y="344" text-anchor="middle" fill="#a5d6ff" font-size="11">K = 256 中心 (码书 2)</text>
+
+    <rect x="850" y="300" width="320" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="1010" y="324" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">… 每子空间独立聚类</text>
+    <text x="1010" y="344" text-anchor="middle" fill="#a5d6ff" font-size="11">K = 256 中心 (码书 8)</text>
+
+    <line x1="220" y1="270" x2="220" y2="298" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+    <line x1="610" y1="270" x2="610" y2="298" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+    <line x1="1010" y1="270" x2="1010" y2="298" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+
+    <!-- 编码: byte -->
+    <rect x="60"  y="390" width="320" height="48" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.4"/>
+    <text x="220" y="418" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">子向量 1 → byte (0..255)</text>
+
+    <rect x="450" y="390" width="320" height="48" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.4"/>
+    <text x="610" y="418" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">子向量 2 → byte (0..255)</text>
+
+    <rect x="850" y="390" width="320" height="48" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.4"/>
+    <text x="1010" y="418" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">…  → byte (0..255)</text>
+
+    <line x1="220" y1="360" x2="220" y2="388" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+    <line x1="610" y1="360" x2="610" y2="388" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+    <line x1="1010" y1="360" x2="1010" y2="388" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+
+    <!-- Final -->
+    <rect x="380" y="470" width="480" height="50" rx="14" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.8"/>
+    <text x="620" y="494" text-anchor="middle" fill="#9be7b3" font-size="14" font-weight="700">压缩向量 = m = 8 bytes ★</text>
+    <text x="620" y="512" text-anchor="middle" fill="#a5d6ff" font-size="11">3072 → 8 bytes  ·  384× 内存压缩</text>
+
+    <line x1="220" y1="438" x2="500" y2="468" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+    <line x1="610" y1="438" x2="620" y2="468" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+    <line x1="1010" y1="438" x2="740" y2="468" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+  </svg>
+</div>
+
+<h3>PQ 参数与压缩率</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 16-11-1 · PQ 配置与内存收益(768 维基线)</div>
+  <table>
+    <thead>
+      <tr><th>m (子向量数)</th><th>K (码书大小)</th><th>每向量 bytes</th><th>压缩率</th><th>recall@10</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>—(原 FP32)</td><td>—</td><td>3072</td><td>1×</td><td>0.95</td></tr>
+      <tr><td>8</td><td>256</td><td>8</td><td>384× ⚠ 过激</td><td>0.65</td></tr>
+      <tr><td>16</td><td>256</td><td>16</td><td>192×</td><td>0.78</td></tr>
+      <tr><td>32</td><td>256</td><td>32</td><td>96×</td><td>0.85</td></tr>
+      <tr><td>64</td><td>256</td><td>64</td><td>48×</td><td>0.91</td></tr>
+      <tr><td>128</td><td>256</td><td>128</td><td>24×</td><td>0.93</td></tr>
+      <tr><td>256</td><td>256</td><td>256</td><td>12×</td><td>0.94</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key-insight">
+  <strong>PQ 的"内存 vs recall"曲线非常陡</strong>。从 m=8(8 bytes / vec)到 m=64(64 bytes / vec)recall 从 0.65 跳到 0.91, 内存只多 8 倍——这说明 m=8 太激进, 子空间太粗丢失信息。生产实践: <strong>m = D / 8 到 D / 4</strong>(即每子向量 8-4 维)是甜点, 配 K=256(单 byte 编码)。Lucene 9.x 暂未官方支持 PQ, 想用要自己实现 KnnVectorsFormat 或用 Faiss 在 Lucene 外做。
+</div>
+
+<h3>距离计算: ADC (Asymmetric Distance Computation)</h3>
+
+<pre><code class="language-text">PQ 查询时的 ADC 距离计算:
+
+  1. 离线: 训练 m × K 个聚类中心 c[i][j]
+           其中 i ∈ [0, m), j ∈ [0, K)
+
+  2. 写入: 每个 doc 向量 v_d 切成 m 子向量
+           每子向量找最近聚类中心 ID
+           v_d 压缩成 m bytes (每 byte = 中心 ID)
+
+  3. 查询时:
+     a. query 向量 q 切成 m 子向量 q[0..m-1]
+     b. 对每个子空间 i, 预计算 q[i] 到 K 个中心的距离
+        → 距离表 dist_table[i][j] = ‖q[i] - c[i][j]‖²
+        总共 m × K 个 float (256 × 8 = 2KB), 完全装进 L1 cache
+     c. 对每个 doc, 查 m 次表累加:
+        dist(q, v_d) ≈ Σ_i dist_table[i][v_d_codes[i]]
+        每 doc m 次表查询, 极快
+
+  ADC 优势:
+    - 距离计算只需 m 次查表 + 累加, 无浮点乘法
+    - 距离表完全在 cache, 命中率 100%
+    - 1e8 doc 的 Top-100 查询延迟 ~ 1 ms</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s16-12">16.12 段合并: 多 graph 合并算法</h2>
+<!-- ============================================================ -->
+
+<p>Lucene 是 segment-based 架构: 每次 commit 产出一个新段, 后台 merge policy 周期合并多段。HNSW 段合并是个特殊问题——<strong>不能简单拼接两个图</strong>, 因为图节点的 ord 在新段里要重排, 邻居关系完全要重算。</p>
+
+<h3>三种合并策略</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 16-12-1 · HNSW segment merge 三种策略</div>
+  <table>
+    <thead>
+      <tr><th>策略</th><th>实现</th><th>速度</th><th>结果质量</th><th>Lucene 用</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>完全重建</td><td>合并所有向量, 从空图重新 build</td><td>慢(O(N log N))</td><td>最优</td><td>段差异大时</td></tr>
+      <tr><td>最大段为基</td><td>取最大段图, 增量 add 其他段向量</td><td>中等</td><td>接近最优</td><td>★ 默认</td></tr>
+      <tr><td>简单拼接</td><td>把两个图的邻居链合并</td><td>快</td><td>差(图结构破坏)</td><td>禁用</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>"最大段为基" 算法</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 16-12-1 · merge 时以最大段为基的算法</div>
+  <svg viewBox="0 0 1240 760" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- Start -->
+    <rect x="380" y="20" width="480" height="62" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.8"/>
+    <text x="620" y="46" text-anchor="middle" fill="#cfe9ff" font-size="14" font-weight="700">开始 merge</text>
+    <text x="620" y="68" text-anchor="middle" fill="#a5d6ff" font-size="11">seg1 = 100K · seg2 = 200K · seg3 = 50K</text>
+
+    <!-- Pick -->
+    <rect x="430" y="120" width="380" height="50" rx="12" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="620" y="150" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">选最大段 seg2 作为 base graph ★</text>
+    <line x1="620" y1="82" x2="620" y2="118" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+
+    <!-- Init -->
+    <rect x="380" y="200" width="480" height="56" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="620" y="224" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">把 seg2 的图原样保留</text>
+    <text x="620" y="244" text-anchor="middle" fill="#a5d6ff" font-size="11">200K 节点的 ord 不变 — 复用所有边</text>
+    <line x1="620" y1="170" x2="620" y2="198" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+
+    <!-- Loop 框 -->
+    <rect x="120" y="290" width="1000" height="270" rx="14" fill="rgba(189,140,255,0.05)" stroke="#bc8cff" stroke-width="1.2" stroke-dasharray="6 3"/>
+    <text x="160" y="312" fill="#bc8cff" font-size="12" font-weight="700">loop · 遍历 seg1 + seg3 的每个向量 v (150K 个)</text>
+
+    <rect x="380" y="330" width="480" height="50" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.4"/>
+    <text x="620" y="358" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">取 v ← seg1 ∪ seg3 下一个未处理向量</text>
+    <line x1="620" y1="256" x2="620" y2="328" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+
+    <rect x="380" y="400" width="480" height="56" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="620" y="424" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">HnswGraphBuilder.addNode(v) 插入到 base graph</text>
+    <text x="620" y="442" text-anchor="middle" fill="#a5d6ff" font-size="11">分配新 ord (= base.size + i)</text>
+    <line x1="620" y1="380" x2="620" y2="398" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+
+    <rect x="380" y="476" width="480" height="48" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.4"/>
+    <text x="620" y="504" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">heuristic 选邻居 · 双向连边 · pruning</text>
+    <line x1="620" y1="456" x2="620" y2="474" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+
+    <!-- 决策菱形 -->
+    <polygon points="620,540 740,548 620,556 500,548" fill="rgba(248,81,73,0.08)" stroke="#f85149" stroke-width="1.4"/>
+    <text x="620" y="552" text-anchor="middle" fill="#ffadad" font-size="11" font-weight="700">还有向量?</text>
+    <line x1="620" y1="524" x2="620" y2="538" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+
+    <!-- 是 → 回 loop -->
+    <path d="M 740 548 Q 1100 548 1100 380 Q 1100 350 870 350" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr-r)"/>
+    <text x="1100" y="468" text-anchor="middle" fill="#ffadad" font-size="11" font-weight="700">是</text>
+
+    <!-- 否 → Done -->
+    <line x1="620" y1="556" x2="620" y2="608" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+    <text x="640" y="585" fill="#9be7b3" font-size="11" font-weight="700">否</text>
+
+    <!-- Done -->
+    <rect x="380" y="610" width="480" height="56" rx="14" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.6"/>
+    <text x="620" y="634" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">完成 merge — 新图 350K 节点</text>
+    <text x="620" y="654" text-anchor="middle" fill="#a5d6ff" font-size="11">recall 与全量重建相比仅低 0.5%</text>
+
+    <!-- Write -->
+    <rect x="380" y="690" width="480" height="50" rx="12" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="620" y="718" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">写入新段 .vec / .vem / .vex</text>
+    <line x1="620" y1="666" x2="620" y2="688" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+  </svg>
+</div>
+
+<h3>合并代价</h3>
+
+<p>"最大段为基" 策略的代价 = (其他段总向量数) × O(efConstruction × log N) 次距离计算。10 个 1M 段合并到 1 个 10M 段: 9M × 100 × 23 ≈ 2 × 10¹⁰ 次距离, 单线程约 30 分钟, 多线程(<code>numMergeWorkers=8</code>)约 5 分钟。</p>
+
+<pre><code class="language-java">import org.apache.lucene.index.MergePolicy;
+import org.apache.lucene.index.TieredMergePolicy;
+import org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsFormat;
+import java.util.concurrent.Executors;
+
+public class HnswMergeConfig {
+
+    public static IndexWriterConfig configWithMergeWorkers() {
+        Lucene99HnswVectorsFormat fmt = new Lucene99HnswVectorsFormat(
+            16,        // M
+            100,       // beamWidth
+            8,         // numMergeWorkers (并行合并线程)
+            Executors.newFixedThreadPool(8));  // executor
+
+        Lucene99Codec codec = new Lucene99Codec() {
+            @Override
+            public KnnVectorsFormat getKnnVectorsFormatForField(String field) {
+                return fmt;
+            }
+        };
+
+        IndexWriterConfig cfg = new IndexWriterConfig();
+        cfg.setCodec(codec);
+
+        TieredMergePolicy mp = new TieredMergePolicy();
+        mp.setMaxMergeAtOnce(8);
+        mp.setSegmentsPerTier(8);
+        mp.setMaxMergedSegmentMB(5000);
+        cfg.setMergePolicy(mp);
+        return cfg;
+    }
+}</code></pre>
+
+<div class="warning">
+  <strong>HNSW merge 是写入路径上最贵的操作</strong>。单段构造 1M 向量 ~5 分钟, 合并 10 段 1M 到 10M ~30 分钟——是构造的 6 倍。生产里要避免: (1) <code>maxMergedSegmentMB</code> 设小 (~5GB), 限制单次合并规模; (2) 业务低峰期触发 <code>forceMerge(maxNumSegments=10)</code>, 不要在线 forceMerge 到 1; (3) 启用 <code>numMergeWorkers</code> 并行(Lucene 9.10+); (4) 用 SQ7 减小图规模, 间接加速 merge。<em>没规划好 merge 的 HNSW 集群, 半夜段合并能把 GC / IO 全打爆。</em>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s16-13">16.13 内存与磁盘估算</h2>
+<!-- ============================================================ -->
+
+<p>HNSW 的内存模型必须精确算清楚——上线前算错, 线上 OOM 就晚了。本节给出三种典型规模下的具体数字。</p>
+
+<h3>内存估算公式</h3>
+
+<pre><code class="language-text">HNSW 总内存 = 向量数据 + 图结构 + JVM 开销
+
+  向量数据 (heap or mmap):
+    FP32: dim × 4 × N bytes
+    SQ7:  dim × 1 × N bytes
+    SQ4:  dim × 0.5 × N bytes (打包)
+
+  图结构 (mmap 文件 .vex):
+    Layer 0: 2 × M × 4 × N bytes (邻居 ord, 加倍 = 32 邻居)
+    其他层:  M × 4 × N × Σ(1/e^l) ≈ M × 4 × N × 0.6
+    总计:    M × 4 × N × 2.6
+
+  JVM 开销:
+    HnswGraphReader 缓存: ~100 MB
+    OS page cache 份额:   建议 1.5× 向量数据大小</code></pre>
+
+<h3>三种规模实测</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 16-13-1 · 不同规模的内存与磁盘占用</div>
+  <table>
+    <thead>
+      <tr><th>规模</th><th>FP32 向量</th><th>SQ7 向量</th><th>图结构</th><th>FP32 总内存</th><th>SQ7 总内存</th><th>建图时间</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1M × 768D</td><td>3.1 GB</td><td>768 MB</td><td>166 MB</td><td>~5 GB</td><td>~1.5 GB</td><td>5 分钟</td></tr>
+      <tr><td>10M × 768D</td><td>31 GB</td><td>7.7 GB</td><td>1.7 GB</td><td>~50 GB</td><td>~12 GB</td><td>1 小时</td></tr>
+      <tr><td>100M × 768D</td><td>307 GB</td><td>76 GB</td><td>17 GB</td><td>~480 GB</td><td>~120 GB</td><td>10 小时</td></tr>
+      <tr><td>1B × 768D</td><td>3 TB</td><td>768 GB</td><td>166 GB</td><td>~5 TB</td><td>~1.2 TB</td><td>4 天</td></tr>
+      <tr><td>1M × 1536D (OpenAI)</td><td>6.1 GB</td><td>1.5 GB</td><td>166 MB</td><td>~10 GB</td><td>~2.5 GB</td><td>10 分钟</td></tr>
+      <tr><td>10M × 384D (BERT mini)</td><td>15 GB</td><td>3.8 GB</td><td>1.7 GB</td><td>~25 GB</td><td>~7 GB</td><td>30 分钟</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>核心指标</h3>
+
+<div class="metric-row">
+  <div class="metric"><div class="value">480 GB</div><div class="label">FP32 100M·768D 内存</div></div>
+  <div class="metric"><div class="value">120 GB</div><div class="label">SQ7 100M·768D 内存</div></div>
+  <div class="metric"><div class="value">60 GB</div><div class="label">PQ 100M·768D 内存</div></div>
+  <div class="metric"><div class="value">10000×</div><div class="label">vs 暴搜加速比</div></div>
+</div>
+
+<div class="metric-row">
+  <div class="metric"><div class="value">0.95</div><div class="label">recall@10 (M=16, ef=100)</div></div>
+  <div class="metric"><div class="value">5 ms</div><div class="label">P95 latency 1M·768D</div></div>
+  <div class="metric"><div class="value">~3000</div><div class="label">QPS 单 shard 1M</div></div>
+  <div class="metric"><div class="value">10 小时</div><div class="label">100M 向量构建时间</div></div>
+</div>
+
+<div class="key-insight">
+  <strong>"内存就是钱" 在向量检索体现得淋漓尽致</strong>。100M 向量集群: FP32 需要 480 GB(单机不可能, 至少 4 节点分片), SQ7 后 120 GB(单台 256 GB 内存机器可装下, 节省 75% 服务器成本), PQ 后 60 GB(普通 128 GB 机器即可)。Lucene 项目过去 5 年最重要的 ANN 优化都是<strong>压缩</strong>方向, 不是算法方向——SQ7、SQ4、PQ、Binary Quantization 都是为了让向量装下。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s16-14">16.14 召回评估与 efSearch 调参</h2>
+<!-- ============================================================ -->
+
+<p>HNSW 是<strong>近似</strong>算法, 没有"召回率"数字就不能上线——你不知道返回的 Top-10 里有几个是真实最近邻。本节给出召回评估的标准流程与 efSearch 调参手册。</p>
+
+<h3>Brute Force 基线</h3>
+
+<p>评估必须有<strong>暴力 KNN 基线</strong>: 对同一组查询向量, 遍历所有 doc 算 cosine 取真实 Top-K, 然后比对 HNSW 返回的 Top-K, 计算 <code>recall@K = |HNSW_topK ∩ exact_topK| / K</code>。基线只在评估时跑, 不进生产查询路径。</p>
+
+<pre><code class="language-java">import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.KnnFloatVectorQuery;
+import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.util.PriorityQueue;
+import org.apache.lucene.index.FloatVectorValues;
+import org.apache.lucene.search.DocIdSetIterator;
+import java.util.*;
+
+public class BruteForceKnnEvaluator {
+
+    public static int[] exactTopK(IndexReader reader, String field,
+                                   float[] query, int k) throws IOException {
+        PriorityQueue&lt;float[]&gt; pq = new PriorityQueue&lt;&gt;(k) {
+            @Override
+            protected boolean lessThan(float[] a, float[] b) {
+                return a[0] &lt; b[0];
+            }
+        };
+
+        for (LeafReaderContext leaf : reader.leaves()) {
+            FloatVectorValues vv = leaf.reader().getFloatVectorValues(field);
+            if (vv == null) continue;
+            int doc;
+            while ((doc = vv.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+                float score = cosine(query, vv.vectorValue());
+                if (pq.size() < k) {
+                    pq.add(new float[]{score, leaf.docBase + doc});
+                } else if (score > pq.top()[0]) {
+                    pq.top()[0] = score;
+                    pq.top()[1] = leaf.docBase + doc;
+                    pq.updateTop();
+                }
+            }
+        }
+
+        return Arrays.stream(pq.toArray(new float[0][]))
+                     .sorted((a, b) -> Float.compare(b[0], a[0]))
+                     .mapToInt(a -> (int) a[1])
+                     .toArray();
+    }
+
+    public static double recallAtK(IndexReader r, String field,
+                                    float[] q, int k) throws IOException {
+        int[] exact = exactTopK(r, field, q, k);
+        TopDocs hnsw = new IndexSearcher(r).search(
+            new KnnFloatVectorQuery(field, q, k), k);
+        Set&lt;Integer&gt; exactSet = new HashSet&lt;&gt;();
+        for (int d : exact) exactSet.add(d);
+        long hit = Arrays.stream(hnsw.scoreDocs)
+                         .filter(s -> exactSet.contains(s.doc))
+                         .count();
+        return (double) hit / k;
+    }
+
+    private static float cosine(float[] a, float[] b) {
+        float dot = 0, na = 0, nb = 0;
+        for (int i = 0; i < a.length; i++) {
+            dot += a[i] * b[i];
+            na += a[i] * a[i];
+            nb += b[i] * b[i];
+        }
+        return (float) (dot / (Math.sqrt(na) * Math.sqrt(nb)));
+    }
+}</code></pre>
+
+<h3>评估查询集的设计</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 16-14-1 · 召回评估查询集组成</div>
+  <table>
+    <thead>
+      <tr><th>类别</th><th>数量</th><th>来源</th><th>检测什么</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>高频热点</td><td>50</td><td>业务侧统计</td><td>主路径 recall</td></tr>
+      <tr><td>长尾稀疏</td><td>50</td><td>抽样冷区域</td><td>HNSW 在稀疏 cluster 表现</td></tr>
+      <tr><td>边界 (空/重复)</td><td>20</td><td>人造</td><td>退化 / overflow 场景</td></tr>
+      <tr><td>跨语言</td><td>30</td><td>多语言 query</td><td>embedding 一致性</td></tr>
+      <tr><td><strong>合计</strong></td><td><strong>150</strong></td><td>—</td><td>—</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>efSearch vs recall vs latency</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 16-14-2 · efSearch 调参基线 (1M 向量, 768D, M=16)</div>
+  <table>
+    <thead>
+      <tr><th>efSearch</th><th>recall@10</th><th>recall@100</th><th>P50 latency</th><th>P95 latency</th><th>P99 latency</th><th>QPS (单 thread)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>16</td><td>0.85</td><td>0.79</td><td>0.7 ms</td><td>1.2 ms</td><td>2 ms</td><td>1430</td></tr>
+      <tr><td>32</td><td>0.90</td><td>0.86</td><td>1.2 ms</td><td>2 ms</td><td>3 ms</td><td>830</td></tr>
+      <tr><td>50</td><td>0.92</td><td>0.89</td><td>1.8 ms</td><td>3 ms</td><td>5 ms</td><td>555</td></tr>
+      <tr><td>100 (默认)</td><td>0.95</td><td>0.93</td><td>3 ms</td><td>5 ms</td><td>8 ms</td><td>333</td></tr>
+      <tr><td>200</td><td>0.97</td><td>0.96</td><td>6 ms</td><td>10 ms</td><td>15 ms</td><td>166</td></tr>
+      <tr><td>500</td><td>0.99</td><td>0.98</td><td>15 ms</td><td>25 ms</td><td>40 ms</td><td>66</td></tr>
+      <tr><td>1000</td><td>0.995</td><td>0.99</td><td>30 ms</td><td>50 ms</td><td>80 ms</td><td>33</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">图 16-14-1 · efSearch 调参决策流</div>
+  <svg viewBox="0 0 1240 700" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- Start -->
+    <rect x="500" y="20" width="240" height="50" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="620" y="50" text-anchor="middle" fill="#cfe9ff" font-size="14" font-weight="700">业务需求 (recall, latency)</text>
+
+    <!-- Q1 菱形 -->
+    <polygon points="620,110 800,160 620,210 440,160" fill="rgba(248,81,73,0.10)" stroke="#f85149" stroke-width="1.6"/>
+    <text x="620" y="158" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">recall 要求?</text>
+    <text x="620" y="178" text-anchor="middle" fill="#a5d6ff" font-size="10">分支 4 路</text>
+    <line x1="620" y1="70" x2="620" y2="108" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+
+    <!-- 4 个分支 -->
+    <rect x="20"   y="260" width="240" height="64" rx="12" fill="rgba(248,81,73,0.18)" stroke="#f85149" stroke-width="1.6"/>
+    <text x="140" y="284" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">&lt; 0.85</text>
+    <text x="140" y="304" text-anchor="middle" fill="#ffadad" font-size="11">重新评估 — HNSW 不适合</text>
+
+    <rect x="280"  y="260" width="240" height="64" rx="12" fill="url(#g-green)"  stroke="#3fb950" stroke-width="1.4"/>
+    <text x="400" y="284" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">≥ 0.85</text>
+    <text x="400" y="304" text-anchor="middle" fill="#a5d6ff" font-size="11">efSearch=16-50 · P95 1-3 ms</text>
+
+    <rect x="540"  y="260" width="240" height="64" rx="12" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.6"/>
+    <text x="660" y="284" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">≥ 0.95 (默认 ★)</text>
+    <text x="660" y="304" text-anchor="middle" fill="#a5d6ff" font-size="11">efSearch=100-200 · P95 5-10 ms</text>
+
+    <rect x="800"  y="260" width="240" height="64" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.4"/>
+    <text x="920" y="284" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">≥ 0.99</text>
+    <text x="920" y="304" text-anchor="middle" fill="#a5d6ff" font-size="11">efSearch=500-1000 · P95 25-50 ms</text>
+
+    <line x1="500" y1="170" x2="270" y2="258" stroke="#f85149" stroke-width="1.4" marker-end="url(#arr-r)"/>
+    <line x1="540" y1="180" x2="410" y2="258" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+    <line x1="660" y1="208" x2="660" y2="258" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+    <line x1="740" y1="180" x2="900" y2="258" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+
+    <!-- Q2 菱形(中分支) -->
+    <polygon points="660,360 820,400 660,440 500,400" fill="rgba(212,153,34,0.10)" stroke="#d29922" stroke-width="1.4"/>
+    <text x="660" y="396" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">latency &lt; 5 ms ?</text>
+    <text x="660" y="414" text-anchor="middle" fill="#a5d6ff" font-size="10">P95 实测</text>
+    <line x1="660" y1="324" x2="660" y2="358" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+
+    <!-- Q3 菱形(高分支) -->
+    <polygon points="920,360 1080,400 920,440 760,400" fill="rgba(189,140,255,0.10)" stroke="#bc8cff" stroke-width="1.4"/>
+    <text x="920" y="396" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">QPS &gt; 100 ?</text>
+    <text x="920" y="414" text-anchor="middle" fill="#a5d6ff" font-size="10">单机吞吐</text>
+    <line x1="920" y1="324" x2="920" y2="358" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+
+    <!-- 终态: Done1 / Reduce -->
+    <rect x="380" y="500" width="220" height="56" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.6"/>
+    <text x="490" y="524" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">✓ 配置完成 (是)</text>
+    <text x="490" y="542" text-anchor="middle" fill="#a5d6ff" font-size="11">recall + latency 都达标</text>
+    <line x1="540" y1="430" x2="490" y2="498" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+
+    <rect x="640" y="500" width="220" height="56" rx="12" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.4"/>
+    <text x="750" y="524" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">降 efSearch (否)</text>
+    <text x="750" y="542" text-anchor="middle" fill="#a5d6ff" font-size="11">或更细分片 — 重测</text>
+    <line x1="780" y1="430" x2="750" y2="498" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+
+    <!-- 终态: Done2 / Scale -->
+    <rect x="900" y="500" width="120" height="56" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="960" y="524" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">✓ 单机 OK</text>
+    <text x="960" y="542" text-anchor="middle" fill="#a5d6ff" font-size="11">是</text>
+    <line x1="900" y1="430" x2="960" y2="498" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+
+    <rect x="1060" y="500" width="160" height="56" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="1140" y="524" text-anchor="middle" fill="#e6d3ff" font-size="12" font-weight="700">水平扩展</text>
+    <text x="1140" y="542" text-anchor="middle" fill="#a5d6ff" font-size="11">多 shard · 否</text>
+    <line x1="1080" y1="400" x2="1140" y2="498" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+
+    <text x="620" y="630" text-anchor="middle" fill="#39d2c0" font-size="13" font-weight="700">★ 默认走中间 (≥0.95) — 95% 业务足够 — 上线后基于真实 query 集再调</text>
+    <text x="620" y="660" text-anchor="middle" fill="#d29922" font-size="11">底线: 不要拍脑袋设 efSearch — 一定要先有 BruteForce 基线 + recall 自动化测试</text>
+  </svg>
+</div>
+
+<div class="real-world">
+  <strong>真实场景: 电商商品语义搜索 efSearch 上线流程</strong>。某电商团队上线 BERT-based 商品语义搜索, 1000 万 SKU, 用 Lucene 9.x KnnFloatVectorQuery。最初配置 efSearch=100(默认), recall@10 测得 0.92, 不达预期。诊断流程: (1) 用 BruteForceKnnEvaluator 跑 150 query 基线; (2) 发现"长尾稀疏 query"recall 仅 0.78, 拉低均值; (3) 把 efSearch 提到 200, recall 升到 0.95, P95 从 5 ms 涨到 12 ms; (4) Prometheus 监控 QPS 从 5000 → 2500, 业务可接受; (5) 同时启用 SQ7 把内存从 30 GB 降到 8 GB, 单机装下完整索引, 砍掉一半机器。<em>关键: efSearch 不能拍脑袋, 必须基于业务 query 的 recall 测试结果调。</em>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s16-15">16.15 filter 混合查询的退化</h2>
+<!-- ============================================================ -->
+
+<p>纯 KNN 查询 ("找语义最相似的 100 个订单")很少独立出现, 真实业务总是 KNN + filter ("找<em>本租户</em>下<em>已支付</em>状态<em>近 30 天</em>的语义相似订单")。但 HNSW 与 filter 的组合有一个<strong>致命陷阱</strong>: filter 命中率低时 recall 会静默退化, 而你不会立刻发现。</p>
+
+<h3>退化机制</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 16-15-1 · filter + KNN 的退化路径</div>
+  <svg viewBox="0 0 1240 460" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- A → B → C 横向链 -->
+    <rect x="20"  y="40" width="200" height="64" rx="12" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="120" y="68" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">query 向量 + filter</text>
+    <text x="120" y="88" text-anchor="middle" fill="#a5d6ff" font-size="11">KnnFloatVectorQuery + Bool</text>
+
+    <rect x="260" y="40" width="240" height="64" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="380" y="64" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">HNSW 走图找候选</text>
+    <text x="380" y="84" text-anchor="middle" fill="#a5d6ff" font-size="11">K × efSearch 个 candidate</text>
+
+    <rect x="540" y="40" width="240" height="64" rx="12" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="660" y="64" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">逐个查 acceptDocs</text>
+    <text x="660" y="84" text-anchor="middle" fill="#a5d6ff" font-size="11">filter bitmap (FixedBitSet)</text>
+
+    <line x1="220" y1="72" x2="258" y2="72" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="500" y1="72" x2="538" y2="72" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+
+    <!-- D 决策菱形 -->
+    <polygon points="900,72 1080,40 1220,72 1080,104" fill="rgba(248,81,73,0.10)" stroke="#f85149" stroke-width="1.6"/>
+    <text x="1080" y="68" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">命中 filter 比例?</text>
+    <text x="1080" y="86" text-anchor="middle" fill="#a5d6ff" font-size="10">3 路分支</text>
+    <line x1="780" y1="72" x2="898" y2="72" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+
+    <!-- 三个终态: 高/中/低 -->
+    <rect x="780" y="170" width="430" height="68" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="995" y="194" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">高 (&gt; 30%): topK 充足</text>
+    <text x="995" y="214" text-anchor="middle" fill="#a5d6ff" font-size="11">recall ~0.95 (与无 filter 接近)</text>
+    <text x="995" y="232" text-anchor="middle" fill="#a5d6ff" font-size="10">默认 HNSW 即可</text>
+
+    <rect x="780" y="260" width="430" height="68" rx="12" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.6"/>
+    <text x="995" y="284" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">中 (10-30%): topK 勉强凑足</text>
+    <text x="995" y="304" text-anchor="middle" fill="#a5d6ff" font-size="11">recall 跌到 0.7-0.9</text>
+    <text x="995" y="322" text-anchor="middle" fill="#a5d6ff" font-size="10">提高 efSearch 或加 fallback</text>
+
+    <rect x="780" y="350" width="430" height="78" rx="12" fill="rgba(248,81,73,0.20)" stroke="#f85149" stroke-width="1.8"/>
+    <text x="995" y="374" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">低 (&lt; 10%) ★ 灾难</text>
+    <text x="995" y="394" text-anchor="middle" fill="#ffadad" font-size="11">recall 急剧下降到 0.3-0.5</text>
+    <text x="995" y="412" text-anchor="middle" fill="#ffadad" font-size="11" font-weight="700">必须强制走 brute force / pre-filter</text>
+
+    <line x1="1080" y1="105" x2="850" y2="170" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+    <line x1="1080" y1="105" x2="1080" y2="258" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+    <line x1="1080" y1="105" x2="1140" y2="348" stroke="#f85149" stroke-width="1.4" marker-end="url(#arr-r)"/>
+
+    <!-- 左侧注释: 退化机制 -->
+    <rect x="20" y="180" width="700" height="240" rx="12" fill="rgba(248,81,73,0.05)" stroke="#f85149" stroke-width="1.2" stroke-dasharray="6 3"/>
+    <text x="40" y="206" fill="#f85149" font-size="13" font-weight="700">退化机制 (静默 failure)</text>
+    <text x="40" y="232" fill="#a5d6ff" font-size="12">① HNSW 图遍历找邻居时 <tspan fill="#39d2c0" font-weight="700">不知道 filter</tspan> — 把 filter 留到 collector 里做</text>
+    <text x="40" y="256" fill="#a5d6ff" font-size="12">② 候选 K × efSearch (1000) 个 — 90% 被 filter 干掉 → 只剩 100 个</text>
+    <text x="40" y="280" fill="#a5d6ff" font-size="12">③ 这 100 个未必含真正的 Top-K (recall 缺失部分被剪掉)</text>
+    <text x="40" y="304" fill="#a5d6ff" font-size="12">④ 监控只看 latency 不看 recall — 用户感知不到 “缺漏”</text>
+    <text x="40" y="332" fill="#ffd591" font-size="12" font-weight="700">→ 修复方案 (按命中率挑):</text>
+    <text x="40" y="354" fill="#a5d6ff" font-size="11">    50%+ : 默认 HNSW</text>
+    <text x="40" y="372" fill="#a5d6ff" font-size="11">    10-30%: 提 efSearch 200→400</text>
+    <text x="40" y="390" fill="#a5d6ff" font-size="11">    &lt; 10%: 强制 brute force, 跳过 HNSW (Lucene 9.10+ 自动)</text>
+    <text x="40" y="408" fill="#a5d6ff" font-size="11">    &lt; 1%  : 重新设计 — filter 应作 pre-filter 缩小数据集</text>
+  </svg>
+</div>
+
+<h3>filter 命中率 → recall 实测</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 16-15-1 · filter 命中率 → recall 表现</div>
+  <table>
+    <thead>
+      <tr><th>filter 命中率</th><th>recall@10 (HNSW)</th><th>修复方案</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>&gt; 50%</td><td>~0.95 (与无 filter 接近)</td><td>默认 HNSW</td></tr>
+      <tr><td>30-50%</td><td>~0.88</td><td>提高 efSearch (100→200)</td></tr>
+      <tr><td>10-30%</td><td>~0.70</td><td>提高 efSearch (200→400)</td></tr>
+      <tr><td>&lt; 10%</td><td>&lt; 0.5 (灾难)</td><td><strong>强制走 brute force</strong>, 跳过 HNSW</td></tr>
+      <tr><td>&lt; 1%</td><td>&lt; 0.3</td><td>重新设计: filter 应作 pre-filter 缩小数据集</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>三种修复方案</h3>
+
+<pre><code class="language-java">// 方案 A: 提高 efSearch (适合 filter 命中率 10-30%)
+public Query searchWithBoostedEf(float[] q, Query filter, int k) {
+    return new KnnFloatVectorQuery(
+        "orderEmbedding",
+        q,
+        k,
+        filter,
+        400);    // 提高 ef 弥补 filter 损失
+}
+
+// 方案 B: Pre-filter + Brute Force (适合 filter 命中率 < 10%)
+public Query searchWithPreFilter(float[] q, Query filter, int k,
+                                  IndexReader reader) throws IOException {
+    long candidateCount = countMatching(reader, filter);
+    if (candidateCount < 10000) {
+        return new ExactKnnQuery("orderEmbedding", q, k, filter);
+    }
+    return new KnnFloatVectorQuery("orderEmbedding", q, k, filter);
+}
+
+// 方案 C: 多 segment 独立索引 (按 tenant_id 分子索引)
+// 查询时只走对应 tenant 的子索引, filter 命中率自然 100%
+// 详见 16.15.3 分租户多索引架构</code></pre>
+
+<h3>监控信号</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 16-15-2 · filter 退化监控指标</div>
+  <table>
+    <thead>
+      <tr><th>信号</th><th>阈值</th><th>含义</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>KNN 查询 candidate visited / k</td><td>&gt; 50</td><td>filter 严或 efSearch 不足</td></tr>
+      <tr><td>KNN brute fallback 比例</td><td>&gt; 5%</td><td>大量 filter 触发降级</td></tr>
+      <tr><td>filter cache miss</td><td>&gt; 30%</td><td>filter 多样, cache 不命中</td></tr>
+      <tr><td>recall 在线评估</td><td>&lt; 0.9</td><td>上面任一原因导致</td></tr>
+      <tr><td>P95 latency 突增</td><td>&gt; 2× baseline</td><td>brute fallback 触发或 ef 自动放大</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="warning">
+  <strong>HNSW 不是为重过滤场景设计的</strong>。如果你的业务有强 filter 需求(比如多租户 SaaS, 单租户数据占总量 &lt; 1%), 一定要先评估 filter 命中率, 再决定是直接用 HNSW、调 efSearch、还是退化到 brute force。<em>默认值会在 filter 命中率 &lt; 30% 时静默退化 recall, 不易察觉</em>——上线前必须用真实业务 filter 模式做 recall 评估, 不能只测无 filter 的 baseline。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s16-16">16.16 生产陷阱清单</h2>
+<!-- ============================================================ -->
+
+<p>HNSW 在生产里常见的 8 个陷阱, 全部来自真实事故复盘。每个给出现象、根因、修复。</p>
+
+<div class="diagram">
+  <div class="diagram-title">表 16-16-1 · HNSW 生产陷阱清单</div>
+  <table>
+    <thead>
+      <tr><th>#</th><th>陷阱</th><th>现象</th><th>根因</th><th>修复</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1</td><td>维度不匹配</td><td>查询抛 IllegalArgumentException</td><td>索引 dim ≠ query dim</td><td>统一 embedding model 版本</td></tr>
+      <tr><td>2</td><td>similarity 不一致</td><td>recall &lt; 0.5</td><td>索引 COSINE / 查询 DOT_PRODUCT</td><td>统一 VectorSimilarityFunction</td></tr>
+      <tr><td>3</td><td>未归一化用 DOT</td><td>recall 极差</td><td>DOT 要求归一向量</td><td>l2normalize 或换 COSINE</td></tr>
+      <tr><td>4</td><td>filter 命中率低</td><td>recall 静默跌</td><td>HNSW 候选都被 filter 掉</td><td>brute force fallback / pre-filter</td></tr>
+      <tr><td>5</td><td>内存爆 OOM</td><td>JVM 直接挂</td><td>fp32 1e8 = 480 GB</td><td>启用 SQ7 或多分片</td></tr>
+      <tr><td>6</td><td>建图 / merge 慢</td><td>索引落后实时数据</td><td>efConstruction 高 + 大段</td><td>降 efC, maxMergedSegmentMB ↓</td></tr>
+      <tr><td>7</td><td>recall 漂移</td><td>线上 recall 时高时低</td><td>段数变化导致图质量波动</td><td>定期 forceMerge 到 ~10 段</td></tr>
+      <tr><td>8</td><td>段图损坏</td><td>CheckIndex 报错</td><td>异常关闭或磁盘故障</td><td>重建段, 监控 fsync</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>HNSW vs IVF / FLAT 对比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 16-16-2 · ANN 算法对比</div>
+  <table>
+    <thead>
+      <tr><th>算法</th><th>主要思想</th><th>构造代价</th><th>查询速度</th><th>内存</th><th>recall</th><th>filter 友好</th><th>Lucene 实现</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>FLAT (暴搜)</td><td>逐 doc 算距离</td><td>0</td><td>慢 O(N)</td><td>仅向量数据</td><td>1.0 (精确)</td><td>★★★</td><td>有 (小段)</td></tr>
+      <tr><td>HNSW</td><td>多层小世界图</td><td>中</td><td>极快 O(log N)</td><td>高 (图 + 向量)</td><td>0.95-0.99</td><td>★ 退化风险</td><td>★ Lucene99 默认</td></tr>
+      <tr><td>IVF</td><td>k-means 倒排桶</td><td>慢 (k-means)</td><td>快</td><td>中</td><td>0.85-0.95</td><td>★★★ (分桶)</td><td>无 (用 Faiss)</td></tr>
+      <tr><td>ScaNN (Google)</td><td>量化 + 树</td><td>慢</td><td>快</td><td>中</td><td>0.90-0.95</td><td>★★</td><td>无</td></tr>
+      <tr><td>Annoy (Spotify)</td><td>多树 LSH</td><td>中</td><td>中</td><td>低</td><td>0.85-0.92</td><td>★★</td><td>无</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>vector field vs term field 决策</h3>
+
+<div class="compare-grid">
+  <div>
+    <h4>用 KnnFloatVectorField 的场景</h4>
+    <ul>
+      <li>语义检索: BERT/OpenAI/CLIP embedding</li>
+      <li>"找相似" 类业务: 商品推荐、相似图片</li>
+      <li>容错检索: 用户表达模糊但意思清晰</li>
+      <li>跨模态: 文搜图 / 图搜文</li>
+      <li>recall 敏感, 不要求精确</li>
+    </ul>
+  </div>
+  <div>
+    <h4>用 TermQuery / TextField 的场景</h4>
+    <ul>
+      <li>精确匹配: 订单号、SKU、用户 ID</li>
+      <li>关键词检索: 标题里出现"iphone"</li>
+      <li>布尔逻辑: status=PAID AND amount &gt; 100</li>
+      <li>排序聚合: 按时间 / 价格排序</li>
+      <li>必须精确, 不能近似</li>
+    </ul>
+  </div>
+</div>
+
+<h3>调参指南速查</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 16-16-3 · HNSW 调参手册</div>
+  <table>
+    <thead>
+      <tr><th>场景</th><th>规模</th><th>M</th><th>efConstruction</th><th>efSearch</th><th>量化</th><th>说明</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>POC / 开发</td><td>&lt; 100K</td><td>16</td><td>100</td><td>100</td><td>无</td><td>默认即可</td></tr>
+      <tr><td>电商商品搜索</td><td>1M-10M</td><td>16</td><td>200</td><td>100</td><td>SQ7</td><td>recall 0.95 + 内存 4× 省</td></tr>
+      <tr><td>语义检索</td><td>10M-100M</td><td>32</td><td>400</td><td>200</td><td>SQ7</td><td>高 M 提 recall</td></tr>
+      <tr><td>大规模推荐</td><td>100M-1B</td><td>16-32</td><td>200</td><td>100</td><td>SQ7 或 PQ</td><td>必须分片</td></tr>
+      <tr><td>低延迟在线</td><td>&lt; 10M</td><td>16</td><td>100</td><td>50</td><td>SQ7</td><td>recall 0.92 / latency 2 ms</td></tr>
+      <tr><td>高召回离线</td><td>任意</td><td>32</td><td>500</td><td>500</td><td>无 (FP32)</td><td>recall 0.99 / latency 50 ms</td></tr>
+      <tr><td>多租户 SaaS</td><td>变量</td><td>16</td><td>200</td><td>200</td><td>SQ7</td><td>建议按 tenant 分 segment</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>核心源码入口</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 16-16-4 · HNSW 相关核心源码</div>
+  <table>
+    <thead>
+      <tr><th>类</th><th>路径</th><th>职责</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>KnnFloatVectorField</code></td><td><code>core/.../document/</code></td><td>写入侧 API</td></tr>
+      <tr><td><code>KnnFloatVectorQuery</code></td><td><code>core/.../search/</code></td><td>查询侧 API</td></tr>
+      <tr><td><code>FloatVectorValues</code></td><td><code>core/.../index/</code></td><td>向量数据迭代器</td></tr>
+      <tr><td><code>VectorSimilarityFunction</code></td><td><code>core/.../index/</code></td><td>4 种相似度枚举</td></tr>
+      <tr><td><code>HnswGraph</code></td><td><code>core/.../util/hnsw/</code></td><td>图数据结构抽象</td></tr>
+      <tr><td><code>OnHeapHnswGraph</code></td><td><code>core/.../util/hnsw/</code></td><td>堆内图(构造时用)</td></tr>
+      <tr><td><code>HnswGraphBuilder</code></td><td><code>core/.../util/hnsw/</code></td><td>构造算法实现</td></tr>
+      <tr><td><code>HnswGraphSearcher</code></td><td><code>core/.../util/hnsw/</code></td><td>搜索算法实现</td></tr>
+      <tr><td><code>NeighborQueue</code></td><td><code>core/.../util/hnsw/</code></td><td>候选堆 (min/max heap)</td></tr>
+      <tr><td><code>RandomVectorScorer</code></td><td><code>core/.../util/hnsw/</code></td><td>距离计算抽象</td></tr>
+      <tr><td><code>VectorUtil</code></td><td><code>core/.../util/</code></td><td>SIMD 距离实现</td></tr>
+      <tr><td><code>Lucene99HnswVectorsFormat</code></td><td><code>core/.../codecs/lucene99/</code></td><td>FP32 Codec</td></tr>
+      <tr><td><code>Lucene99HnswScalarQuantizedVectorsFormat</code></td><td><code>core/.../codecs/lucene99/</code></td><td>SQ7/SQ4 Codec</td></tr>
+      <tr><td><code>Lucene99HnswVectorsReader</code></td><td><code>core/.../codecs/lucene99/</code></td><td>读 .vec/.vem/.vex</td></tr>
+      <tr><td><code>Lucene99HnswVectorsWriter</code></td><td><code>core/.../codecs/lucene99/</code></td><td>写 .vec/.vem/.vex</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="real-world">
+  <strong>真实场景: 某语义搜索平台 1 周内 4 次紧急扩容</strong>。某创业公司上线 BERT 语义搜索, 数据从 100 万快速涨到 5000 万, 4 次紧急扩容: (1) 第一次内存爆, FP32 5000 万 768D = 154 GB 单机装不下, 紧急扩成 4 节点; (2) 第二次召回突跌, 发现是 segment 数从 5 涨到 50 后图质量下降, forceMerge 到 10 段恢复; (3) 第三次延迟突增, 是某客户 filter 极严(单租户数据 &lt; 1%)触发 brute fallback, 改成按 tenant 分 sub-index; (4) 第四次构建慢, 启用 SQ7 + numMergeWorkers=8 后建图时间从 3 小时降到 40 分钟。<em>教训: HNSW 部署前必须做容量规划 + recall 评估 + filter 模式分析, 不要等爆了再补。</em>
+</div>
+
+<!-- ============================================================ -->
+<!-- Chapter Summary -->
+<!-- ============================================================ -->
+
+<div class="chapter-summary" id="s16-summary">
+  <h2>16.17 本章小结</h2>
+  <table>
+    <thead>
+      <tr><th>关注点</th><th>核心 API / 概念</th><th>关键建议</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>为什么倒排不行</td><td>float term 词典爆炸 + 无相似度</td><td>语义检索必须用 KnnFloatVectorField</td></tr>
+      <tr><td>HNSW 算法本质</td><td>分层小世界图 + 贪心导航</td><td>顶层稀疏 / 底层稠密, 上下游层数 O(log N)</td></tr>
+      <tr><td>距离度量</td><td>EUCLIDEAN / COSINE / DOT_PRODUCT</td><td>BERT 默认 COSINE; 归一化后用 DOT 更快</td></tr>
+      <tr><td>层级随机分配</td><td><code>level = floor(-ln(rand) × M_L)</code></td><td>M=16 时 Layer 0=100% / Layer 1=37% / 顶层 ~50</td></tr>
+      <tr><td>构造算法</td><td>HnswGraphBuilder 5 阶段</td><td>heuristic 选邻居保证多样性</td></tr>
+      <tr><td>搜索算法</td><td>顶层贪心下降 + Layer 0 ef 候选堆</td><td>efSearch 默认 100, 调大 → recall ↑ 延迟 ↑</td></tr>
+      <tr><td>核心参数</td><td>M / efConstruction / efSearch</td><td>M=16 内存平衡, ef 构造 200, ef 搜 100 是默认</td></tr>
+      <tr><td>VectorValues 抽象</td><td>FloatVectorValues + HnswGraph</td><td>Codec 替换不影响业务代码</td></tr>
+      <tr><td>三文件物理布局</td><td>.vec(向量) + .vem(元) + .vex(图)</td><td>mmap 加 OS page cache, 监控 hit ratio</td></tr>
+      <tr><td>SIMD 距离计算</td><td>jdk.incubator.vector + AVX2/512</td><td>10× 加速, byte 距离更快</td></tr>
+      <tr><td>SQ7 标量量化</td><td>Lucene99HnswScalarQuantizedVectorsFormat</td><td>4× 内存省, recall 损失 &lt; 1%</td></tr>
+      <tr><td>PQ Product Quantization</td><td>m × K 子向量码书</td><td>Lucene 暂未官方支持, 用 Faiss</td></tr>
+      <tr><td>段合并算法</td><td>"最大段为基" + 增量 add</td><td>maxMergedSegmentMB &lt; 5GB, numMergeWorkers ≥ 4</td></tr>
+      <tr><td>内存估算</td><td>FP32 1e8 = 480 GB → SQ7 = 120 GB</td><td>1e7+ 规模强烈推荐 SQ7</td></tr>
+      <tr><td>召回评估</td><td>BruteForceKnnEvaluator + 150 query 套件</td><td>recall &lt; 0.9 不允许上线</td></tr>
+      <tr><td>efSearch 调参</td><td>16/100/500 三档基线</td><td>必须基于真实业务 query 测</td></tr>
+      <tr><td>filter 退化</td><td>filter 命中率 &lt; 10% recall 跌到 0.3</td><td>brute fallback 或 pre-filter 缩小集</td></tr>
+      <tr><td>生产陷阱</td><td>8 大类: 维度 / similarity / 内存 / merge</td><td>上线前 8 项 checklist 全过</td></tr>
+      <tr><td>HNSW vs IVF/FLAT</td><td>HNSW 速度内存平衡, IVF 内存最省, FLAT 精确</td><td>Lucene 9.x 只内置 HNSW + FLAT</td></tr>
+      <tr><td>核心源码</td><td>util.hnsw.* + codecs.lucene99.*</td><td>HnswGraphBuilder / HnswGraphSearcher 是核心</td></tr>
+    </tbody>
+  </table>
+  <p class="next-hint">下一章 <a href="17-compression-stored-fields.html">第 17 章 · 压缩与 Stored Fields</a> 把 Lucene 的<em>压缩体系</em>展开。HNSW 的向量数据是浮点, 压缩思路是量化(SQ/PQ); 而 Stored Fields(用 IndexableField.STORE 标记的字段)是任意字节流, 压缩走 LZ4 / DEFLATE 通用算法。下一章拆解 .fdt / .fdx / .fdm 三文件的 chunk 组织、LZ4 与 ZSTD 算法的取舍、StoredFieldsFormat 的 Codec 框架, 以及与本章 KnnVectorsFormat 的设计共通点——它们都是 Codec 体系的子模块, 都遵循"Format = Reader + Writer + 物理布局"的统一架构。</p>
+</div>
+
+<!-- ============================================================ -->
+<!-- Chapter navigation -->
+<!-- ============================================================ -->
+<div class="chapter-nav">
+  <a href="15-topk-wand-collector.html">&larr; 第 15 章 &middot; TopK 与 WAND Collector</a>
+  <a href="17-compression-stored-fields.html">第 17 章 &middot; 压缩与 Stored Fields &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 Lucene &middot; 第 16 章 &middot; HNSW 向量检索</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){setTimeout(function(){document.querySelectorAll('.mermaid svg,.diagram svg').forEach(function(svg){var h=parseInt(svg.getAttribute('height')||svg.getBoundingClientRect().height);if(h>500){svg.style.maxHeight='500px';svg.style.width='auto';var p=svg.closest('.diagram');if(p)p.style.overflowX='auto';}});},1500);});</script>
+</body>
+</html>

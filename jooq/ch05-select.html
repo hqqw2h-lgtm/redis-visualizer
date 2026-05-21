@@ -1,0 +1,1717 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 5 章 · SELECT 查询构建 — 图解 jOOQ</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 jOOQ</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="ch04-typesystem.html">上一章 ch04-typesystem</a>
+  <a href="ch06-dml.html">下一章 ch06-dml</a>
+</nav>
+
+<aside class="toc">
+<a href="#5.0-章首速览">5.0 章首速览</a>
+<a href="#5.1-select-构建流水线">5.1 SELECT 构建流水线</a>
+<a href="#5.2-condition-条件组合">5.2 Condition 条件组合</a>
+<a href="#5.3-join-连接">5.3 JOIN 连接</a>
+<a href="#5.4-排序与分页">5.4 排序与分页</a>
+<a href="#5.5-子查询">5.5 子查询</a>
+<a href="#5.6-动态查询构建">5.6 动态查询构建</a>
+<a href="#5.7-陷阱与限制">5.7 陷阱与限制</a>
+<a href="#5.8-select-测试护栏">5.8 SELECT 测试护栏</a>
+<a href="#5.9-源码深潜">5.9 源码深潜</a>
+<a href="#5.10-本章要点">5.10 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 5 章 · SELECT 查询构建</h1>
+<p class="subtitle">v7 图解版 · 自动从 v6 markdown 生成 · Mermaid 图原样保留</p>
+<div class="chapter-intro"><p>SELECT 是 SQL 中最复杂的语句,也是 jOOQ 类型系统价值集中体现的场景。jOOQ 的 SELECT API 通过 Step 接口链实现类型驱动的状态机:每一步返回更具体的中间类型,编译器在每步约束下一步合法操作。该设计既不是 Builder 模式的随意拼接,也不是字符串拼接的延后报错,而是把 SQL 子句顺序固化为类型签名。</p>
+<p>本章按"流水线 → 条件 → JOIN → 排序与分页 → 子查询 → 动态构建 → 陷阱 → 源码"的结构展开。所有示例使用三表 schema:<code>customers</code>(用户)、<code>orders</code>(订单)、<code>products</code>(商品),覆盖单表查询、多表关联、子查询、动态过滤、Keyset 分页等典型场景。</p>
+</div>
+<h2 id="5.0-章首速览">5.0 章首速览</h2>
+<h3>图 5-0:SELECT 全景</h3>
+<div class="diagram">
+  <div class="diagram-title">图 5-0 · SELECT 查询构建全景 — 7 大主题 + 子要点</div>
+  <svg viewBox="0 0 920 420" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="320" y="14" width="280" height="56" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="38" text-anchor="middle" fill="#bc8cff" font-size="14" font-weight="bold">SELECT 查询构建</text>
+    <text x="460" y="58" text-anchor="middle" fill="#c9d1d9" font-size="11">Step 链 + Condition + JOIN + 子查询 + 动态</text>
+
+    <path d="M 340 70 L 70  130" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 380 70 L 200 130" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 420 70 L 340 130" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 70 L 460 130" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 500 70 L 580 130" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 540 70 L 720 130" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 580 70 L 850 130" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="10"  y="135" width="120" height="44" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="2"/>
+    <text x="70"  y="155" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">§5.1</text>
+    <text x="70"  y="172" text-anchor="middle" fill="#c9d1d9" font-size="10">流水线</text>
+
+    <rect x="140" y="135" width="120" height="44" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="2"/>
+    <text x="200" y="155" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">§5.2</text>
+    <text x="200" y="172" text-anchor="middle" fill="#c9d1d9" font-size="10">Condition</text>
+
+    <rect x="280" y="135" width="120" height="44" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="340" y="155" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">§5.3</text>
+    <text x="340" y="172" text-anchor="middle" fill="#c9d1d9" font-size="10">JOIN</text>
+
+    <rect x="400" y="135" width="120" height="44" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="155" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">§5.4</text>
+    <text x="460" y="172" text-anchor="middle" fill="#c9d1d9" font-size="10">排序 / 分页</text>
+
+    <rect x="520" y="135" width="120" height="44" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="580" y="155" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">§5.5</text>
+    <text x="580" y="172" text-anchor="middle" fill="#c9d1d9" font-size="10">子查询</text>
+
+    <rect x="660" y="135" width="120" height="44" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="2"/>
+    <text x="720" y="155" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">§5.6</text>
+    <text x="720" y="172" text-anchor="middle" fill="#c9d1d9" font-size="10">动态查询</text>
+
+    <rect x="790" y="135" width="120" height="44" rx="8" fill="url(#g-red)"    stroke="#f85149" stroke-width="2"/>
+    <text x="850" y="155" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">§5.7-5.10</text>
+    <text x="850" y="172" text-anchor="middle" fill="#c9d1d9" font-size="10">陷阱 + 源码</text>
+
+    <path d="M 70  179 L 70  220" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 200 179 L 200 220" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 340 179 L 340 220" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 179 L 460 220" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 580 179 L 580 220" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 720 179 L 720 220" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 850 179 L 850 220" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="10"  y="225" width="120" height="46" rx="6" fill="#161b22" stroke="#58a6ff"/>
+    <text x="70"  y="245" text-anchor="middle" fill="#c9d1d9" font-size="10">Step 接口链</text>
+    <text x="70"  y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">状态机</text>
+
+    <rect x="140" y="225" width="120" height="46" rx="6" fill="#161b22" stroke="#3fb950"/>
+    <text x="200" y="245" text-anchor="middle" fill="#c9d1d9" font-size="10">AND / OR / NOT</text>
+    <text x="200" y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">布尔代数</text>
+
+    <rect x="280" y="225" width="120" height="46" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="340" y="245" text-anchor="middle" fill="#c9d1d9" font-size="10">显式 / 隐式</text>
+    <text x="340" y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">5 种类型</text>
+
+    <rect x="400" y="225" width="120" height="46" rx="6" fill="#161b22" stroke="#bc8cff"/>
+    <text x="460" y="245" text-anchor="middle" fill="#c9d1d9" font-size="10">OFFSET vs SEEK</text>
+    <text x="460" y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">分页策略</text>
+
+    <rect x="520" y="225" width="120" height="46" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="580" y="245" text-anchor="middle" fill="#c9d1d9" font-size="10">asField/asTable</text>
+    <text x="580" y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">EXISTS / IN</text>
+
+    <rect x="660" y="225" width="120" height="46" rx="6" fill="#161b22" stroke="#3fb950"/>
+    <text x="720" y="245" text-anchor="middle" fill="#c9d1d9" font-size="10">List&lt;Condition&gt;</text>
+    <text x="720" y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">noCondition</text>
+
+    <rect x="790" y="225" width="120" height="46" rx="6" fill="#161b22" stroke="#f85149"/>
+    <text x="850" y="245" text-anchor="middle" fill="#c9d1d9" font-size="10">N+1 / 深分页</text>
+    <text x="850" y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">NULL 语义</text>
+
+    <rect x="60" y="300" width="800" height="100" rx="8" fill="#0d1117" stroke="#30363d"/>
+    <text x="460" y="325" text-anchor="middle" fill="#8b949e" font-size="11">阅读路径:§5.1 流水线 → §5.2 Condition → §5.3 JOIN → §5.4 分页 → §5.5 子查询 → §5.6 动态构建</text>
+    <text x="460" y="345" text-anchor="middle" fill="#8b949e" font-size="11">SELECT API 通过 Step 接口实现类型驱动状态机 — 每一步返回更具体类型,约束下一步合法操作</text>
+    <text x="460" y="365" text-anchor="middle" fill="#8b949e" font-size="11">三表 schema:customers / orders / products — 覆盖单表 / 多表 / 子查询 / 动态过滤 / Keyset 分页</text>
+    <text x="460" y="385" text-anchor="middle" fill="#8b949e" font-size="11">SQL 子句顺序固化为类型签名 · 编译期检查 · 不存在"忘记 FROM"或"WHERE 在 ORDER BY 之后"</text>
+  </svg>
+</div>
+<p>本章按"流水线 → 子句 → 子查询 → 动态 → 陷阱 → 源码"七层组织,前六节展开机制,最后两节回到陷阱与源码深潜。</p>
+<h2 id="5.1-select-构建流水线">5.1 SELECT 构建流水线</h2>
+<h3>5.1.1 Step 接口链</h3>
+<div class="diagram">
+  <div class="diagram-title">图 5-1-1 · SELECT Step 接口链 — 类型驱动的状态机</div>
+  <svg viewBox="0 0 920 480" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20"  y="40" width="150" height="56" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="95"  y="64" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">DSLContext</text>
+    <text x="95"  y="82" text-anchor="middle" fill="#c9d1d9" font-size="10">入口对象</text>
+
+    <path d="M 170 68 L 215 68" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="192" y="58" text-anchor="middle" fill="#3fb950" font-size="9" font-weight="bold">.select(...)</text>
+
+    <rect x="220" y="40" width="180" height="56" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="310" y="64" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">SelectSelectStep</text>
+    <text x="310" y="82" text-anchor="middle" fill="#c9d1d9" font-size="10">投影确定</text>
+
+    <path d="M 400 68 L 445 68" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="422" y="58" text-anchor="middle" fill="#3fb950" font-size="9" font-weight="bold">.from(...)</text>
+
+    <rect x="450" y="40" width="180" height="56" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="540" y="64" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">SelectFromStep</text>
+    <text x="540" y="82" text-anchor="middle" fill="#c9d1d9" font-size="10">数据源确定</text>
+
+    <path d="M 630 68 L 675 68" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="652" y="58" text-anchor="middle" fill="#3fb950" font-size="9" font-weight="bold">.where(...)</text>
+
+    <rect x="680" y="40" width="180" height="56" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="770" y="64" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">SelectWhereStep</text>
+    <text x="770" y="82" text-anchor="middle" fill="#c9d1d9" font-size="10">过滤已加</text>
+
+    <path d="M 770 96 Q 770 120 540 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 540 96 L 540 130" stroke="#58a6ff" stroke-width="1.5" fill="none"/>
+    <text x="555" y="120" fill="#3fb950" font-size="9" font-weight="bold">.join(...)</text>
+
+    <rect x="450" y="135" width="180" height="50" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="540" y="158" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">SelectJoinStep</text>
+    <text x="540" y="176" text-anchor="middle" fill="#c9d1d9" font-size="10">.on(...) 回到 FromStep</text>
+
+    <path d="M 540 185 Q 380 200 380 96" stroke="#d29922" stroke-width="1.5" stroke-dasharray="6 3" fill="none" marker-end="url(#arr)"/>
+
+    <path d="M 770 96 L 770 220" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="800" y="155" fill="#3fb950" font-size="9" font-weight="bold">.groupBy(...)</text>
+
+    <rect x="680" y="225" width="180" height="50" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="770" y="248" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">SelectGroupByStep</text>
+    <text x="770" y="265" text-anchor="middle" fill="#c9d1d9" font-size="10">分组确定</text>
+
+    <path d="M 770 275 L 770 305" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="800" y="294" fill="#3fb950" font-size="9" font-weight="bold">.having(...)</text>
+
+    <rect x="680" y="310" width="180" height="50" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="770" y="333" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">SelectHavingStep</text>
+    <text x="770" y="350" text-anchor="middle" fill="#c9d1d9" font-size="10">聚合过滤</text>
+
+    <path d="M 680 335 L 540 335" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="610" y="325" text-anchor="middle" fill="#3fb950" font-size="9" font-weight="bold">.orderBy(...)</text>
+
+    <rect x="350" y="310" width="180" height="50" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="440" y="333" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">SelectOrderByStep</text>
+    <text x="440" y="350" text-anchor="middle" fill="#c9d1d9" font-size="10">排序确定</text>
+
+    <path d="M 350 335 L 215 335" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="280" y="325" text-anchor="middle" fill="#3fb950" font-size="9" font-weight="bold">.limit(n)</text>
+
+    <rect x="20"  y="310" width="180" height="50" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="110" y="333" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">SelectLimitStep</text>
+    <text x="110" y="350" text-anchor="middle" fill="#c9d1d9" font-size="10">数量限制</text>
+
+    <path d="M 110 360 L 110 395" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="140" y="380" fill="#3fb950" font-size="9" font-weight="bold">.offset(m)</text>
+
+    <rect x="20"  y="400" width="180" height="50" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="110" y="423" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">SelectOffsetStep</text>
+    <text x="110" y="440" text-anchor="middle" fill="#c9d1d9" font-size="10">偏移已设</text>
+
+    <path d="M 200 425 L 305 425" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="252" y="415" text-anchor="middle" fill="#3fb950" font-size="9" font-weight="bold">.fetch()</text>
+
+    <rect x="310" y="400" width="200" height="50" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="410" y="423" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">Result&lt;Record&gt;</text>
+    <text x="410" y="440" text-anchor="middle" fill="#c9d1d9" font-size="10">执行 + 取回结果</text>
+
+    <text x="640" y="425" text-anchor="middle" fill="#8b949e" font-size="11">每个 Step 仅暴露当前合法的下一步方法</text>
+    <text x="640" y="445" text-anchor="middle" fill="#8b949e" font-size="11">SQL 子句顺序在编译期被强制</text>
+  </svg>
+</div>
+<p>每个 <code>Step</code> 接口仅暴露当前状态合法的下一步方法。<code>SelectSelectStep</code> 不能直接调用 <code>.where()</code>,因为 <code>FROM</code> 子句尚未指定。该约束使 SQL 子句顺序在编译期被检查,无需运行时校验。</p>
+<h3>5.1.2 JDBC 与 jOOQ 等价对比</h3>
+<pre><code class="language-java">// JDBC:字符串拼接,无编译期检查
+String sql = &quot;SELECT id, name FROM customers &quot;
+    + &quot;WHERE status = ? &quot;
+    + &quot;ORDER BY name LIMIT 10&quot;;
+PreparedStatement ps = conn.prepareStatement(sql);
+ps.setString(1, &quot;ACTIVE&quot;);
+ResultSet rs = ps.executeQuery();
+
+// jOOQ:每步类型约束
+Result&lt;Record2&lt;Long, String&gt;&gt; result = ctx
+    .select(CUSTOMERS.ID, CUSTOMERS.NAME)
+    .from(CUSTOMERS)
+    .where(CUSTOMERS.STATUS.eq(&quot;ACTIVE&quot;))
+    .orderBy(CUSTOMERS.NAME)
+    .limit(10)
+    .fetch();
+</code></pre>
+<pre><code class="language-sql">select customers.id, customers.name
+from customers
+where customers.status = ?
+order by customers.name
+limit ?
+</code></pre>
+<pre><code class="language-text">binds: [ACTIVE, 10]
+result type: Record2&lt;Long, String&gt;
+rows  : 3
+</code></pre>
+<h3>5.1.3 内部调用链</h3>
+<div class="diagram">
+  <div class="diagram-title">图 5-1-3 · 内部调用链 — Step 门面 / SelectQueryImpl / Render / Bind 协作</div>
+  <svg viewBox="0 0 920 500" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="10"  y="20" width="110" height="36" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="65"  y="44" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">应用代码</text>
+    <rect x="140" y="20" width="140" height="36" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="210" y="44" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">DefaultDSLContext</text>
+    <rect x="300" y="20" width="140" height="36" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="370" y="44" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">Select*Step 门面</text>
+    <rect x="460" y="20" width="140" height="36" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="530" y="44" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">SelectQueryImpl</text>
+    <rect x="620" y="20" width="120" height="36" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="680" y="44" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">RenderContext</text>
+    <rect x="760" y="20" width="120" height="36" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="820" y="44" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">BindContext</text>
+    <rect x="800" y="68" width="100" height="36" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="850" y="92" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">JDBC / R2DBC</text>
+
+    <line x1="65"  y1="104" x2="65"  y2="490" stroke="#30363d" stroke-dasharray="3 3"/>
+    <line x1="210" y1="104" x2="210" y2="490" stroke="#30363d" stroke-dasharray="3 3"/>
+    <line x1="370" y1="104" x2="370" y2="490" stroke="#30363d" stroke-dasharray="3 3"/>
+    <line x1="530" y1="104" x2="530" y2="490" stroke="#30363d" stroke-dasharray="3 3"/>
+    <line x1="680" y1="104" x2="680" y2="490" stroke="#30363d" stroke-dasharray="3 3"/>
+    <line x1="820" y1="104" x2="820" y2="490" stroke="#30363d" stroke-dasharray="3 3"/>
+    <line x1="850" y1="104" x2="850" y2="490" stroke="#30363d" stroke-dasharray="3 3"/>
+
+    <path d="M 65 130 L 210 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="137" y="124" text-anchor="middle" fill="#c9d1d9" font-size="11">① select(CUSTOMERS.ID, NAME)</text>
+
+    <path d="M 210 160 L 530 160" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="370" y="154" text-anchor="middle" fill="#c9d1d9" font-size="11">② new SelectQueryImpl()</text>
+
+    <path d="M 210 190 L 370 190" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" fill="none" marker-end="url(#arr)"/>
+    <text x="290" y="184" text-anchor="middle" fill="#c9d1d9" font-size="11">③ 返回 SelectSelectStep 门面</text>
+
+    <path d="M 65 230 L 370 230" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="217" y="224" text-anchor="middle" fill="#c9d1d9" font-size="11">④ from / where / orderBy / limit</text>
+
+    <path d="M 370 270 L 530 270" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="450" y="264" text-anchor="middle" fill="#c9d1d9" font-size="11">⑤ addFrom / addConditions / ...</text>
+
+    <path d="M 65 310 L 530 310" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="297" y="304" text-anchor="middle" fill="#c9d1d9" font-size="11">⑥ fetch() / getSQL()</text>
+
+    <path d="M 530 350 L 680 350" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="605" y="344" text-anchor="middle" fill="#c9d1d9" font-size="11">⑦ accept(ctx) 渲染 SQL</text>
+
+    <path d="M 530 390 L 820 390" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="675" y="384" text-anchor="middle" fill="#c9d1d9" font-size="11">⑧ 收集 bind values</text>
+
+    <path d="M 680 430 L 850 430" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" fill="none" marker-end="url(#arr)"/>
+    <text x="765" y="424" text-anchor="middle" fill="#c9d1d9" font-size="11">⑨ SQL 字符串</text>
+
+    <path d="M 820 470 L 850 470" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" fill="none" marker-end="url(#arr)"/>
+    <text x="835" y="464" text-anchor="middle" fill="#c9d1d9" font-size="11">⑩ bind</text>
+  </svg>
+</div>
+<table>
+<thead>
+<tr>
+<th>层次</th>
+<th>代表对象</th>
+<th>关注点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>入口</td>
+<td><code>DefaultDSLContext.select</code></td>
+<td>创建查询对象</td>
+</tr>
+<tr>
+<td>类型门面</td>
+<td><code>SelectSelectStep</code> 等</td>
+<td>编译期 API 约束</td>
+</tr>
+<tr>
+<td>运行时树</td>
+<td><code>SelectQueryImpl</code></td>
+<td>可变查询状态</td>
+</tr>
+<tr>
+<td>AST 节点</td>
+<td><code>Table / Field / Condition</code></td>
+<td><code>accept(Context)</code> 遍历</td>
+</tr>
+<tr>
+<td>渲染 / 绑定</td>
+<td><code>RenderContext / BindContext</code></td>
+<td>方言适配 + 参数</td>
+</tr>
+</tbody>
+</table>
+<h3>5.1.4 selectFrom 快捷入口</h3>
+<pre><code class="language-java">Result&lt;CustomersRecord&gt; customers = ctx.selectFrom(CUSTOMERS)
+    .where(CUSTOMERS.STATUS.eq(&quot;ACTIVE&quot;))
+    .fetch();
+</code></pre>
+<pre><code class="language-sql">select customers.id, customers.name, customers.email,
+       customers.status, customers.created_at
+from customers
+where customers.status = ?
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>API</th>
+<th>SQL</th>
+<th>返回</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>select(F1, F2).from(T)</code></td>
+<td>投影</td>
+<td><code>Result&lt;RecordN&gt;</code></td>
+<td>报表 / 列表</td>
+</tr>
+<tr>
+<td><code>selectFrom(T)</code></td>
+<td>全列</td>
+<td><code>Result&lt;TRecord&gt;</code></td>
+<td>CRUD / store()</td>
+</tr>
+<tr>
+<td><code>selectCount().from(T)</code></td>
+<td>聚合</td>
+<td><code>Record1&lt;Integer&gt;</code></td>
+<td>计数</td>
+</tr>
+<tr>
+<td><code>selectOne().from(T).limit(1)</code></td>
+<td>存在性</td>
+<td><code>Record1&lt;Integer&gt;</code></td>
+<td>EXISTS 替代</td>
+</tr>
+</tbody>
+</table>
+<h2 id="5.2-condition-条件组合">5.2 Condition 条件组合</h2>
+<h3>5.2.1 条件树结构</h3>
+<div class="diagram">
+  <div class="diagram-title">图 5-2-1 · Condition 布尔代数树 — AND / OR / NOT 三层组合</div>
+  <svg viewBox="0 0 920 420" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="380" y="14" width="160" height="44" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="460" y="42" text-anchor="middle" fill="#d29922" font-size="14" font-weight="bold">WHERE</text>
+
+    <path d="M 460 58 L 460 95" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="380" y="100" width="160" height="44" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="460" y="128" text-anchor="middle" fill="#3fb950" font-size="14" font-weight="bold">AND</text>
+
+    <path d="M 410 144 L 130 200" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 430 144 L 320 200" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 490 144 L 600 200" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 510 144 L 790 200" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="40"  y="205" width="180" height="50" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="130" y="228" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">叶节点 ①</text>
+    <text x="130" y="246" text-anchor="middle" fill="#c9d1d9" font-size="11">status = 'ACTIVE'</text>
+
+    <rect x="230" y="205" width="180" height="50" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="320" y="228" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">叶节点 ②</text>
+    <text x="320" y="246" text-anchor="middle" fill="#c9d1d9" font-size="11">age &gt;= 18</text>
+
+    <rect x="510" y="205" width="180" height="50" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="600" y="228" text-anchor="middle" fill="#d29922" font-size="14" font-weight="bold">OR</text>
+    <text x="600" y="246" text-anchor="middle" fill="#c9d1d9" font-size="10">中间节点</text>
+
+    <rect x="700" y="205" width="180" height="50" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="790" y="228" text-anchor="middle" fill="#f85149" font-size="14" font-weight="bold">NOT</text>
+    <text x="790" y="246" text-anchor="middle" fill="#c9d1d9" font-size="10">否定节点</text>
+
+    <path d="M 560 255 L 470 310" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 640 255 L 720 310" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 790 255 L 790 310" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="380" y="315" width="180" height="50" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="470" y="338" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">叶节点 ③</text>
+    <text x="470" y="356" text-anchor="middle" fill="#c9d1d9" font-size="11">role = 'ADMIN'</text>
+
+    <rect x="620" y="315" width="180" height="50" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="710" y="338" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">叶节点 ④</text>
+    <text x="710" y="356" text-anchor="middle" fill="#c9d1d9" font-size="11">role = 'MANAGER'</text>
+
+    <path d="M 790 255 L 790 315" stroke="#f85149" stroke-width="0"/>
+    <rect x="700" y="315" width="0" height="0"/>
+
+    <rect x="40" y="380" width="840" height="30" rx="6" fill="#0d1117" stroke="#30363d"/>
+    <text x="60" y="400" fill="#8b949e" font-size="11">渲染:WHERE status='ACTIVE' AND age&gt;=18 AND (role='ADMIN' OR role='MANAGER') AND NOT (deleted=true)</text>
+  </svg>
+</div>
+<p><code>Condition</code> 表达式形成布尔代数树。<code>and / or / not</code> 通过方法调用消除 SQL 文本中的括号歧义,使条件组合在编译期可读、可测试。</p>
+<h3>5.2.2 Condition 构建路径</h3>
+<table>
+<thead>
+<tr>
+<th>路径</th>
+<th>API 示例</th>
+<th>输出</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>字段方法</td>
+<td><code>CUSTOMERS.AGE.ge(18)</code></td>
+<td><code>Condition</code></td>
+</tr>
+<tr>
+<td>集合</td>
+<td><code>CUSTOMERS.STATUS.in("A", "B")</code></td>
+<td><code>Condition</code></td>
+</tr>
+<tr>
+<td>字符串</td>
+<td><code>CUSTOMERS.NAME.like("%john%")</code></td>
+<td><code>Condition</code></td>
+</tr>
+<tr>
+<td>空判断</td>
+<td><code>CUSTOMERS.EMAIL.isNotNull()</code></td>
+<td><code>Condition</code></td>
+</tr>
+<tr>
+<td>DSL 静态</td>
+<td><code>DSL.and(c1, c2, c3)</code></td>
+<td><code>Condition</code></td>
+</tr>
+<tr>
+<td>链式</td>
+<td><code>c1.and(c2).or(c3)</code></td>
+<td><code>Condition</code></td>
+</tr>
+<tr>
+<td>透明</td>
+<td><code>DSL.noCondition()</code></td>
+<td><code>Condition</code>(无影响)</td>
+</tr>
+<tr>
+<td>永真 / 永假</td>
+<td><code>trueCondition / falseCondition</code></td>
+<td><code>Condition</code></td>
+</tr>
+</tbody>
+</table>
+<h3>5.2.3 复杂条件示例</h3>
+<pre><code class="language-java">ctx.selectFrom(CUSTOMERS)
+   .where(CUSTOMERS.STATUS.eq(&quot;ACTIVE&quot;))
+   .and(CUSTOMERS.AGE.ge(18))
+   .and(CUSTOMERS.TIER.in(&quot;ADMIN&quot;, &quot;MANAGER&quot;))
+   .andNot(CUSTOMERS.DELETED.eq(true))
+   .and(CUSTOMERS.CREATED_AT.between(
+       LocalDateTime.of(2024, 1, 1, 0, 0),
+       LocalDateTime.of(2024, 12, 31, 23, 59, 59)))
+   .fetch();
+</code></pre>
+<pre><code class="language-sql">select customers.id, customers.name, customers.role, customers.age,
+       customers.status, customers.created_at
+from customers
+where customers.status = ?
+  and customers.age &gt;= ?
+  and customers.role in (?, ?)
+  and not (customers.deleted = ?)
+  and customers.created_at between ? and ?
+</code></pre>
+<h3>5.2.4 集合驱动的动态条件</h3>
+<pre><code class="language-java">List&lt;Condition&gt; filters = new ArrayList&lt;&gt;();
+filters.add(CUSTOMERS.STATUS.eq(&quot;ACTIVE&quot;));
+filters.add(CUSTOMERS.AGE.ge(minAge));
+if (role != null) {
+    filters.add(CUSTOMERS.TIER.eq(role));
+}
+
+ctx.selectFrom(CUSTOMERS)
+   .where(DSL.and(filters))
+   .fetch();
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>输入</th>
+<th><code>DSL.and(...)</code></th>
+<th><code>DSL.or(...)</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>空集合</td>
+<td><code>trueCondition()</code></td>
+<td><code>falseCondition()</code></td>
+</tr>
+<tr>
+<td>单元素</td>
+<td>该元素</td>
+<td>该元素</td>
+</tr>
+<tr>
+<td>多元素</td>
+<td>串联 AND</td>
+<td>串联 OR</td>
+</tr>
+</tbody>
+</table>
+<p><code>DSL.and / or</code> 对空集合返回布尔常量,使空过滤器不破坏 SQL 语义。该对称性是动态查询构建的基石。</p>
+<h2 id="5.3-join-连接">5.3 JOIN 连接</h2>
+<h3>5.3.1 五种 JOIN 类型对照</h3>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>保留行</th>
+<th>未匹配侧</th>
+<th>典型用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>INNER JOIN</td>
+<td>双侧匹配</td>
+<td>不返回</td>
+<td>主表 + 必有关联</td>
+</tr>
+<tr>
+<td>LEFT JOIN</td>
+<td>左表全部</td>
+<td>右表 NULL</td>
+<td>主表 + 可选统计</td>
+</tr>
+<tr>
+<td>RIGHT JOIN</td>
+<td>右表全部</td>
+<td>左表 NULL</td>
+<td>较少使用</td>
+</tr>
+<tr>
+<td>FULL JOIN</td>
+<td>双侧全部</td>
+<td>任一侧 NULL</td>
+<td>对账 / 差异比对</td>
+</tr>
+<tr>
+<td>CROSS JOIN</td>
+<td>笛卡尔积</td>
+<td>无匹配</td>
+<td>维度扩展 / 组合</td>
+</tr>
+</tbody>
+</table>
+<h3>5.3.2 显式 JOIN API</h3>
+<table>
+<thead>
+<tr>
+<th>JOIN</th>
+<th>jOOQ API</th>
+<th>SQL</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>INNER</td>
+<td><code>.join(T).on(c)</code></td>
+<td><code>JOIN t ON c</code></td>
+</tr>
+<tr>
+<td>LEFT</td>
+<td><code>.leftJoin(T).on(c)</code></td>
+<td><code>LEFT OUTER JOIN t ON c</code></td>
+</tr>
+<tr>
+<td>RIGHT</td>
+<td><code>.rightJoin(T).on(c)</code></td>
+<td><code>RIGHT OUTER JOIN t ON c</code></td>
+</tr>
+<tr>
+<td>FULL</td>
+<td><code>.fullJoin(T).on(c)</code></td>
+<td><code>FULL OUTER JOIN t ON c</code></td>
+</tr>
+<tr>
+<td>CROSS</td>
+<td><code>.crossJoin(T)</code></td>
+<td><code>CROSS JOIN t</code></td>
+</tr>
+<tr>
+<td>LATERAL</td>
+<td><code>.crossJoin(lateral(...))</code></td>
+<td><code>CROSS JOIN LATERAL ...</code></td>
+</tr>
+</tbody>
+</table>
+<h3>5.3.3 三表 JOIN 实例</h3>
+<pre><code class="language-java">Result&lt;Record3&lt;String, LocalDate, String&gt;&gt; result = ctx
+    .select(CUSTOMERS.NAME, ORDERS.ORDER_DATE, PRODUCTS.NAME)
+    .from(CUSTOMERS)
+    .join(ORDERS).on(CUSTOMERS.ID.eq(ORDERS.CUSTOMER_ID))
+    .join(PRODUCTS).on(ORDERS.PRODUCT_ID.eq(PRODUCTS.ID))
+    .where(ORDERS.STATUS.eq(&quot;COMPLETED&quot;))
+    .orderBy(ORDERS.ORDER_DATE.desc())
+    .fetch();
+</code></pre>
+<pre><code class="language-sql">select customers.name, orders.order_date, products.name
+from customers
+join orders on customers.id = orders.customer_id
+join products on orders.product_id = products.id
+where orders.status = ?
+order by orders.order_date desc
+</code></pre>
+<h3>5.3.4 隐式连接(implicit join)</h3>
+<pre><code class="language-java">// 显式 JOIN
+ctx.select(CUSTOMERS.NAME, PRODUCTS.NAME)
+   .from(ORDERS)
+   .join(CUSTOMERS).on(ORDERS.CUSTOMER_ID.eq(CUSTOMERS.ID))
+   .join(PRODUCTS).on(ORDERS.PRODUCT_ID.eq(PRODUCTS.ID))
+   .fetch();
+
+// 隐式连接(jOOQ 3.11+)
+ctx.select(
+       ORDERS.customer().NAME,
+       ORDERS.product().NAME)
+   .from(ORDERS)
+   .fetch();
+</code></pre>
+<pre><code class="language-sql">select customers.name, products.name
+from orders
+left join customers on orders.customer_id = customers.id
+left join products on orders.product_id = products.id
+</code></pre>
+<p>隐式连接基于 codegen 识别的外键路径,默认渲染为 LEFT JOIN(避免可空外键过滤主表行)。需要 INNER JOIN 或显式条件时仍应使用显式 <code>.join().on()</code>。</p>
+<h3>5.3.5 隐式连接方言支持</h3>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th>PG</th>
+<th>MySQL</th>
+<th>Oracle</th>
+<th>SQL Server</th>
+<th>H2</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单路径隐式连接</td>
+<td>支持</td>
+<td>支持</td>
+<td>支持</td>
+<td>支持</td>
+<td>支持</td>
+</tr>
+<tr>
+<td>多路径隐式连接</td>
+<td>支持</td>
+<td>支持</td>
+<td>视版本</td>
+<td>视版本</td>
+<td>支持</td>
+</tr>
+<tr>
+<td>自连接路径</td>
+<td>支持</td>
+<td>支持</td>
+<td>视版本</td>
+<td>视版本</td>
+<td>支持</td>
+</tr>
+<tr>
+<td>嵌套路径</td>
+<td>支持</td>
+<td>支持</td>
+<td>视版本</td>
+<td>视版本</td>
+<td>支持</td>
+</tr>
+</tbody>
+</table>
+<h2 id="5.4-排序与分页">5.4 排序与分页</h2>
+<h3>5.4.1 orderBy 与 SortField</h3>
+<pre><code class="language-java">ctx.selectFrom(ORDERS)
+   .orderBy(
+       ORDERS.PRIORITY.desc(),
+       ORDERS.CREATED_AT.asc().nullsLast())
+   .fetch();
+</code></pre>
+<pre><code class="language-sql">select orders.id, orders.priority, orders.created_at, orders.status
+from orders
+order by orders.priority desc, orders.created_at asc nulls last
+</code></pre>
+<h3>5.4.2 OFFSET 与 SEEK 对比</h3>
+<div class="diagram">
+  <div class="diagram-title">图 5-4-2 · OFFSET vs SEEK 时序对比 — 第 100 页(每页 20)同位置的扫描差异</div>
+  <svg viewBox="0 0 920 420" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20"  y="20" width="120" height="36" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="80"  y="44" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">客户端</text>
+    <rect x="780" y="20" width="120" height="36" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="840" y="44" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">数据库</text>
+
+    <line x1="80"  y1="56" x2="80"  y2="410" stroke="#30363d" stroke-dasharray="3 3"/>
+    <line x1="840" y1="56" x2="840" y2="410" stroke="#30363d" stroke-dasharray="3 3"/>
+
+    <rect x="200" y="70" width="500" height="26" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="450" y="88" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">场景 A · OFFSET 分页 — 第 100 页 LIMIT 20 OFFSET 1980</text>
+
+    <path d="M 80 120 L 840 120" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="460" y="114" text-anchor="middle" fill="#c9d1d9" font-size="11">① SELECT ... ORDER BY id LIMIT 20 OFFSET 1980</text>
+
+    <rect x="500" y="135" width="380" height="40" rx="6" fill="#161b22" stroke="#f85149"/>
+    <text x="690" y="153" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">扫描 2000 行,丢前 1980 行</text>
+    <text x="690" y="169" text-anchor="middle" fill="#c9d1d9" font-size="10">O(n) 复杂度:数据量越大、页码越深越慢</text>
+
+    <path d="M 840 195 L 80 195" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" fill="none" marker-end="url(#arr)"/>
+    <text x="460" y="189" text-anchor="middle" fill="#c9d1d9" font-size="11">② 返回 20 rows · 耗时随页码线性增长</text>
+
+    <rect x="200" y="220" width="500" height="26" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="450" y="238" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">场景 B · SEEK 分页 — 同位置但用 WHERE 推进</text>
+
+    <path d="M 80 270 L 840 270" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="460" y="264" text-anchor="middle" fill="#c9d1d9" font-size="11">③ SELECT ... WHERE id &gt; 1980 ORDER BY id LIMIT 20</text>
+
+    <rect x="500" y="285" width="380" height="40" rx="6" fill="#161b22" stroke="#3fb950"/>
+    <text x="690" y="303" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">索引定位 + 顺序读 20 行</text>
+    <text x="690" y="319" text-anchor="middle" fill="#c9d1d9" font-size="10">O(log n + page) 复杂度:与页码无关</text>
+
+    <path d="M 840 345 L 80 345" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" fill="none" marker-end="url(#arr)"/>
+    <text x="460" y="339" text-anchor="middle" fill="#c9d1d9" font-size="11">④ 返回 20 rows · 恒定耗时</text>
+
+    <rect x="40" y="370" width="840" height="40" rx="6" fill="#0d1117" stroke="#30363d"/>
+    <text x="60" y="390" fill="#8b949e" font-size="11">差异:OFFSET 扫描 = page × pageSize + pageSize,SEEK 扫描 = pageSize</text>
+    <text x="60" y="405" fill="#8b949e" font-size="11">SEEK 限制:不支持跳到任意页;只能"下一页 / 上一页",但适合无限滚动 / API 游标分页</text>
+  </svg>
+</div>
+<h3>5.4.3 OFFSET 与 SEEK 性能对照</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">页码</th>
+<th style="text-align: right;">OFFSET 扫描行</th>
+<th style="text-align: right;">SEEK 扫描行</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">20</td>
+<td style="text-align: right;">20</td>
+</tr>
+<tr>
+<td style="text-align: right;">10</td>
+<td style="text-align: right;">200</td>
+<td style="text-align: right;">20</td>
+</tr>
+<tr>
+<td style="text-align: right;">100</td>
+<td style="text-align: right;">2,000</td>
+<td style="text-align: right;">20</td>
+</tr>
+<tr>
+<td style="text-align: right;">1,000</td>
+<td style="text-align: right;">20,000</td>
+<td style="text-align: right;">20</td>
+</tr>
+<tr>
+<td style="text-align: right;">10,000</td>
+<td style="text-align: right;">200,000</td>
+<td style="text-align: right;">20</td>
+</tr>
+</tbody>
+</table>
+<p>OFFSET 扫描成本与页码线性增长,SEEK 利用排序键索引保持恒定。数据量超过十万行时,深分页应优先使用 SEEK。</p>
+<h3>5.4.4 SEEK 复合键示例</h3>
+<pre><code class="language-java">ctx.selectFrom(ORDERS)
+   .orderBy(ORDERS.CREATED_AT.desc(), ORDERS.ID.desc())
+   .seek(lastCreatedAt, lastId)
+   .limit(20)
+   .fetch();
+</code></pre>
+<pre><code class="language-sql">select orders.id, orders.status, orders.created_at
+from orders
+where (orders.created_at, orders.id) &lt; (?, ?)
+order by orders.created_at desc, orders.id desc
+limit ?
+</code></pre>
+<h3>5.4.5 分页策略决策树</h3>
+<div class="diagram">
+  <div class="diagram-title">图 5-4-5 · 分页策略决策树 — 三个问题选定方案</div>
+  <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <path d="M 460 20 L 380 60 L 460 100 L 540 60 Z" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="460" y="56" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">Q1</text>
+    <text x="460" y="72" text-anchor="middle" fill="#c9d1d9" font-size="10">需要跳到任意页?</text>
+
+    <path d="M 380 60 L 200 130" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="270" y="100" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">是</text>
+
+    <path d="M 540 60 L 700 130" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="640" y="100" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">否</text>
+
+    <rect x="80"  y="135" width="240" height="50" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="200" y="158" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">OFFSET 分页</text>
+    <text x="200" y="176" text-anchor="middle" fill="#c9d1d9" font-size="10">支持任意页跳转(管理后台 / 表格分页)</text>
+
+    <path d="M 700 100 L 700 130" stroke="#58a6ff" stroke-width="0"/>
+    <path d="M 700 60 L 700 130" stroke="#3fb950" stroke-width="0"/>
+    <path d="M 700 65 L 700 135" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <path d="M 620 130 L 780 130 L 780 180 L 620 180 Z" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <path d="M 700 130 L 620 155 L 700 180 L 780 155 Z" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="700" y="152" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">Q2</text>
+    <text x="700" y="168" text-anchor="middle" fill="#c9d1d9" font-size="10">数据量 &gt; 10 万?</text>
+
+    <path d="M 620 155 L 380 210" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="500" y="190" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">否</text>
+
+    <path d="M 780 155 L 800 210" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="810" y="190" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">是</text>
+
+    <rect x="280" y="215" width="200" height="50" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="380" y="238" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">OFFSET 分页</text>
+    <text x="380" y="256" text-anchor="middle" fill="#c9d1d9" font-size="10">小数据集深页代价可接受</text>
+
+    <path d="M 720 215 L 880 215 L 880 270 L 720 270 Z" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <path d="M 800 215 L 720 242 L 800 270 L 880 242 Z" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="800" y="240" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">Q3</text>
+    <text x="800" y="256" text-anchor="middle" fill="#c9d1d9" font-size="10">排序键有唯一索引?</text>
+
+    <path d="M 720 242 L 600 320" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="660" y="290" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">是</text>
+
+    <path d="M 800 270 L 800 320" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="820" y="300" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">否</text>
+
+    <rect x="480" y="325" width="240" height="50" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="600" y="348" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">SEEK 分页</text>
+    <text x="600" y="366" text-anchor="middle" fill="#c9d1d9" font-size="10">无限滚动 / API 游标 · 恒定耗时</text>
+
+    <rect x="720" y="325" width="180" height="50" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="810" y="346" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">混合分页</text>
+    <text x="810" y="362" text-anchor="middle" fill="#c9d1d9" font-size="10">前 N 页 OFFSET + 深页 SEEK</text>
+
+    <rect x="40" y="400" width="840" height="50" rx="6" fill="#0d1117" stroke="#30363d"/>
+    <text x="60" y="420" fill="#8b949e" font-size="11">最佳实践:管理后台默认 OFFSET(用户期望跳页) · 公开 API 默认 SEEK(无限滚动)</text>
+    <text x="60" y="440" fill="#8b949e" font-size="11">混合策略:UI 显示前 10 页,超过 10 页强制改为"加载更多"(降级到 SEEK)</text>
+  </svg>
+</div>
+<h2 id="5.5-子查询">5.5 子查询</h2>
+<h3>5.5.1 三类子查询位置</h3>
+<div class="diagram">
+  <div class="diagram-title">图 5-5-1 · 子查询的四种位置 — asField / asTable / EXISTS / IN</div>
+  <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="380" y="14" width="160" height="50" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="38" text-anchor="middle" fill="#bc8cff" font-size="14" font-weight="bold">SELECT 子查询</text>
+    <text x="460" y="55" text-anchor="middle" fill="#c9d1d9" font-size="10">Select&lt;...&gt; 对象</text>
+
+    <path d="M 400 64 L 130 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="250" y="100" text-anchor="middle" fill="#3fb950" font-size="10" font-weight="bold">.asField(alias)</text>
+
+    <path d="M 430 64 L 350 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="380" y="100" text-anchor="middle" fill="#3fb950" font-size="10" font-weight="bold">.asTable(alias)</text>
+
+    <path d="M 490 64 L 570 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="535" y="100" text-anchor="middle" fill="#3fb950" font-size="10" font-weight="bold">DSL.exists(...)</text>
+
+    <path d="M 520 64 L 790 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="670" y="100" text-anchor="middle" fill="#3fb950" font-size="10" font-weight="bold">field.in(...)</text>
+
+    <rect x="20"  y="135" width="200" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="120" y="158" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">标量子查询</text>
+    <text x="120" y="176" text-anchor="middle" fill="#c9d1d9" font-size="10">SELECT 列表</text>
+    <text x="120" y="190" text-anchor="middle" fill="#8b949e" font-size="10">返回 1 行 × 1 列</text>
+
+    <rect x="240" y="135" width="200" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="340" y="158" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">派生表</text>
+    <text x="340" y="176" text-anchor="middle" fill="#c9d1d9" font-size="10">FROM 子句</text>
+    <text x="340" y="190" text-anchor="middle" fill="#8b949e" font-size="10">返回 N 行 × M 列</text>
+
+    <rect x="460" y="135" width="200" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="560" y="158" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">EXISTS 子查询</text>
+    <text x="560" y="176" text-anchor="middle" fill="#c9d1d9" font-size="10">WHERE 子句</text>
+    <text x="560" y="190" text-anchor="middle" fill="#8b949e" font-size="10">返回 boolean</text>
+
+    <rect x="680" y="135" width="200" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="780" y="158" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">IN 子查询</text>
+    <text x="780" y="176" text-anchor="middle" fill="#c9d1d9" font-size="10">WHERE 子句</text>
+    <text x="780" y="190" text-anchor="middle" fill="#8b949e" font-size="10">返回 1 列 × N 行</text>
+
+    <path d="M 120 195 L 120 230" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 340 195 L 340 230" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 560 195 L 560 230" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 780 195 L 780 230" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="20"  y="235" width="200" height="100" rx="6" fill="#161b22" stroke="#58a6ff"/>
+    <text x="35"  y="255" fill="#58a6ff" font-size="10" font-weight="bold">用法:</text>
+    <text x="35"  y="272" fill="#c9d1d9" font-size="10">select(NAME,</text>
+    <text x="35"  y="288" fill="#c9d1d9" font-size="10">  selectCount()</text>
+    <text x="35"  y="304" fill="#c9d1d9" font-size="10">    .from(ORDERS)...</text>
+    <text x="35"  y="320" fill="#c9d1d9" font-size="10">    .asField("cnt"))</text>
+
+    <rect x="240" y="235" width="200" height="100" rx="6" fill="#161b22" stroke="#3fb950"/>
+    <text x="255" y="255" fill="#3fb950" font-size="10" font-weight="bold">用法:</text>
+    <text x="255" y="272" fill="#c9d1d9" font-size="10">var t = select(...)</text>
+    <text x="255" y="288" fill="#c9d1d9" font-size="10">  .asTable("agg");</text>
+    <text x="255" y="304" fill="#c9d1d9" font-size="10">ctx.select(t.field(..))</text>
+    <text x="255" y="320" fill="#c9d1d9" font-size="10">   .from(t).join(...)</text>
+
+    <rect x="460" y="235" width="200" height="100" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="475" y="255" fill="#d29922" font-size="10" font-weight="bold">用法:</text>
+    <text x="475" y="272" fill="#c9d1d9" font-size="10">.where(DSL.exists(</text>
+    <text x="475" y="288" fill="#c9d1d9" font-size="10">  selectOne()</text>
+    <text x="475" y="304" fill="#c9d1d9" font-size="10">    .from(ORDERS)</text>
+    <text x="475" y="320" fill="#c9d1d9" font-size="10">    .where(...)))</text>
+
+    <rect x="680" y="235" width="200" height="100" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="695" y="255" fill="#d29922" font-size="10" font-weight="bold">用法:</text>
+    <text x="695" y="272" fill="#c9d1d9" font-size="10">.where(CUSTOMERS.ID</text>
+    <text x="695" y="288" fill="#c9d1d9" font-size="10">  .in(select(</text>
+    <text x="695" y="304" fill="#c9d1d9" font-size="10">    ORDERS.CUSTOMER_ID)</text>
+    <text x="695" y="320" fill="#c9d1d9" font-size="10">    .from(ORDERS)))</text>
+
+    <rect x="40" y="355" width="840" height="90" rx="6" fill="#0d1117" stroke="#30363d"/>
+    <text x="60" y="375" fill="#8b949e" font-size="11">关键设计:子查询本身仍是 Select 对象 — 同一个 select(...) 通过不同方法获得不同位置语义</text>
+    <text x="60" y="395" fill="#8b949e" font-size="11">asField 要求子查询返回单行单列;asTable 允许多行多列(派生表)</text>
+    <text x="60" y="415" fill="#8b949e" font-size="11">EXISTS 短路(找到一条即停)+ 三值逻辑安全;IN 适合小集合 + 现代优化器自动转半连接</text>
+    <text x="60" y="435" fill="#8b949e" font-size="11">类型安全:asField 返回 Field&lt;T&gt;,asTable 返回 Table&lt;Record&gt; — 在 SELECT 投影 / JOIN 中可继续类型驱动</text>
+  </svg>
+</div>
+<h3>5.5.2 标量子查询 asField</h3>
+<pre><code class="language-java">Field&lt;Integer&gt; orderCount = ctx
+    .selectCount()
+    .from(ORDERS)
+    .where(ORDERS.CUSTOMER_ID.eq(CUSTOMERS.ID))
+    .asField(&quot;order_count&quot;);
+
+ctx.select(CUSTOMERS.NAME, orderCount)
+   .from(CUSTOMERS)
+   .fetch();
+</code></pre>
+<pre><code class="language-sql">select customers.name,
+       (select count(*)
+        from orders
+        where orders.customer_id = customers.id) as order_count
+from customers
+</code></pre>
+<h3>5.5.3 派生表 asTable</h3>
+<pre><code class="language-java">var topBuyers = ctx
+    .select(ORDERS.CUSTOMER_ID, DSL.count().as(&quot;cnt&quot;))
+    .from(ORDERS)
+    .groupBy(ORDERS.CUSTOMER_ID)
+    .having(DSL.count().ge(10))
+    .asTable(&quot;top_buyers&quot;);
+
+Field&lt;Long&gt;    userId = topBuyers.field(ORDERS.CUSTOMER_ID);
+Field&lt;Integer&gt; cnt    = topBuyers.field(&quot;cnt&quot;, Integer.class);
+
+ctx.select(CUSTOMERS.NAME, cnt)
+   .from(CUSTOMERS)
+   .join(topBuyers).on(CUSTOMERS.ID.eq(userId))
+   .orderBy(cnt.desc())
+   .fetch();
+</code></pre>
+<h3>5.5.4 EXISTS 与 IN 子查询</h3>
+<pre><code class="language-java">ctx.selectFrom(CUSTOMERS)
+   .where(DSL.exists(
+       ctx.selectOne()
+          .from(ORDERS)
+          .where(ORDERS.CUSTOMER_ID.eq(CUSTOMERS.ID))))
+   .fetch();
+
+ctx.selectFrom(CUSTOMERS)
+   .where(CUSTOMERS.ID.in(
+       ctx.select(ORDERS.CUSTOMER_ID)
+          .from(ORDERS)
+          .join(PRODUCTS).on(ORDERS.PRODUCT_ID.eq(PRODUCTS.ID))
+          .where(PRODUCTS.CATEGORY.eq(&quot;ELECTRONICS&quot;))))
+   .fetch();
+</code></pre>
+<h3>5.5.5 EXISTS 与 IN 选型</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>EXISTS</th>
+<th>IN</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>短路</td>
+<td>找到第一条即停</td>
+<td>需扫描结果集</td>
+</tr>
+<tr>
+<td>NULL 语义</td>
+<td>三值逻辑安全</td>
+<td>NULL 处理需注意</td>
+</tr>
+<tr>
+<td>优化器重写</td>
+<td>通常已优化</td>
+<td>现代 DB 自动转半连接</td>
+</tr>
+<tr>
+<td>大子查询</td>
+<td>优势明显</td>
+<td>视优化器</td>
+</tr>
+<tr>
+<td>小子查询</td>
+<td>等价</td>
+<td>表达直观</td>
+</tr>
+</tbody>
+</table>
+<p>PostgreSQL 12+ 与 MySQL 8.0+ 的优化器能将 IN 子查询自动重写为半连接,两者性能差异在多数场景下接近。EXISTS 在大结果集与相关子查询场景仍具优势。</p>
+<h2 id="5.6-动态查询构建">5.6 动态查询构建</h2>
+<h3>5.6.1 字符串拼接 vs jOOQ</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>字符串拼接 / XML 模板</th>
+<th>jOOQ 动态构建</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>字段引用</td>
+<td>文本,运行时报错</td>
+<td>生成字段,编译失败</td>
+</tr>
+<tr>
+<td>参数</td>
+<td>可能拼接到 SQL</td>
+<td>默认绑定参数</td>
+</tr>
+<tr>
+<td>条件组合</td>
+<td>模板标签 + 括号</td>
+<td><code>Condition</code> 一等公民</td>
+</tr>
+<tr>
+<td>测试</td>
+<td>集成测试</td>
+<td>断言 SQL + bind</td>
+</tr>
+<tr>
+<td>重构</td>
+<td>全局搜索替换</td>
+<td>IDE 自动重构</td>
+</tr>
+</tbody>
+</table>
+<h3>5.6.2 动态 WHERE 模式</h3>
+<pre><code class="language-java">public Result&lt;CustomersRecord&gt; searchUsers(
+        String name, String email, String role,
+        Integer minAge, Integer maxAge) {
+
+    List&lt;Condition&gt; conditions = new ArrayList&lt;&gt;();
+    if (name != null)   conditions.add(CUSTOMERS.NAME.containsIgnoreCase(name));
+    if (email != null)  conditions.add(CUSTOMERS.EMAIL.eq(email));
+    if (role != null)   conditions.add(CUSTOMERS.TIER.eq(role));
+    if (minAge != null) conditions.add(CUSTOMERS.AGE.ge(minAge));
+    if (maxAge != null) conditions.add(CUSTOMERS.AGE.le(maxAge));
+
+    return ctx.selectFrom(CUSTOMERS)
+              .where(conditions)
+              .orderBy(CUSTOMERS.NAME)
+              .fetch();
+}
+</code></pre>
+<h3>5.6.3 动态 JOIN 模式</h3>
+<pre><code class="language-java">SelectJoinStep&lt;Record&gt; query = ctx.select(ORDERS.fields())
+                                  .from(ORDERS);
+
+if (needUserName) {
+    query = query.join(CUSTOMERS).on(ORDERS.CUSTOMER_ID.eq(CUSTOMERS.ID));
+}
+if (needProductInfo) {
+    query = query.join(PRODUCTS).on(ORDERS.PRODUCT_ID.eq(PRODUCTS.ID));
+}
+
+return query.where(conditions).fetch();
+</code></pre>
+<h3>5.6.4 动态排序模式</h3>
+<pre><code class="language-java">SortField&lt;?&gt; sortField = switch (sortBy) {
+    case &quot;name&quot;  -&gt; asc ? CUSTOMERS.NAME.asc()  : CUSTOMERS.NAME.desc();
+    case &quot;age&quot;   -&gt; asc ? CUSTOMERS.AGE.asc()   : CUSTOMERS.AGE.desc();
+    case &quot;email&quot; -&gt; asc ? CUSTOMERS.EMAIL.asc() : CUSTOMERS.EMAIL.desc();
+    default      -&gt; CUSTOMERS.ID.asc();
+};
+
+ctx.selectFrom(CUSTOMERS)
+   .where(conditions)
+   .orderBy(sortField)
+   .limit(pageSize)
+   .fetch();
+</code></pre>
+<p><code>switch</code> 白名单是动态排序的安全模式。直接把前端字段名传给 <code>field(userInput)</code> 会引入 SQL 注入风险,应避免。</p>
+<h3>5.6.5 noCondition 透明条件</h3>
+<pre><code class="language-java">ctx.selectFrom(CUSTOMERS)
+   .where(
+       name != null ? CUSTOMERS.NAME.like(name) : noCondition(),
+       role != null ? CUSTOMERS.TIER.eq(role)   : noCondition())
+   .fetch();
+</code></pre>
+<p><code>DSL.noCondition()</code> 在最终 SQL 中不渲染,不影响 AND / OR 语义。该机制使三元表达式风格的动态条件无需 <code>if</code> 分支。</p>
+<h2 id="5.7-陷阱与限制">5.7 陷阱与限制</h2>
+<h3>图 5-7:SELECT 陷阱分类</h3>
+<div class="diagram">
+  <div class="diagram-title">图 5-7 · SELECT 陷阱分类 — 3 大类 8 个高频问题</div>
+  <svg viewBox="0 0 920 400" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="370" y="14" width="180" height="44" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="460" y="36" text-anchor="middle" fill="#f85149" font-size="14" font-weight="bold">SELECT 陷阱</text>
+    <text x="460" y="52" text-anchor="middle" fill="#c9d1d9" font-size="10">8 个高频问题 · 3 个类别</text>
+
+    <path d="M 400 58 L 200 100" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 58 L 460 100" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 520 58 L 720 100" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="100" y="105" width="200" height="44" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="200" y="127" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">类别 1 · 性能类</text>
+    <text x="200" y="143" text-anchor="middle" fill="#c9d1d9" font-size="10">SQL 慢 / 资源浪费</text>
+
+    <rect x="360" y="105" width="200" height="44" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="460" y="127" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">类别 2 · 逻辑类</text>
+    <text x="460" y="143" text-anchor="middle" fill="#c9d1d9" font-size="10">结果错 / 语义偏</text>
+
+    <rect x="620" y="105" width="200" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="720" y="127" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">类别 3 · 方言类</text>
+    <text x="720" y="143" text-anchor="middle" fill="#c9d1d9" font-size="10">跨数据库差异</text>
+
+    <path d="M 160 149 L 100 175" stroke="#8b949e" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 200 149 L 200 175" stroke="#8b949e" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 240 149 L 300 175" stroke="#8b949e" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <path d="M 400 149 L 360 175" stroke="#8b949e" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 149 L 460 175" stroke="#8b949e" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 520 149 L 560 175" stroke="#8b949e" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <path d="M 680 149 L 660 175" stroke="#8b949e" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 760 149 L 780 175" stroke="#8b949e" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="40"  y="180" width="120" height="60" rx="6" fill="#161b22" stroke="#f85149"/>
+    <text x="100" y="200" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">1</text>
+    <text x="100" y="218" text-anchor="middle" fill="#c9d1d9" font-size="10">整表读全列</text>
+    <text x="100" y="232" text-anchor="middle" fill="#8b949e" font-size="9">含 BLOB</text>
+
+    <rect x="170" y="180" width="120" height="60" rx="6" fill="#161b22" stroke="#f85149"/>
+    <text x="230" y="200" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">2</text>
+    <text x="230" y="218" text-anchor="middle" fill="#c9d1d9" font-size="10">深 OFFSET</text>
+    <text x="230" y="232" text-anchor="middle" fill="#8b949e" font-size="9">页码线性慢</text>
+
+    <rect x="300" y="180" width="120" height="60" rx="6" fill="#161b22" stroke="#f85149"/>
+    <text x="360" y="200" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">3</text>
+    <text x="360" y="218" text-anchor="middle" fill="#c9d1d9" font-size="10">N+1 查询</text>
+    <text x="360" y="232" text-anchor="middle" fill="#8b949e" font-size="9">循环内 fetch</text>
+
+    <rect x="430" y="180" width="120" height="60" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="490" y="200" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">4</text>
+    <text x="490" y="218" text-anchor="middle" fill="#c9d1d9" font-size="10">eq(null)</text>
+    <text x="490" y="232" text-anchor="middle" fill="#8b949e" font-size="9">永假条件</text>
+
+    <rect x="560" y="180" width="120" height="60" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="620" y="200" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">5</text>
+    <text x="620" y="218" text-anchor="middle" fill="#c9d1d9" font-size="10">OR 缺括号</text>
+    <text x="620" y="232" text-anchor="middle" fill="#8b949e" font-size="9">条件范围错</text>
+
+    <rect x="690" y="180" width="100" height="60" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="740" y="200" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">6</text>
+    <text x="740" y="218" text-anchor="middle" fill="#c9d1d9" font-size="10">空 IN 列表</text>
+    <text x="740" y="232" text-anchor="middle" fill="#8b949e" font-size="9">方言异常</text>
+
+    <rect x="660" y="245" width="120" height="60" rx="6" fill="#161b22" stroke="#58a6ff"/>
+    <text x="720" y="265" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">7</text>
+    <text x="720" y="283" text-anchor="middle" fill="#c9d1d9" font-size="10">NULLS F/L</text>
+    <text x="720" y="297" text-anchor="middle" fill="#8b949e" font-size="9">模拟差异</text>
+
+    <rect x="790" y="245" width="120" height="60" rx="6" fill="#161b22" stroke="#58a6ff"/>
+    <text x="850" y="265" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">8</text>
+    <text x="850" y="283" text-anchor="middle" fill="#c9d1d9" font-size="10">隐式连接</text>
+    <text x="850" y="297" text-anchor="middle" fill="#8b949e" font-size="9">渲染差异</text>
+
+    <rect x="40" y="320" width="840" height="70" rx="8" fill="#0d1117" stroke="#30363d"/>
+    <text x="60" y="340" fill="#8b949e" font-size="11">严重度:</text>
+    <text x="60" y="358" fill="#f85149" font-size="11" font-weight="bold">高:1 / 2 / 3</text>
+    <text x="170" y="358" fill="#c9d1d9" font-size="11">— 性能问题 · 必须用 EXPLAIN 验证 · 监控慢查询日志</text>
+    <text x="60" y="376" fill="#d29922" font-size="11" font-weight="bold">中:4 / 5 / 6</text>
+    <text x="170" y="376" fill="#c9d1d9" font-size="11">— 逻辑错误 · 单元测试 + SQL snapshot 覆盖 · isNull / eqOrIsNull 替代</text>
+  </svg>
+</div>
+<h3>表 5-7:陷阱明细</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">#</th>
+<th>陷阱</th>
+<th>症状</th>
+<th>根因</th>
+<th>修复</th>
+<th>监控指标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">1</td>
+<td>整表读全列</td>
+<td>网络 / 内存浪费</td>
+<td><code>selectFrom</code> 含大字段</td>
+<td>显式投影</td>
+<td>网络字节数</td>
+</tr>
+<tr>
+<td style="text-align: right;">2</td>
+<td>深 OFFSET</td>
+<td>页码线性慢</td>
+<td><code>LIMIT/OFFSET</code></td>
+<td>改 SEEK</td>
+<td>EXPLAIN rows</td>
+</tr>
+<tr>
+<td style="text-align: right;">3</td>
+<td>N+1 查询</td>
+<td>查询次数 = 行数</td>
+<td>循环内 fetch</td>
+<td>JOIN 或 MULTISET</td>
+<td>慢查询日志</td>
+</tr>
+<tr>
+<td style="text-align: right;">4</td>
+<td><code>eq(null)</code></td>
+<td>永假条件</td>
+<td>三值逻辑</td>
+<td><code>isNull / eqOrIsNull</code></td>
+<td>单元测试</td>
+</tr>
+<tr>
+<td style="text-align: right;">5</td>
+<td>OR 缺括号</td>
+<td>条件范围错</td>
+<td>文本拼接</td>
+<td><code>Condition</code> 组合</td>
+<td>snapshot</td>
+</tr>
+<tr>
+<td style="text-align: right;">6</td>
+<td>空 IN 列表</td>
+<td>永假或方言异常</td>
+<td>集合空</td>
+<td>提前分支</td>
+<td>单元测试</td>
+</tr>
+<tr>
+<td style="text-align: right;">7</td>
+<td>NULLS FIRST/LAST</td>
+<td>方言不一致</td>
+<td>方言差异</td>
+<td>显式排序键</td>
+<td>跨方言测试</td>
+</tr>
+<tr>
+<td style="text-align: right;">8</td>
+<td>隐式连接</td>
+<td>渲染版本差异</td>
+<td>外键路径</td>
+<td>显式 join</td>
+<td>snapshot</td>
+</tr>
+</tbody>
+</table>
+<h3>关键反例与正例</h3>
+<pre><code class="language-java">// 反例:整表读全列含 BLOB
+ctx.selectFrom(DOCUMENTS).fetch();
+
+// 正例:显式投影
+ctx.select(DOCUMENTS.ID, DOCUMENTS.TITLE, DOCUMENTS.CREATED_AT)
+   .from(DOCUMENTS)
+   .fetch();
+</code></pre>
+<pre><code class="language-java">// 反例:eq(null) 永假
+CUSTOMERS.EMAIL.eq((String) null);
+
+// 正例:isNull
+CUSTOMERS.EMAIL.isNull();
+
+// 正例:可空字段统一
+CUSTOMERS.EMAIL.eqOrIsNull(value);
+</code></pre>
+<pre><code class="language-java">// 反例:N+1
+Result&lt;CustomersRecord&gt; customers = ctx.selectFrom(CUSTOMERS).fetch();
+for (CustomersRecord c : customers) {
+    Result&lt;OrdersRecord&gt; orders = ctx.selectFrom(ORDERS)
+        .where(ORDERS.CUSTOMER_ID.eq(c.getId()))
+        .fetch();
+}
+
+// 正例:JOIN
+ctx.select(CUSTOMERS.NAME, ORDERS.ORDER_DATE, ORDERS.AMOUNT)
+   .from(CUSTOMERS)
+   .leftJoin(ORDERS).on(CUSTOMERS.ID.eq(ORDERS.CUSTOMER_ID))
+   .fetch();
+
+// 更优:MULTISET(第 11 章)
+ctx.select(CUSTOMERS.NAME,
+       multiset(
+           select(ORDERS.ORDER_DATE, ORDERS.AMOUNT)
+           .from(ORDERS)
+           .where(ORDERS.CUSTOMER_ID.eq(CUSTOMERS.ID))
+       ).as(&quot;orders&quot;))
+   .from(CUSTOMERS)
+   .fetch();
+</code></pre>
+<h2 id="5.8-select-测试护栏">5.8 SELECT 测试护栏</h2>
+<h3>5.8.1 SQL Snapshot + bind</h3>
+<pre><code class="language-java">@Test
+void recent_orders_query_keeps_sql_and_bind() {
+    var query = dsl
+        .select(ORDERS.ID, ORDERS.STATUS, ORDERS.AMOUNT)
+        .from(ORDERS)
+        .join(CUSTOMERS).on(ORDERS.CUSTOMER_ID.eq(CUSTOMERS.ID))
+        .where(CUSTOMERS.COUNTRY.eq(&quot;CN&quot;))
+        .and(ORDERS.AMOUNT.gt(new BigDecimal(&quot;50.00&quot;)))
+        .orderBy(ORDERS.ID.asc())
+        .seek(100L)
+        .limit(20);
+
+    assertThat(query.getSQL(ParamType.INDEXED))
+        .isEqualToNormalizingWhitespace(&quot;&quot;&quot;
+            select orders.id, orders.status, orders.amount
+            from orders
+            join customers on orders.customer_id = customers.id
+            where customers.country = ?
+              and orders.amount &gt; ?
+              and orders.id &gt; ?
+            order by orders.id asc
+            limit ?
+            &quot;&quot;&quot;);
+
+    assertThat(query.getBindValues())
+        .containsExactly(&quot;CN&quot;, new BigDecimal(&quot;50.00&quot;), 100L, 20);
+}
+</code></pre>
+<h3>5.8.2 动态查询安全断言</h3>
+<pre><code class="language-java">@Test
+void dynamic_search_keeps_user_input_as_bind() {
+    String name = &quot;Customer'; DROP TABLE customers; --&quot;;
+    var query = dsl.select(CUSTOMERS.ID, CUSTOMERS.NAME)
+        .from(CUSTOMERS)
+        .where(CUSTOMERS.NAME.containsIgnoreCase(name))
+        .orderBy(CUSTOMERS.ID)
+        .limit(20);
+
+    assertThat(query.getSQL(ParamType.INDEXED))
+        .contains(&quot;?&quot;)
+        .doesNotContain(&quot;DROP TABLE&quot;);
+    assertThat(query.getBindValues())
+        .contains(&quot;%Customer'; DROP TABLE customers; --%&quot;, 20);
+}
+</code></pre>
+<h3>5.8.3 EXPLAIN 基线</h3>
+<pre><code class="language-sql">EXPLAIN (ANALYZE, BUFFERS)
+select orders.id, orders.created_at, orders.status
+from orders
+where (orders.created_at, orders.id) &lt; (?, ?)
+order by orders.created_at desc, orders.id desc
+limit ?;
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>计划信号</th>
+<th>期望</th>
+<th>回归处理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Index Scan</td>
+<td>使用复合索引</td>
+<td>补索引</td>
+</tr>
+<tr>
+<td>Rows Removed</td>
+<td>接近 0</td>
+<td>检查可下推性</td>
+</tr>
+<tr>
+<td>Sort Method</td>
+<td>内存排序</td>
+<td>避免 external merge</td>
+</tr>
+<tr>
+<td>Buffers read</td>
+<td>稳定</td>
+<td>数据分布或计划退化</td>
+</tr>
+</tbody>
+</table>
+<h2 id="5.9-源码深潜">5.9 源码深潜</h2>
+<h3>图 5-9:SELECT 内部架构</h3>
+<div class="diagram">
+  <div class="diagram-title">图 5-9 · SELECT 内部架构 — 从入口到 Result&lt;RecordN&gt; 的完整链路</div>
+  <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20"  y="40" width="200" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="120" y="64" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">① DSLContext.select(...)</text>
+    <text x="120" y="82" text-anchor="middle" fill="#c9d1d9" font-size="10">应用代码入口</text>
+    <text x="120" y="96" text-anchor="middle" fill="#8b949e" font-size="10">接口契约</text>
+
+    <path d="M 220 70 L 260 70" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="260" y="40" width="200" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="360" y="64" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">② DefaultDSLContext</text>
+    <text x="360" y="82" text-anchor="middle" fill="#c9d1d9" font-size="10">实现类</text>
+    <text x="360" y="96" text-anchor="middle" fill="#8b949e" font-size="10">持有 Configuration</text>
+
+    <path d="M 460 70 L 500 70" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="500" y="40" width="200" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="600" y="64" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">③ Select*Step 门面</text>
+    <text x="600" y="82" text-anchor="middle" fill="#c9d1d9" font-size="10">类型状态机</text>
+    <text x="600" y="96" text-anchor="middle" fill="#8b949e" font-size="10">编译期 API 约束</text>
+
+    <path d="M 700 70 L 740 70" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="740" y="40" width="160" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="820" y="64" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">④ SelectQueryImpl</text>
+    <text x="820" y="82" text-anchor="middle" fill="#c9d1d9" font-size="10">运行时可变树</text>
+    <text x="820" y="96" text-anchor="middle" fill="#8b949e" font-size="10">查询根节点</text>
+
+    <path d="M 820 100 L 820 140" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="700" y="145" width="240" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="820" y="169" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">⑤ QueryPart AST</text>
+    <text x="820" y="187" text-anchor="middle" fill="#c9d1d9" font-size="10">Table · Field · Condition</text>
+    <text x="820" y="201" text-anchor="middle" fill="#8b949e" font-size="10">accept(Context) 遍历</text>
+
+    <path d="M 700 175 L 460 220" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 700 175 L 460 290" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="260" y="225" width="200" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="360" y="249" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">⑥ RenderContext</text>
+    <text x="360" y="267" text-anchor="middle" fill="#c9d1d9" font-size="10">方言 LIMIT / JOIN / EXISTS</text>
+    <text x="360" y="281" text-anchor="middle" fill="#8b949e" font-size="10">生成 SQL 字符串</text>
+
+    <rect x="260" y="295" width="200" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="360" y="319" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">⑦ BindContext</text>
+    <text x="360" y="337" text-anchor="middle" fill="#c9d1d9" font-size="10">Val / Param 值</text>
+    <text x="360" y="351" text-anchor="middle" fill="#8b949e" font-size="10">setXxx 到 PreparedStatement</text>
+
+    <path d="M 260 255 L 220 290" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 260 325 L 220 320" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="20"  y="290" width="200" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="120" y="314" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">⑧ PreparedStatement</text>
+    <text x="120" y="332" text-anchor="middle" fill="#c9d1d9" font-size="10">JDBC / R2DBC</text>
+    <text x="120" y="346" text-anchor="middle" fill="#8b949e" font-size="10">协议层</text>
+
+    <path d="M 120 350 L 120 390" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="20"  y="395" width="200" height="50" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="120" y="418" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">⑨ Result&lt;RecordN&gt;</text>
+    <text x="120" y="435" text-anchor="middle" fill="#c9d1d9" font-size="10">类型化结果集</text>
+
+    <rect x="500" y="290" width="400" height="160" rx="8" fill="#0d1117" stroke="#30363d"/>
+    <text x="520" y="312" fill="#8b949e" font-size="11" font-weight="bold">设计取舍:</text>
+    <text x="520" y="332" fill="#c9d1d9" font-size="11">• Step 链 + 可变 Impl:fluent 隐藏可变,动态显式利用</text>
+    <text x="520" y="352" fill="#c9d1d9" font-size="11">• Condition 一等公民:独立创建 / 测试 / 复用</text>
+    <text x="520" y="372" fill="#c9d1d9" font-size="11">• 隐式连接默认 LEFT JOIN:可空外键不丢主行</text>
+    <text x="520" y="392" fill="#c9d1d9" font-size="11">• RenderContext / BindContext 双通道:SQL 与值分离</text>
+    <text x="520" y="412" fill="#c9d1d9" font-size="11">• QueryPart accept(ctx) 访问者:方言适配统一入口</text>
+    <text x="520" y="432" fill="#c9d1d9" font-size="11">• Type 信息贯穿 Step → Impl → AST → Result</text>
+  </svg>
+</div>
+<h3>表 5-9:核心源码入口</h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>org.jooq.DSLContext</code></td>
+<td>接口入口</td>
+</tr>
+<tr>
+<td><code>org.jooq.Select</code></td>
+<td>Select 接口</td>
+</tr>
+<tr>
+<td><code>org.jooq.SelectQuery</code></td>
+<td>可变查询对象</td>
+</tr>
+<tr>
+<td><code>org.jooq.Condition</code></td>
+<td>条件接口</td>
+</tr>
+<tr>
+<td><code>org.jooq.impl.DefaultDSLContext</code></td>
+<td>默认实现</td>
+</tr>
+<tr>
+<td><code>org.jooq.impl.SelectImpl</code></td>
+<td>流水线实现</td>
+</tr>
+<tr>
+<td><code>org.jooq.impl.SelectQueryImpl</code></td>
+<td>查询树根</td>
+</tr>
+<tr>
+<td><code>org.jooq.impl.ConditionProviderImpl</code></td>
+<td>WHERE 容器</td>
+</tr>
+</tbody>
+</table>
+<h3>设计取舍</h3>
+<p><strong>取舍 1:Step 接口与可变 SelectQueryImpl</strong></p>
+<p>Step 接口提供编译期类型导航,<code>SelectQueryImpl</code> 提供运行期可变状态。该双层设计使流畅 DSL 与动态构建在同一对象图上协作:fluent API 隐藏可变性,动态 API 显式利用可变性。</p>
+<p><strong>取舍 2:Condition 一等公民</strong></p>
+<p><code>Condition</code> 不依附于查询对象,可独立创建、组合、传递、测试。该设计使动态 WHERE 不依赖字符串拼接,业务层可以把条件作为参数在多个查询间复用。</p>
+<p><strong>取舍 3:隐式连接默认 LEFT JOIN</strong></p>
+<p>隐式连接渲染为 LEFT JOIN 而非 INNER JOIN。理由:可空外键场景下 INNER JOIN 会过滤主表行,违反"路径导航不应改变主表行数"的直觉。需 INNER JOIN 时仍应显式 <code>.join().on()</code>。</p>
+<div class="chapter-summary">
+<h2>5.10 本章要点</h2>
+
+<table>
+<thead>
+<tr>
+<th>要点</th>
+<th>验证依据</th>
+<th>易错点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Step 链是类型状态机</td>
+<td>编译期检查</td>
+<td>把 Step 当返回类型</td>
+</tr>
+<tr>
+<td><code>Condition</code> 可组合</td>
+<td><code>and / or / not</code></td>
+<td>字符串拼接</td>
+</tr>
+<tr>
+<td>隐式连接默认 LEFT JOIN</td>
+<td>渲染输出</td>
+<td>期望 INNER</td>
+</tr>
+<tr>
+<td>SEEK 优于深 OFFSET</td>
+<td>EXPLAIN 行数</td>
+<td>任意页跳转</td>
+</tr>
+<tr>
+<td>子查询三种位置</td>
+<td><code>asField / asTable / EXISTS</code></td>
+<td>错位使用</td>
+</tr>
+<tr>
+<td><code>noCondition</code> 透明</td>
+<td>snapshot</td>
+<td>三元表达式漏分支</td>
+</tr>
+<tr>
+<td><code>eq(null)</code> 永假</td>
+<td>三值逻辑</td>
+<td>期望 IS NULL</td>
+</tr>
+<tr>
+<td>动态查询 IDE 重构</td>
+<td>字段类型</td>
+<td>字符串拼接</td>
+</tr>
+</tbody>
+</table>
+<p>最小回归命令:</p>
+<pre><code class="language-text">mvn -q test -Dtest=Select*Test
+</code></pre>
+<pre><code class="language-log">[INFO] Tests run: 14, Failures: 0
+</code></pre>
+<hr>
+<p>下一章讨论 jOOQ 的写路径:<code>INSERT / UPDATE / DELETE / MERGE</code> 的 DSL 表达式、<code>RETURNING</code> 子句、批量操作、乐观锁,以及 <code>Record.store()</code> 与 DSL 写入的边界。</p>
+</div>
+
+
+<div class="chapter-nav">
+  <a href="ch04-typesystem.html">&larr; ch04-typesystem · 第 4 章 · 类型系统:Field&lt;T&gt; 与 DataType</a>
+  <a href="ch06-dml.html">ch06-dml · 第 6 章 · DML 操作 &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 jOOQ &middot; 第 5 章 · SELECT 查询构建</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+</body>
+</html>

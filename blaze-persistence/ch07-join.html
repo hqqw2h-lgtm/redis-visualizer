@@ -1,0 +1,942 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-book="blaze">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 7 章 · JOIN 与关联策略 — 图解 Blaze-Persistence</title>
+<link rel="stylesheet" href="books.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="topnav">
+  <a class="brand" href="index.html">📖 图解 Blaze-Persistence</a>
+  <span class="sep">|</span>
+  <a href="ch06-updatable.html">← 第 6 章 · 可更新与可创建视图</a>
+  <span class="sep">|</span>
+  <a href="ch08-cte.html">第 8 章 · CTE 与集合操作 →</a>
+</nav>
+
+<aside class="toc">
+  <a href="#intro">章节导读</a>
+  <a href="#s7-1">7.1 隐式 JOIN vs 显式 JOIN</a>
+  <a href="#s7-1-implicit" class="depth-2">隐式 JOIN 路径解析</a>
+  <a href="#s7-1-explicit" class="depth-2">显式 JOIN 声明</a>
+  <a href="#s7-1-pitfall" class="depth-2">隐式 JOIN 陷阱</a>
+  <a href="#s7-2">7.2 JOIN 类型</a>
+  <a href="#s7-2-types" class="depth-2">四种 JOIN 语义</a>
+  <a href="#s7-2-joinon" class="depth-2">joinOn() 自定义条件</a>
+  <a href="#s7-3">7.3 FETCH JOIN</a>
+  <a href="#s7-3-n1" class="depth-2">N+1 问题与 fetch()</a>
+  <a href="#s7-3-cartesian" class="depth-2">笛卡尔积陷阱</a>
+  <a href="#s7-4">7.4 关联路径表达式</a>
+  <a href="#s7-4-dot" class="depth-2">点号导航与 SQL 解析</a>
+  <a href="#s7-5">7.5 跨实体关联与 Lateral JOIN</a>
+  <a href="#s7-5-lateral" class="depth-2">Lateral JOIN 支持矩阵</a>
+  <a href="#s7-6">7.6 Entity View 中的 JOIN 控制</a>
+  <a href="#s7-6-strategy" class="depth-2">四种 FetchStrategy</a>
+  <a href="#s7-7">7.7 陷阱与限制</a>
+  <a href="#summary">本章小结</a>
+</aside>
+
+<article class="article">
+
+<h1>第 7 章 · JOIN 与关联策略</h1>
+<p class="subtitle">隐式 JOIN · 显式 JOIN · FETCH JOIN · ON 条件 · 关联路径</p>
+
+<!-- ====== intro ====== -->
+<div class="chapter-intro" id="intro">
+  <p class="lead">
+    关联查询是 ORM 中最容易产生性能问题的环节。Blaze-Persistence 在 JPA 的 JOIN 语义之上，
+    提供了<strong>隐式路径解析</strong>、<strong>多种 JOIN 类型</strong>、<strong>FETCH JOIN 优化</strong>
+    和<strong>Lateral JOIN</strong> 等高级能力，让开发者既能写出简洁的查询代码，又能精确控制底层 SQL 的关联策略。
+  </p>
+  <ul class="will-learn">
+    <li>理解隐式 JOIN 与显式 JOIN 的本质差异及其适用场景</li>
+    <li>掌握 INNER / LEFT / RIGHT / FULL 四种 JOIN 类型的 API</li>
+    <li>利用 FETCH JOIN 消除 N+1 查询，同时规避笛卡尔积</li>
+    <li>通过关联路径表达式进行多级实体导航</li>
+    <li>在 Entity View 层面选择最佳 FetchStrategy</li>
+    <li>识别常见 JOIN 陷阱与数据库兼容性限制</li>
+  </ul>
+  <p class="prereq">前置知识：<a href="ch03-criteria.html">第 3 章 · CriteriaBuilder 查询引擎</a></p>
+</div>
+
+<!-- ============================================================ -->
+<!-- 7.1 隐式 JOIN vs 显式 JOIN -->
+<!-- ============================================================ -->
+<h2 id="s7-1">7.1 隐式 JOIN vs 显式 JOIN</h2>
+
+<p>
+  在 Blaze-Persistence 中，当你通过点号表达式（如 <code>order.customer.name</code>）访问关联属性时，
+  框架会<strong>自动推断</strong>所需的 JOIN 并在生成的 JPQL / SQL 中隐式添加。
+  这种「路径导航触发关联」的机制称为<strong>隐式 JOIN</strong>。与之对应，
+  <code>join()</code> / <code>innerJoin()</code> 等 API 让你<strong>显式声明</strong>关联关系及其别名。
+</p>
+
+<div class="diagram">
+  <div class="diagram-title">隐式 JOIN vs 显式 JOIN — 决策流程</div>
+  <div class="mermaid">
+flowchart TD
+    START["编写查询表达式"] --> Q1{"是否包含点号路径?"}
+    Q1 -->|"是: order.customer.name"| IMP["隐式 JOIN"]
+    Q1 -->|"否: 需要自定义别名 / ON 条件"| EXP["显式 JOIN"]
+
+    IMP --> IMP_R["框架自动推断 JOIN 类型\n默认 LEFT JOIN"]
+    IMP --> IMP_D["自动去重：\n相同路径只生成一次 JOIN"]
+
+    EXP --> EXP_A["手动指定 JOIN 类型\nINNER / LEFT / RIGHT / FULL"]
+    EXP --> EXP_B["可附加 ON 条件\njoinOn() API"]
+    EXP --> EXP_C["获得可复用别名\n用于后续 WHERE / SELECT"]
+
+    IMP_R --> GEN["生成 JPQL / SQL"]
+    IMP_D --> GEN
+    EXP_A --> GEN
+    EXP_B --> GEN
+    EXP_C --> GEN
+
+    style START fill:#1e3a5f,stroke:#58a6ff
+    style IMP fill:#1a3a2a,stroke:#3fb950
+    style EXP fill:#2d1f4e,stroke:#bc8cff
+    style GEN fill:#3a2a1a,stroke:#d29922
+  </div>
+</div>
+
+<h3 id="s7-1-implicit">隐式 JOIN 路径解析</h3>
+
+<p>
+  隐式 JOIN 最大的优势是<strong>简洁</strong>——开发者只关注要访问的属性路径，
+  JOIN 的生成完全交给框架。Blaze-Persistence 会对路径进行解析，
+  按照实体元模型将每一段路径映射为相应的 SQL JOIN。
+</p>
+
+<pre><code>CriteriaBuilder&lt;Tuple&gt; cb = cbf.create(em, Tuple.class)
+    .from(Order.class, "o")
+    .select("o.customer.name")          // 隐式 LEFT JOIN Customer
+    .select("o.customer.address.city")  // 复用已有 JOIN + 追加 Address JOIN
+    .where("o.customer.vip").eq(true)   // 复用同一个 Customer JOIN
+    .orderByAsc("o.customer.name");
+// 生成 SQL:
+// SELECT c.name, a.city FROM Order o
+//   LEFT JOIN Customer c ON o.customer_id = c.id
+//   LEFT JOIN Address  a ON c.address_id  = a.id
+// WHERE c.vip = true ORDER BY c.name</code></pre>
+
+<div class="key-insight">
+  <strong>路径去重：</strong>多次引用同一路径段（如 <code>o.customer</code>）只会产生一次 JOIN，
+  Blaze-Persistence 内部通过路径注册表进行去重。
+</div>
+
+<h3 id="s7-1-explicit">显式 JOIN 声明</h3>
+
+<p>
+  当你需要控制 JOIN 类型、附加额外 ON 条件或跨实体关联时，使用显式 JOIN API：
+</p>
+
+<pre><code>CriteriaBuilder&lt;Tuple&gt; cb = cbf.create(em, Tuple.class)
+    .from(Order.class, "o")
+    .innerJoin("o.customer", "c")           // 显式 INNER JOIN
+    .leftJoin("o.items", "i")               // 显式 LEFT JOIN
+    .select("c.name")
+    .select("i.productName")
+    .where("c.country").eq("CN");
+// 开发者完全控制 JOIN 类型与别名</code></pre>
+
+<div class="diagram">
+  <div class="diagram-title">隐式 vs 显式 — SQL 生成对比</div>
+  <div class="mermaid">
+flowchart LR
+    subgraph IMPLICIT ["隐式 JOIN"]
+        IA["select('o.customer.name')"] --> IB["框架推断:\nLEFT JOIN Customer c\n  ON o.customer_id = c.id"]
+    end
+
+    subgraph EXPLICIT ["显式 JOIN"]
+        EA["innerJoin('o.customer','c')"] --> EB["开发者声明:\nINNER JOIN Customer c\n  ON o.customer_id = c.id"]
+    end
+
+    IB --> SQL1["SELECT c.name\nFROM Order o\n LEFT JOIN Customer c ..."]
+    EB --> SQL2["SELECT c.name\nFROM Order o\n INNER JOIN Customer c ..."]
+
+    style IMPLICIT fill:#1a3a2a,stroke:#3fb950
+    style EXPLICIT fill:#2d1f4e,stroke:#bc8cff
+  </div>
+</div>
+
+<h3 id="s7-1-pitfall">隐式 JOIN 的问题场景</h3>
+
+<p>
+  当实体中存在<strong>多条路径指向同一目标实体</strong>时，隐式 JOIN 可能导致意想不到的重复关联。
+</p>
+
+<pre><code>// 实体模型：Order 同时有 createdBy 和 approvedBy 两个 User 关联
+// 隐式 JOIN 会为每条路径生成独立的 JOIN
+cb.select("o.createdBy.name")    // LEFT JOIN User u1 ON ...
+  .select("o.approvedBy.name")   // LEFT JOIN User u2 ON ...（不同路径 → 不同 JOIN）
+
+// 显式 JOIN 让你精确控制别名和复用
+cb.leftJoin("o.createdBy", "creator")
+  .leftJoin("o.approvedBy", "approver")
+  .select("creator.name")
+  .select("approver.name");</code></pre>
+
+<div class="warning">
+  <strong>注意：</strong>隐式 JOIN 默认使用 LEFT JOIN。如果业务语义要求 INNER JOIN（即关联必须存在），
+  必须改用显式 JOIN 以避免返回不必要的 NULL 行。
+</div>
+
+<!-- ============================================================ -->
+<!-- 7.2 JOIN 类型 -->
+<!-- ============================================================ -->
+<h2 id="s7-2">7.2 JOIN 类型</h2>
+
+<p>
+  Blaze-Persistence 支持 SQL 标准定义的四种 JOIN 类型，每种类型对未匹配行的处理方式不同。
+</p>
+
+<div class="diagram">
+  <div class="diagram-title">四种 JOIN 类型 — 数据包含关系</div>
+  <div style="display:flex;flex-wrap:wrap;gap:16px;justify-content:center;padding:16px 0;">
+  <div style="border:1px solid #3fb950;border-radius:8px;padding:14px 18px;min-width:180px;max-width:240px;background:rgba(63,185,80,.06);text-align:center;">
+    <div style="font-weight:bold;color:#3fb950;margin-bottom:6px;font-size:14px;">INNER JOIN</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">只返回两表都匹配的行</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:4px;">Order ∩ Customer</div>
+  </div>
+  <div style="border:1px solid #58a6ff;border-radius:8px;padding:14px 18px;min-width:180px;max-width:240px;background:rgba(88,166,255,.06);text-align:center;">
+    <div style="font-weight:bold;color:#58a6ff;margin-bottom:6px;font-size:14px;">LEFT JOIN</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">返回左表所有行<br/>右表无匹配 → NULL</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:4px;">Order ∪ (Order ∩ Customer)</div>
+  </div>
+  <div style="border:1px solid #d29922;border-radius:8px;padding:14px 18px;min-width:180px;max-width:240px;background:rgba(210,153,34,.06);text-align:center;">
+    <div style="font-weight:bold;color:#d29922;margin-bottom:6px;font-size:14px;">RIGHT JOIN</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">返回右表所有行<br/>左表无匹配 → NULL</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:4px;">(Order ∩ Customer) ∪ Customer</div>
+  </div>
+  <div style="border:1px solid #bc8cff;border-radius:8px;padding:14px 18px;min-width:180px;max-width:240px;background:rgba(188,140,255,.06);text-align:center;">
+    <div style="font-weight:bold;color:#bc8cff;margin-bottom:6px;font-size:14px;">FULL JOIN</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">返回两表所有行<br/>任一方无匹配 → NULL</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:4px;">Order ∪ Customer</div>
+  </div>
+</div>
+</div>
+
+<h3 id="s7-2-types">四种 JOIN 的 API</h3>
+
+<table>
+  <thead><tr><th>JOIN 类型</th><th>API 方法</th><th>SQL 生成</th><th>典型场景</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>INNER</code></td>
+      <td><code>innerJoin(path, alias)</code></td>
+      <td><code>INNER JOIN ... ON ...</code></td>
+      <td>关联必须存在（如订单必有客户）</td>
+    </tr>
+    <tr>
+      <td><code>LEFT</code></td>
+      <td><code>leftJoin(path, alias)</code></td>
+      <td><code>LEFT JOIN ... ON ...</code></td>
+      <td>关联可选（如订单可能没有优惠券）</td>
+    </tr>
+    <tr>
+      <td><code>RIGHT</code></td>
+      <td><code>rightJoin(path, alias)</code></td>
+      <td><code>RIGHT JOIN ... ON ...</code></td>
+      <td>以右表为主（少见，可用子查询替代）</td>
+    </tr>
+    <tr>
+      <td><code>FULL</code></td>
+      <td><code>join(path, alias, JoinType.FULL)</code></td>
+      <td><code>FULL OUTER JOIN ... ON ...</code></td>
+      <td>全量匹配报表（如对账）</td>
+    </tr>
+  </tbody>
+</table>
+
+<pre><code>// INNER JOIN — 只查有客户的订单
+CriteriaBuilder&lt;Order&gt; cb = cbf.create(em, Order.class)
+    .from(Order.class, "o")
+    .innerJoin("o.customer", "c")
+    .where("c.country").eq("CN");
+
+// LEFT JOIN — 包含无明细的订单
+CriteriaBuilder&lt;Tuple&gt; cb2 = cbf.create(em, Tuple.class)
+    .from(Order.class, "o")
+    .leftJoin("o.items", "i")
+    .select("o.id").select("i.productName");
+
+// RIGHT JOIN
+CriteriaBuilder&lt;Tuple&gt; cb3 = cbf.create(em, Tuple.class)
+    .from(Order.class, "o")
+    .rightJoin("o.customer", "c")
+    .select("o.id").select("c.name");
+
+// FULL OUTER JOIN
+CriteriaBuilder&lt;Tuple&gt; cb4 = cbf.create(em, Tuple.class)
+    .from(Order.class, "o")
+    .join("o.customer", "c", JoinType.FULL)
+    .select("o.id").select("c.name");</code></pre>
+
+<h3 id="s7-2-joinon">joinOn() — 自定义 JOIN 条件</h3>
+
+<p>
+  <code>joinOn()</code> 允许你在 JOIN 的 <code>ON</code> 子句中附加额外条件，
+  而不是放在 <code>WHERE</code> 中——这在 LEFT JOIN 场景下语义完全不同。
+</p>
+
+<div class="diagram">
+  <div class="diagram-title">ON 条件 vs WHERE 条件 — 语义差异</div>
+  <div class="mermaid">
+flowchart LR
+    subgraph ON_CLAUSE ["ON 条件（joinOn）"]
+        O1["LEFT JOIN items i\n  ON o.id = i.order_id\n  AND i.status = 'ACTIVE'"]
+        O2["效果: 未匹配的 Order 仍保留\ni 列为 NULL"]
+    end
+
+    subgraph WHERE_CLAUSE ["WHERE 条件"]
+        W1["LEFT JOIN items i\n  ON o.id = i.order_id\nWHERE i.status = 'ACTIVE'"]
+        W2["效果: 过滤掉了 i 为 NULL 的行\nLEFT JOIN 退化为 INNER JOIN"]
+    end
+
+    O1 --> O2
+    W1 --> W2
+
+    style ON_CLAUSE fill:#1a3a2a,stroke:#3fb950
+    style WHERE_CLAUSE fill:#3a1a1a,stroke:#f85149
+  </div>
+</div>
+
+<pre><code>CriteriaBuilder&lt;Tuple&gt; cb = cbf.create(em, Tuple.class)
+    .from(Order.class, "o")
+    .leftJoinOn("o.items", "i")             // 开始 ON 条件
+        .on("i.status").eq(ItemStatus.ACTIVE)
+    .end()                                   // 结束 ON 条件
+    .select("o.id")
+    .select("i.productName");
+// SQL: LEFT JOIN OrderItem i ON o.id = i.order_id AND i.status = 'ACTIVE'</code></pre>
+
+<!-- ============================================================ -->
+<!-- 7.3 FETCH JOIN -->
+<!-- ============================================================ -->
+<h2 id="s7-3">7.3 FETCH JOIN</h2>
+
+<p>
+  FETCH JOIN 是解决 JPA 延迟加载 <strong>N+1 问题</strong>的核心手段。
+  Blaze-Persistence 通过 <code>fetch()</code> API 让你在查询时声明需要预加载的关联，
+  将原本需要 N+1 次查询的场景合并为<strong>单次 JOIN 查询</strong>。
+</p>
+
+<div class="diagram">
+  <div class="diagram-title">N+1 问题 vs FETCH JOIN — 查询次数对比</div>
+  <div class="mermaid">
+sequenceDiagram
+    participant App as 应用代码
+    participant BP as Blaze-Persistence
+    participant DB as 数据库
+
+    Note over App,DB: ❌ 无 FETCH JOIN（N+1）
+    App->>BP: 查询 10 个 Order
+    BP->>DB: SELECT * FROM orders (1 次)
+    DB-->>BP: 10 行 Order
+    loop 每个 Order 访问 customer
+        App->>BP: order.getCustomer()
+        BP->>DB: SELECT * FROM customers WHERE id=? (N 次)
+        DB-->>BP: 1 行 Customer
+    end
+    Note over App,DB: 总计: 1 + 10 = 11 次查询
+
+    Note over App,DB: ✅ 使用 FETCH JOIN
+    App->>BP: 查询 Order + fetch customer
+    BP->>DB: SELECT o.*, c.* FROM orders o JOIN customers c ON ... (1 次)
+    DB-->>BP: 10 行 (Order + Customer)
+    Note over App,DB: 总计: 1 次查询
+  </div>
+</div>
+
+<h3 id="s7-3-n1">fetch() API 使用</h3>
+
+<pre><code>// 使用 fetch() 预加载关联
+CriteriaBuilder&lt;Order&gt; cb = cbf.create(em, Order.class)
+    .from(Order.class, "o")
+    .fetch("o.customer")        // FETCH JOIN Customer
+    .fetch("o.items")           // FETCH JOIN OrderItem
+    .where("o.status").eq(OrderStatus.PENDING);
+// SQL: SELECT o FROM Order o
+//        JOIN FETCH o.customer
+//        JOIN FETCH o.items
+//      WHERE o.status = 'PENDING'</code></pre>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <pre><code>// JPA 原生 JOIN FETCH
+em.createQuery(
+  "SELECT o FROM Order o " +
+  "JOIN FETCH o.customer " +
+  "JOIN FETCH o.items " +
+  "WHERE o.status = :s",
+  Order.class)
+  .setParameter("s", "PENDING")
+  .getResultList();</code></pre>
+  </div>
+  <div class="compare-good">
+    <pre><code>// Blaze-Persistence fetch()
+cbf.create(em, Order.class)
+  .from(Order.class, "o")
+  .fetch("o.customer")
+  .fetch("o.items")
+  .where("o.status")
+    .eq(OrderStatus.PENDING)
+  .getResultList();</code></pre>
+  </div>
+</div>
+
+<div class="key-insight">
+  <strong>与 JPA JOIN FETCH 的区别：</strong>Blaze-Persistence 的 <code>fetch()</code>
+  在 Entity View 场景下会自动优化为仅 SELECT 所需字段，而 JPA 的 <code>JOIN FETCH</code>
+  总是加载完整实体。
+</div>
+
+<h3 id="s7-3-cartesian">笛卡尔积陷阱</h3>
+
+<p>
+  同时 FETCH JOIN <strong>多个集合关联</strong>会导致笛卡尔积——
+  如果 Order 有 3 个 Item 和 2 个 Payment，结果集膨胀为 3 × 2 = 6 行。
+</p>
+
+<div class="diagram">
+  <div class="diagram-title">多集合 FETCH JOIN 的笛卡尔积问题</div>
+  <div class="mermaid">
+flowchart TD
+    O["Order #1"] --> I1["Item A"]
+    O --> I2["Item B"]
+    O --> I3["Item C"]
+    O --> P1["Payment X"]
+    O --> P2["Payment Y"]
+
+    subgraph CARTESIAN ["笛卡尔积结果集 = 3 × 2 = 6 行"]
+        R1["(Order#1, Item A, Payment X)"]
+        R2["(Order#1, Item A, Payment Y)"]
+        R3["(Order#1, Item B, Payment X)"]
+        R4["(Order#1, Item B, Payment Y)"]
+        R5["(Order#1, Item C, Payment X)"]
+        R6["(Order#1, Item C, Payment Y)"]
+    end
+
+    I1 --> R1
+    I1 --> R2
+    I2 --> R3
+    I2 --> R4
+    I3 --> R5
+    I3 --> R6
+
+    style O fill:#1e3a5f,stroke:#58a6ff
+    style CARTESIAN fill:#3a1a1a,stroke:#f85149
+  </div>
+</div>
+
+<div class="warning">
+  <strong>规避策略：</strong>对于多集合关联，改用 <strong>SUBSELECT</strong> 或 <strong>MULTISET</strong>
+  FetchStrategy（详见 7.6 节），或将查询拆分为多次单集合 FETCH JOIN。
+  Hibernate 在检测到多 bag FETCH 时会抛出 <code>MultipleBagFetchException</code>。
+</div>
+
+<!-- ============================================================ -->
+<!-- 7.4 关联路径表达式 -->
+<!-- ============================================================ -->
+<h2 id="s7-4">7.4 关联路径表达式</h2>
+
+<p>
+  Blaze-Persistence 允许使用点号分隔的路径表达式进行<strong>多级实体导航</strong>。
+  框架会按路径的每一段自动创建所需的 JOIN，形成从根实体到目标属性的完整关联链。
+</p>
+
+<div class="diagram">
+  <div class="diagram-title">路径表达式解析 — 实体图导航</div>
+  <div class="mermaid">
+flowchart LR
+    ORDER["Order o"] -->|"o.customer"| CUSTOMER["Customer c"]
+    CUSTOMER -->|"c.address"| ADDRESS["Address a"]
+    ADDRESS -->|"a.city"| CITY["city 属性"]
+
+    ORDER -.->|"路径: o.customer.address.city"| CITY
+
+    subgraph SQL_GEN ["SQL 生成"]
+        J1["LEFT JOIN Customer c\n  ON o.customer_id = c.id"]
+        J2["LEFT JOIN Address a\n  ON c.address_id = a.id"]
+        J3["SELECT a.city"]
+    end
+
+    CUSTOMER --> J1
+    ADDRESS --> J2
+    CITY --> J3
+
+    style ORDER fill:#1e3a5f,stroke:#58a6ff
+    style CUSTOMER fill:#2d1f4e,stroke:#bc8cff
+    style ADDRESS fill:#3a2a1a,stroke:#d29922
+    style CITY fill:#1a3a2a,stroke:#3fb950
+    style SQL_GEN fill:#161b22,stroke:#30363d
+  </div>
+</div>
+
+<h3 id="s7-4-dot">点号导航与 SQL 解析</h3>
+
+<pre><code>CriteriaBuilder&lt;Tuple&gt; cb = cbf.create(em, Tuple.class)
+    .from(Order.class, "o")
+    // 四级路径导航
+    .select("o.customer.address.city.name")
+    // 等效 SQL:
+    // SELECT city.name FROM Order o
+    //   LEFT JOIN Customer c    ON o.customer_id = c.id
+    //   LEFT JOIN Address  a    ON c.address_id  = a.id
+    //   LEFT JOIN City     city ON a.city_id     = city.id
+    .getResultList();</code></pre>
+
+<div class="os-note">
+  <strong>Embeddable 导航：</strong>如果路径中某段是 <code>@Embeddable</code> 而非独立实体，
+  Blaze-Persistence 不会为该段生成 JOIN，而是直接引用嵌入属性所在表的列。
+  例如 <code>customer.contactInfo.phone</code> 中，<code>contactInfo</code> 是 Embeddable，
+  则只 JOIN Customer 表，直接读取其 <code>contact_phone</code> 列。
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">Embeddable vs Entity 路径解析差异</div>
+  <div class="mermaid">
+flowchart TD
+    subgraph ENTITY_PATH ["实体路径: o.customer.address"]
+        EP1["Order o"] -->|"JOIN"| EP2["Customer c"]
+        EP2 -->|"JOIN"| EP3["Address a"]
+    end
+
+    subgraph EMBED_PATH ["Embeddable 路径: c.contactInfo.phone"]
+        EB1["Customer c"] -->|"无 JOIN\n直接列引用"| EB2["c.contact_phone"]
+    end
+
+    style ENTITY_PATH fill:#1e3a5f,stroke:#58a6ff
+    style EMBED_PATH fill:#1a3a2a,stroke:#3fb950
+  </div>
+</div>
+
+<p>
+  路径表达式还支持集合导航。对集合属性使用路径会隐式产生 JOIN，
+  随后可用聚合函数或 <code>SIZE</code> 表达式对集合进行计算：
+</p>
+
+<pre><code>// 集合路径 + 聚合
+CriteriaBuilder&lt;Tuple&gt; cb = cbf.create(em, Tuple.class)
+    .from(Order.class, "o")
+    .select("o.id")
+    .select("SIZE(o.items)")             // 隐式 JOIN + COUNT
+    .select("o.items.price").max()       // 隐式 JOIN + MAX
+    .groupBy("o.id");</code></pre>
+
+<!-- ============================================================ -->
+<!-- 7.5 跨实体关联与 Lateral JOIN -->
+<!-- ============================================================ -->
+<h2 id="s7-5">7.5 跨实体关联与 Lateral JOIN</h2>
+
+<p>
+  标准 JPA 只能 JOIN 实体间已声明的 <code>@ManyToOne</code> / <code>@OneToMany</code> 等映射关联。
+  Blaze-Persistence 突破了这一限制，允许<strong>跨实体关联</strong>——
+  即 JOIN 两个没有映射关系的实体，并通过 <code>ON</code> 条件手动指定关联条件。
+</p>
+
+<div class="diagram">
+  <div class="diagram-title">跨实体关联与 Lateral JOIN 架构</div>
+  <div style="display:flex;flex-wrap:wrap;gap:16px;justify-content:center;padding:16px 0;">
+    <div style="flex:1;min-width:200px;max-width:280px;border:1px solid #f85149;border-radius:8px;padding:14px 18px;background:rgba(248,81,73,.06);">
+      <div style="font-weight:bold;color:#f85149;margin-bottom:8px;">标准 JPA JOIN</div>
+      <div style="color:#e6edf3;font-size:13px;line-height:1.7;">只能 JOIN 已映射关联<br><span style="color:#8b949e;">Order →(ManyToOne)→ Customer</span></div>
+      <div style="color:#f85149;font-size:12px;margin-top:8px;">受限于实体映射</div>
+    </div>
+    <div style="flex:1;min-width:200px;max-width:280px;border:1px solid #3fb950;border-radius:8px;padding:14px 18px;background:rgba(63,185,80,.06);">
+      <div style="font-weight:bold;color:#3fb950;margin-bottom:8px;">跨实体关联 (BP)</div>
+      <div style="color:#e6edf3;font-size:13px;line-height:1.7;">JOIN 无映射关系的实体<br>通过 ON 条件手动关联<br><span style="color:#8b949e;">Order ←ON→ AuditLog</span></div>
+      <div style="color:#3fb950;font-size:12px;margin-top:8px;">灵活的跨表查询</div>
+    </div>
+    <div style="flex:1;min-width:200px;max-width:280px;border:1px solid #bc8cff;border-radius:8px;padding:14px 18px;background:rgba(188,140,255,.06);">
+      <div style="font-weight:bold;color:#bc8cff;margin-bottom:8px;">Lateral JOIN</div>
+      <div style="color:#e6edf3;font-size:13px;line-height:1.7;">子查询可引用外层表的列<br>每行外层数据驱动一次子查询<br><span style="color:#8b949e;">类似 SQL 的 LATERAL / APPLY</span></div>
+      <div style="color:#bc8cff;font-size:12px;margin-top:8px;">强大的行级子查询</div>
+    </div>
+  </div>
+</div>
+
+<pre><code>// 跨实体关联：Order 与 AuditLog 没有 JPA 映射
+CriteriaBuilder&lt;Tuple&gt; cb = cbf.create(em, Tuple.class)
+    .from(Order.class, "o")
+    .leftJoinOn(AuditLog.class, "log")
+        .on("log.entityId").eqExpression("o.id")
+        .on("log.entityType").eq("ORDER")
+    .end()
+    .select("o.id")
+    .select("log.action")
+    .select("log.timestamp");</code></pre>
+
+<h3 id="s7-5-lateral">Lateral JOIN 支持矩阵</h3>
+
+<p>
+  Lateral JOIN（也称 <code>CROSS APPLY</code> / <code>OUTER APPLY</code>）允许子查询引用外层查询的列。
+  Blaze-Persistence 在支持该特性的数据库上可生成对应 SQL。
+</p>
+
+<table>
+  <thead><tr><th>数据库</th><th>Lateral JOIN</th><th>语法</th><th>备注</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><span class="provider-badge pg">PostgreSQL</span></td>
+      <td>✅ 支持</td>
+      <td><code>LATERAL</code></td>
+      <td>9.3+ 原生支持</td>
+    </tr>
+    <tr>
+      <td><span class="provider-badge oracle">Oracle</span></td>
+      <td>✅ 支持</td>
+      <td><code>LATERAL</code></td>
+      <td>12c+ 原生支持</td>
+    </tr>
+    <tr>
+      <td><span class="provider-badge sqlserver">SQL Server</span></td>
+      <td>✅ 支持</td>
+      <td><code>CROSS APPLY / OUTER APPLY</code></td>
+      <td>2005+ 支持</td>
+    </tr>
+    <tr>
+      <td><span class="provider-badge mysql">MySQL</span></td>
+      <td>✅ 支持</td>
+      <td><code>LATERAL</code></td>
+      <td>8.0.14+ 支持</td>
+    </tr>
+    <tr>
+      <td><span class="provider-badge h2">H2</span></td>
+      <td>⚠️ 有限</td>
+      <td>—</td>
+      <td>部分版本不支持，测试时注意</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="diagram">
+  <div class="diagram-title">Lateral JOIN 执行模型</div>
+  <div class="mermaid">
+sequenceDiagram
+    participant OT as 外层查询 (Order)
+    participant LQ as Lateral 子查询
+    participant DB as 数据库引擎
+
+    OT->>DB: 遍历 Order 行
+    loop 每行 Order
+        DB->>LQ: 传递当前行的 o.id
+        LQ->>DB: 执行子查询\n(引用 o.id)
+        DB-->>OT: 合并子查询结果
+    end
+    OT-->>OT: 输出最终结果集
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- 7.6 Entity View 中的 JOIN 控制 -->
+<!-- ============================================================ -->
+<h2 id="s7-6">7.6 Entity View 中的 JOIN 控制</h2>
+
+<p>
+  在 Entity View 层面，Blaze-Persistence 提供四种 <code>FetchStrategy</code>
+  来控制关联数据的加载方式。每种策略生成截然不同的 SQL 模式，
+  适用于不同的数据规模和性能需求。
+</p>
+
+<div class="diagram">
+  <div class="diagram-title">四种 FetchStrategy — SQL 生成模式对比</div>
+  <div style="display:flex;flex-wrap:wrap;gap:16px;justify-content:center;padding:16px 0;">
+  <div style="border:1px solid #58a6ff;border-radius:8px;padding:14px 18px;min-width:200px;max-width:260px;background:rgba(88,166,255,.06);">
+    <div style="font-weight:bold;color:#58a6ff;margin-bottom:6px;font-size:14px;">JOIN 策略</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">单一查询 + JOIN</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:4px;font-family:monospace;">SELECT o.*, i.* FROM Order o LEFT JOIN Item i</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:6px;">✅ 最少查询次数<br/>⚠️ 多集合有笛卡尔积风险</div>
+  </div>
+  <div style="border:1px solid #d29922;border-radius:8px;padding:14px 18px;min-width:200px;max-width:260px;background:rgba(210,153,34,.06);">
+    <div style="font-weight:bold;color:#d29922;margin-bottom:6px;font-size:14px;">SELECT 策略</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">主查询 + N 次子查询</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:4px;font-family:monospace;">SELECT * FROM Item WHERE order_id = ? (× N)</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:6px;">✅ 无笛卡尔积<br/>⚠️ N+1 查询</div>
+  </div>
+  <div style="border:1px solid #3fb950;border-radius:8px;padding:14px 18px;min-width:200px;max-width:260px;background:rgba(63,185,80,.06);">
+    <div style="font-weight:bold;color:#3fb950;margin-bottom:6px;font-size:14px;">SUBSELECT 策略</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">主查询 + 1 次批量子查询</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:4px;font-family:monospace;">SELECT * FROM Item WHERE order_id IN (SELECT ...)</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:6px;">✅ 无笛卡尔积<br/>✅ 只需 2 次查询</div>
+  </div>
+  <div style="border:1px solid #bc8cff;border-radius:8px;padding:14px 18px;min-width:200px;max-width:260px;background:rgba(188,140,255,.06);">
+    <div style="font-weight:bold;color:#bc8cff;margin-bottom:6px;font-size:14px;">MULTISET 策略</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">单一查询 + 嵌套集合</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:4px;font-family:monospace;">SELECT o.*, (SELECT ... FROM Item) FROM Order</div>
+    <div style="color:#8b949e;font-size:12px;margin-top:6px;">✅ 单次查询 · ✅ 无笛卡尔积<br/>⚠️ 需数据库支持</div>
+  </div>
+</div>
+</div>
+
+<h3 id="s7-6-strategy">代码示例与策略选择</h3>
+
+<pre><code>@EntityView(Order.class)
+public interface OrderView {
+
+    @IdMapping
+    Long getId();
+
+    // JOIN 策略（默认）— 单一查询
+    @Mapping(fetch = FetchStrategy.JOIN)
+    CustomerView getCustomer();
+
+    // SUBSELECT 策略 — 批量加载集合
+    @Mapping(fetch = FetchStrategy.SUBSELECT)
+    List&lt;OrderItemView&gt; getItems();
+
+    // MULTISET 策略 — 嵌套集合，单次查询
+    @Mapping(fetch = FetchStrategy.MULTISET)
+    List&lt;PaymentView&gt; getPayments();
+}</code></pre>
+
+<table>
+  <thead><tr><th>策略</th><th>查询次数</th><th>笛卡尔积</th><th>适用场景</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>JOIN</code></td>
+      <td>1</td>
+      <td>⚠️ 多集合时有风险</td>
+      <td>单一集合或 @ManyToOne 关联</td>
+    </tr>
+    <tr>
+      <td><code>SELECT</code></td>
+      <td>N+1</td>
+      <td>✅ 无</td>
+      <td>少量主记录时可接受</td>
+    </tr>
+    <tr>
+      <td><code>SUBSELECT</code></td>
+      <td>2</td>
+      <td>✅ 无</td>
+      <td>大量主记录 + 集合关联</td>
+    </tr>
+    <tr>
+      <td><code>MULTISET</code></td>
+      <td>1</td>
+      <td>✅ 无</td>
+      <td>多集合场景的最优解（需 DB 支持）</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="diagram">
+  <div class="diagram-title">策略选择决策树</div>
+  <div class="mermaid">
+flowchart TD
+    START["需要加载关联数据"] --> Q1{"关联类型?"}
+    Q1 -->|"@ManyToOne / 单值"| A1["✅ JOIN 策略\n单次查询即可"]
+    Q1 -->|"@OneToMany / 集合"| Q2{"有几个集合需要加载?"}
+    Q2 -->|"1 个集合"| A2["✅ JOIN 策略\n无笛卡尔积风险"]
+    Q2 -->|"多个集合"| Q3{"数据库支持 MULTISET?"}
+    Q3 -->|"是"| A3["✅ MULTISET 策略\n单查询 + 无笛卡尔积"]
+    Q3 -->|"否"| Q4{"主记录数量?"}
+    Q4 -->|"少量 (<100)"| A4["SELECT 策略\n简单但有 N+1"]
+    Q4 -->|"大量"| A5["✅ SUBSELECT 策略\n2 次查询 + 无笛卡尔积"]
+
+    style START fill:#1e3a5f,stroke:#58a6ff
+    style A1 fill:#1a3a2a,stroke:#3fb950
+    style A2 fill:#1a3a2a,stroke:#3fb950
+    style A3 fill:#2d1f4e,stroke:#bc8cff
+    style A4 fill:#3a2a1a,stroke:#d29922
+    style A5 fill:#1a3a2a,stroke:#3fb950
+  </div>
+</div>
+
+<div class="paper-ref">
+  <strong>📖 参考：</strong><code>@MappingFetch</code> 注解允许在 Entity View 的集合映射上
+  指定 <code>FetchStrategy</code>，覆盖默认行为。结合 <code>@BatchSize</code> 可进一步优化
+  SELECT 策略的批量加载粒度。
+</div>
+
+<!-- ============================================================ -->
+<!-- 7.7 陷阱与限制 -->
+<!-- ============================================================ -->
+<h2 id="s7-7">7.7 陷阱与限制</h2>
+
+<p>
+  JOIN 是性能调优中最需要谨慎的部分。以下列出生产环境中最常见的陷阱。
+</p>
+
+<div class="diagram">
+  <div class="diagram-title">JOIN 常见陷阱全景图</div>
+  <div style="display:flex;flex-wrap:wrap;gap:16px;justify-content:center;padding:16px 0;">
+  <div style="border:1px solid #f85149;border-radius:8px;padding:14px 18px;min-width:200px;max-width:260px;background:rgba(248,81,73,.06);">
+    <div style="font-weight:bold;color:#f85149;margin-bottom:6px;font-size:14px;">陷阱 1: 笛卡尔积</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">多集合 FETCH JOIN<br/>结果集行数爆炸 3×2=6 行</div>
+    <div style="color:#3fb950;font-size:12px;margin-top:6px;">解决: SUBSELECT / MULTISET</div>
+  </div>
+  <div style="border:1px solid #d29922;border-radius:8px;padding:14px 18px;min-width:200px;max-width:260px;background:rgba(210,153,34,.06);">
+    <div style="font-weight:bold;color:#d29922;margin-bottom:6px;font-size:14px;">陷阱 2: 隐式 JOIN 去重</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">相同路径自动去重<br/>不同路径到同一实体 → 多个 JOIN</div>
+    <div style="color:#3fb950;font-size:12px;margin-top:6px;">解决: 使用显式 JOIN + 别名</div>
+  </div>
+  <div style="border:1px solid #f85149;border-radius:8px;padding:14px 18px;min-width:200px;max-width:260px;background:rgba(248,81,73,.06);">
+    <div style="font-weight:bold;color:#f85149;margin-bottom:6px;font-size:14px;">陷阱 3: FETCH + 分页</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">Hibernate 警告 HHH000104<br/>内存中分页! 全量加载后裁剪</div>
+    <div style="color:#3fb950;font-size:12px;margin-top:6px;">解决: 先分页 ID, 再 FETCH JOIN</div>
+  </div>
+  <div style="border:1px solid #d29922;border-radius:8px;padding:14px 18px;min-width:200px;max-width:260px;background:rgba(210,153,34,.06);">
+    <div style="font-weight:bold;color:#d29922;margin-bottom:6px;font-size:14px;">陷阱 4: 深层 JOIN 链</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">o.a.b.c.d.e.f — 6 层 JOIN<br/>SQL 复杂度指数增长</div>
+    <div style="color:#3fb950;font-size:12px;margin-top:6px;">解决: 子查询 / Entity View 拆分</div>
+  </div>
+</div>
+</div>
+
+<h3>陷阱 1: 多集合 FETCH JOIN 的笛卡尔积</h3>
+
+<pre><code>// ❌ 危险: 同时 FETCH 两个集合
+CriteriaBuilder&lt;Order&gt; cb = cbf.create(em, Order.class)
+    .from(Order.class, "o")
+    .fetch("o.items")       // 集合 1
+    .fetch("o.payments");   // 集合 2 → 笛卡尔积!
+
+// ✅ 安全: 使用 SUBSELECT 策略
+@EntityView(Order.class)
+public interface SafeOrderView {
+    @Mapping(fetch = FetchStrategy.JOIN)
+    List&lt;OrderItemView&gt; getItems();        // 只有一个用 JOIN
+
+    @Mapping(fetch = FetchStrategy.SUBSELECT)
+    List&lt;PaymentView&gt; getPayments();       // 另一个用 SUBSELECT
+}</code></pre>
+
+<h3>陷阱 2: FETCH JOIN 与分页冲突</h3>
+
+<div class="warning">
+  <strong>Hibernate 内存分页：</strong>当 FETCH JOIN 集合与 <code>setFirstResult / setMaxResults</code>
+  同时使用时，Hibernate 会发出警告 <code>HHH000104</code>，
+  并在内存中执行分页（先加载全部数据再裁剪）。这在大数据量下会导致 OOM。
+</div>
+
+<pre><code>// ❌ 危险组合
+CriteriaBuilder&lt;Order&gt; cb = cbf.create(em, Order.class)
+    .from(Order.class, "o")
+    .fetch("o.items")
+    .setFirstResult(0)
+    .setMaxResults(20);  // Hibernate 内存分页!
+
+// ✅ 安全: 两阶段查询
+// 阶段 1: 分页取 ID
+List&lt;Long&gt; ids = cbf.create(em, Long.class)
+    .from(Order.class, "o")
+    .select("o.id")
+    .setFirstResult(0)
+    .setMaxResults(20)
+    .getResultList();
+
+// 阶段 2: 用 ID 批量 FETCH
+CriteriaBuilder&lt;Order&gt; cb = cbf.create(em, Order.class)
+    .from(Order.class, "o")
+    .fetch("o.items")
+    .where("o.id").in(ids);</code></pre>
+
+<h3>陷阱 3: 深层 JOIN 链的性能影响</h3>
+
+<div class="metric-row">
+  <div class="metric"><div class="value">2-3</div><div class="label">推荐 JOIN 深度</div></div>
+  <div class="metric"><div class="value">5+</div><div class="label">性能警戒线</div></div>
+  <div class="metric"><div class="value">O(n!)</div><div class="label">执行计划复杂度</div></div>
+</div>
+
+<h3>陷阱 4: Provider 差异</h3>
+
+<table>
+  <thead><tr><th>行为</th><th><span class="provider-badge hibernate">Hibernate</span></th><th><span class="provider-badge eclipselink">EclipseLink</span></th></tr></thead>
+  <tbody>
+    <tr>
+      <td>隐式 JOIN 默认类型</td>
+      <td>LEFT JOIN</td>
+      <td>INNER JOIN</td>
+    </tr>
+    <tr>
+      <td>多 bag FETCH JOIN</td>
+      <td>抛出异常</td>
+      <td>允许（但有笛卡尔积）</td>
+    </tr>
+    <tr>
+      <td>FETCH + 分页</td>
+      <td>内存分页 + 警告</td>
+      <td>静默截断</td>
+    </tr>
+    <tr>
+      <td>Lateral JOIN 支持</td>
+      <td>6.x+ 部分支持</td>
+      <td>不支持</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="diagram">
+  <div class="diagram-title">安全 JOIN 策略检查清单</div>
+  <div class="mermaid">
+flowchart TD
+    CHECK["编写 JOIN 查询"] --> C1{"多个集合\nFETCH JOIN?"}
+    C1 -->|"是"| FIX1["改用 SUBSELECT\n或 MULTISET"]
+    C1 -->|"否"| C2{"JOIN + 分页?"}
+    C2 -->|"是"| FIX2["两阶段查询:\n先分页 ID,\n再 FETCH"]
+    C2 -->|"否"| C3{"JOIN 深度 > 3?"}
+    C3 -->|"是"| FIX3["拆分子查询\n或 Entity View"]
+    C3 -->|"否"| C4{"跨 Provider?"}
+    C4 -->|"是"| FIX4["显式指定 JOIN 类型\n避免隐式差异"]
+    C4 -->|"否"| OK["✅ 安全"]
+
+    style CHECK fill:#1e3a5f,stroke:#58a6ff
+    style FIX1 fill:#1a3a2a,stroke:#3fb950
+    style FIX2 fill:#1a3a2a,stroke:#3fb950
+    style FIX3 fill:#1a3a2a,stroke:#3fb950
+    style FIX4 fill:#1a3a2a,stroke:#3fb950
+    style OK fill:#1a3a2a,stroke:#3fb950
+  </div>
+</div>
+
+<!-- ====== chapter summary ====== -->
+<div class="chapter-summary" id="summary">
+  <h2>📝 本章小结</h2>
+  <ul>
+    <li><strong>隐式 vs 显式 JOIN：</strong>路径表达式触发隐式 LEFT JOIN，显式 API 提供完整的类型和别名控制</li>
+    <li><strong>四种 JOIN 类型：</strong>INNER / LEFT / RIGHT / FULL 各有语义，<code>joinOn()</code> 支持自定义 ON 条件</li>
+    <li><strong>FETCH JOIN：</strong>通过 <code>fetch()</code> 将 N+1 查询合并为单次查询，但需警惕多集合的笛卡尔积</li>
+    <li><strong>路径表达式：</strong>点号导航自动解析为 JOIN 链，Embeddable 段不产生额外 JOIN</li>
+    <li><strong>跨实体关联：</strong>Blaze-Persistence 突破 JPA 映射限制，支持无关联实体的 JOIN 和 Lateral JOIN</li>
+    <li><strong>FetchStrategy：</strong>JOIN / SELECT / SUBSELECT / MULTISET 四策略适配不同场景，MULTISET 是多集合最优解</li>
+    <li><strong>安全清单：</strong>避免多集合 FETCH + 分页组合，限制 JOIN 深度，注意 Provider 行为差异</li>
+  </ul>
+  <p class="next-hint">
+    下一章 → <a href="ch08-cte.html">第 8 章 · CTE 与集合操作</a>：
+    探索公共表达式 (CTE)、递归查询以及 UNION / INTERSECT / EXCEPT 集合操作在 Blaze-Persistence 中的实现。
+  </p>
+</div>
+
+<!-- ====== chapter nav ====== -->
+<nav class="chapter-nav">
+  <a href="ch06-updatable.html">← 第 6 章 · 可更新与可创建视图</a>
+  <a href="ch08-cte.html">第 8 章 · CTE 与集合操作 →</a>
+</nav>
+
+<p class="footer">&copy; 2026 图解 Blaze-Persistence &middot; 第 7 章 &middot; JOIN 与关联策略</p>
+
+</article>
+</div><!-- /container -->
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+mermaid.initialize({
+  theme: 'dark',
+  themeVariables: {
+    primaryColor: '#58a6ff', primaryTextColor: '#e6edf3', primaryBorderColor: '#30363d',
+    lineColor: '#8b949e', secondaryColor: '#161b22', tertiaryColor: '#0d1117',
+    background: '#161b22', mainBkg: '#161b22', nodeBorder: '#30363d',
+    clusterBkg: 'rgba(22,27,34,.5)', clusterBorder: '#30363d', titleColor: '#e6edf3',
+    edgeLabelBackground: '#161b22',
+  },
+  flowchart: { curve: 'basis', padding: 15 },
+  sequence: { actorMargin: 50, messageMargin: 30 },
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,2071 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.12 Geohash 空间索引 — 图解 Redis</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Redis</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="11-hyperloglog.html">上一章</a>
+  <a href="13-lru-lfu.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s12-1">12.1 二维到一维</a>
+  <a href="#s12-2">12.2 位交错构造</a>
+  <a href="#s12-3">12.3 52 位精度</a>
+  <a href="#s12-4">12.4 ZSet 集成</a>
+  <a href="#s12-5">12.5 9 邻居单元</a>
+  <a href="#s12-6">12.6 Haversine 过滤</a>
+  <a href="#s12-7">12.7 误差与精度</a>
+  <a href="#s12-8">12.8 跨步长与跨经度</a>
+  <a href="#s12-9">12.9 GEO 命令实战</a>
+  <a href="#s12-10">12.10 与传统索引对比</a>
+  <a href="#s12-11">12.11 陷阱速查</a>
+  <a href="#s12-12">12.12 源码深潜</a>
+  <a href="#s12-summary">12.13 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 12 章 · Geohash 空间索引</h1>
+<p class="subtitle">Z-order 位交错 · 52 位整数 · ZSet score 复用 · 9 邻居矩形覆盖 · Haversine 二次过滤 · 墨卡托纬度边界</p>
+
+<div class="chapter-intro">
+  <p class="lead">地理坐标 <code>(lon, lat)</code> 是<strong>二维数据</strong>,但 B-tree、跳跃表、哈希表均针对<strong>一维有序键</strong>设计。Redis 通过 <strong>Geohash 编码</strong>将二维坐标映射到一维 <strong>52 位整数</strong>,以 ZSet 的 <code>score</code> 字段存储,使一维有序结构具备空间范围查询能力。<code>GEOADD</code> / <code>GEOSEARCH</code> / <code>GEORADIUS</code> 等命令都构建在该映射之上。</p>
+  <p>Geohash 的核心是 <strong>Z-order(Morton)曲线</strong>:把经度 26 位与纬度 26 位<strong>位交错</strong>(<code>interleave64</code>),让<strong>前缀相同的 hash 值对应几何邻近的点</strong>。这一性质把"求圆形范围内的点"转化为"<strong>查 9 个 Geohash 前缀对应的 score 区间</strong>",再用 <strong>Haversine 公式</strong>精确过滤候选点的真实距离。</p>
+  <p>本章描述 Geohash 的位交错构造、Z-order 曲线性质、52 位精度边界、墨卡托投影限制、9 邻居单元搜索策略,以及 Haversine 距离的最终过滤。把整个 GEO 命令族放进 ZSet 的视角下看,你会发现 Redis "<strong>用现有数据结构封装新语义</strong>" 的工程哲学贯彻得多么彻底 — GEO 没有新建任何底层结构,完全是 ZSet 的 score/member 字段被解释为另一种含义。</p>
+  <ul class="will-learn">
+    <li>为何字典序拼接 <code>"116.0,39.9"</code> 不可行 — 一维线性顺序破坏二维邻近性</li>
+    <li>Z-order 曲线 vs Hilbert 曲线 vs 标准 B-tree:Redis 的工程取舍</li>
+    <li>位交错的位运算技巧:<code>interleave64</code> 用 4 次 mask 完成 26+26 = 52 位扩散</li>
+    <li>26+26 = 52 位的精度刚好对齐 IEEE 754 double 的 52 位尾数 — 无精度丢失</li>
+    <li>Web 墨卡托纬度边界 <code>[-85.05, 85.05]</code> 的来源与代价</li>
+    <li>GEOADD 内部如何转化为 <code>ZADD key (double)hash member</code></li>
+    <li>9 邻居单元(中心 + 8 邻接)为何足以覆盖任意半径的圆形</li>
+    <li>Haversine 公式的几何含义与 Redis 选择它(而非 Vincenty)的原因</li>
+    <li>跨经度 180° 与跨步长边界的处理:<code>geohashEstimateStepsByRadius</code> 的 step-1 安全裕量</li>
+    <li>典型陷阱:大半径查询 CPU 飙升、半径单位混淆、集群 CROSSSLOT 错误</li>
+  </ul>
+  <p class="prereq">前置知识:第 4 章 skiplist + 第 6 章 listpack(理解 ZSet 的双形态存储);三角函数 / 弧度制基础;了解 GPS 经纬度表示。读者无需地理信息系统(GIS)背景,本章会从零讲清 Geohash 的所有数学。</p>
+</div>
+
+<h3>本章全景图</h3>
+
+<p class="svg-title">图 12-0 · 本章导览 — 4 大模块 13 节</p>
+<svg class="svg-diagram" viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="ov-root" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-purple-fill-start)"/><stop offset="1" stop-color="var(--diagram-purple-fill-end)"/></linearGradient>
+    <linearGradient id="ov-blue" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <linearGradient id="ov-cyan" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-cyan-fill-start)"/><stop offset="1" stop-color="var(--diagram-cyan-fill-end)"/></linearGradient>
+    <linearGradient id="ov-green" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <linearGradient id="ov-amber" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-orange-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+    <linearGradient id="ov-rose" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+    <linearGradient id="ov-leaf" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <marker id="ov-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--diagram-blue-stroke)"/></marker>
+  </defs>
+
+  <rect x="380" y="14" width="160" height="46" rx="8" fill="url(#ov-root)" stroke="var(--diagram-purple-stroke)"/>
+  <text x="460" y="42" text-anchor="middle" font-size="14" font-weight="700" fill="var(--diagram-text)">Geohash 空间索引</text>
+
+  <path d="M390,60 L80,108" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none" marker-end="url(#ov-arr)"/>
+  <path d="M420,60 L260,108" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none" marker-end="url(#ov-arr)"/>
+  <path d="M460,60 L460,108" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none" marker-end="url(#ov-arr)"/>
+  <path d="M500,60 L660,108" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none" marker-end="url(#ov-arr)"/>
+  <path d="M530,60 L840,108" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none" marker-end="url(#ov-arr)"/>
+
+  <rect x="20" y="110" width="160" height="40" rx="6" fill="url(#ov-blue)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="100" y="135" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">§12.1-12.3 编码原理</text>
+
+  <rect x="200" y="110" width="160" height="40" rx="6" fill="url(#ov-cyan)" stroke="var(--diagram-cyan-stroke)"/>
+  <text x="280" y="135" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">§12.4 ZSet 集成</text>
+
+  <rect x="380" y="110" width="160" height="40" rx="6" fill="url(#ov-green)" stroke="var(--diagram-green-stroke)"/>
+  <text x="460" y="135" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">§12.5-12.6 范围查询</text>
+
+  <rect x="560" y="110" width="180" height="40" rx="6" fill="url(#ov-amber)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="650" y="135" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">§12.7-12.8 精度与陷阱</text>
+
+  <rect x="760" y="110" width="160" height="40" rx="6" fill="url(#ov-rose)" stroke="var(--diagram-red-stroke)"/>
+  <text x="840" y="135" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">§12.9-12.13 实战</text>
+
+  <path d="M60,150 L60,180" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#ov-arr)"/>
+  <path d="M100,150 L100,230" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#ov-arr)"/>
+  <path d="M140,150 L140,280" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#ov-arr)"/>
+  <rect x="20" y="180" width="160" height="40" rx="6" fill="url(#ov-leaf)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="100" y="206" text-anchor="middle" font-size="11" fill="var(--diagram-blue-text)">§12.1 二维到一维</text>
+  <rect x="20" y="232" width="160" height="40" rx="6" fill="url(#ov-leaf)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="100" y="258" text-anchor="middle" font-size="11" fill="var(--diagram-blue-text)">§12.2 位交错 Z-order</text>
+  <rect x="20" y="284" width="160" height="40" rx="6" fill="url(#ov-leaf)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="100" y="310" text-anchor="middle" font-size="11" fill="var(--diagram-blue-text)">§12.3 52 位精度</text>
+
+  <path d="M280,150 L280,180" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#ov-arr)"/>
+  <rect x="200" y="180" width="160" height="40" rx="6" fill="url(#ov-leaf)" stroke="var(--diagram-cyan-stroke)"/>
+  <text x="280" y="206" text-anchor="middle" font-size="11" fill="var(--diagram-cyan-text)">§12.4 GEOADD→ZADD</text>
+
+  <path d="M420,150 L420,180" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#ov-arr)"/>
+  <path d="M500,150 L500,230" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#ov-arr)"/>
+  <rect x="380" y="180" width="160" height="40" rx="6" fill="url(#ov-leaf)" stroke="var(--diagram-green-stroke)"/>
+  <text x="460" y="206" text-anchor="middle" font-size="11" fill="var(--diagram-green-text)">§12.5 9 邻居单元</text>
+  <rect x="380" y="232" width="160" height="40" rx="6" fill="url(#ov-leaf)" stroke="var(--diagram-green-stroke)"/>
+  <text x="460" y="258" text-anchor="middle" font-size="11" fill="var(--diagram-green-text)">§12.6 Haversine 过滤</text>
+
+  <path d="M620,150 L620,180" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#ov-arr)"/>
+  <path d="M700,150 L700,230" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#ov-arr)"/>
+  <rect x="560" y="180" width="180" height="40" rx="6" fill="url(#ov-leaf)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="650" y="206" text-anchor="middle" font-size="11" fill="var(--diagram-orange-text)">§12.7 误差预算</text>
+  <rect x="560" y="232" width="180" height="40" rx="6" fill="url(#ov-leaf)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="650" y="258" text-anchor="middle" font-size="11" fill="var(--diagram-orange-text)">§12.8 跨步长/跨180°</text>
+
+  <path d="M800,150 L800,180" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#ov-arr)"/>
+  <path d="M820,150 L820,230" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#ov-arr)"/>
+  <path d="M840,150 L840,280" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#ov-arr)"/>
+  <path d="M860,150 L860,330" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#ov-arr)"/>
+  <path d="M880,150 L880,380" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#ov-arr)"/>
+  <rect x="760" y="180" width="160" height="40" rx="6" fill="url(#ov-leaf)" stroke="var(--diagram-red-stroke)"/>
+  <text x="840" y="206" text-anchor="middle" font-size="11" fill="var(--diagram-red-text)">§12.9 命令实战</text>
+  <rect x="760" y="232" width="160" height="40" rx="6" fill="url(#ov-leaf)" stroke="var(--diagram-red-stroke)"/>
+  <text x="840" y="258" text-anchor="middle" font-size="11" fill="var(--diagram-red-text)">§12.10 vs PostGIS</text>
+  <rect x="760" y="284" width="160" height="40" rx="6" fill="url(#ov-leaf)" stroke="var(--diagram-red-stroke)"/>
+  <text x="840" y="310" text-anchor="middle" font-size="11" fill="var(--diagram-red-text)">§12.11 陷阱速查</text>
+  <rect x="760" y="336" width="160" height="40" rx="6" fill="url(#ov-leaf)" stroke="var(--diagram-red-stroke)"/>
+  <text x="840" y="362" text-anchor="middle" font-size="11" fill="var(--diagram-red-text)">§12.12 源码深潜</text>
+  <rect x="760" y="388" width="160" height="40" rx="6" fill="url(#ov-leaf)" stroke="var(--diagram-red-stroke)"/>
+  <text x="840" y="414" text-anchor="middle" font-size="11" fill="var(--diagram-red-text)">§12.13 本章要点</text>
+</svg>
+
+<!-- ============================================================ -->
+<h2 id="s12-1">12.1 二维到一维的映射问题</h2>
+<!-- ============================================================ -->
+
+<p>"<strong>给定一个圆,找圆内所有的点</strong>" — 这是地理服务的核心查询。要让 Redis 这种<strong>纯键值 / 一维有序</strong>的存储支持它,必须先回答一个数学问题:<strong>怎么把二维坐标映射成一维数,同时尽量保留邻近性</strong>?这一节先排除两个直观但错误的方案,再引入 Z-order 曲线。</p>
+
+<h3>12.1.1 为什么不能直接拼接</h3>
+
+<p class="svg-title">图 12-1-1 · 字典序拼接破坏二维邻近性</p>
+<svg class="svg-diagram" viewBox="0 0 920 280" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g1-near" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <linearGradient id="g1-far" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+    <linearGradient id="g1-mid" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-cyan-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+  </defs>
+
+  <text x="20" y="24" font-size="14" font-weight="700" fill="var(--diagram-blue-text)">直观方案:把 (lon, lat) 拼接为字符串作 ZSet score</text>
+
+  <rect x="20" y="40" width="280" height="80" rx="6" fill="url(#g1-mid)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="160" y="64" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">点 A = (116.0, 39.9)</text>
+  <text x="160" y="84" text-anchor="middle" font-family="monospace" font-size="12" fill="var(--diagram-cyan-text)">"116.000_039.900"</text>
+  <text x="160" y="106" text-anchor="middle" font-size="11" fill="var(--diagram-blue-text)">基准点(北京附近)</text>
+
+  <rect x="320" y="40" width="280" height="80" rx="6" fill="url(#g1-near)" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
+  <text x="460" y="64" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-blue-text)">点 B = (116.0, 40.0)</text>
+  <text x="460" y="84" text-anchor="middle" font-family="monospace" font-size="12" fill="var(--diagram-blue-text)">"116.000_040.000"</text>
+  <text x="460" y="106" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-blue-text)">字典序紧邻 ✓ · 地理 11.1 km</text>
+
+  <rect x="620" y="40" width="280" height="80" rx="6" fill="url(#g1-far)" stroke="var(--diagram-red-stroke)" stroke-width="2"/>
+  <text x="760" y="64" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">点 C = (115.0, 39.9)</text>
+  <text x="760" y="84" text-anchor="middle" font-family="monospace" font-size="12" fill="var(--diagram-red-text)">"115.000_039.900"</text>
+  <text x="760" y="106" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-text)">字典序远 ✗ · 地理只 85.4 km</text>
+
+  <text x="20" y="158" font-size="14" font-weight="700" fill="var(--diagram-orange-text)">★ 整数跳变问题</text>
+  <rect x="20" y="170" width="880" height="40" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="40" y="190" font-size="12" fill="var(--diagram-orange-text)">经度 116.99 → 117.00 整数跳变, 字典序骤变, 物理上仍然紧邻 → <tspan font-weight="700">空间邻近性彻底丢失</tspan></text>
+  <text x="40" y="206" font-size="11" fill="var(--diagram-red-text)">A 与 D=(116.5, 39.9) 字典序也近, 但跨字符串字段时反而失序</text>
+
+  <rect x="20" y="226" width="880" height="46" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+  <text x="40" y="248" font-size="13" font-weight="700" fill="var(--diagram-purple-text)">★ 根本问题:</text>
+  <text x="170" y="248" font-size="12" fill="var(--diagram-blue-text)">线性字典序只能保留"一个维度的邻近性"</text>
+  <text x="40" y="266" font-size="12" font-weight="700" fill="var(--diagram-green-text)">→ 二维到一维必须用"曲线"来折叠 (Z-order, Hilbert, ...)</text>
+</svg>
+
+<h3>12.1.2 平面填充曲线对比</h3>
+
+<p class="svg-title">图 12-1-2 · 三种平面填充曲线的局部性比较</p>
+<svg class="svg-diagram" viewBox="0 0 920 280" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="curv-bad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+    <linearGradient id="curv-good" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <linearGradient id="curv-mid" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-orange-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+  </defs>
+
+  <!-- Naive -->
+  <rect x="20" y="20" width="280" height="240" rx="8" fill="url(#curv-bad)" opacity="0.15" stroke="var(--diagram-red-stroke)" stroke-width="2"/>
+  <text x="160" y="44" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-red-text)">拼接编码 · 不可行</text>
+  <rect x="40" y="60" width="240" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+  <text x="160" y="82" text-anchor="middle" font-family="monospace" font-size="11" fill="var(--diagram-red-text)">A = (116.0, 39.9)</text>
+  <text x="160" y="98" text-anchor="middle" font-size="10" fill="var(--diagram-red-text)">"116.000_039.900"</text>
+  <rect x="40" y="120" width="240" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+  <text x="160" y="142" text-anchor="middle" font-family="monospace" font-size="11" fill="var(--diagram-green-text)">B = (116.0, 40.0)</text>
+  <text x="160" y="158" text-anchor="middle" font-size="10" fill="var(--diagram-green-text)">字典序邻接 ✓ · 仅 11 km</text>
+  <rect x="40" y="180" width="240" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+  <text x="160" y="202" text-anchor="middle" font-family="monospace" font-size="11" fill="var(--diagram-red-text)">C = (115.0, 39.9)</text>
+  <text x="160" y="218" text-anchor="middle" font-size="10" fill="var(--diagram-red-text)">字典序远 ✗ · 仅 85 km</text>
+  <text x="160" y="246" text-anchor="middle" font-size="10" font-style="italic" fill="var(--diagram-orange-text)">整数跳变破坏邻近性</text>
+
+  <!-- Z-order -->
+  <rect x="320" y="20" width="280" height="240" rx="8" fill="url(#curv-good)" opacity="0.15" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
+  <text x="460" y="44" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-green-text)">Z-order · Redis 采用 ★</text>
+  <rect x="340" y="60" width="240" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+  <text x="460" y="80" text-anchor="middle" font-family="monospace" font-size="11" fill="var(--diagram-green-text)">A = (116.0, 39.9)</text>
+  <text x="460" y="96" text-anchor="middle" font-family="monospace" font-size="10" fill="var(--diagram-green-text)">0xCB3D…A2</text>
+  <rect x="340" y="120" width="240" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+  <text x="460" y="140" text-anchor="middle" font-family="monospace" font-size="11" fill="var(--diagram-green-text)">B = (116.0, 40.0)</text>
+  <text x="460" y="156" text-anchor="middle" font-family="monospace" font-size="10" fill="var(--diagram-green-text)">0xCB3D…A3 (前缀同)</text>
+  <rect x="340" y="180" width="240" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+  <text x="460" y="200" text-anchor="middle" font-family="monospace" font-size="11" fill="var(--diagram-green-text)">C = (115.0, 39.9)</text>
+  <text x="460" y="216" text-anchor="middle" font-family="monospace" font-size="10" fill="var(--diagram-green-text)">0xCB3D…A0 (前缀同)</text>
+  <text x="460" y="246" text-anchor="middle" font-size="10" font-style="italic" fill="var(--diagram-green-text)">高位前缀 = 几何邻近</text>
+
+  <!-- Hilbert -->
+  <rect x="620" y="20" width="280" height="240" rx="8" fill="url(#curv-mid)" opacity="0.15" stroke="var(--diagram-orange-stroke)" stroke-width="2"/>
+  <text x="760" y="44" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-orange-text)">Hilbert · 备选方案</text>
+  <rect x="640" y="60" width="240" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="760" y="82" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">局部性更好</text>
+  <text x="760" y="98" text-anchor="middle" font-size="10" fill="var(--diagram-orange-text)">点间距离方差更小</text>
+  <rect x="640" y="120" width="240" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="760" y="142" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">编码复杂度高</text>
+  <text x="760" y="158" text-anchor="middle" font-size="10" fill="var(--diagram-orange-text)">26 次状态机迭代</text>
+  <rect x="640" y="180" width="240" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="760" y="200" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">常数比 Z-order ×5</text>
+  <text x="760" y="216" text-anchor="middle" font-size="10" fill="var(--diagram-orange-text)">Redis 不采用</text>
+  <text x="760" y="246" text-anchor="middle" font-size="10" font-style="italic" fill="var(--diagram-orange-text)">PostGIS / 高级 GIS 才用</text>
+</svg>
+
+<p>Z-order 曲线(也称 <strong>Morton 编码</strong>)的核心性质:<strong>二维坐标位交错后,前缀相同的 hash 值对应几何上邻近的点</strong>。Hilbert 曲线在局部性上略优(连续点间的距离方差更小),但编码 / 解码需要更多位运算。Redis 选择 Z-order 在工程上更简洁 — <code>interleave64</code> 用 <strong>4 次 mask + 4 次 shift</strong> 即可完成,而 Hilbert 需要 26 次状态机迭代。</p>
+
+<h3>12.1.3 三种二维到一维方案对比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 12-1-1 · 二维 → 一维方案的工程权衡</div>
+  <table>
+    <thead><tr><th>方案</th><th>局部性保留</th><th>编码复杂度</th><th>解码复杂度</th><th>Redis 是否使用</th><th>关键劣势</th></tr></thead>
+    <tbody>
+      <tr><td>字典序拼接</td><td>极差</td><td>O(1)</td><td>O(1)</td><td>否</td><td>整数跳变破坏邻近性</td></tr>
+      <tr><td><strong>Z-order(Morton)</strong></td><td><strong>良好</strong></td><td><strong>O(p) 位交错</strong></td><td><strong>O(p) 位反交错</strong></td><td><strong>是</strong></td><td><strong>无,本场景最优</strong></td></tr>
+      <tr><td>Hilbert</td><td>优秀</td><td>O(p²) 状态机</td><td>O(p²) 状态机</td><td>否</td><td>编解码常数大 5×</td></tr>
+      <tr><td>四叉树(Quadtree)</td><td>优秀</td><td>O(log N) 树深</td><td>O(log N)</td><td>否</td><td>需独立索引结构</td></tr>
+      <tr><td>R-tree</td><td>优秀</td><td>O(log N)</td><td>O(log N)</td><td>否</td><td>需 O(N) 内存维护</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key-insight">
+  <strong>Redis 的工程取舍</strong>:Geohash + Z-order 让 GEO 命令<strong>零额外索引开销</strong> — 完全复用 ZSet 的 skiplist + dict,新增的只是命令实现里的位运算函数。如果选 Hilbert 或 R-tree,会引入新的数据结构,违反 Redis "<strong>用最少结构覆盖最多场景</strong>" 的原则。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-2">12.2 位交错构造 Geohash</h2>
+<!-- ============================================================ -->
+
+<p>位交错(bit interleaving)是 Geohash 的核心。把经度的 26 位与纬度的 26 位<strong>交替排布</strong>成一个 52 位整数,这个整数就是 Z-order 曲线在该坐标点的"位置"。这一节先讲清"递归二分"产生每一位的过程,再讲<code>interleave64</code> 的位运算实现,最后用 4×4 网格直观展示 Z-order。</p>
+
+<h3>12.2.1 递归二分确定每一位</h3>
+
+<p class="svg-title">图 12-2-1 · 经度 116.4074 的 26 位编码过程(递归二分)</p>
+<svg class="svg-diagram" viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bs-l" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+    <linearGradient id="bs-r" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <linearGradient id="bs-pt" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-orange-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+  </defs>
+
+  <text x="20" y="24" font-size="14" font-weight="700" fill="var(--diagram-blue-text)">Step 1-7 (头 7 位) · lon = 116.4074 落在每步右/左子区间</text>
+
+  <!-- Step 1: lon ≥ 0 → bit=1 right -->
+  <g>
+    <rect x="20" y="40" width="430" height="36" rx="4" fill="url(#bs-l)" opacity="0.5"/>
+    <rect x="450" y="40" width="430" height="36" rx="4" fill="url(#bs-r)" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
+    <text x="30" y="62" font-size="11" fill="var(--diagram-red-text)">-180</text>
+    <text x="450" y="62" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-text)">0 (mid)</text>
+    <text x="870" y="62" text-anchor="end" font-size="11" fill="var(--diagram-text)">180</text>
+    <circle cx="725" cy="58" r="6" fill="url(#bs-pt)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="725" y="92" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">116.4 → bit 25 = 1</text>
+  </g>
+
+  <!-- Step 2: [0,180] → ≥90 right -->
+  <g>
+    <rect x="450" y="108" width="215" height="36" rx="4" fill="url(#bs-l)" opacity="0.5"/>
+    <rect x="665" y="108" width="215" height="36" rx="4" fill="url(#bs-r)" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
+    <text x="455" y="130" font-size="11" fill="var(--diagram-red-text)">0</text>
+    <text x="665" y="130" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-text)">90</text>
+    <text x="875" y="130" text-anchor="end" font-size="11" fill="var(--diagram-text)">180</text>
+    <circle cx="725" cy="126" r="6" fill="url(#bs-pt)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="725" y="160" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">116.4 → bit 24 = 1</text>
+  </g>
+
+  <!-- Step 3: [90,180] → <135 left -->
+  <g>
+    <rect x="665" y="176" width="107" height="36" rx="4" fill="url(#bs-l)" stroke="var(--diagram-red-stroke)" stroke-width="2"/>
+    <rect x="772" y="176" width="107" height="36" rx="4" fill="url(#bs-r)" opacity="0.5"/>
+    <text x="668" y="198" font-size="11" fill="var(--diagram-text)">90</text>
+    <text x="772" y="198" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-text)">135</text>
+    <text x="875" y="198" text-anchor="end" font-size="11" fill="var(--diagram-red-text)">180</text>
+    <circle cx="725" cy="194" r="6" fill="url(#bs-pt)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="725" y="228" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">116.4 → bit 23 = 0</text>
+  </g>
+
+  <!-- Steps 4-7 compact summary -->
+  <rect x="20" y="244" width="430" height="120" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="40" y="266" font-size="13" font-weight="700" fill="var(--diagram-purple-text)">Steps 4-7 (递归继续)</text>
+  <text x="40" y="288" font-family="monospace" font-size="11" fill="var(--diagram-blue-text)">[90, 135] ≥112.5 → bit 22 = 1</text>
+  <text x="40" y="306" font-family="monospace" font-size="11" fill="var(--diagram-blue-text)">[112.5, 135] &lt;123.75 → bit 21 = 0</text>
+  <text x="40" y="324" font-family="monospace" font-size="11" fill="var(--diagram-blue-text)">[112.5, 123.75] &lt;118.13 → bit 20 = 0</text>
+  <text x="40" y="342" font-family="monospace" font-size="11" fill="var(--diagram-blue-text)">[112.5, 118.13] ≥115.31 → bit 19 = 1</text>
+  <text x="40" y="358" font-size="11" fill="var(--diagram-orange-text)">… 总计递归 26 次 → lon_bits = 1 1 0 1 0 0 1 …</text>
+
+  <!-- Final interleaving -->
+  <rect x="470" y="244" width="430" height="120" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
+  <text x="490" y="266" font-size="13" font-weight="700" fill="var(--diagram-green-text)">位交错合成 Geohash 52 位</text>
+  <text x="490" y="288" font-family="monospace" font-size="11" fill="var(--diagram-blue-text)">lon_bits = b25 b24 b23 … b1 b0</text>
+  <text x="490" y="306" font-family="monospace" font-size="11" fill="var(--diagram-blue-text)">lat_bits = a25 a24 a23 … a1 a0</text>
+  <text x="490" y="332" font-family="monospace" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">Geohash = b25 a25 b24 a24 … b1 a1 b0 a0</text>
+  <text x="490" y="354" font-size="11" fill="var(--diagram-blue-text)">前 N 位相同 ⇒ 两点位于同一 (180/2^(N/2))² 矩形</text>
+</svg>
+
+<h3>12.2.2 interleave64 位运算技巧</h3>
+
+<p class="svg-title">图 12-2-2 · 位交错的高效实现 — 5 次 mask 扩散完成 O(1) 交错</p>
+<svg class="svg-diagram" viewBox="0 0 920 240" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bx-stage" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-cyan-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <linearGradient id="bx-final" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <marker id="bx-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--diagram-blue-stroke)"/></marker>
+  </defs>
+
+  <text x="20" y="24" font-size="14" font-weight="700" fill="var(--diagram-blue-text)">把 32-bit lon 的每一位"摊开"到 64-bit 偶数位 — 5 次 mask 扩散</text>
+
+  <rect x="20" y="40" width="140" height="50" rx="6" fill="url(#bx-stage)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="90" y="62" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">x = lon (32 bit)</text>
+  <text x="90" y="80" text-anchor="middle" font-family="monospace" font-size="10" fill="var(--diagram-cyan-text)">32-bit 连续</text>
+  <path d="M160,65 L180,65" stroke="var(--diagram-blue-stroke)" stroke-width="2" fill="none" marker-end="url(#bx-arr)"/>
+
+  <rect x="180" y="40" width="140" height="50" rx="6" fill="url(#bx-stage)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="250" y="58" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-text)">&lt;&lt;16 + mask</text>
+  <text x="250" y="74" text-anchor="middle" font-family="monospace" font-size="10" fill="var(--diagram-cyan-text)">0x0000FFFF0000FFFF</text>
+  <text x="250" y="86" text-anchor="middle" font-size="9" fill="var(--diagram-blue-text)">16-bit 块</text>
+  <path d="M320,65 L340,65" stroke="var(--diagram-blue-stroke)" stroke-width="2" fill="none" marker-end="url(#bx-arr)"/>
+
+  <rect x="340" y="40" width="140" height="50" rx="6" fill="url(#bx-stage)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="410" y="58" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-text)">&lt;&lt;8 + mask</text>
+  <text x="410" y="74" text-anchor="middle" font-family="monospace" font-size="10" fill="var(--diagram-cyan-text)">0x00FF…00FF</text>
+  <text x="410" y="86" text-anchor="middle" font-size="9" fill="var(--diagram-blue-text)">8-bit 块</text>
+  <path d="M480,65 L500,65" stroke="var(--diagram-blue-stroke)" stroke-width="2" fill="none" marker-end="url(#bx-arr)"/>
+
+  <rect x="500" y="40" width="140" height="50" rx="6" fill="url(#bx-stage)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="570" y="58" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-text)">&lt;&lt;4 + mask</text>
+  <text x="570" y="74" text-anchor="middle" font-family="monospace" font-size="10" fill="var(--diagram-cyan-text)">0x0F0F…0F0F</text>
+  <text x="570" y="86" text-anchor="middle" font-size="9" fill="var(--diagram-blue-text)">4-bit nibble</text>
+  <path d="M640,65 L660,65" stroke="var(--diagram-blue-stroke)" stroke-width="2" fill="none" marker-end="url(#bx-arr)"/>
+
+  <rect x="660" y="40" width="120" height="50" rx="6" fill="url(#bx-stage)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="720" y="58" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-text)">&lt;&lt;2 + mask</text>
+  <text x="720" y="74" text-anchor="middle" font-family="monospace" font-size="10" fill="var(--diagram-cyan-text)">0x3333…3333</text>
+  <path d="M780,65 L800,65" stroke="var(--diagram-blue-stroke)" stroke-width="2" fill="none" marker-end="url(#bx-arr)"/>
+
+  <rect x="800" y="40" width="100" height="50" rx="6" fill="url(#bx-final)" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
+  <text x="850" y="58" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-blue-text)">&lt;&lt;1 + 0x5555</text>
+  <text x="850" y="74" text-anchor="middle" font-size="10" font-weight="700" fill="var(--diagram-blue-text)">每位在偶数位</text>
+
+  <!-- Combine -->
+  <rect x="20" y="110" width="880" height="50" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+  <text x="40" y="132" font-size="13" font-weight="700" fill="var(--diagram-green-text)">★ 同样处理 lat(进奇数位), 然后 result = x | (y &lt;&lt; 1) — 完美交错</text>
+  <text x="40" y="150" font-size="11" fill="var(--diagram-blue-text)">总开销:5 次扩散(每次 1 OR + 1 mask)+ 1 次最终 OR = <tspan font-weight="700" fill="var(--diagram-green-text)">11 次位运算 (O(1) 常数)</tspan></text>
+
+  <!-- Note -->
+  <rect x="20" y="174" width="880" height="58" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="40" y="194" font-size="12" font-weight="700" fill="var(--diagram-purple-text)">朴素 vs 高效:</text>
+  <text x="40" y="212" font-size="11" fill="var(--diagram-blue-text)">朴素法逐位拼接需 O(p) = 26 次循环, 高效法用 mask 扩散一次到位 O(1) · 见 <tspan font-family="monospace" fill="var(--diagram-orange-text)">src/util.c interleave64()</tspan></text>
+  <text x="40" y="228" font-size="11" fill="var(--diagram-blue-text)">反向操作 <tspan font-family="monospace" fill="var(--diagram-orange-text)">deinterleave64</tspan> 用相同 mask 序列倒着收缩</text>
+</svg>
+<pre><code class="language-c">/* src/util.c — 位交错的紧凑实现 */
+uint64_t interleave64(uint32_t xlo, uint32_t ylo) {
+    static const uint64_t B[] = {
+        0x5555555555555555ULL, 0x3333333333333333ULL,
+        0x0F0F0F0F0F0F0F0FULL, 0x00FF00FF00FF00FFULL,
+        0x0000FFFF0000FFFFULL
+    };
+    static const unsigned int S[] = {1, 2, 4, 8, 16};
+    uint64_t x = xlo, y = ylo;
+    x = (x | (x &lt;&lt; S[4])) &amp; B[4];   x = (x | (x &lt;&lt; S[3])) &amp; B[3];
+    x = (x | (x &lt;&lt; S[2])) &amp; B[2];   x = (x | (x &lt;&lt; S[1])) &amp; B[1];
+    x = (x | (x &lt;&lt; S[0])) &amp; B[0];
+    y = (y | (y &lt;&lt; S[4])) &amp; B[4];   y = (y | (y &lt;&lt; S[3])) &amp; B[3];
+    y = (y | (y &lt;&lt; S[2])) &amp; B[2];   y = (y | (y &lt;&lt; S[1])) &amp; B[1];
+    y = (y | (y &lt;&lt; S[0])) &amp; B[0];
+    return x | (y &lt;&lt; 1);
+}</code></pre>
+
+<h3>12.2.3 Z-order 曲线的几何可视化</h3>
+
+<p class="svg-title">图 12-2-3 · 4×4 网格上的 Z-order 编码顺序</p>
+<svg class="svg-diagram" viewBox="0 0 920 480" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="zo-q0" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <linearGradient id="zo-q1" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <linearGradient id="zo-q2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-orange-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+    <linearGradient id="zo-q3" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-purple-fill-start)"/><stop offset="1" stop-color="var(--diagram-purple-fill-end)"/></linearGradient>
+    <marker id="zo-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--diagram-orange-stroke)"/></marker>
+  </defs>
+
+  <!-- Title -->
+  <text x="240" y="24" text-anchor="middle" font-size="14" font-weight="700" fill="var(--diagram-blue-text)">4×4 网格 + Z-order 顺序(连成 Z 字)</text>
+
+  <!-- 4x4 grid (left side) -->
+  <g transform="translate(40, 40)">
+    <!-- bottom row y=0 -->
+    <rect x="0" y="300" width="100" height="100" fill="url(#zo-q0)" stroke="var(--diagram-blue-stroke)"/><text x="50" y="358" text-anchor="middle" font-size="28" font-weight="700" fill="var(--diagram-text)">0</text>
+    <rect x="100" y="300" width="100" height="100" fill="url(#zo-q0)" stroke="var(--diagram-blue-stroke)"/><text x="150" y="358" text-anchor="middle" font-size="28" font-weight="700" fill="var(--diagram-text)">1</text>
+    <rect x="200" y="300" width="100" height="100" fill="url(#zo-q1)" stroke="var(--diagram-green-stroke)"/><text x="250" y="358" text-anchor="middle" font-size="28" font-weight="700" fill="var(--diagram-text)">4</text>
+    <rect x="300" y="300" width="100" height="100" fill="url(#zo-q1)" stroke="var(--diagram-green-stroke)"/><text x="350" y="358" text-anchor="middle" font-size="28" font-weight="700" fill="var(--diagram-text)">5</text>
+    <!-- row y=1 -->
+    <rect x="0" y="200" width="100" height="100" fill="url(#zo-q0)" stroke="var(--diagram-blue-stroke)"/><text x="50" y="258" text-anchor="middle" font-size="28" font-weight="700" fill="var(--diagram-text)">2</text>
+    <rect x="100" y="200" width="100" height="100" fill="url(#zo-q0)" stroke="var(--diagram-blue-stroke)"/><text x="150" y="258" text-anchor="middle" font-size="28" font-weight="700" fill="var(--diagram-text)">3</text>
+    <rect x="200" y="200" width="100" height="100" fill="url(#zo-q1)" stroke="var(--diagram-green-stroke)"/><text x="250" y="258" text-anchor="middle" font-size="28" font-weight="700" fill="var(--diagram-text)">6</text>
+    <rect x="300" y="200" width="100" height="100" fill="url(#zo-q1)" stroke="var(--diagram-green-stroke)"/><text x="350" y="258" text-anchor="middle" font-size="28" font-weight="700" fill="var(--diagram-text)">7</text>
+    <!-- row y=2 -->
+    <rect x="0" y="100" width="100" height="100" fill="url(#zo-q2)" stroke="var(--diagram-orange-stroke)"/><text x="50" y="158" text-anchor="middle" font-size="28" font-weight="700" fill="var(--diagram-blue-text)">8</text>
+    <rect x="100" y="100" width="100" height="100" fill="url(#zo-q2)" stroke="var(--diagram-orange-stroke)"/><text x="150" y="158" text-anchor="middle" font-size="28" font-weight="700" fill="var(--diagram-blue-text)">9</text>
+    <rect x="200" y="100" width="100" height="100" fill="url(#zo-q3)" stroke="var(--diagram-purple-stroke)"/><text x="250" y="158" text-anchor="middle" font-size="28" font-weight="700" fill="var(--diagram-text)">12</text>
+    <rect x="300" y="100" width="100" height="100" fill="url(#zo-q3)" stroke="var(--diagram-purple-stroke)"/><text x="350" y="158" text-anchor="middle" font-size="28" font-weight="700" fill="var(--diagram-text)">13</text>
+    <!-- top row y=3 -->
+    <rect x="0" y="0" width="100" height="100" fill="url(#zo-q2)" stroke="var(--diagram-orange-stroke)"/><text x="50" y="58" text-anchor="middle" font-size="28" font-weight="700" fill="var(--diagram-blue-text)">10</text>
+    <rect x="100" y="0" width="100" height="100" fill="url(#zo-q2)" stroke="var(--diagram-orange-stroke)"/><text x="150" y="58" text-anchor="middle" font-size="28" font-weight="700" fill="var(--diagram-blue-text)">11</text>
+    <rect x="200" y="0" width="100" height="100" fill="url(#zo-q3)" stroke="var(--diagram-purple-stroke)"/><text x="250" y="58" text-anchor="middle" font-size="28" font-weight="700" fill="var(--diagram-text)">14</text>
+    <rect x="300" y="0" width="100" height="100" fill="url(#zo-q3)" stroke="var(--diagram-purple-stroke)"/><text x="350" y="58" text-anchor="middle" font-size="28" font-weight="700" fill="var(--diagram-text)">15</text>
+
+    <!-- Z curve path: 0→1→2→3→4→5→6→7→...→15 -->
+    <path d="M 50,350 L 150,350 L 50,250 L 150,250 L 250,350 L 350,350 L 250,250 L 350,250 L 50,150 L 150,150 L 50,50 L 150,50 L 250,150 L 350,150 L 250,50 L 350,50"
+          stroke="var(--diagram-orange-stroke)" stroke-width="3" fill="none" stroke-linejoin="round" marker-end="url(#zo-arr)" opacity="0.85"/>
+  </g>
+
+  <!-- Axis labels -->
+  <text x="20" y="240" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-blue-text)" transform="rotate(-90 20 240)">纬度 →</text>
+  <text x="240" y="460" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-blue-text)">经度 →</text>
+
+  <!-- Right side annotations -->
+  <g transform="translate(490, 50)">
+    <text x="0" y="0" font-size="14" font-weight="700" fill="var(--diagram-purple-text)">关键性质</text>
+
+    <rect x="0" y="14" width="400" height="76" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="14" y="34" font-size="12" font-weight="700" fill="var(--diagram-blue-text)">① 同前缀 = 同区域</text>
+    <text x="14" y="54" font-size="11" fill="var(--diagram-blue-text)">cell 0,1,2,3 共享高 2 位 "00xx" → 左下 2×2</text>
+    <text x="14" y="72" font-size="11" fill="var(--diagram-blue-text)">cell 4,5,6,7 共享高 2 位 "01xx" → 右下 2×2</text>
+    <text x="14" y="88" font-size="11" fill="var(--diagram-blue-text)">cell 8-11 → 左上 2×2, cell 12-15 → 右上 2×2</text>
+
+    <rect x="0" y="104" width="400" height="78" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+    <text x="14" y="124" font-size="12" font-weight="700" fill="var(--diagram-red-text)">② 邻近不一定相邻 — 角落跳跃</text>
+    <text x="14" y="144" font-size="11" fill="var(--diagram-red-text)">cell 3 与 cell 4 物理相邻, 但编码差大</text>
+    <text x="14" y="162" font-size="11" fill="var(--diagram-red-text)">cell 7 与 cell 8 是另一个跳跃边界</text>
+    <text x="14" y="178" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">→ GEOSEARCH 必须查 3×3 = 9 邻居单元补偿</text>
+
+    <rect x="0" y="196" width="400" height="60" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+    <text x="14" y="216" font-size="12" font-weight="700" fill="var(--diagram-green-text)">③ 同层每加一位精度边长减半</text>
+    <text x="14" y="234" font-size="11" fill="var(--diagram-blue-text)">每方向 +1 位 → 单元边长 / 2</text>
+    <text x="14" y="250" font-size="11" fill="var(--diagram-blue-text)">总 +2 位 → 单元面积 / 4(quadtree 递归)</text>
+
+    <rect x="0" y="270" width="400" height="80" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="14" y="290" font-size="12" font-weight="700" fill="var(--diagram-orange-text)">Z 字形访问顺序</text>
+    <text x="14" y="310" font-size="11" fill="var(--diagram-blue-text)">0 → 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → … → 15</text>
+    <text x="14" y="330" font-size="11" fill="var(--diagram-blue-text)">连接成 Z 字形, 递归到下一层时每个 4-cell</text>
+    <text x="14" y="346" font-size="11" fill="var(--diagram-blue-text)">子格内同样按 Z 顺序访问 → 自相似结构</text>
+  </g>
+</svg>
+
+<div class="key-insight">
+  <strong>Z-order 的"角落跳跃"</strong>:cell 3 (右上角) 到 cell 4 (左下角下一行) 物理上相邻,但 Z-order 编码 3 → 4 跨越很大。这就是为什么 GEOSEARCH 必须查 <strong>3×3 = 9 个邻居单元</strong>,而不是只查目标点所在单元 — 圆可能跨过 Z-order 的"跳跃边界"落入相邻单元。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-3">12.3 52 位精度边界</h2>
+<!-- ============================================================ -->
+
+<p>为什么 Redis 选 26+26 = 52 位,不是 32+32 = 64 位或 16+16 = 32 位?这一节回答精度选型的工程逻辑:<strong>52 位刚好对齐 IEEE 754 double 的尾数,且 0.6 m 精度恰好高于 GPS 自身误差</strong> — 再高就是浪费。</p>
+
+<h3>12.3.1 位数与精度对照</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 12-3-1 · Geohash 位数与赤道单元尺寸</div>
+  <table>
+    <thead><tr><th>位数(经/纬各 N 位)</th><th>单元尺寸(赤道附近)</th><th>应用场景</th></tr></thead>
+    <tbody>
+      <tr><td>5 / 5 = 10</td><td>4 992 km × 4 992 km</td><td>大洲</td></tr>
+      <tr><td>10 / 10 = 20</td><td>156 km × 156 km</td><td>省 / 州</td></tr>
+      <tr><td>15 / 15 = 30</td><td>4.9 km × 4.9 km</td><td>城市内</td></tr>
+      <tr><td>20 / 20 = 40</td><td>152 m × 152 m</td><td>街区</td></tr>
+      <tr><td>25 / 25 = 50</td><td>4.7 m × 4.7 m</td><td>楼宇</td></tr>
+      <tr><td><strong>26 / 26 = 52</strong></td><td><strong>0.6 m × 0.6 m</strong></td><td><strong>Redis 默认</strong></td></tr>
+      <tr><td>30 / 30 = 60</td><td>~4 cm × 4 cm</td><td>RTK GNSS(超出消费场景)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>12.3.2 选择 52 位的三个理由</h3>
+
+<div class="key-insight">
+  <strong>Redis 选 26+26 = 52 位的工程逻辑</strong>:<br>
+  ① <strong>52 位完美装入 ZSet score 的 double 尾数</strong>:IEEE 754 double 有 52 位尾数 + 11 位指数 + 1 位符号,52 位整数能完整无损地塞进 double 表示;<br>
+  ② <strong>0.6 m 精度对消费级 LBS 充足</strong>:消费 GPS 自身误差 5-10 m,工业 GPS 1-3 m,提高 Geohash 精度无收益;<br>
+  ③ <strong>不开放配置,避免合并问题</strong>:若位数可调,两个不同位数的 GEO key 无法合并(类似 PFMERGE 的精度兼容问题),工程上不划算。
+</div>
+
+<h3>12.3.3 精度随位数指数衰减</h3>
+
+<p class="svg-title">图 12-3-1 · 单元尺寸随位数指数减小(对数纵轴,赤道附近)</p>
+<svg class="svg-diagram" viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bd-bar" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-cyan-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <linearGradient id="bd-redis" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+  </defs>
+
+  <!-- Y axis -->
+  <line x1="80" y1="40" x2="80" y2="300" stroke="var(--diagram-blue-stroke)" stroke-width="2"/>
+  <line x1="80" y1="300" x2="820" y2="300" stroke="var(--diagram-blue-stroke)" stroke-width="2"/>
+
+  <!-- Y grid + labels (log scale) -->
+  <g font-size="11" fill="var(--diagram-blue-text)" font-family="monospace">
+    <text x="74" y="56" text-anchor="end">10 km</text><line x1="78" y1="52" x2="820" y2="52" stroke="var(--diagram-blue-stroke)"/>
+    <text x="74" y="100" text-anchor="end">1 km</text><line x1="78" y1="96" x2="820" y2="96" stroke="var(--diagram-blue-stroke)"/>
+    <text x="74" y="148" text-anchor="end">100 m</text><line x1="78" y1="144" x2="820" y2="144" stroke="var(--diagram-blue-stroke)"/>
+    <text x="74" y="194" text-anchor="end">10 m</text><line x1="78" y1="190" x2="820" y2="190" stroke="var(--diagram-blue-stroke)"/>
+    <text x="74" y="240" text-anchor="end">1 m</text><line x1="78" y1="236" x2="820" y2="236" stroke="var(--diagram-blue-stroke)"/>
+    <text x="74" y="282" text-anchor="end">0.1 m</text><line x1="78" y1="278" x2="820" y2="278" stroke="var(--diagram-blue-stroke)"/>
+  </g>
+
+  <!-- Bars: 20, 25, 30, 35, 40, 45, 50, 52 bits -->
+  <!-- bar width 60, gap 30; start x=100 -->
+  <g>
+    <!-- 20 bit, ~156 km, top of chart -->
+    <rect x="100" y="48" width="60" height="252" fill="url(#bd-bar)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="130" y="40" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-blue-text)">156 km</text>
+    <text x="130" y="318" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-blue-text)">20</text>
+
+    <!-- 25 bit, ~4.9 km -->
+    <rect x="190" y="76" width="60" height="224" fill="url(#bd-bar)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="220" y="68" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-blue-text)">4.9 km</text>
+    <text x="220" y="318" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-blue-text)">25</text>
+
+    <!-- 30 bit, ~152 m -->
+    <rect x="280" y="124" width="60" height="176" fill="url(#bd-bar)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="310" y="116" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-blue-text)">152 m</text>
+    <text x="310" y="318" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-blue-text)">30</text>
+
+    <!-- 35 bit, ~19 m -->
+    <rect x="370" y="174" width="60" height="126" fill="url(#bd-bar)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="400" y="166" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-blue-text)">19 m</text>
+    <text x="400" y="318" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-blue-text)">35</text>
+
+    <!-- 40 bit, ~4.7 m -->
+    <rect x="460" y="206" width="60" height="94" fill="url(#bd-bar)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="490" y="198" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-blue-text)">4.7 m</text>
+    <text x="490" y="318" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-blue-text)">40</text>
+
+    <!-- 45 bit, ~1.2 m -->
+    <rect x="550" y="234" width="60" height="66" fill="url(#bd-bar)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="580" y="226" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-blue-text)">1.2 m</text>
+    <text x="580" y="318" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-blue-text)">45</text>
+
+    <!-- 50 bit, ~0.6 m, 50/52 -->
+    <rect x="640" y="254" width="60" height="46" fill="url(#bd-bar)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="670" y="246" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-blue-text)">0.6 m</text>
+    <text x="670" y="318" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-blue-text)">50</text>
+
+    <!-- 52 bit, Redis default -->
+    <rect x="730" y="258" width="60" height="42" fill="url(#bd-redis)" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
+    <text x="760" y="250" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-green-text)">0.6 m ★</text>
+    <text x="760" y="318" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-green-text)">52</text>
+  </g>
+
+  <text x="450" y="346" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-blue-text)">位数(经 + 纬)</text>
+</svg>
+<div class="key-insight">
+  <strong>规律:</strong>每加 2 位(每方向各 1 位),单元尺寸减半 — 几何级数衰减。Redis 默认 52 位刚好落在 <strong>0.6 m</strong>,这是<strong>工程边界</strong>(对齐 IEEE 754 double 尾数)。超出此精度需引入更多位 + 不同 score 表示方案。<br>
+  <strong>高纬度提醒</strong>:经度 1° 实际距离在高纬度变小(地球收缩),cell 形状由正方形变为细长矩形 — 这是墨卡托投影固有的性质。
+</div>
+
+<h3>12.3.4 Web 墨卡托纬度限制</h3>
+
+<p class="svg-title">图 12-3-2 · 为什么 Redis 限制 lat ∈ [-85.05, 85.05]</p>
+<svg class="svg-diagram" viewBox="0 0 920 300" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="ml-pole" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+    <linearGradient id="ml-merc" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+  </defs>
+
+  <!-- Earth lat range bar -->
+  <text x="20" y="24" font-size="14" font-weight="700" fill="var(--diagram-blue-text)">纬度范围对比</text>
+  <rect x="40" y="40" width="50" height="200" rx="6" fill="url(#ml-pole)" stroke="var(--diagram-red-stroke)"/>
+  <text x="65" y="62" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-text)">90°</text>
+  <text x="65" y="222" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-text)">-90°</text>
+  <text x="65" y="258" text-anchor="middle" font-size="10" fill="var(--diagram-red-text)">地球物理</text>
+  <text x="65" y="272" text-anchor="middle" font-size="10" fill="var(--diagram-red-text)">范围</text>
+  <text x="65" y="288" text-anchor="middle" font-size="9" fill="var(--diagram-red-text)">极地不可表示</text>
+
+  <rect x="110" y="50" width="50" height="180" rx="6" fill="url(#ml-merc)" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
+  <text x="135" y="72" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-blue-text)">85.05°</text>
+  <text x="135" y="212" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-blue-text)">-85.05°</text>
+  <text x="135" y="258" text-anchor="middle" font-size="10" fill="var(--diagram-green-text)">Web 墨卡托</text>
+  <text x="135" y="272" text-anchor="middle" font-size="10" fill="var(--diagram-green-text)">范围</text>
+  <text x="135" y="288" text-anchor="middle" font-size="9" fill="var(--diagram-green-text)">Redis 采用 ★</text>
+
+  <!-- Reasons -->
+  <rect x="200" y="40" width="700" height="76" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+  <text x="220" y="62" font-size="13" font-weight="700" fill="var(--diagram-green-text)">✓ 优势</text>
+  <text x="220" y="82" font-size="11" fill="var(--diagram-blue-text)">① 全球瓦片地图(Google/OSM/Mapbox)的标准范围 — GEOHASH 输出可直接用于地图渲染</text>
+  <text x="220" y="100" font-size="11" fill="var(--diagram-blue-text)">② 墨卡托投影下经纬度比接近 1:1 — Geohash 网格更接近正方形, 误差均匀</text>
+
+  <rect x="200" y="124" width="700" height="50" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+  <text x="220" y="146" font-size="13" font-weight="700" fill="var(--diagram-red-text)">✗ 缺陷</text>
+  <text x="220" y="164" font-size="11" fill="var(--diagram-red-text)">无法编码极地坐标 (|lat| &gt; 85.05) — 商业 LBS 极地需求极少, 工程上接受</text>
+
+  <rect x="200" y="184" width="700" height="100" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="220" y="204" font-size="13" font-weight="700" fill="var(--diagram-orange-text)">实际范围(src/geohash.c)</text>
+  <text x="220" y="226" font-size="11" font-family="monospace" fill="var(--diagram-blue-text)">GEO_LAT_MIN  = -85.05112878    GEO_LAT_MAX  =  85.05112878</text>
+  <text x="220" y="242" font-size="11" font-family="monospace" fill="var(--diagram-blue-text)">GEO_LONG_MIN = -180.0          GEO_LONG_MAX =  180.0</text>
+  <text x="220" y="262" font-size="11" fill="var(--diagram-orange-text)">★ 85.05112878° = atan(sinh(π)) × 180/π — 墨卡托 y = π 处的纬度</text>
+  <text x="220" y="278" font-size="11" fill="var(--diagram-blue-text)">确保正方形瓦片不会被拉伸到无穷大(墨卡托极地畸变)</text>
+</svg>
+<pre><code class="language-bash"># GEOADD 极地坐标会失败
+127.0.0.1:6379&gt; GEOADD pole 0 90 northpole
+(error) ERR invalid longitude,latitude pair 0.000000,90.000000</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s12-4">12.4 Geohash 与 ZSet 的集成</h2>
+<!-- ============================================================ -->
+
+<p>GEO 命令族<strong>没有自己的存储结构</strong> — 它们完全是 ZSet 的语义封装。<code>GEOADD</code> 在内部转化为 <code>ZADD</code>,<code>score</code> 是 52 位 Geohash 整数(转 double),<code>member</code> 是用户传入的位置名。这一节展示这层"语义皮"怎么贴在 ZSet 上,以及为什么这样设计代价最小。</p>
+
+<h3>12.4.1 GEOADD 的内部转换时序</h3>
+
+<p class="svg-title">图 12-4-1 · GEOADD 命令的调用链</p>
+<svg class="svg-diagram" viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="gd-cli" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <linearGradient id="gd-cmd" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-purple-fill-start)"/><stop offset="1" stop-color="var(--diagram-purple-fill-end)"/></linearGradient>
+    <linearGradient id="gd-enc" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <linearGradient id="gd-zset" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <marker id="gd-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--diagram-blue-stroke)"/></marker>
+    <marker id="gd-arr-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--diagram-orange-stroke)"/></marker>
+  </defs>
+
+  <!-- swimlanes -->
+  <rect x="60"  y="40" width="120" height="36" rx="6" fill="url(#gd-cli)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="120" y="63" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">Client</text>
+  <line x1="120" y1="76" x2="120" y2="440" stroke="var(--diagram-blue-stroke)" stroke-dasharray="3 3"/>
+
+  <rect x="240" y="40" width="180" height="36" rx="6" fill="url(#gd-cmd)" stroke="var(--diagram-purple-stroke)"/>
+  <text x="330" y="63" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">geoaddCommand()</text>
+  <line x1="330" y1="76" x2="330" y2="440" stroke="var(--diagram-purple-stroke)" stroke-dasharray="3 3"/>
+
+  <rect x="490" y="40" width="180" height="36" rx="6" fill="url(#gd-enc)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="580" y="63" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">geohashEncode()</text>
+  <line x1="580" y1="76" x2="580" y2="440" stroke="var(--diagram-blue-stroke)" stroke-dasharray="3 3"/>
+
+  <rect x="740" y="40" width="140" height="36" rx="6" fill="url(#gd-zset)" stroke="var(--diagram-green-stroke)"/>
+  <text x="810" y="63" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">zsetAdd()</text>
+  <line x1="810" y1="76" x2="810" y2="440" stroke="var(--diagram-green-stroke)" stroke-dasharray="3 3"/>
+
+  <!-- step 1 -->
+  <path d="M120,100 L330,100" stroke="var(--diagram-blue-stroke)" stroke-width="2" marker-end="url(#gd-arr)"/>
+  <text x="225" y="94" text-anchor="middle" font-family="monospace" font-size="11" fill="var(--diagram-blue-text)">① GEOADD key lon lat member</text>
+
+  <!-- step 2 self call -->
+  <path d="M330,130 C400,130 400,160 330,160" stroke="var(--diagram-blue-stroke)" stroke-width="2" fill="none" marker-end="url(#gd-arr)"/>
+  <text x="408" y="138" font-family="monospace" font-size="11" fill="var(--diagram-blue-text)">② 校验 lon ∈ [-180,180]</text>
+  <text x="408" y="154" font-family="monospace" font-size="11" fill="var(--diagram-blue-text)">      lat ∈ [-85.05, 85.05]</text>
+
+  <!-- alt: 越界 -->
+  <path d="M330,180 L120,180" stroke="var(--diagram-red-stroke)" stroke-width="2" stroke-dasharray="5 3" marker-end="url(#gd-arr-r)"/>
+  <text x="225" y="174" text-anchor="middle" font-size="11" fill="var(--diagram-red-text)">alt 越界 → ERR invalid longitude,latitude</text>
+
+  <!-- step 3 encode -->
+  <path d="M330,220 L580,220" stroke="var(--diagram-blue-stroke)" stroke-width="2" marker-end="url(#gd-arr)"/>
+  <text x="455" y="214" text-anchor="middle" font-family="monospace" font-size="11" fill="var(--diagram-blue-text)">③ geohashEncode(lat, lon, 26)</text>
+
+  <!-- step 4 self call -->
+  <path d="M580,240 C650,240 650,270 580,270" stroke="var(--diagram-blue-stroke)" stroke-width="2" fill="none" marker-end="url(#gd-arr)"/>
+  <text x="658" y="248" font-family="monospace" font-size="11" fill="var(--diagram-blue-text)">④ 二维递归二分 ×26</text>
+  <text x="658" y="264" font-family="monospace" font-size="11" fill="var(--diagram-blue-text)">    interleave64(lat,lon)</text>
+
+  <!-- step 5 return -->
+  <path d="M580,300 L330,300" stroke="var(--diagram-orange-stroke)" stroke-width="2" stroke-dasharray="5 3" marker-end="url(#gd-arr-r)"/>
+  <text x="455" y="294" text-anchor="middle" font-family="monospace" font-size="11" fill="var(--diagram-orange-text)">⑤ return 52-bit hash</text>
+
+  <!-- step 6 zsetAdd -->
+  <path d="M330,330 L810,330" stroke="var(--diagram-blue-stroke)" stroke-width="2" marker-end="url(#gd-arr)"/>
+  <text x="570" y="324" text-anchor="middle" font-family="monospace" font-size="11" fill="var(--diagram-blue-text)">⑥ zsetAdd(key, (double)hash, member)</text>
+
+  <!-- step 7 return -->
+  <path d="M810,360 L330,360" stroke="var(--diagram-orange-stroke)" stroke-width="2" stroke-dasharray="5 3" marker-end="url(#gd-arr-r)"/>
+  <text x="570" y="354" text-anchor="middle" font-family="monospace" font-size="11" fill="var(--diagram-orange-text)">⑦ ADDED 1</text>
+
+  <!-- step 8 return to client -->
+  <path d="M330,400 L120,400" stroke="var(--diagram-orange-stroke)" stroke-width="2" stroke-dasharray="5 3" marker-end="url(#gd-arr-r)"/>
+  <text x="225" y="394" text-anchor="middle" font-family="monospace" font-size="11" fill="var(--diagram-orange-text)">⑧ (integer) 1</text>
+</svg>
+
+<h3>12.4.2 ZSet 中的 GEO 数据结构</h3>
+
+<p class="svg-title">图 12-4-2 · GEOADD 后 ZSet 的物理结构(纯 ZSet 复用)</p>
+<svg class="svg-diagram" viewBox="0 0 920 320" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="zs-zset" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-cyan-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <linearGradient id="zs-skip" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <linearGradient id="zs-dict" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-purple-fill-start)"/><stop offset="1" stop-color="var(--diagram-purple-fill-end)"/></linearGradient>
+  </defs>
+
+  <text x="20" y="24" font-size="14" font-weight="700" fill="var(--diagram-blue-text)">GEOADD bj 116.4074 39.9042 "tiananmen" → ZSet 物理表示</text>
+
+  <rect x="20" y="40" width="880" height="36" rx="6" fill="url(#zs-zset)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="460" y="62" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">ZSet bj (encoding = listpack 或 skiplist, 与普通 ZSet 完全一致)</text>
+
+  <!-- skiplist node -->
+  <rect x="20" y="92" width="430" height="140" rx="6" fill="url(#zs-skip)" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
+  <text x="235" y="116" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-blue-text)">skiplist 节点</text>
+  <line x1="40" y1="124" x2="430" y2="124" stroke="var(--diagram-blue-stroke)" opacity="0.3"/>
+  <text x="40" y="146" font-family="monospace" font-size="12" fill="var(--diagram-blue-text)">score  = 4069885821010416</text>
+  <text x="40" y="164" font-size="11" fill="var(--diagram-blue-text)">       (52 位 Geohash 整数, 装 double 尾数)</text>
+  <text x="40" y="190" font-family="monospace" font-size="12" fill="var(--diagram-blue-text)">member = "tiananmen" (sds)</text>
+  <text x="40" y="216" font-size="11" font-style="italic" fill="var(--diagram-blue-text)">按 score 排序的双向链表 + 跳表索引</text>
+
+  <!-- dict node -->
+  <rect x="470" y="92" width="430" height="140" rx="6" fill="url(#zs-dict)" stroke="var(--diagram-purple-stroke)"/>
+  <text x="685" y="116" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">dict 节点 (member → score 反查)</text>
+  <line x1="490" y1="124" x2="880" y2="124" stroke="var(--diagram-panel)" opacity="0.3"/>
+  <text x="490" y="146" font-family="monospace" font-size="12" fill="var(--diagram-text)">key   = "tiananmen" (sds)</text>
+  <text x="490" y="172" font-family="monospace" font-size="12" fill="var(--diagram-text)">value = 4069885821010416 (double)</text>
+  <text x="490" y="216" font-size="11" font-style="italic" fill="var(--diagram-text)">★ZSCORE / GEOPOS / GEODIST 走这里 O(1)</text>
+
+  <!-- Commands map -->
+  <rect x="20" y="246" width="880" height="64" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="40" y="266" font-size="12" font-weight="700" fill="var(--diagram-orange-text)">★ 命令读取路径:</text>
+  <text x="40" y="282" font-size="11" font-family="monospace" fill="var(--diagram-blue-text)">GEOPOS / GEOHASH → ZSCORE → 反解 lon/lat 或 base32 11 字符</text>
+  <text x="40" y="298" font-size="11" font-family="monospace" fill="var(--diagram-blue-text)">GEODIST → 2× ZSCORE → 反解 → Haversine ;  GEOSEARCH → 9× ZRANGEBYSCORE → 二次过滤</text>
+</svg>
+
+<h3>12.4.3 GEO 命令对应的 ZSet 操作</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 12-4-1 · GEO 命令的 ZSet 内部映射</div>
+  <table>
+    <thead><tr><th>GEO 命令</th><th>ZSet 内部操作</th><th>额外计算</th><th>复杂度</th></tr></thead>
+    <tbody>
+      <tr><td><code>GEOADD</code></td><td><code>ZADD</code></td><td>1 次 geohashEncode</td><td>O(log N)</td></tr>
+      <tr><td><code>GEOPOS</code></td><td><code>ZSCORE</code></td><td>1 次 geohashDecode</td><td>O(1)</td></tr>
+      <tr><td><code>GEODIST</code></td><td>2 次 <code>ZSCORE</code></td><td>2 次 decode + Haversine</td><td>O(1)</td></tr>
+      <tr><td><code>GEOSEARCH</code></td><td>9 次 <code>ZRANGEBYSCORE</code></td><td>step 推导 + Haversine 过滤</td><td>O(log N + M)</td></tr>
+      <tr><td><code>GEORADIUSBYMEMBER</code></td><td><code>ZSCORE</code> + GEOSEARCH</td><td>同上</td><td>O(log N + M)</td></tr>
+      <tr><td><code>GEOHASH</code></td><td><code>ZSCORE</code></td><td>转 11 字符 base32</td><td>O(1)</td></tr>
+      <tr><td><code>GEOSEARCHSTORE</code></td><td>GEOSEARCH + <code>ZADD</code></td><td>结果集存到 dst</td><td>O(log N + M)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p>GEO 命令本质是 ZSet 的<strong>语义封装</strong>,数据存储完全复用 ZSet 实现。<code>OBJECT ENCODING</code> 对 GEO key 返回 <code>"listpack"</code> 或 <code>"skiplist"</code>,与普通 ZSet 一致。这种"<strong>新命令族零新结构</strong>"的设计大幅降低了 GEO 的维护成本 — 持久化、复制、cluster 分片等所有机制都自动复用 ZSet 的实现。</p>
+
+<!-- ============================================================ -->
+<h2 id="s12-5">12.5 范围查询:9 邻居单元</h2>
+<!-- ============================================================ -->
+
+<p>这一节是 GEOSEARCH 的核心算法。从"圆形范围"转化到"9 个矩形并集",再转化到"9 次 ZRANGEBYSCORE",每一步都有取舍。掌握 step 推导与 9 邻居关系,才能解释为什么大半径查询会慢、为什么 step-1 安全裕量必要。</p>
+
+<h3>12.5.1 为什么需要查 9 个单元</h3>
+
+<p class="svg-title">图 12-5-1 · 圆形范围跨越单元边界 → 必须查 9 个邻居单元</p>
+<svg class="svg-diagram" viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="n9-c" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <linearGradient id="n9-neigh" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-cyan-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+  </defs>
+
+  <!-- 3x3 grid of cells -->
+  <g transform="translate(40, 40)">
+    <!-- top row -->
+    <rect x="0"   y="0"   width="120" height="120" fill="url(#n9-neigh)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/><text x="60"  y="64" text-anchor="middle" font-size="18" font-weight="700" fill="var(--diagram-text)">NW</text>
+    <rect x="120" y="0"   width="120" height="120" fill="url(#n9-neigh)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/><text x="180" y="64" text-anchor="middle" font-size="18" font-weight="700" fill="var(--diagram-text)">N</text>
+    <rect x="240" y="0"   width="120" height="120" fill="url(#n9-neigh)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/><text x="300" y="64" text-anchor="middle" font-size="18" font-weight="700" fill="var(--diagram-text)">NE</text>
+    <!-- middle row -->
+    <rect x="0"   y="120" width="120" height="120" fill="url(#n9-neigh)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/><text x="60"  y="184" text-anchor="middle" font-size="18" font-weight="700" fill="var(--diagram-text)">W</text>
+    <rect x="120" y="120" width="120" height="120" fill="url(#n9-c)"     stroke="var(--diagram-green-stroke)" stroke-width="3"/><text x="180" y="184" text-anchor="middle" font-size="20" font-weight="700" fill="var(--diagram-blue-text)">C</text>
+    <rect x="240" y="120" width="120" height="120" fill="url(#n9-neigh)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/><text x="300" y="184" text-anchor="middle" font-size="18" font-weight="700" fill="var(--diagram-text)">E</text>
+    <!-- bottom row -->
+    <rect x="0"   y="240" width="120" height="120" fill="url(#n9-neigh)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/><text x="60"  y="304" text-anchor="middle" font-size="18" font-weight="700" fill="var(--diagram-text)">SW</text>
+    <rect x="120" y="240" width="120" height="120" fill="url(#n9-neigh)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/><text x="180" y="304" text-anchor="middle" font-size="18" font-weight="700" fill="var(--diagram-text)">S</text>
+    <rect x="240" y="240" width="120" height="120" fill="url(#n9-neigh)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/><text x="300" y="304" text-anchor="middle" font-size="18" font-weight="700" fill="var(--diagram-text)">SE</text>
+
+    <!-- search circle and center P -->
+    <circle cx="220" cy="200" r="120" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)" stroke-width="3" stroke-dasharray="6 3"/>
+    <circle cx="220" cy="200" r="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/>
+    <text x="232" y="204" font-size="13" font-weight="700" fill="var(--diagram-orange-text)">P</text>
+  </g>
+
+  <!-- Annotations on right -->
+  <g transform="translate(440, 40)">
+    <rect x="0" y="0" width="460" height="60" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+    <text x="14" y="22" font-size="13" font-weight="700" fill="var(--diagram-green-text)">中心单元 C</text>
+    <text x="14" y="42" font-size="11" fill="var(--diagram-blue-text)">geohashEncode(P) 前 step 位 → C 的 Geohash 前缀</text>
+
+    <rect x="0" y="74" width="460" height="92" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="14" y="94" font-size="13" font-weight="700" fill="var(--diagram-blue-text)">8 个邻居单元</text>
+    <text x="14" y="114" font-size="11" fill="var(--diagram-blue-text)">N/S/E/W:lon 或 lat ±1</text>
+    <text x="14" y="132" font-size="11" fill="var(--diagram-blue-text)">NE/NW/SE/SW:对角线 ±1</text>
+    <text x="14" y="152" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">★ P 越靠近边/角, 圆越可能跨入邻居 — 必须 9 个全查</text>
+
+    <rect x="0" y="180" width="460" height="120" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="14" y="200" font-size="13" font-weight="700" fill="var(--diagram-orange-text)">工程取舍 ★ 过覆盖 + 二次过滤</text>
+    <text x="14" y="220" font-size="11" fill="var(--diagram-red-text)">9 矩形并集 ⊋ 圆 → 角点会拉进"圆外候选"</text>
+    <text x="14" y="240" font-size="11" fill="var(--diagram-blue-text)">→ §12.6 Haversine 精确距离过滤剔除</text>
+    <text x="14" y="266" font-size="11" font-weight="700" fill="var(--diagram-purple-text)">总开销:</text>
+    <text x="80" y="266" font-size="11" fill="var(--diagram-blue-text)">9× ZRANGEBYSCORE + M× Haversine</text>
+    <text x="14" y="284" font-size="11" fill="var(--diagram-blue-text)">M = 9 矩形并集内候选点数</text>
+
+    <rect x="0" y="314" width="460" height="58" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="14" y="334" font-size="12" font-weight="700" fill="var(--diagram-purple-text)">三种位置情况:</text>
+    <text x="14" y="352" font-size="10" fill="var(--diagram-blue-text)">A. P 在中心 → 单元已覆盖, 但仍走 9 cell(简化逻辑)</text>
+    <text x="14" y="366" font-size="10" fill="var(--diagram-blue-text)">B. P 在边缘 → 圆跨入 1-2 个相邻单元</text>
+  </g>
+</svg>
+
+<h3>12.5.2 GEOSEARCH 的查询步骤</h3>
+
+<p class="svg-title">图 12-5-2 · GEOSEARCH 完整流程</p>
+<svg class="svg-diagram" viewBox="0 0 920 560" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="gs-in" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-purple-fill-start)"/><stop offset="1" stop-color="var(--diagram-purple-fill-end)"/></linearGradient>
+    <linearGradient id="gs-step" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <linearGradient id="gs-mid" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-cyan-fill-start)"/><stop offset="1" stop-color="var(--diagram-cyan-fill-end)"/></linearGradient>
+    <linearGradient id="gs-hav" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-orange-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+    <linearGradient id="gs-ok" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <linearGradient id="gs-no" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+    <marker id="gs-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--diagram-blue-stroke)"/></marker>
+  </defs>
+
+  <rect x="280" y="14" width="360" height="50" rx="8" fill="url(#gs-in)" stroke="var(--diagram-purple-stroke)"/>
+  <text x="460" y="36" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">GEOSEARCH key FROMLONLAT lon lat</text>
+  <text x="460" y="54" text-anchor="middle" font-family="monospace" font-size="12" fill="var(--diagram-purple-text)">BYRADIUS r m</text>
+
+  <path d="M460,64 L460,90" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#gs-arr)"/>
+  <rect x="280" y="92" width="360" height="48" rx="6" fill="url(#gs-step)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="460" y="112" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">① 估算 step</text>
+  <text x="460" y="130" text-anchor="middle" font-family="monospace" font-size="11" fill="var(--diagram-blue-text)">step = log₂(2π·R / r) 取整</text>
+
+  <path d="M460,140 L460,166" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#gs-arr)"/>
+  <rect x="280" y="168" width="360" height="44" rx="6" fill="url(#gs-mid)" stroke="var(--diagram-cyan-stroke)"/>
+  <text x="460" y="186" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">② geohashEncode(lon,lat) 取前 step 位</text>
+  <text x="460" y="204" text-anchor="middle" font-size="10" fill="var(--diagram-cyan-text)">= 中心单元 hash 前缀</text>
+
+  <path d="M460,212 L460,238" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#gs-arr)"/>
+  <rect x="280" y="240" width="360" height="44" rx="6" fill="url(#gs-mid)" stroke="var(--diagram-cyan-stroke)"/>
+  <text x="460" y="258" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">③ 计算 8 邻居前缀</text>
+  <text x="460" y="276" text-anchor="middle" font-size="10" fill="var(--diagram-cyan-text)">N · S · E · W · NE · NW · SE · SW</text>
+
+  <path d="M460,284 L460,310" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#gs-arr)"/>
+  <rect x="220" y="312" width="480" height="50" rx="6" fill="url(#gs-mid)" stroke="var(--diagram-cyan-stroke)"/>
+  <text x="460" y="332" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">④ 9 × ZRANGEBYSCORE 收集候选</text>
+  <text x="460" y="350" text-anchor="middle" font-family="monospace" font-size="10" fill="var(--diagram-cyan-text)">low = prefix ≪ (52-step) · high = (prefix+1)≪... - 1</text>
+
+  <path d="M460,362 L460,388" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#gs-arr)"/>
+  <rect x="280" y="390" width="360" height="44" rx="6" fill="url(#gs-hav)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="460" y="408" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-blue-text)">⑤ Haversine 精确距离</text>
+  <text x="460" y="426" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">对每个候选 score → decode lon/lat → 计算 d</text>
+
+  <path d="M460,434 L460,460" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#gs-arr)"/>
+  <polygon points="460,464 530,494 460,524 390,494" fill="url(#gs-hav)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="460" y="492" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-blue-text)">d ≤ r ?</text>
+
+  <text x="370" y="500" text-anchor="end" font-size="11" font-weight="700" fill="var(--diagram-green-text)">是</text>
+  <path d="M390,494 L160,494" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#gs-arr)"/>
+  <rect x="20" y="476" width="140" height="40" rx="6" fill="url(#gs-ok)" stroke="var(--diagram-green-stroke)"/>
+  <text x="90" y="500" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">纳入结果 ✓</text>
+
+  <text x="550" y="500" font-size="11" font-weight="700" fill="var(--diagram-red-text)">否</text>
+  <path d="M530,494 L760,494" stroke="var(--diagram-red-stroke)" stroke-width="2" marker-end="url(#gs-arr)"/>
+  <rect x="760" y="476" width="140" height="40" rx="6" fill="url(#gs-no)" stroke="var(--diagram-red-stroke)"/>
+  <text x="830" y="500" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">丢弃 ✗</text>
+
+  <path d="M90,516 Q90,540 460,540" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none"/>
+  <path d="M830,516 Q830,540 460,540" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none"/>
+  <text x="460" y="556" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-blue-text)">⑥ 按距离排序 · 应用 COUNT · 返回客户端</text>
+</svg>
+
+<h3>12.5.3 9 邻居单元的 Geohash 前缀关系</h3>
+
+<p class="svg-title">图 12-5-3 · 邻居前缀的位运算计算(step=6 示例)</p>
+<svg class="svg-diagram" viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="np-c" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <linearGradient id="np-n" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-cyan-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+  </defs>
+
+  <!-- 3x3 grid showing prefixes -->
+  <g transform="translate(40, 40)">
+    <rect x="0"   y="0"   width="220" height="80" fill="url(#np-n)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/>
+    <text x="110" y="26" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">NW (lon-1, lat+1)</text>
+    <text x="110" y="56" text-anchor="middle" font-family="monospace" font-size="13" font-weight="700" fill="var(--diagram-text)">0b101010_010111</text>
+    <rect x="220" y="0"   width="220" height="80" fill="url(#np-n)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/>
+    <text x="330" y="26" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">N (lon, lat+1)</text>
+    <text x="330" y="56" text-anchor="middle" font-family="monospace" font-size="13" font-weight="700" fill="var(--diagram-text)">0b101011_010111</text>
+    <rect x="440" y="0"   width="220" height="80" fill="url(#np-n)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/>
+    <text x="550" y="26" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">NE (lon+1, lat+1)</text>
+    <text x="550" y="56" text-anchor="middle" font-family="monospace" font-size="13" font-weight="700" fill="var(--diagram-text)">0b101100_010111</text>
+
+    <rect x="0"   y="80"  width="220" height="80" fill="url(#np-n)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/>
+    <text x="110" y="106" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">W (lon-1, lat)</text>
+    <text x="110" y="136" text-anchor="middle" font-family="monospace" font-size="13" font-weight="700" fill="var(--diagram-text)">0b101010_010110</text>
+    <rect x="220" y="80"  width="220" height="80" fill="url(#np-c)" stroke="var(--diagram-green-stroke)" stroke-width="3"/>
+    <text x="330" y="106" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-blue-text)">C (lon, lat) ★ 中心</text>
+    <text x="330" y="136" text-anchor="middle" font-family="monospace" font-size="13" font-weight="700" fill="var(--diagram-blue-text)">0b101011_010110</text>
+    <rect x="440" y="80"  width="220" height="80" fill="url(#np-n)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/>
+    <text x="550" y="106" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">E (lon+1, lat)</text>
+    <text x="550" y="136" text-anchor="middle" font-family="monospace" font-size="13" font-weight="700" fill="var(--diagram-text)">0b101100_010110</text>
+
+    <rect x="0"   y="160" width="220" height="80" fill="url(#np-n)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/>
+    <text x="110" y="186" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">SW (lon-1, lat-1)</text>
+    <text x="110" y="216" text-anchor="middle" font-family="monospace" font-size="13" font-weight="700" fill="var(--diagram-text)">0b101010_010101</text>
+    <rect x="220" y="160" width="220" height="80" fill="url(#np-n)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/>
+    <text x="330" y="186" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">S (lon, lat-1)</text>
+    <text x="330" y="216" text-anchor="middle" font-family="monospace" font-size="13" font-weight="700" fill="var(--diagram-text)">0b101011_010101</text>
+    <rect x="440" y="160" width="220" height="80" fill="url(#np-n)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/>
+    <text x="550" y="186" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">SE (lon+1, lat-1)</text>
+    <text x="550" y="216" text-anchor="middle" font-family="monospace" font-size="13" font-weight="700" fill="var(--diagram-text)">0b101100_010101</text>
+  </g>
+
+  <!-- Right notes -->
+  <g transform="translate(720, 40)">
+    <rect x="0" y="0" width="180" height="100" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+    <text x="14" y="20" font-size="12" font-weight="700" fill="var(--diagram-green-text)">score 区间映射</text>
+    <text x="14" y="40" font-size="10" font-family="monospace" fill="var(--diagram-blue-text)">low  = prefix ≪ (52 - 12)</text>
+    <text x="14" y="56" font-size="10" font-family="monospace" fill="var(--diagram-blue-text)">high = (prefix+1)≪40 - 1</text>
+    <text x="14" y="76" font-size="10" fill="var(--diagram-blue-text)">ZRANGEBYSCORE low high</text>
+    <text x="14" y="92" font-size="10" font-weight="700" fill="var(--diagram-orange-text)">9 次 = O(log N + M)</text>
+
+    <rect x="0" y="116" width="180" height="124" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="14" y="136" font-size="12" font-weight="700" fill="var(--diagram-orange-text)">★ 跨步长边界处理</text>
+    <text x="14" y="156" font-size="10" fill="var(--diagram-red-text)">lon = 2^step - 1, +1 越界</text>
+    <text x="14" y="170" font-size="10" fill="var(--diagram-blue-text)">→ 映射回 0 (跨经度 180°)</text>
+    <text x="14" y="192" font-size="10" fill="var(--diagram-red-text)">lat 在最北/南边时</text>
+    <text x="14" y="206" font-size="10" fill="var(--diagram-blue-text)">→ 该方向邻居不存在</text>
+    <text x="14" y="226" font-size="10" font-style="italic" fill="var(--diagram-blue-text)">详见 §12.8</text>
+  </g>
+
+  <rect x="40" y="304" width="860" height="58" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+  <text x="60" y="324" font-size="12" font-weight="700" fill="var(--diagram-purple-text)">step=6 含义:</text>
+  <text x="170" y="324" font-size="12" fill="var(--diagram-blue-text)">Geohash 前 12 位(经/纬各 6 位) → 世界被切成 2^6 × 2^6 = 4096 个单元(赤道附近边长 ≈ 312 km)</text>
+  <text x="60" y="346" font-size="11" fill="var(--diagram-blue-text)">每方向 ±1 单元就是数值 ±1, 故 lon = 0b101011 加 1 = 0b101100 ; 减 1 = 0b101010(其他位不变)</text>
+</svg>
+
+<h3>12.5.4 半径与 step 对照</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 12-5-1 · 半径 r 与 step 的工程对照</div>
+  <table>
+    <thead><tr><th>半径 r</th><th>step(前缀位数)</th><th>单元尺寸(赤道)</th><th>9 单元覆盖范围</th><th>典型业务</th></tr></thead>
+    <tbody>
+      <tr><td>1 m</td><td>26</td><td>0.6 m</td><td>1.8 m</td><td>室内定位</td></tr>
+      <tr><td>10 m</td><td>22</td><td>9.6 m</td><td>28.8 m</td><td>共享单车锁定</td></tr>
+      <tr><td>100 m</td><td>19</td><td>75 m</td><td>225 m</td><td>近邻商家</td></tr>
+      <tr><td>1 km</td><td>16</td><td>600 m</td><td>1.8 km</td><td>外卖配送</td></tr>
+      <tr><td>10 km</td><td>12</td><td>9.6 km</td><td>28.8 km</td><td>城市出行</td></tr>
+      <tr><td>100 km</td><td>9</td><td>76 km</td><td>228 km</td><td>省内枢纽</td></tr>
+      <tr><td>1000 km</td><td>6</td><td>614 km</td><td>1842 km</td><td>跨国查询(不推荐)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p>step 的选取保证 9 单元(3×3)能完整覆盖以 P 为中心、半径 r 的圆。step 偏小会扫描过多候选浪费 CPU,偏大可能漏检边界点。<code>geohashEstimateStepsByRadius</code> 函数实现该计算,且<strong>主动减 1 作安全裕量</strong>(详见 §12.8)。</p>
+
+<!-- ============================================================ -->
+<h2 id="s12-6">12.6 Haversine 距离过滤</h2>
+<!-- ============================================================ -->
+
+<p>9 邻居单元给出的是<strong>矩形覆盖</strong>,而用户要的是<strong>圆形范围</strong>。这中间的差异由 Haversine 公式的二次过滤消除。这一节讲清 Haversine 的几何含义、为什么 Redis 选它而不是更精确的 Vincenty,以及该选择的误差预算。</p>
+
+<h3>12.6.1 Haversine 公式几何含义</h3>
+
+<p class="svg-title">图 12-6-1 · 球面两点之间的最短弧长 — Haversine 公式</p>
+<svg class="svg-diagram" viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="hv-globe" cx="0.4" cy="0.4" r="0.7"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></radialGradient>
+    <linearGradient id="hv-arc" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="var(--diagram-orange-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+  </defs>
+
+  <!-- Globe -->
+  <circle cx="180" cy="190" r="140" fill="url(#hv-globe)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/>
+  <!-- meridian -->
+  <ellipse cx="180" cy="190" rx="50" ry="140" fill="none" stroke="var(--diagram-blue-stroke)" stroke-dasharray="3 2"/>
+  <!-- equator -->
+  <ellipse cx="180" cy="190" rx="140" ry="40" fill="none" stroke="var(--diagram-blue-stroke)" stroke-dasharray="3 2"/>
+
+  <!-- Points A and B -->
+  <circle cx="118" cy="240" r="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/>
+  <text x="118" y="266" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-green-text)">A (φ₁, λ₁)</text>
+  <circle cx="240" cy="148" r="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/>
+  <text x="244" y="142" font-size="13" font-weight="700" fill="var(--diagram-red-text)">B (φ₂, λ₂)</text>
+
+  <!-- Great-circle arc -->
+  <path d="M 118,240 Q 175,160 240,148" stroke="url(#hv-arc)" stroke-width="3" fill="none"/>
+  <text x="180" y="180" font-size="13" font-weight="700" fill="var(--diagram-orange-text)">c = 弧长(角度)</text>
+
+  <!-- Right side: formulas + meaning -->
+  <g transform="translate(370, 30)">
+    <rect x="0" y="0" width="530" height="118" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="14" y="22" font-size="13" font-weight="700" fill="var(--diagram-orange-text)">Haversine 公式</text>
+    <text x="14" y="48" font-family="monospace" font-size="13" fill="var(--diagram-blue-text)">a = sin²(Δφ/2) + cos(φ₁)·cos(φ₂)·sin²(Δλ/2)</text>
+    <text x="14" y="70" font-family="monospace" font-size="13" fill="var(--diagram-blue-text)">c = 2 · atan2(√a, √(1−a))</text>
+    <text x="14" y="92" font-family="monospace" font-size="13" font-weight="700" fill="var(--diagram-green-text)">d = R · c</text>
+    <text x="14" y="110" font-size="10" fill="var(--diagram-blue-text)">R = 6 372 797.560856 m (WGS84 平均半径)</text>
+
+    <rect x="0" y="130" width="530" height="120" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+    <text x="14" y="150" font-size="13" font-weight="700" fill="var(--diagram-purple-text)">几何含义</text>
+    <text x="14" y="170" font-size="11" fill="var(--diagram-blue-text)">· sin²(Δφ/2) — 纬度差的"半弧弦长平方"</text>
+    <text x="14" y="186" font-size="11" fill="var(--diagram-blue-text)">· cos(φ₁)·cos(φ₂)·sin²(Δλ/2) — 经度差的同类项, cos(φ) 缩放因高纬度经度 1° 距离更短</text>
+    <text x="14" y="206" font-size="11" fill="var(--diagram-blue-text)">· a 是两点连线的半弦长平方(归一化单位球)</text>
+    <text x="14" y="222" font-size="11" fill="var(--diagram-blue-text)">· 2·atan2(√a, √(1−a)) 把弦长还原成弧长(角度)</text>
+    <text x="14" y="240" font-size="11" font-weight="700" fill="var(--diagram-green-text)">→ R · c 即真实大圆距离</text>
+
+    <rect x="0" y="262" width="530" height="68" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+    <text x="14" y="282" font-size="13" font-weight="700" fill="var(--diagram-green-text)">计算开销 ★ 主线程友好</text>
+    <text x="14" y="302" font-size="11" fill="var(--diagram-blue-text)">4× 三角函数(sin/cos/atan2)≈ 50 ns + 1× sqrt ≈ 10 ns</text>
+    <text x="14" y="320" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">总 ~100 ns / 次 → 单核 ~10⁷ 次/秒</text>
+  </g>
+</svg>
+
+<h3>12.6.2 矩形覆盖与圆形目标的差异</h3>
+
+<p class="svg-title">图 12-6-2 · GEOSEARCH 的两阶段过滤(粗 → 精)</p>
+<svg class="svg-diagram" viewBox="0 0 920 240" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="tp-step1" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <linearGradient id="tp-step2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-orange-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+    <linearGradient id="tp-step3" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+    <linearGradient id="tp-step4" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-orange-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+    <linearGradient id="tp-step5" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <marker id="tp-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--diagram-blue-stroke)"/></marker>
+  </defs>
+
+  <rect x="14" y="50" width="158" height="100" rx="8" fill="url(#tp-step1)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="93" y="80" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">GEOSEARCH</text>
+  <text x="93" y="100" text-anchor="middle" font-size="11" fill="var(--diagram-blue-text)">查 9 个</text>
+  <text x="93" y="116" text-anchor="middle" font-size="11" fill="var(--diagram-blue-text)">Geohash 单元</text>
+  <text x="93" y="138" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">O(log N + M_coarse)</text>
+
+  <path d="M172,100 L196,100" stroke="var(--diagram-blue-stroke)" stroke-width="2" marker-end="url(#tp-arr)"/>
+
+  <rect x="198" y="50" width="158" height="100" rx="8" fill="url(#tp-step2)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="277" y="80" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-blue-text)">合集是</text>
+  <text x="277" y="100" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-blue-text)">3×3 矩形</text>
+  <text x="277" y="120" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">边长 ≈ 3 × 单元尺寸</text>
+  <text x="277" y="138" text-anchor="middle" font-size="10" font-style="italic" fill="var(--diagram-red-text)">矩形 ⊋ 圆 → 过覆盖</text>
+
+  <path d="M356,100 L380,100" stroke="var(--diagram-blue-stroke)" stroke-width="2" marker-end="url(#tp-arr)"/>
+
+  <rect x="382" y="50" width="158" height="100" rx="8" fill="url(#tp-step3)" stroke="var(--diagram-red-stroke)"/>
+  <text x="461" y="80" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">矩形内含</text>
+  <text x="461" y="100" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">圆外 corner 点</text>
+  <text x="461" y="120" text-anchor="middle" font-size="10" fill="var(--diagram-red-text)">最远角 √2 × 单元</text>
+  <text x="461" y="138" text-anchor="middle" font-size="10" font-style="italic" fill="var(--diagram-red-text)">需二次过滤</text>
+
+  <path d="M540,100 L564,100" stroke="var(--diagram-blue-stroke)" stroke-width="2" marker-end="url(#tp-arr)"/>
+
+  <rect x="566" y="50" width="158" height="100" rx="8" fill="url(#tp-step4)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="645" y="80" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-blue-text)">Haversine 过滤</text>
+  <text x="645" y="100" text-anchor="middle" font-size="11" fill="var(--diagram-blue-text)">distance &gt; r 剔除</text>
+  <text x="645" y="120" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">~100 ns / 点</text>
+  <text x="645" y="138" text-anchor="middle" font-size="10" font-style="italic" fill="var(--diagram-orange-text)">主线程友好</text>
+
+  <path d="M724,100 L748,100" stroke="var(--diagram-blue-stroke)" stroke-width="2" marker-end="url(#tp-arr)"/>
+
+  <rect x="750" y="50" width="158" height="100" rx="8" fill="url(#tp-step5)" stroke="var(--diagram-green-stroke)"/>
+  <text x="829" y="80" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">精确圆形结果 ✓</text>
+  <text x="829" y="104" text-anchor="middle" font-size="11" fill="var(--diagram-green-text)">distance ≤ r 全部纳入</text>
+  <text x="829" y="124" text-anchor="middle" font-size="10" fill="var(--diagram-green-text)">误差仅来源</text>
+  <text x="829" y="138" text-anchor="middle" font-size="10" fill="var(--diagram-green-text)">double + 地球扁率</text>
+
+  <rect x="20" y="180" width="880" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+  <text x="40" y="200" font-size="13" font-weight="700" fill="var(--diagram-purple-text)">★ 设计哲学:</text>
+  <text x="150" y="200" font-size="12" fill="var(--diagram-blue-text)">先用 Geohash 快速裁剪 → 再用 Haversine 精确过滤 = <tspan font-weight="700" fill="var(--diagram-orange-text)">"先粗后细"两阶段</tspan></text>
+  <text x="40" y="216" font-size="11" fill="var(--diagram-blue-text)">如果跳过 Haversine,返回的是正方形近似结果(部分业务可接受),但 Redis 默认严格</text>
+</svg>
+
+<p>矩形覆盖与圆形目标之间的差异由 Haversine 过滤消除。该差异决定了 Geohash 范围查询是"<strong>先粗后细</strong>"的两阶段过程,Geohash 仅用于裁剪候选集,<strong>不直接给出距离</strong>。如果跳过 Haversine 直接返回 9 矩形内的点,你会得到正方形的近似结果(很多业务场景实际可接受,但 Redis 默认严格)。</p>
+
+<h3>12.6.3 Haversine 与其他距离公式对比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 12-6-1 · 球面距离公式精度对比</div>
+  <table>
+    <thead><tr><th>公式</th><th>地球假设</th><th>误差(&lt; 1 km)</th><th>误差(&gt; 1000 km)</th><th>计算开销</th></tr></thead>
+    <tbody>
+      <tr><td>平面欧几里得</td><td>平面</td><td>&lt; 1 m</td><td>数百 km</td><td>1×</td></tr>
+      <tr><td><strong>Haversine</strong></td><td><strong>球面</strong></td><td><strong>&lt; 0.5 m</strong></td><td><strong>&lt; 5 km(地球扁率)</strong></td><td><strong>3×</strong></td></tr>
+      <tr><td>Vincenty</td><td>椭球面(WGS84)</td><td>&lt; 0.01 m</td><td>&lt; 1 m</td><td>100× 迭代</td></tr>
+      <tr><td>Andoyer-Lambert</td><td>椭球面近似</td><td>&lt; 0.1 m</td><td>&lt; 100 m</td><td>10×</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key-insight">
+  <strong>为什么 Redis 选 Haversine 而非 Vincenty</strong>:① 1 km 内误差 &lt; 1 m,远低于 GPS 自身精度;② Vincenty 需迭代收敛,每次 GEODIST 增加 ~100× CPU,在高频 LBS 场景会拖累 P99;③ 即使长距离 5 km 误差,业务对绝对距离误差容忍度高(找 1000 km 外的设施时,差 5 km 不影响决策)。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-7">12.7 误差与精度边界</h2>
+<!-- ============================================================ -->
+
+<p>GEO 查询的最终误差来自三个累积源:Geohash 单元化、double 精度、Haversine 球面假设。这一节把每一项误差画清楚,并给出常见业务场景的误差预算 — 让你能在面试或设计评审时清晰回答"GEO 距离准吗?"</p>
+
+<h3>12.7.1 三层误差源</h3>
+
+<p class="svg-title">图 12-7-1 · GEO 距离的三层误差来源</p>
+<svg class="svg-diagram" viewBox="0 0 920 400" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="er-root" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-purple-fill-start)"/><stop offset="1" stop-color="var(--diagram-purple-fill-end)"/></linearGradient>
+    <linearGradient id="er-src1" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <linearGradient id="er-src2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-cyan-fill-start)"/><stop offset="1" stop-color="var(--diagram-cyan-fill-end)"/></linearGradient>
+    <linearGradient id="er-src3" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-orange-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+    <linearGradient id="er-ok" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <linearGradient id="er-bad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+    <linearGradient id="er-leaf" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <marker id="er-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--diagram-blue-stroke)"/></marker>
+  </defs>
+
+  <rect x="320" y="14" width="280" height="50" rx="8" fill="url(#er-root)" stroke="var(--diagram-purple-stroke)"/>
+  <text x="460" y="42" text-anchor="middle" font-size="14" font-weight="700" fill="var(--diagram-text)">GEO 距离总误差</text>
+  <text x="460" y="58" text-anchor="middle" font-size="11" fill="var(--diagram-purple-text)">三源累积 · 量级差 ≈ 4 个数量级</text>
+
+  <path d="M380,64 L160,108" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#er-arr)"/>
+  <path d="M460,64 L460,108" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#er-arr)"/>
+  <path d="M540,64 L760,108" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#er-arr)"/>
+
+  <rect x="20" y="110" width="280" height="44" rx="6" fill="url(#er-src1)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="160" y="132" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">源 ① Geohash 单元化</text>
+  <text x="160" y="148" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">52 位 = 0.6 m × 0.6 m</text>
+
+  <rect x="320" y="110" width="280" height="44" rx="6" fill="url(#er-src2)" stroke="var(--diagram-cyan-stroke)"/>
+  <text x="460" y="132" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">源 ② double 精度</text>
+  <text x="460" y="148" text-anchor="middle" font-size="10" fill="var(--diagram-cyan-text)">IEEE 754 双精度 + 三角函数</text>
+
+  <rect x="620" y="110" width="280" height="44" rx="6" fill="url(#er-src3)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="760" y="132" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-blue-text)">源 ③ Haversine 球面</text>
+  <text x="760" y="148" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">地球扁率 0.3% 偏差</text>
+
+  <path d="M100,154 L100,188" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#er-arr)"/>
+  <path d="M220,154 L220,266" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#er-arr)"/>
+  <rect x="20" y="192" width="280" height="62" rx="6" fill="url(#er-ok)" stroke="var(--diagram-green-stroke)"/>
+  <text x="160" y="216" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">52-bit 单元 0.6 m → ±0.3 m</text>
+  <text x="160" y="234" text-anchor="middle" font-size="10" fill="var(--diagram-green-text)">远低于 GPS 精度</text>
+  <text x="160" y="248" text-anchor="middle" font-size="10" font-weight="700" fill="var(--diagram-orange-text)">✓ 城市级 LBS 完全够用</text>
+
+  <rect x="20" y="270" width="280" height="60" rx="6" fill="url(#er-leaf)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="160" y="292" text-anchor="middle" font-size="11" fill="var(--diagram-blue-text)">搜索 r=10 km 时 step=12</text>
+  <text x="160" y="308" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">单元 9.6 km · 误差 ±5 km</text>
+  <text x="160" y="324" text-anchor="middle" font-size="10" font-style="italic" fill="var(--diagram-orange-text)">由 §12.6 Haversine 二次过滤修正</text>
+
+  <path d="M400,154 L400,188" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#er-arr)"/>
+  <path d="M520,154 L520,266" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#er-arr)"/>
+  <rect x="320" y="192" width="280" height="62" rx="6" fill="url(#er-ok)" stroke="var(--diagram-green-stroke)"/>
+  <text x="460" y="216" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">52 位整数装入 double</text>
+  <text x="460" y="234" text-anchor="middle" font-size="10" fill="var(--diagram-green-text)">尾数 52 位完全匹配</text>
+  <text x="460" y="248" text-anchor="middle" font-size="10" font-weight="700" fill="var(--diagram-orange-text)">✓ 无精度损失</text>
+
+  <rect x="320" y="270" width="280" height="60" rx="6" fill="url(#er-leaf)" stroke="var(--diagram-cyan-stroke)"/>
+  <text x="460" y="292" text-anchor="middle" font-size="11" fill="var(--diagram-cyan-text)">Haversine 三角函数</text>
+  <text x="460" y="308" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">双精度累计误差 &lt; 1e-9</text>
+  <text x="460" y="324" text-anchor="middle" font-size="10" font-style="italic" fill="var(--diagram-orange-text)">可忽略</text>
+
+  <path d="M700,154 L700,188" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#er-arr)"/>
+  <path d="M820,154 L820,266" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#er-arr)"/>
+  <rect x="620" y="192" width="280" height="62" rx="6" fill="url(#er-leaf)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="760" y="216" text-anchor="middle" font-size="11" fill="var(--diagram-orange-text)">赤道半径 vs 极半径</text>
+  <text x="760" y="234" text-anchor="middle" font-size="10" fill="var(--diagram-orange-text)">相差 0.3% (约 21 km)</text>
+  <text x="760" y="248" text-anchor="middle" font-size="10" font-style="italic" fill="var(--diagram-blue-text)">Redis 取平均半径 R</text>
+
+  <rect x="620" y="270" width="280" height="60" rx="6" fill="url(#er-bad)" stroke="var(--diagram-red-stroke)"/>
+  <text x="760" y="292" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-red-text)">长距离 10 000 km</text>
+  <text x="760" y="308" text-anchor="middle" font-size="10" fill="var(--diagram-red-text)">最大误差 ≈ 21 km (0.2%)</text>
+  <text x="760" y="324" text-anchor="middle" font-size="10" font-style="italic" fill="var(--diagram-orange-text)">✗ 全球查询不推荐用 Haversine</text>
+
+  <rect x="20" y="350" width="880" height="40" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+  <text x="40" y="370" font-size="12" font-weight="700" fill="var(--diagram-purple-text)">★ 结论:</text>
+  <text x="120" y="370" font-size="11" fill="var(--diagram-blue-text)">总误差 ≈ max(单元化, 球面假设) — 100 km 内总误差 &lt; 100 m, 远低于 GPS 输入精度 (5-10 m)</text>
+</svg>
+
+<h3>12.7.2 不同距离场景的误差预算</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 12-7-1 · 常见 LBS 场景误差预算</div>
+  <table>
+    <thead><tr><th>场景</th><th>半径 r</th><th>Geohash 误差</th><th>Haversine 误差</th><th>总误差</th><th>用户感知</th></tr></thead>
+    <tbody>
+      <tr><td>找附近 1 km 商家</td><td>1 km</td><td>±0.3 m</td><td>&lt; 1 m</td><td>&lt; 2 m</td><td>无感</td></tr>
+      <tr><td>找附近 10 km 商家</td><td>10 km</td><td>±0.3 m</td><td>&lt; 10 m</td><td>&lt; 11 m</td><td>无感</td></tr>
+      <tr><td>找省内 100 km 设施</td><td>100 km</td><td>±0.3 m</td><td>&lt; 100 m</td><td>&lt; 101 m</td><td>无感</td></tr>
+      <tr><td>跨国 1 000 km</td><td>1 000 km</td><td>±0.3 m</td><td>&lt; 5 km</td><td>&lt; 5 km</td><td>0.5% 误差,业务可接受</td></tr>
+      <tr><td>极端 10 000 km</td><td>10 000 km</td><td>±0.3 m</td><td>&lt; 21 km</td><td>&lt; 21 km</td><td>0.2% 误差(地球半径方向)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p>对消费级 LBS,Geohash + Haversine 的精度<strong>远高于 GPS 自身定位精度</strong>(消费 GPS 5-10 m,工业 GPS 1-3 m,RTK GNSS 厘米级)。所以 GEO 距离的最大误差源是 GPS 输入,而不是 Redis 的算法。</p>
+
+<!-- ============================================================ -->
+<h2 id="s12-8">12.8 跨步长与跨经度 180 度</h2>
+<!-- ============================================================ -->
+
+<h3>12.8.1 跨经度 180° 的边界</h3>
+
+<p class="svg-title">图 12-8-1 · 国际日期变更线附近的 Geohash 不连续</p>
+<svg class="svg-diagram" viewBox="0 0 920 320" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="dl-west" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-cyan-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <linearGradient id="dl-east" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-purple-fill-start)"/><stop offset="1" stop-color="var(--diagram-purple-fill-end)"/></linearGradient>
+    <marker id="dl-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--diagram-orange-stroke)"/></marker>
+  </defs>
+
+  <text x="20" y="24" font-size="14" font-weight="700" fill="var(--diagram-blue-text)">经度 180° 附近 — Z-order 在此处"折断"</text>
+
+  <!-- west half (positive) -->
+  <rect x="20" y="40" width="420" height="80" rx="6" fill="url(#dl-west)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="230" y="64" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">lon = 179.99 (东侧)</text>
+  <text x="230" y="86" text-anchor="middle" font-family="monospace" font-size="12" fill="var(--diagram-cyan-text)">Geohash 前 1 位 = 1</text>
+  <text x="230" y="106" text-anchor="middle" font-size="11" fill="var(--diagram-cyan-text)">前缀 1xxx… (东半球)</text>
+
+  <circle cx="450" cy="80" r="14" fill="var(--diagram-orange-fill)" stroke="var(--diagram-blue-stroke)" stroke-width="3"/>
+  <text x="450" y="86" text-anchor="middle" font-size="14" font-weight="700" fill="var(--diagram-blue-text)">±180°</text>
+
+  <rect x="480" y="40" width="420" height="80" rx="6" fill="url(#dl-east)" stroke="var(--diagram-purple-stroke)"/>
+  <text x="690" y="64" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">lon = -179.99 (西侧)</text>
+  <text x="690" y="86" text-anchor="middle" font-family="monospace" font-size="12" fill="var(--diagram-purple-text)">Geohash 前 1 位 = 0</text>
+  <text x="690" y="106" text-anchor="middle" font-size="11" fill="var(--diagram-purple-text)">前缀 0xxx… (西半球)</text>
+
+  <path d="M280,130 Q450,160 620,130" stroke="var(--diagram-orange-stroke)" stroke-width="2" stroke-dasharray="4 3" fill="none" marker-end="url(#dl-arr)"/>
+  <text x="450" y="156" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-orange-text)">物理距离 ≈ 2.2 km · 前缀完全不同</text>
+
+  <rect x="20" y="180" width="430" height="124" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="40" y="202" font-size="13" font-weight="700" fill="var(--diagram-orange-text)">Redis 处理 — 经度回绕</text>
+  <text x="40" y="222" font-size="11" font-family="monospace" fill="var(--diagram-blue-text)">east_lon = lon + cell_size</text>
+  <text x="40" y="240" font-size="11" font-family="monospace" fill="var(--diagram-blue-text)">if east_lon &gt; 180:</text>
+  <text x="40" y="256" font-size="11" font-family="monospace" fill="var(--diagram-green-text)">    east_lon = east_lon - 360   ★ 回绕</text>
+  <text x="40" y="278" font-size="11" fill="var(--diagram-blue-text)">见 <tspan font-family="monospace" fill="var(--diagram-orange-text)">geohashGetCoordRange / geohashEstimateStepsByRadius</tspan></text>
+  <text x="40" y="296" font-size="11" fill="var(--diagram-blue-text)">"邻居"列表自动包含跨边界单元 → 太平洋业务无感知</text>
+
+  <rect x="470" y="180" width="430" height="124" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+  <text x="490" y="202" font-size="13" font-weight="700" fill="var(--diagram-red-text)">纬度边界 — 不回绕(无北极/南极通道)</text>
+  <text x="490" y="222" font-size="11" font-family="monospace" fill="var(--diagram-blue-text)">north_lat = lat + cell_size</text>
+  <text x="490" y="240" font-size="11" font-family="monospace" fill="var(--diagram-blue-text)">if north_lat &gt; 85.05:</text>
+  <text x="490" y="256" font-size="11" font-family="monospace" fill="var(--diagram-orange-text)">    ★ 不存在北邻居, 不回绕</text>
+  <text x="490" y="278" font-size="11" fill="var(--diagram-red-text)">只查可用的 ≤ 8 个邻居</text>
+  <text x="490" y="296" font-size="11" fill="var(--diagram-blue-text)">极地附近 GEO 业务场景极少, 工程上接受此简化</text>
+</svg>
+
+<h3>12.8.2 跨步长导致的"边界漏检"</h3>
+
+<p class="svg-title">图 12-8-2 · step 临界处的圆超出 9 单元的情形</p>
+<svg class="svg-diagram" viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="step-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-purple-fill-start)"/><stop offset="1" stop-color="var(--diagram-purple-fill-end)"/></linearGradient>
+    <linearGradient id="step-blue" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <linearGradient id="step-amber" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-orange-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+    <linearGradient id="step-green" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <marker id="step-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--diagram-blue-stroke)"/></marker>
+  </defs>
+
+  <rect x="350" y="20" width="220" height="50" rx="8" fill="url(#step-purple)" stroke="var(--diagram-purple-stroke)"/>
+  <text x="460" y="42" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">搜索 P · 半径 r = 1 km</text>
+  <text x="460" y="60" text-anchor="middle" font-size="11" fill="var(--diagram-purple-text)">step = 16, 单元尺寸 ≈ 600 m</text>
+
+  <path d="M460,72 L460,92" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#step-arr)"/>
+
+  <polygon points="460,100 530,135 460,170 390,135" fill="url(#step-amber)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="460" y="132" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-blue-text)">P 在角点?</text>
+  <text x="460" y="148" text-anchor="middle" font-size="11" fill="var(--diagram-blue-text)">(等价于"超出 9 格")</text>
+
+  <text x="340" y="138" text-anchor="end" font-size="11" font-weight="700" fill="var(--diagram-green-text)">否</text>
+  <path d="M388,135 L210,135" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#step-arr)"/>
+
+  <rect x="20" y="115" width="180" height="60" rx="6" fill="url(#step-green)" stroke="var(--diagram-green-stroke)"/>
+  <text x="110" y="138" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">3×3 = 9 单元覆盖</text>
+  <text x="110" y="155" text-anchor="middle" font-size="10" fill="var(--diagram-green-text)">r=1 km 圆 ⊆ 1.8 km 矩形 ✓</text>
+  <text x="110" y="170" text-anchor="middle" font-size="10" fill="var(--diagram-green-text)">9 单元足够</text>
+
+  <text x="580" y="138" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">是</text>
+  <path d="M532,135 L710,135" stroke="var(--diagram-orange-stroke)" stroke-width="2" marker-end="url(#step-arr)"/>
+
+  <rect x="710" y="105" width="190" height="80" rx="6" fill="url(#step-blue)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="805" y="124" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">验算最远角距离</text>
+  <text x="805" y="142" text-anchor="middle" font-family="monospace" font-size="11" fill="var(--diagram-blue-text)">d = √2 × 600 m</text>
+  <text x="805" y="158" text-anchor="middle" font-family="monospace" font-size="11" fill="var(--diagram-blue-text)">  ≈ 848 m</text>
+  <text x="805" y="176" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">vs. r = 1000 m</text>
+
+  <path d="M805,186 L805,210" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#step-arr)"/>
+
+  <polygon points="805,218 870,253 805,288 740,253" fill="url(#step-amber)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="805" y="250" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-blue-text)">d &lt; r ?</text>
+  <text x="805" y="266" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">(848 &lt; 1000)</text>
+
+  <text x="730" y="258" text-anchor="end" font-size="11" font-weight="700" fill="var(--diagram-red-text)">是</text>
+  <path d="M740,253 L380,253" stroke="var(--diagram-red-stroke)" stroke-width="2" marker-end="url(#step-arr)"/>
+
+  <rect x="20" y="220" width="360" height="80" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+  <text x="200" y="244" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-red-text)">step - 1 安全裕量, 扩大重查</text>
+  <text x="200" y="264" text-anchor="middle" font-size="11" fill="var(--diagram-red-text)">单元 1.2 km · 9 单元 = 3.6 km 矩形</text>
+  <text x="200" y="284" text-anchor="middle" font-size="11" fill="var(--diagram-red-text)">代价: 候选集放大 2×2 = 4 倍</text>
+
+  <text x="870" y="276" text-anchor="start" font-size="11" font-weight="700" fill="var(--diagram-green-text)">否</text>
+  <path d="M850,288 L850,330" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#step-arr)"/>
+
+  <rect x="730" y="330" width="170" height="50" rx="6" fill="url(#step-green)" stroke="var(--diagram-green-stroke)"/>
+  <text x="815" y="354" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">9 单元足够 ✓</text>
+  <text x="815" y="370" text-anchor="middle" font-size="10" fill="var(--diagram-green-text)">无放大代价</text>
+
+  <path d="M200,300 Q200,400 460,400" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none"/>
+  <path d="M815,380 Q815,400 460,400" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none"/>
+  <rect x="380" y="395" width="160" height="40" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="460" y="420" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-blue-text)">END · 返回过滤后结果</text>
+</svg>
+
+<p>Redis 在 <code>geohashEstimateStepsByRadius</code> 中<strong>主动对 step 减 1 用作安全边界</strong>:多扫描一些候选换取边界点不漏检。该策略的代价是高频 GEOSEARCH 的 CPU 开销略大,但漏检会引发业务数据缺失,实现上选择"<strong>宁多扫不漏检</strong>"。</p>
+
+<h3>12.8.3 边界陷阱与处理</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 12-8-1 · GEO 边界场景与 Redis 应对</div>
+  <table>
+    <thead><tr><th>边界场景</th><th>触发条件</th><th>Redis 处理</th><th>业务影响</th></tr></thead>
+    <tbody>
+      <tr><td>跨经度 180°</td><td>太平洋中部业务(斐济 / 新西兰东侧)</td><td><code>geohashGetCoordRange</code> 映射回 -180 侧</td><td>无</td></tr>
+      <tr><td>跨纬度 85.05°</td><td>极地业务(科考 / 极光)</td><td>限制纬度 ±85.05°,GEOADD 报错</td><td>极地坐标无法 GEOADD</td></tr>
+      <tr><td>圆跨多个 step</td><td>半径处于 step 临界值</td><td>step - 1 安全裕量,候选集放大 4×</td><td>CPU 开销略大</td></tr>
+      <tr><td>大圆 r &gt; 万 km</td><td>全球查询</td><td>step 取得很小,候选集巨大</td><td>不推荐用 GEO 实现</td></tr>
+      <tr><td>跨赤道</td><td>南北半球边界</td><td>无特殊处理(纬度 0 自然过渡)</td><td>无</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-9">12.9 GEO 命令实战</h2>
+<!-- ============================================================ -->
+
+<h3>12.9.1 GEO 命令族语法树</h3>
+
+<p class="svg-title">图 12-9-1 · GEO 命令族全景</p>
+<svg class="svg-diagram" viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="gx-root" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-purple-fill-start)"/><stop offset="1" stop-color="var(--diagram-purple-fill-end)"/></linearGradient>
+    <linearGradient id="gx-write" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <linearGradient id="gx-read" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-cyan-fill-start)"/><stop offset="1" stop-color="var(--diagram-cyan-fill-end)"/></linearGradient>
+    <linearGradient id="gx-search" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <linearGradient id="gx-leaf" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <linearGradient id="gx-dep" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+    <linearGradient id="gx-best" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <marker id="gx-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--diagram-blue-stroke)"/></marker>
+  </defs>
+
+  <rect x="380" y="14" width="160" height="44" rx="8" fill="url(#gx-root)" stroke="var(--diagram-purple-stroke)"/>
+  <text x="460" y="42" text-anchor="middle" font-size="14" font-weight="700" fill="var(--diagram-text)">GEO 命令族</text>
+
+  <path d="M460,58 L160,90" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none" marker-end="url(#gx-arr)"/>
+  <path d="M460,58 L460,90" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none" marker-end="url(#gx-arr)"/>
+  <path d="M460,58 L760,90" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none" marker-end="url(#gx-arr)"/>
+
+  <rect x="90" y="92" width="140" height="40" rx="6" fill="url(#gx-write)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="160" y="118" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">写命令</text>
+
+  <rect x="390" y="92" width="140" height="40" rx="6" fill="url(#gx-read)" stroke="var(--diagram-cyan-stroke)"/>
+  <text x="460" y="118" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">读命令</text>
+
+  <rect x="690" y="92" width="140" height="40" rx="6" fill="url(#gx-search)" stroke="var(--diagram-green-stroke)"/>
+  <text x="760" y="118" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">范围查询</text>
+
+  <path d="M160,132 L160,158" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#gx-arr)"/>
+  <rect x="20" y="160" width="280" height="58" rx="6" fill="url(#gx-leaf)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="160" y="182" text-anchor="middle" font-family="monospace" font-size="12" font-weight="700" fill="var(--diagram-blue-text)">GEOADD key [NX|XX] [CH]</text>
+  <text x="160" y="200" text-anchor="middle" font-family="monospace" font-size="11" fill="var(--diagram-blue-text)">lon lat member [lon lat member ...]</text>
+  <text x="160" y="214" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">写入坐标 → ZSet score</text>
+
+  <path d="M420,132 L350,158" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#gx-arr)"/>
+  <path d="M460,132 L460,158" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#gx-arr)"/>
+  <path d="M500,132 L570,158" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#gx-arr)"/>
+
+  <rect x="320" y="160" width="180" height="58" rx="6" fill="url(#gx-leaf)" stroke="var(--diagram-cyan-stroke)"/>
+  <text x="410" y="180" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="var(--diagram-cyan-text)">GEOPOS key member ...</text>
+  <text x="410" y="198" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">→ (lon, lat) 数组</text>
+  <text x="410" y="212" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">decode 一轮</text>
+
+  <rect x="500" y="160" width="160" height="58" rx="6" fill="url(#gx-leaf)" stroke="var(--diagram-cyan-stroke)"/>
+  <text x="580" y="180" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="var(--diagram-cyan-text)">GEODIST k m1 m2</text>
+  <text x="580" y="198" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">→ Haversine 距离</text>
+  <text x="580" y="212" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">球面直线, 非道路</text>
+
+  <rect x="320" y="232" width="320" height="48" rx="6" fill="url(#gx-leaf)" stroke="var(--diagram-cyan-stroke)"/>
+  <text x="480" y="252" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="var(--diagram-cyan-text)">GEOHASH key member ...</text>
+  <text x="480" y="270" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">→ 11 位 base32 字符串 (跨系统交换友好)</text>
+
+  <path d="M730,132 L660,158" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#gx-arr)"/>
+  <path d="M760,132 L760,158" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#gx-arr)"/>
+  <path d="M790,132 L860,158" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#gx-arr)"/>
+
+  <rect x="660" y="160" width="240" height="120" rx="6" fill="url(#gx-best)" stroke="var(--diagram-green-stroke)"/>
+  <text x="780" y="180" text-anchor="middle" font-family="monospace" font-size="12" font-weight="700" fill="var(--diagram-text)">GEOSEARCH key</text>
+  <text x="780" y="198" text-anchor="middle" font-family="monospace" font-size="10" fill="var(--diagram-green-text)">FROMMEMBER | FROMLONLAT</text>
+  <text x="780" y="212" text-anchor="middle" font-family="monospace" font-size="10" fill="var(--diagram-green-text)">BYRADIUS | BYBOX</text>
+  <text x="780" y="226" text-anchor="middle" font-family="monospace" font-size="10" fill="var(--diagram-green-text)">[ASC|DESC] [COUNT n]</text>
+  <text x="780" y="240" text-anchor="middle" font-family="monospace" font-size="10" fill="var(--diagram-green-text)">[WITHCOORD][WITHDIST][WITHHASH]</text>
+  <text x="780" y="262" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">★ 7.0+ 推荐</text>
+
+  <rect x="660" y="295" width="240" height="50" rx="6" fill="url(#gx-leaf)" stroke="var(--diagram-green-stroke)"/>
+  <text x="780" y="316" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="var(--diagram-green-text)">GEOSEARCHSTORE dst src ...</text>
+  <text x="780" y="334" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">结果存 dst, 可叠加 ZSet 命令</text>
+
+  <rect x="660" y="358" width="240" height="58" rx="6" fill="url(#gx-dep)" stroke="var(--diagram-red-stroke)"/>
+  <text x="780" y="378" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="var(--diagram-red-text)">GEORADIUS / BYMEMBER</text>
+  <text x="780" y="396" text-anchor="middle" font-size="10" fill="var(--diagram-red-text)">7.0 标记 deprecated</text>
+  <text x="780" y="410" text-anchor="middle" font-size="10" fill="var(--diagram-red-text)">迁移至 GEOSEARCH</text>
+</svg>
+
+<h3>12.9.2 GEOSEARCH 典型用法</h3>
+
+<pre><code class="language-bash">127.0.0.1:6379&gt; GEOADD store 116.4074 39.9042 "wangfujing" \
+    116.3974 39.9087 "xidan" \
+    116.4669 39.9120 "guomao" \
+    116.3219 39.8991 "fuxingmen"
+(integer) 4
+
+# 以 (116.4, 39.9) 为中心,半径 5 km,按距离升序,带坐标 + 距离,只返回前 3 个
+127.0.0.1:6379&gt; GEOSEARCH store FROMLONLAT 116.4 39.9 BYRADIUS 5 km ASC \
+    WITHCOORD WITHDIST COUNT 3
+1) 1) "wangfujing"
+   2) "0.7042"
+   3) 1) "116.40739679336547852"
+      2) "39.90419988335741460"
+2) 1) "xidan"
+   2) "0.4310"
+   3) 1) "116.39740109443664551"
+      2) "39.90869949486710858"
+3) 1) "fuxingmen"
+   2) "7.6491"
+   3) 1) "116.32189542055130005"
+      2) "39.89909941062907321"
+
+# 两点之间距离
+127.0.0.1:6379&gt; GEODIST store wangfujing xidan km
+"0.9281"
+
+# 11 位 base32 表示(便于跨系统交换)
+127.0.0.1:6379&gt; GEOHASH store wangfujing
+1) "wx4g0bxe940"
+
+# 反查坐标(经过 encode/decode 一轮,精度损失 ~0.5 m)
+127.0.0.1:6379&gt; GEOPOS store wangfujing
+1) 1) "116.40739679336547852"
+   2) "39.90419988335741460"
+
+# BYBOX:矩形范围而非圆形
+127.0.0.1:6379&gt; GEOSEARCH store FROMLONLAT 116.4 39.9 BYBOX 10 5 km ASC
+1) "xidan"
+2) "wangfujing"
+3) "guomao"</code></pre>
+
+<p><code>GEOHASH</code> 返回的 11 位 base32 字符串与 Redis 内部 52 位整数互补:<strong>base32 表示便于跨系统交换</strong>(URL / API / 日志友好),52 位整数用于内部 ZSet score。</p>
+
+<h3>12.9.3 GEOSEARCH 选项速查</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 12-9-1 · GEOSEARCH 关键选项</div>
+  <table>
+    <thead><tr><th>选项</th><th>含义</th><th>默认行为</th><th>性能影响</th></tr></thead>
+    <tbody>
+      <tr><td><code>FROMMEMBER</code></td><td>以已有 member 坐标为中心</td><td>—</td><td>+1 次 ZSCORE</td></tr>
+      <tr><td><code>FROMLONLAT</code></td><td>以指定 (lon, lat) 为中心</td><td>—</td><td>无</td></tr>
+      <tr><td><code>BYRADIUS r [m|km|mi|ft]</code></td><td>圆形范围</td><td>—</td><td>9 单元扫描</td></tr>
+      <tr><td><code>BYBOX w h [m|km|mi|ft]</code></td><td>矩形范围</td><td>—</td><td>类似 9 单元</td></tr>
+      <tr><td><code>ASC / DESC</code></td><td>按距离升序 / 降序</td><td>不排序</td><td>+ O(M log M) 排序</td></tr>
+      <tr><td><code>COUNT n [ANY]</code></td><td>限制返回条数(ANY = 早停)</td><td>不限</td><td>ANY 可大幅加速</td></tr>
+      <tr><td><code>WITHCOORD</code></td><td>返回经纬度</td><td>否</td><td>+ M 次 decode</td></tr>
+      <tr><td><code>WITHDIST</code></td><td>返回距离</td><td>否</td><td>已在过滤阶段计算,~0 增量</td></tr>
+      <tr><td><code>WITHHASH</code></td><td>返回 52 位整数 hash</td><td>否</td><td>~0 增量</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-10">12.10 与传统空间索引对比</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">表 12-10-1 · GEO 方案的工程对比</div>
+  <table>
+    <thead><tr><th>方案</th><th>索引结构</th><th>查询复杂度</th><th>维护开销</th><th>范围查询</th><th>多边形</th><th>适用场景</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Redis GEO</strong></td><td>ZSet + Geohash</td><td>O(log N + M)</td><td>O(log N)</td><td>优秀</td><td>不支持</td><td>实时 LBS,&lt; 100 万点</td></tr>
+      <tr><td>PostgreSQL PostGIS</td><td>GiST + R-tree</td><td>O(log N + M)</td><td>O(log N)</td><td>优秀</td><td>优秀(任意几何)</td><td>复杂 GIS 查询</td></tr>
+      <tr><td>MongoDB 2dsphere</td><td>B-tree + Geohash</td><td>O(log N + M)</td><td>O(log N)</td><td>优秀</td><td>支持</td><td>地理 + 文档混合</td></tr>
+      <tr><td>MySQL SPATIAL</td><td>R-tree</td><td>O(log N + M)</td><td>O(log N)</td><td>优秀</td><td>支持</td><td>关系数据 + 空间</td></tr>
+      <tr><td>Elasticsearch geo_point</td><td>BKD-tree</td><td>O(log N + M)</td><td>O(log N)</td><td>优秀</td><td>支持</td><td>检索 + 地理混合</td></tr>
+      <tr><td>业务自维护 grid index</td><td>hashmap</td><td>O(1)</td><td>O(1)</td><td>一般</td><td>复杂</td><td>极高 QPS,固定网格</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key-insight">
+  <strong>选型建议</strong>:Redis GEO 的优势在于 <strong>ZSet 复用</strong> + <strong>亚毫秒级延迟</strong> + <strong>零额外索引</strong>,劣势在于 <strong>9 单元矩形过查会扫多余候选</strong>、<strong>大半径性能下降</strong>、<strong>不支持多边形</strong>。需要海量数据 + 复杂空间查询(多边形相交、k-NN)时,仍应使用 PostGIS / MongoDB / Elasticsearch。Redis GEO 的甜点场景是"<strong>百万级点的近邻 + 圆形 / 矩形范围查询</strong>"。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-11">12.11 陷阱速查</h2>
+<!-- ============================================================ -->
+
+<h3>12.11.1 陷阱分类</h3>
+
+<p class="svg-title">图 12-11-1 · GEO 陷阱 8 种分类</p>
+<svg class="svg-diagram" viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="pit-root" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+    <linearGradient id="pit-cat" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-orange-fill-start)"/><stop offset="1" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+    <linearGradient id="pit-leaf" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <marker id="pit-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--diagram-blue-stroke)"/></marker>
+  </defs>
+
+  <rect x="390" y="14" width="140" height="44" rx="8" fill="url(#pit-root)" stroke="var(--diagram-red-stroke)"/>
+  <text x="460" y="42" text-anchor="middle" font-size="14" font-weight="700" fill="var(--diagram-text)">GEO 陷阱 (8)</text>
+
+  <path d="M420,58 L120,98" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none" marker-end="url(#pit-arr)"/>
+  <path d="M440,58 L350,98" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none" marker-end="url(#pit-arr)"/>
+  <path d="M480,58 L570,98" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none" marker-end="url(#pit-arr)"/>
+  <path d="M500,58 L800,98" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none" marker-end="url(#pit-arr)"/>
+
+  <rect x="40" y="100" width="180" height="42" rx="6" fill="url(#pit-cat)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="130" y="126" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">数据精度类</text>
+
+  <rect x="260" y="100" width="180" height="42" rx="6" fill="url(#pit-cat)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="350" y="126" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">性能边界类</text>
+
+  <rect x="480" y="100" width="180" height="42" rx="6" fill="url(#pit-cat)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="570" y="126" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">命令语义类</text>
+
+  <rect x="700" y="100" width="180" height="42" rx="6" fill="url(#pit-cat)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="790" y="126" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">集群支持类</text>
+
+  <path d="M100,142 L100,170" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#pit-arr)"/>
+  <path d="M160,142 L160,240" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#pit-arr)"/>
+  <rect x="20" y="172" width="200" height="60" rx="6" fill="url(#pit-leaf)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="120" y="196" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">① 极地坐标无法存储</text>
+  <text x="120" y="216" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">lat ∉ [-85.05, 85.05]</text>
+  <rect x="20" y="242" width="200" height="60" rx="6" fill="url(#pit-leaf)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="120" y="266" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">② 误用 GEODIST = 路径</text>
+  <text x="120" y="286" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">Haversine 是直线距离</text>
+
+  <path d="M320,142 L320,170" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#pit-arr)"/>
+  <path d="M380,142 L380,240" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#pit-arr)"/>
+  <rect x="240" y="172" width="200" height="60" rx="6" fill="url(#pit-leaf)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="340" y="196" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">③ 大半径覆盖巨大</text>
+  <text x="340" y="216" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">9 单元矩形 ≫ 圆</text>
+  <rect x="240" y="242" width="200" height="60" rx="6" fill="url(#pit-leaf)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="340" y="266" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">④ ZRANGE 扫描放大</text>
+  <text x="340" y="286" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">候选过多 → CPU 高</text>
+
+  <path d="M540,142 L540,170" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#pit-arr)"/>
+  <path d="M600,142 L600,240" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#pit-arr)"/>
+  <rect x="460" y="172" width="200" height="60" rx="6" fill="url(#pit-leaf)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="560" y="196" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">⑤ 半径单位默认 m</text>
+  <text x="560" y="216" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">5 → 5 m 而非 5 km</text>
+  <rect x="460" y="242" width="200" height="60" rx="6" fill="url(#pit-leaf)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="560" y="266" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">⑥ GEORADIUS deprecated</text>
+  <text x="560" y="286" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">7.x+ 用 GEOSEARCH</text>
+
+  <path d="M760,142 L760,170" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#pit-arr)"/>
+  <path d="M820,142 L820,240" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#pit-arr)"/>
+  <rect x="680" y="172" width="220" height="60" rx="6" fill="url(#pit-leaf)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="790" y="196" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">⑦ 跨 slot 不可 STORE</text>
+  <text x="790" y="216" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">CROSSSLOT error</text>
+  <rect x="680" y="242" width="220" height="60" rx="6" fill="url(#pit-leaf)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="790" y="266" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">⑧ 多 GEO key 不同 slot</text>
+  <text x="790" y="286" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">用 hash tag {geo}:cn</text>
+</svg>
+
+<h3>12.11.2 陷阱明细</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 12-11-1 · GEO 8 大陷阱</div>
+  <table>
+    <thead><tr><th>#</th><th>陷阱</th><th>症状</th><th>根因</th><th>修复</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>极地坐标无法 GEOADD</td><td>"value is not a valid float"</td><td>限制 lat ∈ [-85.05, 85.05]</td><td>业务避开极地或自行扩展编码</td></tr>
+      <tr><td>2</td><td>GEODIST 当成驾车距离</td><td>UI 显示距离与导航不符</td><td>Haversine 是球面直线,非道路</td><td>引入路径规划服务做二次计算</td></tr>
+      <tr><td>3</td><td>大半径(&gt; 1000 km)查询慢</td><td>GEOSEARCH 耗时 100+ ms</td><td>9 单元覆盖范围大,ZRANGEBYSCORE 扫描多</td><td>限制查询半径,或预过滤行政区</td></tr>
+      <tr><td>4</td><td>ZRANGEBYSCORE 候选过多</td><td>RDB / AOF 慢,内存放大</td><td>M 大,Haversine 二次过滤 CPU 高</td><td>缩小半径或加 <code>COUNT</code></td></tr>
+      <tr><td>5</td><td>半径单位混淆</td><td>半径写 5 实际是 5 m,业务以为 5 km</td><td>GEOSEARCH 默认 m,GEORADIUS 同</td><td>显式写 unit,如 <code>BYRADIUS 5 km</code></td></tr>
+      <tr><td>6</td><td>旧命令 GEORADIUS</td><td>7.x 后已 deprecated 警告</td><td>命令拆分简化为 GEOSEARCH</td><td>迁移到 GEOSEARCH</td></tr>
+      <tr><td>7</td><td>集群下 GEOSEARCHSTORE 失败</td><td>CROSSSLOT error</td><td>dst 与 src 不在同 slot</td><td>用 hash tag 强制同 slot</td></tr>
+      <tr><td>8</td><td>多 GEO key 不在同 slot</td><td>同上</td><td>默认按 key 计算 slot</td><td>用 <code>{geo}:cn</code>、<code>{geo}:us</code></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>12.11.3 反例:用 GEODIST 代替路径规划</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4>错误:把 GEODIST 当导航距离</h4>
+<pre><code class="language-python">dist = redis.geodist("stores", "user_loc", "shop_A", "km")
+display(f"距离您 {dist} km,预计配送 8 分钟")</code></pre>
+    <ul>
+      <li><strong>症状</strong>:UI 显示 2.3 km / 配送 8 分钟,实际驾车 4.5 km / 配送 20 分钟</li>
+      <li><strong>根因</strong>:Haversine 是地球表面的"鸟飞路线" — 不考虑道路、河流、建筑、单行线、限行</li>
+      <li><strong>绕道系数</strong>:市内配送 1.3-1.8 倍, 山地 / 老城区可达 2.5 倍</li>
+      <li><strong>结果</strong>:GEODIST 严重低估真实出行距离 → 用户投诉、配送超时</li>
+    </ul>
+  </div>
+  <div class="compare-good">
+    <h4>修复:GEO 做粗筛,导航做精算</h4>
+<pre><code class="language-python"># 阶段 1 — Redis GEO 粗筛 O(log N + M)
+candidates = redis.geosearch(
+    "stores",
+    fromlonlat=(lon, lat),
+    radius=5, unit="km",
+    withcoord=True, count=50,
+)
+
+# 阶段 2 — 路径规划服务精算 (≤ 50 次)
+for shop in candidates:
+    route = navi.route(user_loc, shop.coord, mode="driving")
+    if route.distance &lt; 3000:
+        valid.append((shop, route))</code></pre>
+    <ul>
+      <li><strong>阶段 1</strong>:Redis 完成 O(log N) 粗筛, 不依赖外部 API</li>
+      <li><strong>阶段 2</strong>:导航 API 只算 ≤ 50 次, 而非全表</li>
+      <li><strong>排序</strong>:按真实驾车距离排序, 用户体验贴近现实</li>
+      <li><strong>降级</strong>:导航 API 故障时退回 Haversine, 在 UI 提示"估算"</li>
+  - 真实距离展示准确
+  - 用户体验提升</code></pre>
+  </div>
+</div>
+
+<h3>12.11.4 反例:不在同 slot 的 GEOSEARCHSTORE</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4>错误:cluster 下默认 key 不同 slot</h4>
+<pre><code class="language-bash"># Redis Cluster 6 节点环境
+127.0.0.1:7001&gt; GEOADD stores 116.4 39.9 "shop_A"
+(integer) 1
+
+127.0.0.1:7001&gt; GEOSEARCHSTORE result stores \
+    FROMLONLAT 116.4 39.9 BYRADIUS 5 km
+(error) CROSSSLOT Keys in request don't hash to the
+        same slot
+
+# 失败原因:
+# - "result" 计算 slot = 5398 (节点 7001)
+# - "stores" 计算 slot = 12539 (节点 7003)
+# 两 key 不在同节点,store 操作无法跨节点</code></pre>
+  </div>
+  <div class="compare-good">
+    <h4>修复:hash tag 强制同 slot</h4>
+<pre><code class="language-bash"># 用 {geo} 标签让 slot 计算只看 {} 内的部分
+127.0.0.1:7001&gt; GEOADD '{geo}:stores' 116.4 39.9 "shop_A"
+(integer) 1
+
+127.0.0.1:7001&gt; GEOSEARCHSTORE '{geo}:result' \
+    '{geo}:stores' \
+    FROMLONLAT 116.4 39.9 BYRADIUS 5 km
+(integer) 1   # ✓ 成功
+
+# 原理:
+# - "{geo}:stores" → slot 算 "geo" → 同 slot
+# - "{geo}:result" → slot 算 "geo" → 同 slot
+# - 两 key 必在同节点,STORE 操作可执行
+
+# 业务约定:同业务的 GEO key 共用 hash tag
+# {geo:cn}:beijing, {geo:cn}:shanghai → 同 slot
+# {geo:us}:nyc, {geo:us}:la → 另一 slot</code></pre>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s12-12">12.12 源码深潜</h2>
+<!-- ============================================================ -->
+
+<h3>12.12.1 GEO 命令调用链</h3>
+
+<p class="svg-title">图 12-12-1 · GEOSEARCH 完整调用链</p>
+<svg class="svg-diagram" viewBox="0 0 920 540" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="src-root" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <linearGradient id="src-cmd" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-purple-fill-start)"/><stop offset="1" stop-color="var(--diagram-purple-fill-end)"/></linearGradient>
+    <linearGradient id="src-enc" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <linearGradient id="src-hav" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-orange-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+    <linearGradient id="src-ok" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <linearGradient id="src-leaf" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <marker id="src-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--diagram-blue-stroke)"/></marker>
+  </defs>
+
+  <rect x="320" y="14" width="280" height="50" rx="8" fill="url(#src-root)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="460" y="36" text-anchor="middle" font-family="monospace" font-size="12" fill="var(--diagram-text)">src/server.c · processCommand()</text>
+  <text x="460" y="54" text-anchor="middle" font-size="11" fill="var(--diagram-blue-text)">命令派发入口</text>
+
+  <path d="M380,64 L160,98" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#src-arr)"/>
+  <path d="M460,64 L460,98" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#src-arr)"/>
+  <path d="M540,64 L760,98" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#src-arr)"/>
+
+  <rect x="20" y="100" width="280" height="46" rx="6" fill="url(#src-cmd)" stroke="var(--diagram-purple-stroke)"/>
+  <text x="160" y="124" text-anchor="middle" font-family="monospace" font-size="12" font-weight="700" fill="var(--diagram-text)">geoaddCommand()</text>
+  <text x="160" y="140" text-anchor="middle" font-size="10" fill="var(--diagram-purple-text)">src/geo.c — GEOADD</text>
+
+  <rect x="320" y="100" width="280" height="46" rx="6" fill="url(#src-cmd)" stroke="var(--diagram-purple-stroke)"/>
+  <text x="460" y="124" text-anchor="middle" font-family="monospace" font-size="12" font-weight="700" fill="var(--diagram-text)">geosearchCommand()</text>
+  <text x="460" y="140" text-anchor="middle" font-size="10" fill="var(--diagram-purple-text)">src/geo.c — GEOSEARCH ★</text>
+
+  <rect x="620" y="100" width="280" height="46" rx="6" fill="url(#src-cmd)" stroke="var(--diagram-purple-stroke)"/>
+  <text x="760" y="124" text-anchor="middle" font-family="monospace" font-size="12" font-weight="700" fill="var(--diagram-text)">geodistCommand()</text>
+  <text x="760" y="140" text-anchor="middle" font-size="10" fill="var(--diagram-purple-text)">src/geo.c — GEODIST</text>
+
+  <!-- geoadd path -->
+  <path d="M160,146 L160,180" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#src-arr)"/>
+  <rect x="20" y="184" width="280" height="46" rx="6" fill="url(#src-enc)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="160" y="208" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="var(--diagram-text)">geohashEncode(lat, lon)</text>
+  <text x="160" y="224" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">src/geohash.c</text>
+
+  <path d="M160,230 L160,260" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#src-arr)"/>
+  <rect x="20" y="264" width="280" height="46" rx="6" fill="url(#src-enc)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="160" y="288" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="var(--diagram-text)">interleave64(latbits, lonbits)</text>
+  <text x="160" y="304" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">src/util.c</text>
+
+  <path d="M160,310 L160,340" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#src-arr)"/>
+  <rect x="20" y="344" width="280" height="40" rx="6" fill="url(#src-leaf)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="160" y="368" text-anchor="middle" font-family="monospace" font-size="11" fill="var(--diagram-blue-text)">zaddCommand 复用</text>
+
+  <!-- geosearch path -->
+  <path d="M460,146 L460,180" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#src-arr)"/>
+  <rect x="320" y="184" width="280" height="46" rx="6" fill="url(#src-enc)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="460" y="206" text-anchor="middle" font-family="monospace" font-size="10" font-weight="700" fill="var(--diagram-text)">geohashGetAreasByRadiusWGS84()</text>
+  <text x="460" y="222" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">推导 step · 计算 9 hash 区间</text>
+
+  <path d="M460,230 L460,260" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#src-arr)"/>
+  <rect x="320" y="264" width="280" height="46" rx="6" fill="url(#src-leaf)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="460" y="288" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="var(--diagram-text)">membersOfAllNeighbors()</text>
+  <text x="460" y="304" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">9× zrangeGenericCommand()</text>
+
+  <path d="M460,310 L460,340" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#src-arr)"/>
+  <rect x="320" y="344" width="280" height="50" rx="6" fill="url(#src-hav)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="460" y="366" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="var(--diagram-blue-text)">geoAppendIfWithinShape()</text>
+  <text x="460" y="384" text-anchor="middle" font-size="11" fill="var(--diagram-blue-text)">Haversine 二次过滤 ★</text>
+
+  <path d="M460,394 L460,420" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#src-arr)"/>
+  <rect x="320" y="424" width="280" height="44" rx="6" fill="url(#src-leaf)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="460" y="446" text-anchor="middle" font-size="11" fill="var(--diagram-blue-text)">按距离排序 + COUNT 截断</text>
+  <text x="460" y="462" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">qsort 或 partial sort</text>
+
+  <path d="M460,468 L460,492" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#src-arr)"/>
+  <rect x="360" y="496" width="200" height="36" rx="6" fill="url(#src-ok)" stroke="var(--diagram-green-stroke)"/>
+  <text x="460" y="520" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-text)">返回客户端</text>
+
+  <!-- geodist path -->
+  <path d="M760,146 L760,180" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#src-arr)"/>
+  <rect x="620" y="184" width="280" height="46" rx="6" fill="url(#src-enc)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="760" y="206" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="var(--diagram-text)">2× zsetScore()</text>
+  <text x="760" y="222" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">取两 member 的 52-bit hash</text>
+
+  <path d="M760,230 L760,260" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#src-arr)"/>
+  <rect x="620" y="264" width="280" height="46" rx="6" fill="url(#src-enc)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="760" y="286" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="var(--diagram-text)">geohashDecode() ×2</text>
+  <text x="760" y="304" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">52-bit → (lon, lat) 反解</text>
+
+  <path d="M760,310 L760,340" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#src-arr)"/>
+  <rect x="620" y="344" width="280" height="50" rx="6" fill="url(#src-hav)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="760" y="366" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="var(--diagram-blue-text)">geohashGetDistance()</text>
+  <text x="760" y="384" text-anchor="middle" font-size="11" fill="var(--diagram-blue-text)">Haversine R·c</text>
+
+  <path d="M760,394 Q760,500 580,514" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none" marker-end="url(#src-arr)"/>
+  <path d="M160,384 Q160,500 340,514" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none" marker-end="url(#src-arr)"/>
+</svg>
+
+<h3>12.12.2 核心源码入口</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 12-12-1 · GEO 源码地图</div>
+  <table>
+    <thead><tr><th>源码文件</th><th>关键函数</th><th>职责</th></tr></thead>
+    <tbody>
+      <tr><td><code>src/geo.c</code></td><td><code>geoaddCommand()</code></td><td>GEOADD 命令实现</td></tr>
+      <tr><td><code>src/geo.c</code></td><td><code>geosearchCommand()</code></td><td>GEOSEARCH 主入口</td></tr>
+      <tr><td><code>src/geo.c</code></td><td><code>geoposCommand()</code></td><td>GEOPOS 反解坐标</td></tr>
+      <tr><td><code>src/geo.c</code></td><td><code>geodistCommand()</code></td><td>GEODIST + Haversine</td></tr>
+      <tr><td><code>src/geo.c</code></td><td><code>membersOfAllNeighbors()</code></td><td>9 邻居 hash 区间收集</td></tr>
+      <tr><td><code>src/geo.c</code></td><td><code>geoAppendIfWithinShape()</code></td><td>Haversine 距离过滤</td></tr>
+      <tr><td><code>src/geohash.c</code></td><td><code>geohashEncode</code> / <code>geohashDecode</code></td><td>52 位编解码</td></tr>
+      <tr><td><code>src/geohash.c</code></td><td><code>geohashGetCoordRange()</code></td><td>经纬度 → 单元边界</td></tr>
+      <tr><td><code>src/geohash_helper.c</code></td><td><code>geohashEstimateStepsByRadius()</code></td><td>半径 → step 推导</td></tr>
+      <tr><td><code>src/geohash_helper.c</code></td><td><code>geohashGetDistance()</code></td><td>Haversine 距离实现</td></tr>
+      <tr><td><code>src/util.c</code></td><td><code>interleave64</code> / <code>deinterleave64</code></td><td>位交错位运算</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>12.12.3 geohashEncode 关键代码</h3>
+
+<pre><code class="language-c">/* src/geohash.c — 简化版 */
+
+#define GEO_LAT_MIN  -85.05112878
+#define GEO_LAT_MAX   85.05112878
+#define GEO_LONG_MIN -180.0
+#define GEO_LONG_MAX  180.0
+
+int geohashEncode(const GeoHashRange *long_range,
+                  const GeoHashRange *lat_range,
+                  double longitude, double latitude,
+                  uint8_t step, GeoHashBits *hash) {
+    /* 1. 越界检查 */
+    if (longitude > 180.0 || longitude < -180.0 ||
+        latitude > 85.05112878 || latitude < -85.05112878) {
+        return 0;
+    }
+
+    hash->bits = 0;
+    hash->step = step;
+
+    /* 2. 把经纬度归一化到 [0, 1) */
+    double lat_offset =
+        (latitude - lat_range->min) /
+        (lat_range->max - lat_range->min);
+    double long_offset =
+        (longitude - long_range->min) /
+        (long_range->max - long_range->min);
+
+    /* 3. 缩放到 [0, 2^step) 整数 */
+    lat_offset  *= (1ULL << step);
+    long_offset *= (1ULL << step);
+
+    /* 4. 位交错: lat 占奇数位,lon 占偶数位 */
+    hash->bits = interleave64(lat_offset, long_offset);
+    return 1;
+}
+
+/* Haversine 实现 (src/geohash_helper.c) */
+double geohashGetDistance(double lon1d, double lat1d,
+                          double lon2d, double lat2d) {
+    double lat1r = deg_rad(lat1d);
+    double lat2r = deg_rad(lat2d);
+    double u = sin((lat2r - lat1r) / 2);
+    double v = sin((deg_rad(lon2d - lon1d)) / 2);
+    double a = u * u + cos(lat1r) * cos(lat2r) * v * v;
+    return 2.0 * EARTH_RADIUS_IN_METERS *
+           asin(sqrt(a));
+}
+
+/* ★ 关键不变量:
+ *   1. interleave64 的输入必须是已经缩放到 [0, 2^step) 的整数
+ *   2. step ≤ 26,否则结果超出 52 位无法装 double
+ *   3. Haversine 的 EARTH_RADIUS = 6372797.560856 m (WGS84 平均)
+ */</code></pre>
+
+<h3>12.12.4 设计取舍</h3>
+
+<p class="svg-title">图 12-12-2 · GEO 数据结构选型决策树</p>
+<svg class="svg-diagram" viewBox="0 0 920 560" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="dt-need" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-purple-fill-start)"/><stop offset="1" stop-color="var(--diagram-purple-fill-end)"/></linearGradient>
+    <linearGradient id="dt-q" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-orange-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+    <linearGradient id="dt-bad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+    <linearGradient id="dt-warn" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+    <linearGradient id="dt-ok" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <linearGradient id="dt-mid" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <marker id="dt-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="var(--diagram-blue-stroke)"/></marker>
+  </defs>
+
+  <rect x="280" y="14" width="360" height="54" rx="8" fill="url(#dt-need)" stroke="var(--diagram-purple-stroke)"/>
+  <text x="460" y="36" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">需求</text>
+  <text x="460" y="56" text-anchor="middle" font-size="11" fill="var(--diagram-purple-text)">二维坐标 + 范围查询 + Redis 集成</text>
+
+  <path d="M460,68 L460,92" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#dt-arr)"/>
+  <polygon points="460,100 590,140 460,180 330,140" fill="url(#dt-q)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="460" y="138" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-blue-text)">是否需要</text>
+  <text x="460" y="156" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-blue-text)">新建数据结构?</text>
+
+  <text x="280" y="138" text-anchor="end" font-size="11" font-weight="700" fill="var(--diagram-red-text)">是</text>
+  <path d="M330,140 L160,140" stroke="var(--diagram-red-stroke)" stroke-width="2" marker-end="url(#dt-arr)"/>
+  <rect x="20" y="118" width="140" height="44" rx="6" fill="url(#dt-bad)" stroke="var(--diagram-red-stroke)"/>
+  <text x="90" y="138" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-text)">R-tree/Quadtree</text>
+  <text x="90" y="154" text-anchor="middle" font-size="10" fill="var(--diagram-red-text)">额外 O(N) 内存 ✗</text>
+
+  <text x="650" y="138" font-size="11" font-weight="700" fill="var(--diagram-green-text)">否 · 复用</text>
+  <path d="M590,140 L760,140" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#dt-arr)"/>
+
+  <polygon points="760,100 880,140 760,180 640,140" fill="url(#dt-q)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="760" y="138" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-blue-text)">哪种映射?</text>
+  <text x="760" y="154" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">(保留邻近性)</text>
+
+  <path d="M760,180 L760,210" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#dt-arr)"/>
+  <text x="630" y="218" font-size="10" fill="var(--diagram-red-text)">字典序</text>
+  <text x="760" y="218" text-anchor="middle" font-size="10" font-weight="700" fill="var(--diagram-green-text)">Z-order ★</text>
+  <text x="880" y="218" text-anchor="end" font-size="10" fill="var(--diagram-orange-text)">Hilbert</text>
+
+  <path d="M640,200 L500,228" stroke="var(--diagram-red-stroke)" stroke-width="1.5" fill="none" marker-end="url(#dt-arr)"/>
+  <rect x="380" y="232" width="200" height="44" rx="6" fill="url(#dt-bad)" stroke="var(--diagram-red-stroke)"/>
+  <text x="480" y="252" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-text)">不可行</text>
+  <text x="480" y="268" text-anchor="middle" font-size="10" fill="var(--diagram-red-text)">整数跳变破坏邻近</text>
+
+  <rect x="660" y="232" width="200" height="44" rx="6" fill="url(#dt-ok)" stroke="var(--diagram-green-stroke)"/>
+  <text x="760" y="252" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-text)">interleave64 O(1)</text>
+  <text x="760" y="268" text-anchor="middle" font-size="10" fill="var(--diagram-green-text)">4 mask + 4 shift</text>
+
+  <path d="M880,200 L900,228" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" fill="none"/>
+  <rect x="900" y="0" width="0" height="0"/>
+  <!-- Hilbert leaf positioned right side -->
+  <line x1="880" y1="180" x2="880" y2="232" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" stroke-dasharray="3 2"/>
+  <text x="910" y="252" text-anchor="end" font-size="9" fill="var(--diagram-orange-text)">Hilbert: 编码 5× 慢</text>
+
+  <path d="M760,276 L760,304" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#dt-arr)"/>
+  <polygon points="760,310 880,350 760,390 640,350" fill="url(#dt-q)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="760" y="348" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-blue-text)">精度位数?</text>
+
+  <path d="M640,350 L500,350" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#dt-arr)"/>
+  <text x="570" y="344" text-anchor="middle" font-size="10" fill="var(--diagram-red-text)">32 位</text>
+  <rect x="320" y="328" width="180" height="44" rx="6" fill="url(#dt-bad)" stroke="var(--diagram-red-stroke)"/>
+  <text x="410" y="348" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-text)">精度 ~10 m</text>
+  <text x="410" y="364" text-anchor="middle" font-size="10" fill="var(--diagram-red-text)">城市级 LBS 不够</text>
+
+  <path d="M880,350 L900,350" stroke="var(--diagram-blue-stroke)" stroke-width="1.5"/>
+  <text x="824" y="402" text-anchor="middle" font-size="10" fill="var(--diagram-orange-text)">64 位</text>
+  <rect x="640" y="404" width="240" height="44" rx="6" fill="url(#dt-warn)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="760" y="424" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">超出 double 尾数</text>
+  <text x="760" y="440" text-anchor="middle" font-size="10" fill="var(--diagram-orange-text)">需自定义 score, 增加复杂度</text>
+
+  <path d="M760,390 L760,410" stroke="var(--diagram-blue-stroke)" stroke-width="1.5"/>
+  <text x="760" y="404" text-anchor="middle" font-size="10" font-weight="700" fill="var(--diagram-green-text)">52 位 ★</text>
+
+  <path d="M760,448 L460,490" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#dt-arr)"/>
+  <rect x="200" y="490" width="520" height="56" rx="8" fill="url(#dt-ok)" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
+  <text x="460" y="514" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-text)">★ Redis 选择 = Z-order + 26+26=52 位 + Haversine 二次过滤</text>
+  <text x="460" y="534" text-anchor="middle" font-size="11" fill="var(--diagram-green-text)">零额外索引 · 完美装入 double · 0.6 m 精度</text>
+</svg>
+
+<h4>取舍 1:9 邻居代替 R-tree</h4>
+
+<p>R-tree 提供更紧凑的范围查询(只需 O(log N) 棵子树),但需要额外 O(N) 内存维护索引节点。9 邻居方案完全复用 ZSet 的 skiplist,无额外内存,代价是查询时多扫 ~9× 候选。Redis 选择前者契合"<strong>轻量、零额外索引</strong>"原则 — 一个 GEO key 与一个普通 ZSet key 在内存占用上完全相同。</p>
+
+<h4>取舍 2:Haversine 而非 Vincenty</h4>
+
+<p>Haversine 假设球面,Vincenty 用 WGS84 椭球面更精确。Redis 选择 Haversine:1 km 范围内误差 &lt; 1 m,超过 GPS 精度,且 Vincenty 的迭代计算开销(每次 GEODIST 增加 ~100×)在高频 LBS 场景下显著拖累 P99。<strong>对绝大多数业务,Haversine 的"足够准 + 100× 快"是更好的选择</strong>。</p>
+
+<h4>取舍 3:固定 26+26 = 52 位精度</h4>
+
+<p>Redis 不开放 Geohash 位数配置:52 位完美装入 double 尾数 52 位,无精度丢失;同时 0.6 m 精度对消费级 LBS 充足。可配置反而增加 PFMERGE 类问题(两 GEO key 合并需位数一致),工程上不划算。这与第 14 章 HyperLogLog 不开放精度配置的逻辑一致 — <strong>把可调参数转化为算法不变量,降低使用复杂度</strong>。</p>
+
+<!-- ============================================================ -->
+<h2 id="s12-summary">12.13 本章要点</h2>
+<!-- ============================================================ -->
+
+<div class="chapter-summary">
+
+<h3>关键事实</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 12-13-1 · Geohash 关键事实速查</div>
+  <table>
+    <thead><tr><th>要点</th><th>源码 / 命令依据</th><th>易错点</th></tr></thead>
+    <tbody>
+      <tr><td>Geohash 用位交错构造 Z-order 一维序</td><td><code>interleave64</code></td><td>不是字典序拼接</td></tr>
+      <tr><td>52 位精度 0.6 m</td><td><code>geohashEncode</code> 中 26+26</td><td>高于 GPS 自身精度,无需扩展</td></tr>
+      <tr><td>52 位完美装入 double 尾数</td><td>IEEE 754 double 尾数 52 位</td><td>无精度损失</td></tr>
+      <tr><td>纬度限制 ±85.05° (Web 墨卡托)</td><td><code>GEO_LAT_MIN/MAX</code></td><td>极地坐标无法 GEOADD</td></tr>
+      <tr><td>GEO 完全复用 ZSet 存储</td><td><code>geoaddCommand → zsetAdd</code></td><td><code>OBJECT ENCODING</code> 返回 listpack/skiplist</td></tr>
+      <tr><td>9 邻居单元覆盖圆形范围</td><td><code>membersOfAllNeighbors</code></td><td>需 step-1 安全裕量</td></tr>
+      <tr><td>Haversine 二次距离过滤</td><td><code>geoAppendIfWithinShape</code></td><td>精确圆形 ≠ Geohash 矩形</td></tr>
+      <tr><td>Haversine 选用 WGS84 平均半径</td><td><code>EARTH_RADIUS_IN_METERS = 6372797.560856</code></td><td>1 km 内误差 &lt; 1 m</td></tr>
+      <tr><td>GEORADIUS 已 deprecated</td><td>7.0 命令拆分</td><td>迁移到 GEOSEARCH</td></tr>
+      <tr><td>集群下需 hash tag</td><td>CROSSSLOT 错误</td><td>用 <code>{geo}:cn</code> 强制同 slot</td></tr>
+      <tr><td>大半径(&gt; 1000 km)性能下降</td><td>9 单元覆盖巨大</td><td>限制半径或换 PostGIS</td></tr>
+      <tr><td>GEODIST 是球面直线,非道路</td><td>Haversine 公式</td><td>需路径规划服务做精算</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>最小回归测试</h3>
+
+<pre><code class="language-bash">redis-cli DEL geo:test
+
+# 写入两个北京地标
+redis-cli GEOADD geo:test 116.4074 39.9042 "tiananmen"
+redis-cli GEOADD geo:test 116.3974 39.9087 "xidan"
+# 期望: 1 \n 1
+
+# 距离查询
+redis-cli GEODIST geo:test tiananmen xidan km
+# 期望: "0.9281"
+
+# 5 km 范围搜索
+redis-cli GEOSEARCH geo:test FROMLONLAT 116.40 39.90 BYRADIUS 5 km
+# 期望: 1) "tiananmen" 2) "xidan"
+
+# 反解坐标
+redis-cli GEOPOS geo:test tiananmen
+# 期望: 1) 1) "116.40739679336547852" 2) "39.90419988335741460"
+
+# base32 表示
+redis-cli GEOHASH geo:test tiananmen
+# 期望: 1) "wx4g0bxe940"
+
+# 极地坐标拒绝(验证墨卡托限制)
+redis-cli GEOADD geo:test 0 90 "northpole"
+# 期望: (error) ERR invalid longitude,latitude pair 0.000000,90.000000
+
+# OBJECT ENCODING 验证 ZSet 集成
+redis-cli OBJECT ENCODING geo:test
+# 期望: "listpack" (元素少时)</code></pre>
+
+<h3>性能速查</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 12-13-2 · GEO 性能基线 (M2 Pro 单实例)</div>
+  <table>
+    <thead><tr><th>操作</th><th>时延 P99</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>GEOADD</td><td>3-8 μs</td><td>1 次 encode + ZADD</td></tr>
+      <tr><td>GEOPOS</td><td>1-3 μs</td><td>ZSCORE + decode</td></tr>
+      <tr><td>GEODIST</td><td>2-5 μs</td><td>2 ZSCORE + Haversine</td></tr>
+      <tr><td>GEOSEARCH r=1km M=10</td><td>30-80 μs</td><td>9 ZRANGEBYSCORE + 10 Haversine</td></tr>
+      <tr><td>GEOSEARCH r=10km M=100</td><td>150-400 μs</td><td>9 ZRANGEBYSCORE + 100 Haversine</td></tr>
+      <tr><td>GEOSEARCH r=100km M=1000</td><td>2-8 ms</td><td>候选集大,排序成主开销</td></tr>
+      <tr><td>GEOSEARCH r=1000km M=10K</td><td>50-200 ms</td><td>不推荐,改用 PostGIS</td></tr>
+      <tr><td>GEOHASH</td><td>2-4 μs</td><td>ZSCORE + base32 编码</td></tr>
+      <tr><td>1M 点 GEO key 内存</td><td>~80 MB</td><td>每点 ~80 byte (ZSet 节点)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key-insight">
+  <strong>教学结论(生产可直接借用)</strong>:<br>
+  ① GEO 完全是 ZSet 的语义皮 — <strong>持久化 / 复制 / cluster 自动支持</strong>;<br>
+  ② 52 位精度 = 0.6 m,<strong>高于消费 GPS 自身误差</strong>,无需提高;<br>
+  ③ <strong>GEOSEARCH 半径 ≤ 100 km 时性能优秀</strong>(&lt; 1 ms),超大半径请评估业务必要性;<br>
+  ④ <strong>必须显式写半径单位</strong>(<code>5 km</code> 而非 <code>5</code>),省略默认 m 是常见 bug 源;<br>
+  ⑤ 集群下 GEO 多 key 操作必须 <strong>hash tag</strong>(<code>{geo}:xx</code>);<br>
+  ⑥ <strong>GEODIST 不是路径距离</strong>,UI 显示需要路径规划服务二次计算。
+</div>
+
+<h3>下一章预告</h3>
+
+<p>GEO 章展示 Redis 如何用<strong>工程化映射</strong>把复杂数据(二维坐标)塞进既有数据结构(ZSet)。下一章 <strong><code>13-lru-lfu.html</code></strong> 讨论另一个工程妥协:<strong>精确 LRU 需要 O(N) 双向链表维护,精确 LFU 需要无限计数器</strong>,Redis 都用不起。Redis 选用 <strong>24 位时钟 + 采样池 + Morris 计数 + 衰减</strong>,在 ±5% 误差内做到 O(1) 内存与 O(K) 命中查找。下一章描述 <code>redisObject</code> 的 24 位 lru 字段布局、采样池演化算法、Morris 对数计数的概率特性,以及 <strong>八种 maxmemory-policy</strong>(noeviction / allkeys-lru / allkeys-lfu / volatile-* / allkeys-random 等)的取舍场景。</p>
+
+</div>
+
+<p class="footer">&copy; 2026 图解 Redis &middot; 第 12 章 &middot; Geohash 空间索引</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/c.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){setTimeout(function(){document.querySelectorAll('.mermaid svg,.diagram svg').forEach(function(svg){var h=parseInt(svg.getAttribute('height')||svg.getBoundingClientRect().height);if(h>500){svg.style.maxHeight='500px';svg.style.width='auto';var p=svg.closest('.diagram');if(p)p.style.overflowX='auto';}});},1500);});</script>
+</body>
+</html>

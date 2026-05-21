@@ -1,0 +1,1345 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 27 章 · JCA 连接器架构 — 图解 Spring Boot</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="g-blue" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#1e3a8a"/><stop offset="100%" stop-color="#1e293b"/></linearGradient>
+    <linearGradient id="g-green" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#14532d"/><stop offset="100%" stop-color="#1e293b"/></linearGradient>
+    <linearGradient id="g-orange" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#7c2d12"/><stop offset="100%" stop-color="#1e293b"/></linearGradient>
+    <linearGradient id="g-red" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#7f1d1d"/><stop offset="100%" stop-color="#1e293b"/></linearGradient>
+    <linearGradient id="g-purple" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#4c1d95"/><stop offset="100%" stop-color="#1e293b"/></linearGradient>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#8b949e"/></marker>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Spring Boot</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="ch26-oxm.html">上一章 ch26-oxm</a>
+  <a href="ch28-jmx.html">下一章 ch28-jmx</a>
+</nav>
+
+<aside class="toc">
+<a href="#27.0-章首速览">27.0 章首速览</a>
+<a href="#27.1-jca-合约">27.1 JCA 合约</a>
+<a href="#27.2-jndi-消费容器资源">27.2 JNDI 消费容器资源</a>
+<a href="#27.3-cci-出站调用">27.3 CCI 出站调用</a>
+<a href="#27.4-xa-事务">27.4 XA 事务</a>
+<a href="#27.5-入站消息端点">27.5 入站消息端点</a>
+<a href="#27.6-陷阱与限制">27.6 陷阱与限制</a>
+<a href="#27.7-源码深潜">27.7 源码深潜</a>
+<a href="#27.8-本章要点">27.8 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 27 章 · JCA 连接器架构</h1>
+<p class="subtitle">v7 图解版 · 自动从 v6 markdown 生成 · Mermaid 图原样保留</p>
+<div class="chapter-intro"><p>JCA(Jakarta Connector Architecture,旧称 Java Connector Architecture)由 JSR-322 定义,核心目标是把 Java 应用接入异构 EIS(Enterprise Information System)系统时必须处理的四件事标准化:连接生命周期、XA 事务登记、安全主体传播、入站消息分发。</p>
+<p>资源适配器(<code>ResourceAdapter</code>,RAR 包)由应用服务器部署。<code>ManagedConnectionFactory</code> 创建受管连接,<code>ConnectionManager</code> 与连接池协作分配连接,<code>XAResource</code> 把 EIS 操作登记进全局事务,<code>MessageEndpoint</code> 接收 EIS 主动推送的消息。</p>
+<p>Spring Boot 应用通常不复刻完整 JCA 容器。<code>JndiObjectFactoryBean</code> 从应用服务器查找已部署的 <code>ConnectionFactory</code>,<code>CciTemplate</code> 封装 CCI(Common Client Interface)交互,<code>JtaTransactionManager</code> 把 JCA 资源接入 JTA 事务,<code>GenericMessageEndpointManager</code> 注册入站端点。</p>
+<p>本章按「JCA 合约 → JNDI 消费 → CCI 出站 → JTA 事务 → 入站端点 → 陷阱 → 源码深潜」展开,聚焦 SAP、CICS、AS/400、大型机等遗留系统的集成边界。</p>
+</div>
+<h2 id="27.0-章首速览">27.0 章首速览</h2>
+<div class="diagram">
+<div class="diagram-title">图 27-0-1 · JCA 全景(出站调用 + XA 事务参与 + 入站消息分发 三大场景)</div>
+<svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="24" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">ResourceAdapter 作为枢纽 — 连 CF/TM/ME 三大组件桥接 Spring 业务</text>
+
+  <rect x="20" y="180" width="200" height="100" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="3"/>
+  <text x="120" y="208" text-anchor="middle" fill="#fee2e2" font-size="13" font-weight="bold">★ ResourceAdapter</text>
+  <text x="120" y="226" text-anchor="middle" fill="#fee2e2" font-size="9">RAR / ra.xml</text>
+  <text x="120" y="242" text-anchor="middle" fill="#fee2e2" font-size="9">ManagedConnectionFactory</text>
+  <text x="120" y="262" text-anchor="middle" fill="#fee2e2" font-size="8">★ JCA 核心枢纽</text>
+
+  <path d="M220,210 L380,140" stroke="#bc8cff" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <path d="M220,240 L380,330" stroke="#bc8cff" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="290" y="160" fill="#fed7aa" font-size="9" font-weight="bold">★ register XAResource</text>
+  <path d="M220,270 L380,420" stroke="#bc8cff" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="290" y="360" fill="#fed7aa" font-size="9" font-weight="bold">★ deliver message</text>
+
+  <rect x="380" y="100" width="220" height="80" rx="12" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="490" y="124" text-anchor="middle" fill="#dbeafe" font-size="12" font-weight="bold">★ ① ConnectionFactory</text>
+  <text x="490" y="142" text-anchor="middle" fill="#dbeafe" font-size="9">CCI / vendor API</text>
+  <text x="490" y="158" text-anchor="middle" fill="#dbeafe" font-size="9">connection pooling</text>
+
+  <rect x="380" y="290" width="220" height="80" rx="12" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="490" y="314" text-anchor="middle" fill="#fee2e2" font-size="12" font-weight="bold">★ ② TransactionManager</text>
+  <text x="490" y="332" text-anchor="middle" fill="#fee2e2" font-size="9">JTA / XA / 2PC</text>
+  <text x="490" y="348" text-anchor="middle" fill="#fee2e2" font-size="9">commit / rollback</text>
+
+  <rect x="380" y="380" width="220" height="80" rx="12" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+  <text x="490" y="404" text-anchor="middle" fill="#fecaca" font-size="12" font-weight="bold">★ ③ MessageEndpoint</text>
+  <text x="490" y="422" text-anchor="middle" fill="#fecaca" font-size="9">ActivationSpec</text>
+  <text x="490" y="438" text-anchor="middle" fill="#fecaca" font-size="9">inbound delivery</text>
+
+  <path d="M600,330 L600,170 L600,140" stroke="#d29922" stroke-width="2" stroke-dasharray="3,2" marker-end="url(#arr)" fill="none"/>
+  <text x="610" y="240" fill="#fed7aa" font-size="9">commit/rollback</text>
+
+  <path d="M600,140 L780,200" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="650" y="170" fill="#dbeafe" font-size="9" font-weight="bold">getConnection()</text>
+  <path d="M600,420 L780,260" stroke="#f85149" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="650" y="370" fill="#fecaca" font-size="9" font-weight="bold">deliver</text>
+
+  <rect x="700" y="180" width="200" height="100" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="3"/>
+  <text x="800" y="206" text-anchor="middle" fill="#bbf7d0" font-size="13" font-weight="bold">★ Spring 业务</text>
+  <text x="800" y="226" text-anchor="middle" fill="#bbf7d0" font-size="9">CciTemplate</text>
+  <text x="800" y="242" text-anchor="middle" fill="#bbf7d0" font-size="9">@Endpoint POJO</text>
+  <text x="800" y="262" text-anchor="middle" fill="#bbf7d0" font-size="8">★ 业务集成入口</text>
+</svg>
+</div>
+<h3>表 27-0-1:本章节次结构</h3>
+<table>
+<thead>
+<tr>
+<th>节次</th>
+<th>主题</th>
+<th>关键类</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>27.1</td>
+<td>JCA 合约</td>
+<td><code>ResourceAdapter</code>、<code>ManagedConnection</code>、<code>XAResource</code></td>
+</tr>
+<tr>
+<td>27.2</td>
+<td>JNDI 消费容器资源</td>
+<td><code>JndiObjectFactoryBean</code>、<code>@EnableTransactionManagement</code></td>
+</tr>
+<tr>
+<td>27.3</td>
+<td>CCI 出站</td>
+<td><code>CciTemplate</code>、<code>InteractionSpec</code>、<code>MappedRecord</code></td>
+</tr>
+<tr>
+<td>27.4</td>
+<td>XA 事务</td>
+<td><code>JtaTransactionManager</code>、<code>@Transactional</code></td>
+</tr>
+<tr>
+<td>27.5</td>
+<td>入站端点</td>
+<td><code>GenericMessageEndpointManager</code>、<code>MessageEndpointFactory</code></td>
+</tr>
+<tr>
+<td>27.6</td>
+<td>陷阱</td>
+<td>6 类生产问题</td>
+</tr>
+<tr>
+<td>27.7</td>
+<td>源码深潜</td>
+<td>调用链、设计取舍</td>
+</tr>
+</tbody>
+</table>
+<h2 id="27.1-jca-合约">27.1 JCA 合约</h2>
+<div class="diagram">
+<div class="diagram-title">图 27-1-1 · JCA 出站与入站合约(Connection / Transaction / Security + Message / Work / Lifecycle)</div>
+<svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="24" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">6 大合约 — 出站(应用→EIS) + 入站(EIS→应用) 对称设计</text>
+
+  <rect x="380" y="200" width="160" height="50" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="3"/>
+  <text x="460" y="222" text-anchor="middle" fill="#fee2e2" font-size="12" font-weight="bold">★ Spring Boot</text>
+  <text x="460" y="240" text-anchor="middle" fill="#fee2e2" font-size="9">Application</text>
+
+  <rect x="20" y="50" width="340" height="200" rx="12" fill="none" stroke="#58a6ff" stroke-width="2" stroke-dasharray="5,3"/>
+  <text x="190" y="74" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">★ 出站合约(应用主动调 EIS)</text>
+
+  <rect x="50" y="90" width="280" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="190" y="108" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">★ ① Connection Management</text>
+  <text x="190" y="122" text-anchor="middle" fill="#dbeafe" font-size="9">ManagedConnection / ConnectionFactory</text>
+
+  <rect x="50" y="140" width="280" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="190" y="158" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">★ ② Transaction Management</text>
+  <text x="190" y="172" text-anchor="middle" fill="#dbeafe" font-size="9">LocalTransaction / XAResource</text>
+
+  <rect x="50" y="190" width="280" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="190" y="208" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">★ ③ Security Management</text>
+  <text x="190" y="222" text-anchor="middle" fill="#dbeafe" font-size="9">Subject / PasswordCredential</text>
+
+  <path d="M380,220 L330,110" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M380,225 L330,160" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M380,230 L330,210" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="560" y="50" width="340" height="200" rx="12" fill="none" stroke="#f85149" stroke-width="2" stroke-dasharray="5,3"/>
+  <text x="730" y="74" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">★ 入站合约(EIS 主动推送)</text>
+
+  <rect x="590" y="90" width="280" height="40" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+  <text x="730" y="108" text-anchor="middle" fill="#fecaca" font-size="11" font-weight="bold">★ ④ Message Inflow</text>
+  <text x="730" y="122" text-anchor="middle" fill="#fecaca" font-size="9">MessageEndpoint</text>
+
+  <rect x="590" y="140" width="280" height="40" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+  <text x="730" y="158" text-anchor="middle" fill="#fecaca" font-size="11" font-weight="bold">★ ⑤ Work Management</text>
+  <text x="730" y="172" text-anchor="middle" fill="#fecaca" font-size="9">WorkManager(线程供给)</text>
+
+  <rect x="590" y="190" width="280" height="40" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+  <text x="730" y="208" text-anchor="middle" fill="#fecaca" font-size="11" font-weight="bold">★ ⑥ Lifecycle Management</text>
+  <text x="730" y="222" text-anchor="middle" fill="#fecaca" font-size="9">ResourceAdapter.start()/stop()</text>
+
+  <path d="M590,110 L540,220" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <path d="M590,160 L590,110" stroke="#f85149" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#arr)" fill="none"/>
+  <text x="600" y="135" fill="#fecaca" font-size="9">supply</text>
+  <path d="M590,210 L590,180" stroke="#f85149" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#arr)" fill="none"/>
+  <text x="600" y="200" fill="#fecaca" font-size="9">control</text>
+
+  <text x="20" y="290" fill="#fed7aa" font-size="10" font-weight="bold">★ 关键设计:出站 = 应用是发起方,EIS 是被动方;入站 = 反过来,EIS 异步推消息给应用</text>
+  <text x="20" y="312" fill="#fed7aa" font-size="9">★ Connection Management 解决「资源池化」 — 应用看到的是 ConnectionFactory,实际是池化后的代理</text>
+  <text x="20" y="332" fill="#fed7aa" font-size="9">★ Transaction Management 区分「本地事务(单 RA)」与「XA 事务(跨 RA + JDBC)」</text>
+  <text x="20" y="352" fill="#fed7aa" font-size="9">★ Work Management 让 RA 不能自己开线程(容器统一管理),解决 EJB 时代「应用乱开线程」问题</text>
+  <text x="20" y="372" fill="#fed7aa" font-size="9">★ Lifecycle Management 让 RA 在容器停机时优雅释放 EIS 连接(否则 EIS 会挂残留 socket)</text>
+  <text x="20" y="392" fill="#fed7aa" font-size="9">★ Spring Boot 仅消费出站合约的 Connection / Transaction;入站合约通过 SimpleMessageListenerContainer 间接使用</text>
+</svg>
+</div>
+<h3>表 27-1-1:JCA 五大合约</h3>
+<table>
+<thead>
+<tr>
+<th>合约</th>
+<th>提供方</th>
+<th>Spring 入口</th>
+<th>生产关注点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>连接管理</td>
+<td>应用服务器 + RA</td>
+<td><code>ConnectionFactory</code>、<code>CciTemplate</code></td>
+<td>池大小、泄漏、ClassLoader</td>
+</tr>
+<tr>
+<td>事务管理</td>
+<td>JTA TransactionManager</td>
+<td><code>JtaTransactionManager</code>、<code>@Transactional</code></td>
+<td>XA enlist、2PC、recover</td>
+</tr>
+<tr>
+<td>安全管理</td>
+<td>容器安全域</td>
+<td>JNDI、credential mapping</td>
+<td>密码轮换、审计主体</td>
+</tr>
+<tr>
+<td>消息入站</td>
+<td>RA + WorkManager</td>
+<td><code>GenericMessageEndpointManager</code></td>
+<td>幂等、重试、死信</td>
+</tr>
+<tr>
+<td>生命周期</td>
+<td>RA</td>
+<td>容器部署 RAR</td>
+<td>启停顺序、native 库</td>
+</tr>
+</tbody>
+</table>
+<h3>27.1.1 角色边界</h3>
+<pre><code class="language-text">+-----------------------------------+
+| Application Server                 |
+|  +-----------------------------+  |
+|  | ResourceAdapter (RAR)       |  |
+|  |  - ManagedConnectionFactory |  |
+|  |  - ConnectionManager        |  |
+|  |  - XAResource               |  |
+|  |  - WorkManager              |  |
+|  +--------------+--------------+  |
+|                 |                  |
+|         JNDI / lookup              |
+|                 |                  |
++-----------------v-----------------+
+                  |
++-----------------v-----------------+
+| Spring Boot Application            |
+|  - JndiObjectFactoryBean           |
+|  - CciTemplate                     |
+|  - JtaTransactionManager           |
+|  - GenericMessageEndpointManager   |
++-----------------------------------+
+</code></pre>
+<p>应用服务器(WebSphere、WebLogic、WildFly)提供完整 JCA 容器:连接池、安全域、JTA 事务管理器、<code>WorkManager</code>、ClassLoader 隔离。Spring Boot 进程作为消费者,只通过标准接口(<code>ConnectionFactory</code>、<code>MappedRecord</code>、<code>MessageEndpoint</code>)与 RA 交互。</p>
+<h2 id="27.2-jndi-消费容器资源">27.2 JNDI 消费容器资源</h2>
+<div class="diagram">
+<div class="diagram-title">图 27-2-1 · RAR 部署与 JNDI 绑定时序(管理员部署 → RA 启动 → JNDI 注册 → Boot 查找)</div>
+<svg viewBox="0 0 920 420" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="24" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">RA 部署一次 + Spring Boot 通过 JNDI 取出代理 + 执行 EIS 交互</text>
+
+  <text x="80"  y="60" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">Admin</text>
+  <text x="260" y="60" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">★ Server</text>
+  <text x="460" y="60" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">★ RA</text>
+  <text x="660" y="60" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">★ Spring Boot</text>
+  <text x="860" y="60" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">EIS</text>
+
+  <line x1="80"  y1="80" x2="80"  y2="390" stroke="#bc8cff" stroke-dasharray="3,2"/>
+  <line x1="260" y1="80" x2="260" y2="390" stroke="#58a6ff" stroke-dasharray="3,2"/>
+  <line x1="460" y1="80" x2="460" y2="390" stroke="#d29922" stroke-dasharray="3,2"/>
+  <line x1="660" y1="80" x2="660" y2="390" stroke="#3fb950" stroke-dasharray="3,2"/>
+  <line x1="860" y1="80" x2="860" y2="390" stroke="#f85149" stroke-dasharray="3,2"/>
+
+  <path d="M80,110 L260,110" stroke="#bc8cff" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="170" y="103" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">★ ① deploy eis-ra.rar</text>
+
+  <path d="M260,150 L460,150" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="360" y="143" text-anchor="middle" fill="#dbeafe" font-size="10" font-weight="bold">★ ② start(BootstrapContext)</text>
+
+  <path d="M460,190 L260,190" stroke="#d29922" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="360" y="183" text-anchor="middle" fill="#fed7aa" font-size="10" font-weight="bold">★ ③ register CF + XAResource</text>
+
+  <path d="M660,230 L260,230" stroke="#3fb950" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="460" y="223" text-anchor="middle" fill="#bbf7d0" font-size="10" font-weight="bold">★ ④ JNDI lookup java:/eis/CustomerCF</text>
+
+  <path d="M260,270 L660,270" stroke="#58a6ff" stroke-width="2" stroke-dasharray="3,2" marker-end="url(#arr)" fill="none"/>
+  <text x="460" y="263" text-anchor="middle" fill="#dbeafe" font-size="10" font-weight="bold">★ ⑤ ConnectionFactory proxy</text>
+
+  <path d="M660,310 L860,310" stroke="#3fb950" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="760" y="303" text-anchor="middle" fill="#bbf7d0" font-size="10" font-weight="bold">★ ⑥ execute interaction</text>
+
+  <text x="20" y="370" fill="#fed7aa" font-size="10">★ ①②③ 部署期一次性完成 → ④⑤⑥ 每次业务调用都走 — Boot 不直接管 RA 生命周期</text>
+</svg>
+</div>
+<h3>27.2.1 配置属性</h3>
+<pre><code class="language-yaml">spring:
+  application:
+    name: customer-jca-adapter
+  jta:
+    enabled: true
+
+eis:
+  customer:
+    connection-factory-jndi-name: java:/eis/CustomerCF
+    interaction-timeout: 3s
+    audit-enabled: true
+</code></pre>
+<h3>27.2.2 Spring Bean 装配</h3>
+<pre><code class="language-java">@Configuration
+@EnableTransactionManagement
+public class JcaClientConfiguration {
+
+    @Bean
+    JndiObjectFactoryBean customerConnectionFactory(CustomerJcaProperties properties) {
+        JndiObjectFactoryBean bean = new JndiObjectFactoryBean();
+        bean.setJndiName(properties.connectionFactoryJndiName());
+        bean.setProxyInterface(jakarta.resource.cci.ConnectionFactory.class);
+        bean.setLookupOnStartup(true);
+        return bean;
+    }
+
+    @Bean
+    CciTemplate customerCciTemplate(ConnectionFactory customerConnectionFactory) {
+        CciTemplate template = new CciTemplate(customerConnectionFactory);
+        template.setOutputRecordCreator(inputRecord -&gt; {
+            RecordFactory factory = customerConnectionFactory.getRecordFactory();
+            return factory.createMappedRecord(&quot;customer-output&quot;);
+        });
+        return template;
+    }
+
+    @Bean
+    PlatformTransactionManager transactionManager() {
+        return new JtaTransactionManager();
+    }
+}
+</code></pre>
+<p><code>setLookupOnStartup(true)</code> 强制启动期 JNDI 查找,避免运行时首次调用才暴露 JNDI 名错误。<code>setProxyInterface</code> 让注入点接收的是接口代理而非 <code>Object</code>,提升类型安全。</p>
+<h3>27.2.3 启动探针</h3>
+<pre><code class="language-java">@Bean
+ApplicationRunner jcaStartupProbe(ConnectionFactory customerConnectionFactory) {
+    return args -&gt; {
+        try (Connection connection = customerConnectionFactory.getConnection()) {
+            ConnectionMetaData metaData = connection.getMetaData();
+            log.info(&quot;jca probe ok eisProduct={} eisVersion={} user={}&quot;,
+                metaData.getEISProductName(),
+                metaData.getEISProductVersion(),
+                metaData.getUserName());
+        }
+    };
+}
+</code></pre>
+<p>启动探针在容器启动完成后立即触发一次 JNDI + getConnection 验证。失败时直接抛出 <code>ResourceException</code> 并保留 EIS 错误码,避免业务流量首次调用才暴露问题。</p>
+<pre><code class="language-log">2026-05-02T15:43:13.612 INFO  jca probe ok eisProduct=Legacy Customer Hub eisVersion=8.4.17 user=svc_customer_read
+</code></pre>
+<p>启动失败时:</p>
+<pre><code class="language-log">2026-05-02T15:44:09.388 ERROR jca probe failed: jakarta.resource.ResourceException: EIS-1008 authentication failed
+  rootCause=EIS security domain [CUSTOMER_REALM] rejected credential alias [cust-read-prod]
+  action=check application-server credential mapping
+</code></pre>
+<h2 id="27.3-cci-出站调用">27.3 CCI 出站调用</h2>
+<div class="diagram">
+<div class="diagram-title">图 27-3-1 · CciTemplate 执行链时序(模板方法 8 步 — 取连接 → 创建 Interaction → 执行 → 关闭)</div>
+<svg viewBox="0 0 920 520" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="24" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">CciTemplate 类比 JdbcTemplate — 取连接/执行/关闭统一管理</text>
+
+  <text x="70"  y="60" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">Service</text>
+  <text x="220" y="60" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">★ Template</text>
+  <text x="370" y="60" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">CF</text>
+  <text x="520" y="60" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">Conn</text>
+  <text x="670" y="60" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">★ Interaction</text>
+  <text x="850" y="60" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">EIS</text>
+
+  <line x1="70"  y1="80" x2="70"  y2="490" stroke="#bc8cff" stroke-dasharray="3,2"/>
+  <line x1="220" y1="80" x2="220" y2="490" stroke="#58a6ff" stroke-dasharray="3,2"/>
+  <line x1="370" y1="80" x2="370" y2="490" stroke="#3fb950" stroke-dasharray="3,2"/>
+  <line x1="520" y1="80" x2="520" y2="490" stroke="#d29922" stroke-dasharray="3,2"/>
+  <line x1="670" y1="80" x2="670" y2="490" stroke="#bc8cff" stroke-dasharray="3,2"/>
+  <line x1="850" y1="80" x2="850" y2="490" stroke="#f85149" stroke-dasharray="3,2"/>
+
+  <path d="M70,110 L220,110" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="145" y="103" text-anchor="middle" fill="#fee2e2" font-size="9" font-weight="bold">★ ① execute(spec, input)</text>
+
+  <path d="M220,150 L370,150" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="295" y="143" text-anchor="middle" fill="#dbeafe" font-size="9">② getConnection()</text>
+
+  <path d="M370,190 L220,190" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#arr)" fill="none"/>
+  <text x="295" y="183" text-anchor="middle" fill="#bbf7d0" font-size="9" font-weight="bold">★ ③ managed Connection</text>
+
+  <path d="M220,230 L520,230" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="370" y="223" text-anchor="middle" fill="#dbeafe" font-size="9">④ createInteraction()</text>
+
+  <path d="M220,270 L670,270" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="445" y="263" text-anchor="middle" fill="#dbeafe" font-size="9" font-weight="bold">★ ⑤ execute(spec, input, output)</text>
+
+  <path d="M670,310 L850,310" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="760" y="303" text-anchor="middle" fill="#fee2e2" font-size="9" font-weight="bold">★ ⑥ CUSTOMER_READ</text>
+
+  <path d="M850,350 L670,350" stroke="#f85149" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#arr)" fill="none"/>
+  <text x="760" y="343" text-anchor="middle" fill="#fecaca" font-size="9" font-weight="bold">★ ⑦ MappedRecord</text>
+
+  <path d="M220,390 L520,390" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="370" y="383" text-anchor="middle" fill="#dbeafe" font-size="9" font-weight="bold">★ ⑧ close()(归还到池)</text>
+
+  <path d="M220,430 L70,430" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#arr)" fill="none"/>
+  <text x="145" y="423" text-anchor="middle" fill="#dbeafe" font-size="9">⑨ CustomerSnapshot</text>
+
+  <text x="20" y="475" fill="#fed7aa" font-size="10">★ Template 模式 = 资源生命周期由框架管 + 业务只关心 spec/input/output 转换</text>
+</svg>
+</div>
+<h3>27.3.1 InteractionSpec 与 RecordFactory</h3>
+<pre><code class="language-java">@Bean
+InteractionSpec readCustomerSpec() {
+    CustomerInteractionSpec spec = new CustomerInteractionSpec();
+    spec.setFunctionName(&quot;CUSTOMER_READ&quot;);
+    spec.setInteractionVerb(InteractionSpec.SYNC_SEND_RECEIVE);
+    spec.setExecutionTimeout(3000);
+    return spec;
+}
+</code></pre>
+<p><code>InteractionSpec</code> 是厂商特定接口(<code>CustomerInteractionSpec</code> 由 RA 提供),描述本次交互的元数据(函数名、超时、同步/异步语义)。<code>RecordFactory</code> 创建 <code>MappedRecord</code>(键值对)、<code>IndexedRecord</code>(列表)等标准 CCI 数据结构。</p>
+<h3>27.3.2 Gateway 实现</h3>
+<pre><code class="language-java">@Component
+public class CustomerGateway {
+
+    private final CciTemplate cciTemplate;
+    private final InteractionSpec readCustomerSpec;
+
+    public CustomerGateway(CciTemplate cciTemplate, InteractionSpec readCustomerSpec) {
+        this.cciTemplate = cciTemplate;
+        this.readCustomerSpec = readCustomerSpec;
+    }
+
+    public CustomerSnapshot findCustomer(String customerId) {
+        return (CustomerSnapshot) cciTemplate.execute(readCustomerSpec,
+            recordFactory -&gt; {
+                MappedRecord record = recordFactory.createMappedRecord(&quot;CUSTOMER_READ&quot;);
+                record.put(&quot;CUSTOMER_ID&quot;, customerId);
+                record.put(&quot;INCLUDE_BLOCK_STATUS&quot;, &quot;Y&quot;);
+                return record;
+            },
+            output -&gt; {
+                MappedRecord record = (MappedRecord) output;
+                return new CustomerSnapshot(
+                    (String) record.get(&quot;CUSTOMER_ID&quot;),
+                    (String) record.get(&quot;NAME&quot;),
+                    (String) record.get(&quot;BLOCK_STATUS&quot;));
+            });
+    }
+}
+</code></pre>
+<p><code>CciTemplate.execute()</code> 接收 <code>RecordCreator</code> 与 <code>RecordExtractor</code> 两个回调:前者构造输入记录,后者把输出记录映射成 DTO。模板内部完成 <code>getConnection()</code> / <code>createInteraction()</code> / <code>close()</code> 全过程,异常被转换为 <code>DataAccessException</code> 体系。</p>
+<pre><code class="language-log">2026-05-02T15:45:21.090 INFO  interaction=CUSTOMER_READ customerId=10000042 elapsed=42ms status=OK
+</code></pre>
+<h3>27.3.3 连接池指标</h3>
+<pre><code class="language-java">@Component
+public class JcaPoolMetrics implements MeterBinder {
+
+    private final ManagedConnectionPoolMXBean pool;
+
+    public JcaPoolMetrics(ManagedConnectionPoolMXBean pool) {
+        this.pool = pool;
+    }
+
+    @Override
+    public void bindTo(MeterRegistry registry) {
+        Gauge.builder(&quot;jca.connections.active&quot;, pool, ManagedConnectionPoolMXBean::getActiveCount)
+            .description(&quot;Active managed JCA connections&quot;)
+            .register(registry);
+        Gauge.builder(&quot;jca.connections.idle&quot;, pool, ManagedConnectionPoolMXBean::getIdleCount)
+            .description(&quot;Idle managed JCA connections&quot;)
+            .register(registry);
+        Gauge.builder(&quot;jca.connections.waiting&quot;, pool, ManagedConnectionPoolMXBean::getWaitingThreadCount)
+            .description(&quot;Threads waiting for JCA connection&quot;)
+            .register(registry);
+    }
+}
+</code></pre>
+<p>JCA 池指标必须通过 JMX MBean(<code>ManagedConnectionPoolMXBean</code>)从应用服务器暴露,Spring 进程内不维护池状态。<code>waitingThreadCount</code> 持续大于 0 是池容量不足或连接泄漏的早期信号。</p>
+<h2 id="27.4-xa-事务">27.4 XA 事务</h2>
+<div class="diagram">
+<div class="diagram-title">图 27-4-1 · XA 两阶段提交时序(begin → 业务操作 → prepare(全员投票) → commit(协调器决议))</div>
+<svg viewBox="0 0 920 600" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="24" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">2PC = 投票阶段(prepare) + 提交阶段(commit) — TM 全局协调 DB 与 RA</text>
+
+  <text x="80"  y="60" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">App</text>
+  <text x="260" y="60" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">★ JTA TM</text>
+  <text x="460" y="60" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">JDBC XAResource</text>
+  <text x="680" y="60" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">JCA XAResource</text>
+  <text x="860" y="60" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">EIS</text>
+
+  <line x1="80"  y1="80" x2="80"  y2="570" stroke="#bc8cff" stroke-dasharray="3,2"/>
+  <line x1="260" y1="80" x2="260" y2="570" stroke="#d29922" stroke-dasharray="3,2"/>
+  <line x1="460" y1="80" x2="460" y2="570" stroke="#58a6ff" stroke-dasharray="3,2"/>
+  <line x1="680" y1="80" x2="680" y2="570" stroke="#3fb950" stroke-dasharray="3,2"/>
+  <line x1="860" y1="80" x2="860" y2="570" stroke="#f85149" stroke-dasharray="3,2"/>
+
+  <path d="M80,110 L260,110" stroke="#bc8cff" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="170" y="103" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">★ ① begin global tx XID</text>
+
+  <path d="M80,150 L460,150" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="270" y="143" text-anchor="middle" fill="#fee2e2" font-size="9">② insert audit row</text>
+
+  <path d="M80,190 L680,190" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="380" y="183" text-anchor="middle" fill="#fee2e2" font-size="9">③ execute ORDER_RESERVE</text>
+
+  <path d="M680,230 L860,230" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="770" y="223" text-anchor="middle" fill="#bbf7d0" font-size="9">④ reserve stock</text>
+
+  <rect x="20" y="260" width="880" height="180" rx="8" fill="#0d1117" stroke="#d29922" stroke-width="2"/>
+  <text x="50" y="280" fill="#fed7aa" font-size="11" font-weight="bold">★ Phase 1: PREPARE(投票)</text>
+
+  <path d="M260,300 L460,300" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="360" y="293" text-anchor="middle" fill="#fed7aa" font-size="9" font-weight="bold">⑤ prepare</text>
+
+  <path d="M460,330 L260,330" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#arr)" fill="none"/>
+  <text x="360" y="323" text-anchor="middle" fill="#dbeafe" font-size="9" font-weight="bold">★ ⑥ XA_OK ✓</text>
+
+  <path d="M260,360 L680,360" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="470" y="353" text-anchor="middle" fill="#fed7aa" font-size="9" font-weight="bold">⑦ prepare</text>
+
+  <path d="M680,390 L260,390" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#arr)" fill="none"/>
+  <text x="470" y="383" text-anchor="middle" fill="#bbf7d0" font-size="9" font-weight="bold">★ ⑧ XA_OK ✓</text>
+
+  <text x="50" y="420" fill="#fed7aa" font-size="9">★ 全员 XA_OK → TM 决定 commit;任一拒绝 → 全员 rollback</text>
+
+  <rect x="20" y="450" width="880" height="100" rx="8" fill="#0d1117" stroke="#3fb950" stroke-width="2"/>
+  <text x="50" y="470" fill="#bbf7d0" font-size="11" font-weight="bold">★ Phase 2: COMMIT(全员提交)</text>
+
+  <path d="M260,490 L460,490" stroke="#3fb950" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="360" y="483" text-anchor="middle" fill="#bbf7d0" font-size="9" font-weight="bold">⑨ commit (DB)</text>
+
+  <path d="M260,525 L680,525" stroke="#3fb950" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="470" y="518" text-anchor="middle" fill="#bbf7d0" font-size="9" font-weight="bold">⑩ commit (RA)</text>
+
+  <text x="20" y="585" fill="#fed7aa" font-size="9">★ in-doubt 风险:Phase 1 完成后 TM 崩溃 → DB/RA 被锁住,需 DBA 人工恢复(陷阱 27-6-2)</text>
+</svg>
+</div>
+<h3>27.4.1 强一致业务场景</h3>
+<pre><code class="language-java">@Service
+public class OrderReservationService {
+
+    private final CustomerGateway customerGateway;
+    private final ReservationGateway reservationGateway;
+    private final OrderAuditRepository auditRepository;
+
+    @Transactional
+    public ReservationResult reserve(OrderCommand command) {
+        CustomerSnapshot customer = customerGateway.findCustomer(command.customerId());
+        ReservationResult result = reservationGateway.reserveStock(
+            command.orderId(), command.items());
+        auditRepository.save(OrderAudit.success(
+            command.orderId(),
+            customer.customerId(),
+            result.reservationId()));
+        return result;
+    }
+}
+</code></pre>
+<p><code>@Transactional</code> 触发 <code>JtaTransactionManager</code> 开启全局事务,JDBC 连接与 JCA 连接的 <code>XAResource</code> 都会被 enlist 进同一个 XID。任意一方 <code>prepare</code> 失败,JTA 协调器对所有资源调用 <code>rollback</code>,数据库与 EIS 状态同步回滚。</p>
+<h3>27.4.2 XA 提交日志</h3>
+<pre><code class="language-log">2026-05-02T15:48:30.112 DEBUG com.arjuna.ats.jta : Begin XA transaction xid=0:ffffc0a8012a:8f3a:6634f9de:42
+2026-05-02T15:48:30.188 DEBUG ReservationGateway : interaction=ORDER_RESERVE orderId=O1001 reservationId=R-778201 status=PREPARED
+2026-05-02T15:48:30.217 DEBUG com.arjuna.ats.jta : XAResource.prepare resource=jdbc/order-db vote=XA_OK
+2026-05-02T15:48:30.225 DEBUG com.arjuna.ats.jta : XAResource.prepare resource=jca/CustomerCF vote=XA_OK
+2026-05-02T15:48:30.251 INFO  OrderReservationService : committed orderId=O1001 reservationId=R-778201
+</code></pre>
+<h3>27.4.3 EIS 失败时回滚</h3>
+<pre><code class="language-java">@Transactional
+public ReservationResult reserveWithRollback(OrderCommand command) {
+    auditRepository.save(OrderAudit.started(command.orderId()));
+    return reservationGateway.reserveStock(command.orderId(), command.items());
+}
+</code></pre>
+<p>EIS 抛 <code>ResourceException</code> 时:</p>
+<pre><code class="language-log">2026-05-02T15:49:04.404 WARN  ReservationGateway : interaction=ORDER_RESERVE orderId=O1001 failed code=EIS-STOCK-409 message=insufficient stock
+2026-05-02T15:49:04.411 DEBUG com.arjuna.ats.jta : Marking global transaction rollback-only xid=0:ffffc0a8012a:8f3a:6634f9de:43
+2026-05-02T15:49:04.427 DEBUG com.arjuna.ats.jta : XAResource.rollback resource=jdbc/order-db
+2026-05-02T15:49:04.438 DEBUG com.arjuna.ats.jta : XAResource.rollback resource=jca/CustomerCF
+</code></pre>
+<p>数据库审计行回滚,EIS 端预留的库存释放,业务状态最终一致。</p>
+<h3>表 27-4-1:本地事务 vs XA 事务</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>本地事务</th>
+<th>XA 全局事务</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>资源数</td>
+<td>1</td>
+<td>多个(JDBC + JCA)</td>
+</tr>
+<tr>
+<td>Spring 类</td>
+<td><code>CciLocalTransactionManager</code></td>
+<td><code>JtaTransactionManager</code></td>
+</tr>
+<tr>
+<td>协议</td>
+<td>EIS 私有 commit/rollback</td>
+<td>XA 2PC</td>
+</tr>
+<tr>
+<td>延迟</td>
+<td>微秒级</td>
+<td>毫秒级(prepare + commit)</td>
+</tr>
+<tr>
+<td>失败模式</td>
+<td>单点失败</td>
+<td>in-doubt 事务需 recover</td>
+</tr>
+<tr>
+<td>适用</td>
+<td>单资源、最终一致可接受</td>
+<td>监管 / 库存 / 账务强一致</td>
+</tr>
+</tbody>
+</table>
+<h2 id="27.5-入站消息端点">27.5 入站消息端点</h2>
+<div class="diagram">
+<div class="diagram-title">图 27-5-1 · Message Inflow 时序(EIS 推消息 → RA 用 WorkManager 调度 → ME 包事务 → Service 处理)</div>
+<svg viewBox="0 0 920 480" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="24" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">入站合约:EIS 主动推消息 + Work Management 控制线程 + 事务自动包裹</text>
+
+  <text x="70"  y="60" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">EIS</text>
+  <text x="220" y="60" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">★ RA</text>
+  <text x="370" y="60" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">★ WM</text>
+  <text x="520" y="60" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">★ ME</text>
+  <text x="670" y="60" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">★ Service</text>
+  <text x="850" y="60" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">★ TM</text>
+
+  <line x1="70"  y1="80" x2="70"  y2="450" stroke="#f85149" stroke-dasharray="3,2"/>
+  <line x1="220" y1="80" x2="220" y2="450" stroke="#d29922" stroke-dasharray="3,2"/>
+  <line x1="370" y1="80" x2="370" y2="450" stroke="#58a6ff" stroke-dasharray="3,2"/>
+  <line x1="520" y1="80" x2="520" y2="450" stroke="#bc8cff" stroke-dasharray="3,2"/>
+  <line x1="670" y1="80" x2="670" y2="450" stroke="#3fb950" stroke-dasharray="3,2"/>
+  <line x1="850" y1="80" x2="850" y2="450" stroke="#d29922" stroke-dasharray="3,2"/>
+
+  <path d="M70,110 L220,110" stroke="#f85149" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="145" y="103" text-anchor="middle" fill="#fecaca" font-size="10" font-weight="bold">★ ① status event</text>
+
+  <path d="M220,150 L370,150" stroke="#d29922" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="295" y="143" text-anchor="middle" fill="#fed7aa" font-size="10" font-weight="bold">★ ② schedule Work</text>
+
+  <path d="M370,190 L520,190" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="445" y="183" text-anchor="middle" fill="#dbeafe" font-size="10" font-weight="bold">★ ③ beforeDelivery</text>
+
+  <path d="M520,230 L850,230" stroke="#bc8cff" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="685" y="223" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">★ ④ begin / join tx</text>
+
+  <path d="M520,270 L670,270" stroke="#bc8cff" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="595" y="263" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">★ ⑤ handle(OrderStatusChanged)</text>
+
+  <path d="M670,310 L520,310" stroke="#3fb950" stroke-width="2" stroke-dasharray="3,2" marker-end="url(#arr)" fill="none"/>
+  <text x="595" y="303" text-anchor="middle" fill="#bbf7d0" font-size="10">⑥ result</text>
+
+  <path d="M520,350 L850,350" stroke="#bc8cff" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="685" y="343" text-anchor="middle" fill="#fee2e2" font-size="10" font-weight="bold">★ ⑦ commit or rollback</text>
+
+  <path d="M370,390 L520,390" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <text x="445" y="383" text-anchor="middle" fill="#dbeafe" font-size="10" font-weight="bold">★ ⑧ afterDelivery</text>
+
+  <text x="20" y="435" fill="#fed7aa" font-size="10">★ before/afterDelivery 包了一层事务壳 — 业务方法异常会触发 rollback,自动回退 EIS 操作</text>
+</svg>
+</div>
+<h3>27.5.1 ActivationSpec 与 EndpointManager</h3>
+<pre><code class="language-java">@Configuration
+public class JcaInboundConfiguration {
+
+    @Bean
+    ActivationSpec orderStatusActivationSpec() {
+        OrderStatusActivationSpec spec = new OrderStatusActivationSpec();
+        spec.setDestination(&quot;ORDER.STATUS.CHANGED&quot;);
+        spec.setMaxSessions(8);
+        spec.setRedeliveryAttempts(5);
+        return spec;
+    }
+
+    @Bean
+    GenericMessageEndpointManager orderStatusEndpointManager(
+            ResourceAdapter resourceAdapter,
+            ActivationSpec orderStatusActivationSpec,
+            MessageEndpointFactory orderStatusEndpointFactory) {
+        GenericMessageEndpointManager manager = new GenericMessageEndpointManager();
+        manager.setResourceAdapter(resourceAdapter);
+        manager.setActivationSpec(orderStatusActivationSpec);
+        manager.setMessageEndpointFactory(orderStatusEndpointFactory);
+        return manager;
+    }
+}
+</code></pre>
+<p><code>GenericMessageEndpointManager</code> 在启动时调用 <code>resourceAdapter.endpointActivation(factory, spec)</code>,把 endpoint 工厂注册到 RA。RA 收到 EIS 消息后,通过 <code>WorkManager</code> 调度 <code>Work</code> 实例,在工作线程上调用 <code>factory.createEndpoint().beforeDelivery() / handle() / afterDelivery()</code>。</p>
+<h3>27.5.2 业务处理器</h3>
+<pre><code class="language-java">@Component
+public class OrderStatusEndpoint implements OrderStatusListener {
+
+    private final ProcessedEventRepository processedEvents;
+    private final OrderStatusService orderStatusService;
+
+    @Transactional
+    @Override
+    public void onStatusChanged(OrderStatusMessage message) {
+        if (processedEvents.existsByEventId(message.eventId())) {
+            log.info(&quot;skip duplicate jca message eventId={}&quot;, message.eventId());
+            return;
+        }
+        orderStatusService.applyStatus(
+            message.orderId(),
+            message.status(),
+            message.changedAt());
+        processedEvents.save(new ProcessedEvent(message.eventId()));
+    }
+}
+</code></pre>
+<p>入站端点必须实现幂等。RA 在事务回滚或 ACK 失败时会重投消息,业务侧通过 <code>eventId</code> 唯一约束阻止重复处理。<code>processedEvents</code> 表与业务表共享同一个事务,保证「处理 + 标记」原子化。</p>
+<pre><code class="language-log">2026-05-02T15:52:02.113 INFO  received eventId=EVT-20260502-991 orderId=O1001 status=CONFIRMED
+2026-05-02T15:52:06.088 INFO  skip duplicate jca message eventId=EVT-20260502-991
+</code></pre>
+<h3>27.5.3 失败重投</h3>
+<pre><code class="language-log">2026-05-02T15:52:33.902 ERROR eventId=EVT-20260502-992 orderId=O1001 failed: database deadlock
+2026-05-02T15:52:33.918 DEBUG com.arjuna.ats.jta : rollback inbound transaction xid=0:ffffc0a8012a:8f3a:6634f9de:52
+2026-05-02T15:52:33.930 WARN  OrderResourceAdapter : redelivery scheduled eventId=EVT-20260502-992 attempt=2 delay=PT30S
+</code></pre>
+<p>RA 根据 <code>redeliveryAttempts</code> 配置控制重投次数,超过阈值后消息进入死信队列(由 EIS 或 RA 决定)。Spring 业务代码不直接控制重投策略。</p>
+<h2 id="27.6-陷阱与限制">27.6 陷阱与限制</h2>
+<div class="diagram">
+<div class="diagram-title">图 27-6-1 · JCA 六大陷阱速查思维导图(ClassLoader / XA in-doubt / 云原生 / 容器绑定 / 异常 / 打包)</div>
+<svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="24" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">六大 JCA 生产陷阱 — 现代 Spring Boot 项目慎用 JCA 的核心原因</text>
+
+  <ellipse cx="460" cy="230" rx="110" ry="40" fill="url(#g-red)" stroke="#f85149" stroke-width="3"/>
+  <text x="460" y="226" text-anchor="middle" fill="#fecaca" font-size="13" font-weight="bold">★ JCA 陷阱</text>
+  <text x="460" y="246" text-anchor="middle" fill="#fecaca" font-size="9">六大类</text>
+
+  <path d="M350,210 L160,90"  stroke="#f85149" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <path d="M350,230 L160,230" stroke="#f85149" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <path d="M350,260 L160,360" stroke="#f85149" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <path d="M570,210 L760,90"  stroke="#f85149" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <path d="M570,230 L760,230" stroke="#f85149" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+  <path d="M570,260 L760,360" stroke="#f85149" stroke-width="2" marker-end="url(#arr)" fill="none"/>
+
+  <rect x="20" y="60" width="240" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+  <text x="140" y="80" text-anchor="middle" fill="#dbeafe" font-size="11" font-weight="bold">★ ① ClassLoader 隔离</text>
+  <text x="140" y="96" text-anchor="middle" fill="#dbeafe" font-size="9">同名不同 ClassLoader</text>
+  <text x="140" y="110" text-anchor="middle" fill="#dbeafe" font-size="8">→ ClassCastException</text>
+
+  <rect x="20" y="200" width="240" height="60" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="3"/>
+  <text x="140" y="220" text-anchor="middle" fill="#fecaca" font-size="11" font-weight="bold">★ ② XA in-doubt</text>
+  <text x="140" y="236" text-anchor="middle" fill="#fecaca" font-size="9">prepare 后 TM 崩溃</text>
+  <text x="140" y="250" text-anchor="middle" fill="#fecaca" font-size="8">→ 资源永久锁定 — 最严重</text>
+
+  <rect x="20" y="330" width="240" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+  <text x="140" y="350" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">★ ③ 云原生不友好</text>
+  <text x="140" y="366" text-anchor="middle" fill="#fee2e2" font-size="9">native 库 / preStop 钩子</text>
+  <text x="140" y="380" text-anchor="middle" fill="#fee2e2" font-size="8">→ K8s 滚动重启时 EIS 残留</text>
+
+  <rect x="660" y="60" width="240" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="780" y="80" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">★ ④ 应用服务器绑定</text>
+  <text x="780" y="96" text-anchor="middle" fill="#fee2e2" font-size="9">RA 强依赖容器服务</text>
+  <text x="780" y="110" text-anchor="middle" fill="#fee2e2" font-size="8">→ Spring Boot embed 用不了</text>
+
+  <rect x="660" y="200" width="240" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+  <text x="780" y="220" text-anchor="middle" fill="#bbf7d0" font-size="11" font-weight="bold">★ ⑤ 异常透明度差</text>
+  <text x="780" y="236" text-anchor="middle" fill="#bbf7d0" font-size="9">ResourceException 丢上下文</text>
+  <text x="780" y="250" text-anchor="middle" fill="#bbf7d0" font-size="8">→ 排障极困难</text>
+
+  <rect x="660" y="330" width="240" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+  <text x="780" y="350" text-anchor="middle" fill="#fee2e2" font-size="11" font-weight="bold">★ ⑥ RAR 打包成本</text>
+  <text x="780" y="366" text-anchor="middle" fill="#fee2e2" font-size="9">ra.xml + 各厂商描述符</text>
+  <text x="780" y="380" text-anchor="middle" fill="#fee2e2" font-size="8">→ Java EE 时代遗产</text>
+
+  <text x="20" y="435" fill="#fed7aa" font-size="10">★ 现代实践:新项目用 REST/gRPC 替代 JCA;遗留集成保留 JCA 但用 Spring Boot 嵌入 Narayana JTA</text>
+</svg>
+</div>
+<h3>表 27-6-1:陷阱明细</h3>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>严重级</th>
+<th>陷阱</th>
+<th>症状</th>
+<th>根因</th>
+<th>修复</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>致命</td>
+<td>ClassLoader 隔离</td>
+<td><code>JCoTable cannot be cast to JCoTable</code></td>
+<td>RAR 与 WAR 各自加载同名类</td>
+<td>EIS 客户端库放共享 ClassLoader</td>
+</tr>
+<tr>
+<td>2</td>
+<td>致命</td>
+<td>XA in-doubt 事务</td>
+<td>资源锁住、数据半提交</td>
+<td><code>XAResource.recover()</code> 不完整</td>
+<td>监控 + 人工 commit/rollback</td>
+</tr>
+<tr>
+<td>3</td>
+<td>高</td>
+<td>云原生限制</td>
+<td>native 库失败、preStop 不生效</td>
+<td>完整 EE 容器假设</td>
+<td>容器化前验证本地库</td>
+</tr>
+<tr>
+<td>4</td>
+<td>高</td>
+<td>应用服务器绑定</td>
+<td>迁移失败</td>
+<td>RA 强依赖容器服务</td>
+<td>REST 优先,JCA 仅强一致场景</td>
+</tr>
+<tr>
+<td>5</td>
+<td>中</td>
+<td>异常不透明</td>
+<td><code>ResourceException: Error executing interaction</code></td>
+<td>丢失 EIS 错误码</td>
+<td>包装 <code>CciTemplate</code> 记录上下文</td>
+</tr>
+<tr>
+<td>6</td>
+<td>中</td>
+<td>RAR 打包</td>
+<td><code>ResourceAdapterInternalException</code></td>
+<td>描述符或依赖错误</td>
+<td>Arquillian / 容器集成测试</td>
+</tr>
+</tbody>
+</table>
+<h3>27.6.1 陷阱 1:ClassLoader 隔离</h3>
+<pre><code class="language-text">+---------------------------+      +---------------------------+
+| RAR ClassLoader           |      | WAR ClassLoader           |
+|   sapjco3.jar             |      |   sapjco3.jar (重复)      |
+|   JCoTable v3.0.18        |      |   JCoTable v3.0.18        |
++---------------------------+      +---------------------------+
+              |                                    |
+              v                                    v
+   class JCoTable@RAR  !=  class JCoTable@WAR
+   即使字节码相同, JVM 视为不同类 -&gt; ClassCastException
+</code></pre>
+<p>修复策略:</p>
+<pre><code class="language-text">1. EIS 客户端库放共享 ClassLoader
+   WebLogic    : $DOMAIN_HOME/lib/
+   WebSphere   : Shared Library
+   WildFly     : JBoss Module(modules.xml)
+2. 业务边界只暴露标准类型
+   MappedRecord output = (MappedRecord) interaction.execute(spec, input);
+   String userName = (String) output.get(&quot;USERNAME&quot;);
+3. 厂商私有类型留在 Gateway 内部
+</code></pre>
+<h3>27.6.2 陷阱 2:XA in-doubt 监控</h3>
+<pre><code class="language-java">@Scheduled(fixedRate = 300_000)
+public void monitorInDoubtTransactions() {
+    int count = jtaTransactionManager.getInDoubtTransactionCount();
+    if (count &gt; 0) {
+        log.warn(&quot;found {} in-doubt XA transactions, manual intervention may be needed&quot;, count);
+        alertService.sendAlert(AlertLevel.HIGH, &quot;XA in-doubt transactions: &quot; + count);
+    }
+}
+</code></pre>
+<p><code>prepare</code> 阶段后协调器崩溃是 in-doubt 事务的典型来源。资源端在重启前一直锁住相关行,业务影响放大。<code>XAResource.recover()</code> 必须正确实现 <code>TMSTARTRSCAN</code> / <code>TMENDRSCAN</code>,否则事务管理器拿不到 in-doubt 列表。</p>
+<pre><code class="language-log">2026-05-02T16:00:00.002 WARN  XaRecoveryMonitor : found 2 in-doubt XA transactions
+  resource=jca/CustomerCF oldestAge=PT18M42S
+  action=run recovery console and inspect EIS transaction log
+</code></pre>
+<h3>27.6.3 陷阱 3:云原生支持</h3>
+<p>JCA RA 通常依赖以下应用服务器特性,这些在轻量容器(Docker / Kubernetes)中需要额外配置:</p>
+<pre><code class="language-text">+-------------------+----------------+--------------------------+
+| 依赖项             | 应用服务器     | 容器化处理                |
++-------------------+----------------+--------------------------+
+| native 共享库     | LD_LIBRARY_PATH| 镜像内安装 + ldconfig    |
+| ClassLoader 隔离  | 容器自动管理   | 手动管理 module 路径     |
+| WorkManager       | 容器自动管理   | 自定义 Executor + 监控   |
+| JTA 事务日志      | 持久化目录     | PersistentVolume 挂载    |
+| preStop 优雅停止  | 容器钩子       | SmartLifecycle + grace   |
+| 安全域            | LDAP 集成      | 显式 SecretManager       |
++-------------------+----------------+--------------------------+
+</code></pre>
+<h3>27.6.4 陷阱 4:服务器绑定</h3>
+<table>
+<thead>
+<tr>
+<th>应用服务器</th>
+<th>RA 部署方式</th>
+<th>JNDI 命名空间</th>
+<th>迁移成本</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>WebSphere</td>
+<td>wsadmin 脚本 / Admin Console</td>
+<td><code>eis/CustomerCF</code></td>
+<td>高</td>
+</tr>
+<tr>
+<td>WebLogic</td>
+<td>JCA Resource Adapter Module</td>
+<td><code>eis/CustomerCF</code></td>
+<td>高</td>
+</tr>
+<tr>
+<td>WildFly</td>
+<td>RAR + standalone.xml</td>
+<td><code>java:/eis/CustomerCF</code></td>
+<td>中</td>
+</tr>
+<tr>
+<td>Spring Boot 嵌入式</td>
+<td><code>ResourceAdapterFactoryBean</code></td>
+<td>应用内</td>
+<td>仅测试用</td>
+</tr>
+</tbody>
+</table>
+<p>跨应用服务器迁移时,RA 配置、JNDI 命名空间、安全域映射、连接池参数都需要重新调整。架构层面应优先评估 EIS 是否提供 REST / OData,REST + Outbox 模式可避免 JCA 的容器绑定。</p>
+<h3>27.6.5 陷阱 5:异常透明度</h3>
+<pre><code class="language-java">@Component
+public class InstrumentedCciTemplate {
+
+    public &lt;T&gt; T execute(InteractionSpec spec, RecordCreator creator, RecordExtractor&lt;T&gt; extractor) {
+        long start = System.nanoTime();
+        try {
+            T result = (T) cciTemplate.execute(spec, creator, extractor);
+            log.info(&quot;interaction={} elapsedMs={} status=OK&quot;,
+                describeSpec(spec), (System.nanoTime() - start) / 1_000_000);
+            return result;
+        } catch (DataAccessException e) {
+            String eisCode = extractEisCode(e);
+            log.error(&quot;interaction={} elapsedMs={} status=FAIL eisCode={} cause={}&quot;,
+                describeSpec(spec),
+                (System.nanoTime() - start) / 1_000_000,
+                eisCode,
+                rootCause(e));
+            throw e;
+        }
+    }
+}
+</code></pre>
+<p><code>ResourceException</code> 的子类(<code>EISSystemException</code>、<code>SecurityException</code>、<code>LocalTransactionException</code>)携带 EIS 错误码,但 RA 默认仅在 message 中拼接。包装层需要显式提取并记录,排障时能直接定位到 EIS 端业务错误而非 Java 调用栈。</p>
+<h3>27.6.6 陷阱 6:RAR 打包</h3>
+<pre><code class="language-text">eis-ra.rar
+├── META-INF/
+│   ├── ra.xml                    # JCA 标准描述符
+│   ├── ironjacamar.xml           # WildFly 厂商扩展(可选)
+│   └── MANIFEST.MF
+├── eis-ra-impl.jar              # ResourceAdapter 实现
+├── eis-ra-api.jar               # Interaction / Record 接口
+└── lib/
+    ├── vendor-client.jar        # EIS 客户端库
+    └── native/
+        └── libeisclient.so      # native 共享库
+</code></pre>
+<p><code>ra.xml</code> 必须声明 <code>ManagedConnectionFactory</code>、<code>ConnectionFactory</code>、<code>Connection</code>、<code>MessageListener</code> 等所有 JCA 角色实现类。版本不匹配、依赖缺失、native 库路径错误均触发 <code>ResourceAdapterInternalException</code>。</p>
+<h2 id="27.7-源码深潜">27.7 源码深潜</h2>
+<h3>表 27-7-1:Spring 侧关键源码入口</h3>
+<table>
+<thead>
+<tr>
+<th>层次</th>
+<th>入口类</th>
+<th>关键方法</th>
+<th>运行时职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>JNDI 绑定</td>
+<td><code>JndiObjectFactoryBean</code></td>
+<td><code>lookup()</code></td>
+<td>容器查找 <code>ConnectionFactory</code> / RA</td>
+</tr>
+<tr>
+<td>出站模板</td>
+<td><code>CciTemplate</code></td>
+<td><code>execute()</code></td>
+<td>获取连接、<code>Interaction</code>、关闭</td>
+</tr>
+<tr>
+<td>连接工具</td>
+<td><code>ConnectionFactoryUtils</code></td>
+<td><code>getConnection()</code></td>
+<td>复用事务绑定的 CCI Connection</td>
+</tr>
+<tr>
+<td>记录回调</td>
+<td><code>RecordCreator</code> / <code>RecordExtractor</code></td>
+<td>接口回调</td>
+<td>隔离记录构造与结果映射</td>
+</tr>
+<tr>
+<td>本地事务</td>
+<td><code>CciLocalTransactionManager</code></td>
+<td><code>doBegin()</code></td>
+<td>单 JCA 资源本地事务</td>
+</tr>
+<tr>
+<td>全局事务</td>
+<td><code>JtaTransactionManager</code></td>
+<td><code>doBegin()</code></td>
+<td>JTA 登记 XAResource</td>
+</tr>
+<tr>
+<td>RA 启动</td>
+<td><code>ResourceAdapterFactoryBean</code></td>
+<td><code>afterPropertiesSet()</code></td>
+<td>嵌入式启动(测试用)</td>
+</tr>
+<tr>
+<td>入站端点</td>
+<td><code>GenericMessageEndpointManager</code></td>
+<td><code>start()</code></td>
+<td>调用 <code>endpointActivation()</code></td>
+</tr>
+<tr>
+<td>Endpoint 工厂</td>
+<td><code>GenericMessageEndpointFactory</code></td>
+<td><code>createEndpoint()</code></td>
+<td>业务 endpoint + 事务接入</td>
+</tr>
+<tr>
+<td>JCA 标准</td>
+<td><code>ConnectionManager</code></td>
+<td><code>allocateConnection()</code></td>
+<td>RA 与容器协作分配</td>
+</tr>
+</tbody>
+</table>
+<div class="diagram">
+<div class="diagram-title">图 27-7-1 · Spring 调用 JCA 的完整链路时序(JNDI 查找 → CciTemplate → 池化 → XA 加入 → EIS 调用)</div>
+<svg viewBox="0 0 920 660" xmlns="http://www.w3.org/2000/svg">
+  <text x="460" y="24" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">完整 8 大组件链路 — 11 步走完一次 EIS 调用</text>
+
+  <text x="55"  y="60" text-anchor="middle" fill="#bc8cff" font-size="10" font-weight="bold">Boot</text>
+  <text x="170" y="60" text-anchor="middle" fill="#58a6ff" font-size="10" font-weight="bold">★ JNDI</text>
+  <text x="290" y="60" text-anchor="middle" fill="#3fb950" font-size="10" font-weight="bold">★ CCI</text>
+  <text x="410" y="60" text-anchor="middle" fill="#d29922" font-size="10" font-weight="bold">CF</text>
+  <text x="530" y="60" text-anchor="middle" fill="#d29922" font-size="10" font-weight="bold">★ CM</text>
+  <text x="650" y="60" text-anchor="middle" fill="#bc8cff" font-size="10" font-weight="bold">★ RA/MC</text>
+  <text x="770" y="60" text-anchor="middle" fill="#d29922" font-size="10" font-weight="bold">★ TM</text>
+  <text x="880" y="60" text-anchor="middle" fill="#f85149" font-size="10" font-weight="bold">EIS</text>
+
+  <line x1="55"  y1="80" x2="55"  y2="630" stroke="#bc8cff" stroke-dasharray="3,2"/>
+  <line x1="170" y1="80" x2="170" y2="630" stroke="#58a6ff" stroke-dasharray="3,2"/>
+  <line x1="290" y1="80" x2="290" y2="630" stroke="#3fb950" stroke-dasharray="3,2"/>
+  <line x1="410" y1="80" x2="410" y2="630" stroke="#d29922" stroke-dasharray="3,2"/>
+  <line x1="530" y1="80" x2="530" y2="630" stroke="#d29922" stroke-dasharray="3,2"/>
+  <line x1="650" y1="80" x2="650" y2="630" stroke="#bc8cff" stroke-dasharray="3,2"/>
+  <line x1="770" y1="80" x2="770" y2="630" stroke="#d29922" stroke-dasharray="3,2"/>
+  <line x1="880" y1="80" x2="880" y2="630" stroke="#f85149" stroke-dasharray="3,2"/>
+
+  <path d="M55,100 L170,100" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="115" y="93" text-anchor="middle" fill="#fee2e2" font-size="9" font-weight="bold">① lookup</text>
+
+  <path d="M170,135 L55,135" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#arr)" fill="none"/>
+  <text x="115" y="128" text-anchor="middle" fill="#dbeafe" font-size="9" font-weight="bold">★ ② CF proxy</text>
+
+  <path d="M55,170 L290,170" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="170" y="163" text-anchor="middle" fill="#fee2e2" font-size="9" font-weight="bold">★ ③ execute(spec, input, extractor)</text>
+
+  <path d="M290,205 L410,205" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="350" y="198" text-anchor="middle" fill="#bbf7d0" font-size="9">④ getConn</text>
+
+  <path d="M410,240 L530,240" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="470" y="233" text-anchor="middle" fill="#fed7aa" font-size="9" font-weight="bold">★ ⑤ allocateConn</text>
+
+  <path d="M530,275 L650,275" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="590" y="268" text-anchor="middle" fill="#fed7aa" font-size="9" font-weight="bold">★ ⑥ match/create MC</text>
+
+  <path d="M530,315 L770,315" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="650" y="308" text-anchor="middle" fill="#fed7aa" font-size="9" font-weight="bold">★ ⑦ enlist XAResource(如有全局 tx)</text>
+
+  <path d="M290,360 L650,360" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="470" y="353" text-anchor="middle" fill="#bbf7d0" font-size="9" font-weight="bold">★ ⑧ createInteraction().execute()</text>
+
+  <path d="M650,400 L880,400" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="765" y="393" text-anchor="middle" fill="#fee2e2" font-size="9" font-weight="bold">★ ⑨ vendor protocol call</text>
+
+  <path d="M880,435 L650,435" stroke="#f85149" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#arr)" fill="none"/>
+  <text x="765" y="428" text-anchor="middle" fill="#fecaca" font-size="9" font-weight="bold">★ ⑩ output record</text>
+
+  <path d="M650,470 L290,470" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#arr)" fill="none"/>
+  <text x="470" y="463" text-anchor="middle" fill="#fee2e2" font-size="9">⑪ MappedRecord</text>
+
+  <path d="M290,510 L530,510" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr)" fill="none"/>
+  <text x="410" y="503" text-anchor="middle" fill="#bbf7d0" font-size="9" font-weight="bold">★ ⑫ close logical connection(归还池)</text>
+
+  <text x="20" y="565" fill="#fed7aa" font-size="10">★ App Server 的 ConnectionManager(CM) 是关键 — 负责连接池化 + XA 自动 enlist + 安全 Subject 注入</text>
+  <text x="20" y="585" fill="#fed7aa" font-size="9">★ Spring 端只接触 JNDI/CciTemplate/CF 三件套,池化与事务由容器内部完成</text>
+  <text x="20" y="605" fill="#fed7aa" font-size="9">★ Boot 嵌入式部署时由 Narayana JTA 取代 CM 角色完成 enlist;但 RA 仍需要兼容</text>
+</svg>
+</div>
+    CCI-->>Boot: mapped DTO
+
+</div></div>
+<h3>27.7.1 设计取舍</h3>
+<p><strong>取舍 1:Spring 不应复刻完整 JCA 容器</strong></p>
+<p>JCA 设计前提是完整应用服务器:JNDI、安全域、<code>WorkManager</code>、连接池、事务日志、XA recovery、ClassLoader 隔离。Spring Boot 进程临时拼装这些组件通常仅覆盖 happy path,无法处理 in-doubt recover、重投、安全域映射等场景。生产环境的强一致 JCA 集成应部署在 WebSphere / WebLogic / WildFly 中,Spring 仅作为业务消费者。</p>
+<p><strong>取舍 2:CCI 标准化与厂商私有 API</strong></p>
+<p>CCI 提供 <code>Connection</code>、<code>Interaction</code>、<code>MappedRecord</code> 等标准接口,业务代码只依赖标准类型时易于切换 RA。但厂商私有 API(如 SAP JCo 的 <code>JCoFunction</code>、CICS 的 COMMAREA)能力更强、性能更好。折中方案:Gateway 层使用厂商 API 实现,对外只暴露 DTO;业务层只见标准类型。</p>
+<p><strong>取舍 3:JCA 与 REST/Outbox 的选择</strong></p>
+<table>
+<thead>
+<tr>
+<th>场景特征</th>
+<th>推荐方案</th>
+<th>理由</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>EIS 已提供 REST / OData</td>
+<td>REST + Outbox</td>
+<td>避免 JCA 容器绑定,云原生友好</td>
+</tr>
+<tr>
+<td>强一致(库存、账务)</td>
+<td>JCA + JTA/XA</td>
+<td>REST 难以实现跨系统 2PC</td>
+</tr>
+<tr>
+<td>仅查询、最终一致</td>
+<td>REST</td>
+<td>JCA 重型基础设施成本不合理</td>
+</tr>
+<tr>
+<td>EIS 仅支持私有协议</td>
+<td>JCA</td>
+<td>RA 厂商通常仅提供 JCA 接入</td>
+</tr>
+<tr>
+<td>受监管环境合规审计</td>
+<td>JCA</td>
+<td>XA 事务日志符合审计要求</td>
+</tr>
+</tbody>
+</table>
+<h3>表 27-7-2:验证矩阵</h3>
+<table>
+<thead>
+<tr>
+<th>验证目标</th>
+<th>工具</th>
+<th>关键断言</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CciTemplate</code> 资源关闭</td>
+<td>集成测试 + JCA 池指标</td>
+<td>调用后 <code>activeConnections == 0</code></td>
+</tr>
+<tr>
+<td>XA 回滚</td>
+<td>模拟 EIS 异常</td>
+<td>数据库审计行计数为 0</td>
+</tr>
+<tr>
+<td>入站幂等</td>
+<td>重复投递相同 <code>eventId</code></td>
+<td>处理次数 = 1</td>
+</tr>
+<tr>
+<td>启动探针</td>
+<td>启动时调用 <code>getConnection()</code></td>
+<td>日志输出 EIS product / version / user</td>
+</tr>
+<tr>
+<td>池指标</td>
+<td>Actuator <code>/metrics</code></td>
+<td><code>jca.connections.{active,idle,waiting}</code> 暴露</td>
+</tr>
+</tbody>
+</table>
+<pre><code class="language-java">@Test
+void cciTemplateClosesLogicalConnectionAfterInteraction() {
+    CustomerSnapshot snapshot = customerGateway.findCustomer(&quot;10000042&quot;);
+    assertThat(snapshot.customerId()).isEqualTo(&quot;10000042&quot;);
+    assertThat(jcaPoolMetrics.activeConnections()).isZero();
+    assertThat(interactionProbe.lastInteraction()).isEqualTo(&quot;CUSTOMER_READ&quot;);
+}
+
+@Test
+void xaRollbackRemovesAuditRowWhenEisFails() {
+    assertThatThrownBy(() -&gt; orderReservationService.reserveWithRollback(command))
+        .isInstanceOf(ResourceAccessException.class);
+    Integer rows = jdbcTemplate.queryForObject(
+        &quot;select count(*) from order_audit where order_id = ?&quot;,
+        Integer.class, command.orderId());
+    assertThat(rows).isZero();
+}
+
+@Test
+void inboundEndpointIsIdempotentForRedelivery() {
+    OrderStatusMessage message = new OrderStatusMessage(
+        &quot;EVT-1&quot;, &quot;SO-1&quot;, &quot;CONFIRMED&quot;, Instant.now());
+    endpoint.onStatusChanged(message);
+    endpoint.onStatusChanged(message);
+    assertThat(processedEvents.countByEventId(&quot;EVT-1&quot;)).isEqualTo(1);
+    assertThat(orderStatusHistory.countByOrderId(&quot;SO-1&quot;)).isEqualTo(1);
+}
+</code></pre>
+<h3>27.7.2 生产护栏五项</h3>
+<pre><code class="language-text">+---+--------------------------+--------------------------------+
+| # | 护栏项                    | 监控指标 / 日志                 |
++---+--------------------------+--------------------------------+
+| 1 | 启动探针记录元数据         | EIS product/version/user        |
+| 2 | CCI 调用上下文日志         | interaction/elapsed/eisCode     |
+| 3 | XA in-doubt 监控           | in-doubt count, oldest age      |
+| 4 | 入站 endpoint 重投日志     | eventId, attempt, delay         |
+| 5 | 连接池 JMX 暴露            | active/idle/waiting             |
++---+--------------------------+--------------------------------+
+</code></pre>
+<div class="chapter-summary">
+<h2>27.8 本章要点</h2>
+
+<table>
+<thead>
+<tr>
+<th>要点</th>
+<th>源码 / 配置依据</th>
+<th>易错点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>JCA 标准化连接 / 事务 / 安全 / 入站 / 生命周期五大合约</td>
+<td>JSR-322 / Jakarta Connectors</td>
+<td>Spring 仅消费,不复刻容器</td>
+</tr>
+<tr>
+<td><code>ResourceAdapter</code>(RAR)由应用服务器部署</td>
+<td><code>ra.xml</code> + 厂商描述符</td>
+<td>Spring Boot 进程不打包 RAR</td>
+</tr>
+<tr>
+<td><code>JndiObjectFactoryBean</code> 启动期查找</td>
+<td><code>setLookupOnStartup(true)</code></td>
+<td>运行时首次失败延迟暴露</td>
+</tr>
+<tr>
+<td><code>CciTemplate</code> 封装 CCI 出站</td>
+<td><code>getConnection / createInteraction / close</code></td>
+<td>异常包装为 <code>DataAccessException</code></td>
+</tr>
+<tr>
+<td><code>JtaTransactionManager</code> 把 JCA + JDBC enlist 同一 XID</td>
+<td><code>XAResource.prepare/commit</code></td>
+<td>in-doubt 事务必须监控</td>
+</tr>
+<tr>
+<td><code>GenericMessageEndpointManager</code> 注册入站</td>
+<td><code>endpointActivation()</code></td>
+<td>端点必须幂等</td>
+</tr>
+<tr>
+<td>连接池指标走 JMX <code>ManagedConnectionPoolMXBean</code></td>
+<td><code>MeterBinder</code> 桥接 Micrometer</td>
+<td>Spring 不维护池状态</td>
+</tr>
+<tr>
+<td>ClassLoader 隔离:EIS 客户端库放共享 ClassLoader</td>
+<td>WebSphere Shared Library / WildFly Module</td>
+<td>同名类不同 CL → ClassCastException</td>
+</tr>
+<tr>
+<td>XA in-doubt 事务必须监控 + 人工干预</td>
+<td><code>getInDoubtTransactionCount()</code></td>
+<td>资源永久锁定风险</td>
+</tr>
+<tr>
+<td>业务边界只暴露标准类型(<code>MappedRecord</code> / DTO)</td>
+<td>Gateway 模式</td>
+<td>厂商私有类型穿透业务边界</td>
+</tr>
+<tr>
+<td>EIS 已提供 REST 时优先 REST + Outbox</td>
+<td>对比矩阵</td>
+<td>JCA 重型基础设施成本不合理</td>
+</tr>
+</tbody>
+</table>
+<p>最小回归验证:</p>
+<pre><code class="language-bash"># 启动探针检查 JNDI + getConnection
+curl http://localhost:8080/actuator/health/jca
+
+# 连接池指标
+curl http://localhost:8080/actuator/metrics/jca.connections.active
+
+# XA in-doubt 监控
+curl http://localhost:8080/actuator/metrics/jta.transactions.indoubt
+</code></pre>
+<hr>
+<p><strong>下一章:JMX 管理与监控</strong></p>
+<p>JMX(Java Management Extensions,JSR-3 / JSR-160)定义了 Java 应用的标准化管理接口。下一章讨论 Spring 的 JMX 集成:<code>MBeanServer</code> 抽象、<code>@ManagedResource</code> / <code>@ManagedOperation</code> / <code>@ManagedAttribute</code> 注解暴露、<code>ObjectName</code> 命名约定、JMX 通知机制、远程 JMX 连接器的安全配置,以及与 Micrometer / Actuator 的协作。JCA 的连接池、入站端点、XA recovery 状态正是生产环境最应通过 JMX 暴露给运维的对象。</p>
+</div>
+
+
+<div class="chapter-nav">
+  <a href="ch26-oxm.html">&larr; ch26-oxm · 第 26 章 · OXM 对象 XML 映射</a>
+  <a href="ch28-jmx.html">ch28-jmx · 第 28 章 · JMX 管理与监控 &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 Spring Boot &middot; 第 27 章 · JCA 连接器架构</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+</body>
+</html>

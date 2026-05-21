@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.19 Share Consumer (KIP-932) — 图解 Kafka</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Kafka</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="18-papers.html">上一章</a>
+  <a href="20-quotas.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s19-0">19.0 章首速览</a>
+  <a href="#s19-1">19.1 适用与拒绝场景</a>
+  <a href="#s19-2">19.2 Record Lock 机制</a>
+  <a href="#s19-3">19.3 ShareFetch RPC</a>
+  <a href="#s19-4">19.4 三态 ACK</a>
+  <a href="#s19-5">19.5 Coordinator 状态机</a>
+  <a href="#s19-6">19.6 顺序退化与去重</a>
+  <a href="#s19-7">19.7 监控指标</a>
+  <a href="#s19-8">19.8 设计取舍</a>
+  <a href="#s19-9">19.9 陷阱</a>
+  <a href="#s19-summary">19.10 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 19 章 · Share Consumer 与 Share Groups (KIP-932)</h1>
+<p class="subtitle">ShareConsumer · Share Group Coordinator · Record Lock · per-record ACK · __share_group_state · ACCEPT / RELEASE / REJECT</p>
+
+<div class="chapter-intro">
+  <p class="lead">十多年来 Kafka 一直坚持"<strong>一个 partition 同一时间只能被一个 consumer 独占</strong>"这条铁律。这条铁律让分区内严格有序成为可能,也让 offset commit 变成简单的"<em>整型前缀推进</em>"。但代价同样硬:并行度上限 = partition 数。如果你的业务是慢任务池 — 一条记录处理 10 秒,但 partition 数只有 10,你最多并行 10 个 worker,扩容只能加 partition,而加 partition 又会影响下游 key 分布。</p>
+  <p>Kafka 4.1 preview 引入的 <strong>Share Consumer + Share Group</strong>(KIP-932)就是为了打破这条铁律。它把"<em>分区独占</em>" 改成"<em>记录级竞争</em>" — 同一个 partition 的不同 record 可以分发给不同 ShareConsumer 并行处理,每条记录单独 ACK,失败的记录可以 RELEASE 重投。这种"<em>Pub/Sub-like 工作池</em>"语义之前只能用 RabbitMQ / SQS / ActiveMQ 实现,现在 Kafka 原生支持了。</p>
+  <p>但它<strong>不是替代</strong> Consumer Group,而是<strong>补齐</strong>。流处理、ETL、严格顺序场景继续用 Consumer Group。任务池、慢任务、异步处理用 Share Group。本章详细讲两者的差异、Record Lock 实现、ACK 三态语义、Coordinator 状态机、压测与监控要点。</p>
+  <ul class="will-learn">
+    <li>Consumer Group 在"<em>慢任务池</em>" 场景的扩容瓶颈</li>
+    <li>Record-level lock:每条 record 在 Coordinator 上的 owner / deadline / count</li>
+    <li>ShareFetch RPC:Coordinator 怎样按可用 record 分发</li>
+    <li>三态 ACK:ACCEPT(终态成功)/ RELEASE(重投)/ REJECT(终态失败)</li>
+    <li>Delivery limit + Lock timeout 两道防线</li>
+    <li><code>__share_group_state</code> internal topic + Coordinator 状态机</li>
+    <li>顺序退化和去重(at-least-once 仍然成立)</li>
+    <li>压测要点:Coordinator 是状态热点</li>
+  </ul>
+  <p class="prereq">第 8 章 Consumer Group;第 13 章 Log Compaction;第 14 章 Purgatory;基本的消息队列概念(SQS / RabbitMQ)。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s19-0">19.0 章首速览</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">图 19-0 · Share Group 全景</div>
+<svg viewBox="0 0 900 520" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="520" fill="#0f172a" rx="8"/>
+
+  <!-- Topic on left -->
+  <rect x="20" y="40" width="200" height="200" rx="10" fill="#1e293b" stroke="#475569" stroke-dasharray="4 3"/>
+  <text x="120" y="65" text-anchor="middle" fill="#cbd5e1" font-size="12" font-weight="700">Topic: shipment-created</text>
+
+  <rect x="40" y="90" width="160" height="50" rx="6" fill="url(#g-purple)"/>
+  <text x="120" y="110" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Partition 0</text>
+  <text x="120" y="128" text-anchor="middle" fill="#e9d5ff" font-size="10">offset 100..199</text>
+
+  <rect x="40" y="160" width="160" height="50" rx="6" fill="url(#g-purple)"/>
+  <text x="120" y="180" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Partition 1</text>
+  <text x="120" y="198" text-anchor="middle" fill="#e9d5ff" font-size="10">offset 200..299</text>
+
+  <!-- Coordinator middle -->
+  <rect x="290" y="40" width="320" height="430" rx="12" fill="#0d1117" stroke="#94a3b8" stroke-width="2"/>
+  <text x="450" y="68" text-anchor="middle" fill="#fff" font-size="14" font-weight="700">Share Group Coordinator</text>
+
+  <rect x="310" y="90" width="280" height="60" rx="6" fill="url(#g-blue)" stroke="#60a5fa"/>
+  <text x="450" y="115" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">ShareFetch dispatcher</text>
+  <text x="450" y="135" text-anchor="middle" fill="#dbeafe" font-size="10">按可用记录(非锁)分发给 Worker</text>
+
+  <rect x="310" y="170" width="280" height="110" rx="6" fill="url(#g-orange)" stroke="#f59e0b"/>
+  <text x="450" y="195" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">Record Lock Table</text>
+  <text x="450" y="215" text-anchor="middle" fill="#fef3c7" font-size="10">offset → owner / deadline / count</text>
+  <text x="320" y="238" fill="#fef3c7" font-size="10">- 100 → Worker A, exp 14:23:30, count 1</text>
+  <text x="320" y="255" fill="#fef3c7" font-size="10">- 101 → Worker B, exp 14:23:30, count 1</text>
+  <text x="320" y="272" fill="#fef3c7" font-size="10">- 102 → released (count 2)</text>
+
+  <rect x="310" y="300" width="280" height="60" rx="6" fill="url(#g-green)" stroke="#22c55e"/>
+  <text x="450" y="325" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">__share_group_state</text>
+  <text x="450" y="345" text-anchor="middle" fill="#dcfce7" font-size="10">compacted topic, 持久化锁 + 投递状态</text>
+
+  <rect x="310" y="380" width="280" height="60" rx="6" fill="url(#g-red)" stroke="#ef4444"/>
+  <text x="450" y="405" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">Retry Policy</text>
+  <text x="450" y="425" text-anchor="middle" fill="#fecaca" font-size="10">lock timeout + delivery limit</text>
+
+  <!-- Workers right -->
+  <rect x="680" y="40" width="200" height="200" rx="10" fill="#1e293b" stroke="#475569" stroke-dasharray="4 3"/>
+  <text x="780" y="65" text-anchor="middle" fill="#cbd5e1" font-size="12" font-weight="700">Share Group: fulfillment</text>
+
+  <rect x="700" y="90" width="160" height="40" rx="6" fill="url(#g-green)"/>
+  <text x="780" y="115" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Worker A</text>
+
+  <rect x="700" y="140" width="160" height="40" rx="6" fill="url(#g-green)"/>
+  <text x="780" y="165" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Worker B</text>
+
+  <rect x="700" y="190" width="160" height="40" rx="6" fill="url(#g-green)"/>
+  <text x="780" y="215" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Worker C</text>
+
+  <!-- arrows -->
+  <path d="M220 115 L290 115" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M220 185 L290 130" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+  <path d="M610 110 L680 110" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M610 130 L680 160" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M610 140 L680 210" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+  <path d="M700 110 Q650 250 600 220" stroke="#fbbf24" stroke-width="1.5" fill="none" marker-end="url(#arr)" stroke-dasharray="4 3"/>
+  <text x="650" y="250" fill="#fef3c7" font-size="10">ACCEPT/RELEASE/REJECT</text>
+</svg>
+</div>
+
+<table>
+  <thead><tr><th>维度</th><th>Consumer Group</th><th>Share Group</th></tr></thead>
+  <tbody>
+    <tr><td>分配粒度</td><td>Partition</td><td><strong>Record</strong></td></tr>
+    <tr><td>并行度上限</td><td>分区数</td><td>锁配额 + Worker 数 + 处理耗时</td></tr>
+    <tr><td>确认模型</td><td>offset commit(前缀)</td><td><strong>per-record ACK</strong></td></tr>
+    <tr><td>重试模型</td><td>业务自管</td><td>RELEASE / 超时自动重投</td></tr>
+    <tr><td>顺序保证</td><td>分区内严格有序</td><td><strong>同分区可乱序竞争</strong></td></tr>
+    <tr><td>协调状态</td><td><code>__consumer_offsets</code></td><td><code>__share_group_state</code></td></tr>
+    <tr><td>适用场景</td><td>流处理 / ETL</td><td>任务池 / 慢任务 / 异步 Worker</td></tr>
+  </tbody>
+</table>
+
+<div class="diagram">
+  <div class="diagram-title">图 19-0-1 · 三句话</div>
+<pre><code>1 Share Group 是记录级竞争消费
+  打破分区独占
+  代价是失去分区内顺序
+
+2 ACK 是 per-record 三态决策
+  ACCEPT 终态成功
+  RELEASE 重投, REJECT 终态失败
+
+3 Coordinator 是状态热点
+  __share_group_state 必须按内部 topic 管理
+  压测必看其 ISR 与写入延迟</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s19-1">19.1 适用与拒绝场景</h2>
+<!-- ============================================================ -->
+
+<div class="compare-grid">
+  <div>
+    <h4>✅ 适合 Share Group</h4>
+    <ul>
+      <li>慢任务池(每条 record 处理 1s - 60s)</li>
+      <li>需要逐条 retry / 死信(DLQ)</li>
+      <li>不依赖分区内顺序(record 之间独立)</li>
+      <li>Worker 数远大于 partition 数</li>
+      <li>任务时长方差大(快慢混合)</li>
+    </ul>
+  </div>
+  <div>
+    <h4>❌ 不适合(用 Consumer Group)</h4>
+    <ul>
+      <li>需要分区内严格有序</li>
+      <li>流处理 / Kafka Streams</li>
+      <li>事务(EOS)读取(Share Group 不兼容 transactional consumer)</li>
+      <li>下游有 stateful join,依赖 partition 路由</li>
+      <li>毫秒级延迟敏感(Coordinator 多一跳)</li>
+    </ul>
+  </div>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">图 19-1 · Consumer Group 并行瓶颈 vs Share Group</div>
+<svg viewBox="0 0 900 360" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="360" fill="#0f172a" rx="8"/>
+
+  <!-- Left: Consumer Group -->
+  <rect x="20" y="20" width="420" height="320" rx="10" fill="#1e293b" stroke="#60a5fa"/>
+  <text x="230" y="50" text-anchor="middle" fill="#60a5fa" font-size="13" font-weight="700">Consumer Group(分区独占)</text>
+
+  <g transform="translate(40, 70)">
+    <rect x="0" y="0" width="80" height="30" rx="4" fill="url(#g-purple)"/>
+    <text x="40" y="20" text-anchor="middle" fill="#fff" font-size="11">P0</text>
+    <path d="M80 15 L150 15" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+    <rect x="150" y="0" width="120" height="30" rx="4" fill="url(#g-green)"/>
+    <text x="210" y="20" text-anchor="middle" fill="#fff" font-size="11">Worker 1 (busy 10s)</text>
+
+    <rect x="0" y="50" width="80" height="30" rx="4" fill="url(#g-purple)"/>
+    <text x="40" y="70" text-anchor="middle" fill="#fff" font-size="11">P1</text>
+    <path d="M80 65 L150 65" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+    <rect x="150" y="50" width="120" height="30" rx="4" fill="url(#g-green)"/>
+    <text x="210" y="70" text-anchor="middle" fill="#fff" font-size="11">Worker 2 (busy 10s)</text>
+
+    <rect x="0" y="100" width="80" height="30" rx="4" fill="url(#g-purple)"/>
+    <text x="40" y="120" text-anchor="middle" fill="#fff" font-size="11">P2</text>
+    <path d="M80 115 L150 115" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+    <rect x="150" y="100" width="120" height="30" rx="4" fill="url(#g-green)"/>
+    <text x="210" y="120" text-anchor="middle" fill="#fff" font-size="11">Worker 3 (busy 10s)</text>
+
+    <rect x="290" y="50" width="100" height="80" rx="6" fill="url(#g-red)" opacity="0.6"/>
+    <text x="340" y="80" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Worker 4-N</text>
+    <text x="340" y="100" text-anchor="middle" fill="#fecaca" font-size="10">IDLE(无 partition)</text>
+  </g>
+
+  <text x="230" y="240" text-anchor="middle" fill="#fbbf24" font-size="12" font-weight="700">最大并行 = partition 数 = 3</text>
+  <text x="230" y="262" text-anchor="middle" fill="#fbbf24" font-size="11">扩容只能加 partition(影响 key 分布)</text>
+  <text x="230" y="285" text-anchor="middle" fill="#fecaca" font-size="11">慢任务把整个 partition 卡住</text>
+  <text x="230" y="310" text-anchor="middle" fill="#fecaca" font-size="11">throughput = 3 / 10s = 0.3 record/s</text>
+
+  <!-- Right: Share Group -->
+  <rect x="460" y="20" width="420" height="320" rx="10" fill="#1e293b" stroke="#22c55e"/>
+  <text x="670" y="50" text-anchor="middle" fill="#86efac" font-size="13" font-weight="700">Share Group(record 竞争)</text>
+
+  <g transform="translate(480, 70)">
+    <rect x="0" y="0" width="100" height="100" rx="6" fill="url(#g-purple)"/>
+    <text x="50" y="22" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">P0 + P1 + P2</text>
+    <text x="50" y="40" text-anchor="middle" fill="#e9d5ff" font-size="10">offset 100..1000</text>
+    <text x="50" y="60" text-anchor="middle" fill="#e9d5ff" font-size="10">所有 records</text>
+    <text x="50" y="80" text-anchor="middle" fill="#e9d5ff" font-size="10">作为竞争池</text>
+
+    <rect x="240" y="0" width="140" height="20" rx="3" fill="url(#g-green)"/>
+    <text x="310" y="14" text-anchor="middle" fill="#fff" font-size="10">Worker 1 (rec 100)</text>
+
+    <rect x="240" y="25" width="140" height="20" rx="3" fill="url(#g-green)"/>
+    <text x="310" y="39" text-anchor="middle" fill="#fff" font-size="10">Worker 2 (rec 101)</text>
+
+    <rect x="240" y="50" width="140" height="20" rx="3" fill="url(#g-green)"/>
+    <text x="310" y="64" text-anchor="middle" fill="#fff" font-size="10">Worker 3 (rec 102)</text>
+
+    <rect x="240" y="75" width="140" height="20" rx="3" fill="url(#g-green)"/>
+    <text x="310" y="89" text-anchor="middle" fill="#fff" font-size="10">Worker 4 (rec 103)</text>
+
+    <rect x="240" y="100" width="140" height="20" rx="3" fill="url(#g-green)"/>
+    <text x="310" y="114" text-anchor="middle" fill="#fff" font-size="10">Worker N (rec ...)</text>
+
+    <path d="M100 50 Q170 50 240 10" stroke="#22c55e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M100 50 Q170 50 240 35" stroke="#22c55e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M100 50 L240 60" stroke="#22c55e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M100 50 Q170 50 240 85" stroke="#22c55e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  </g>
+
+  <text x="670" y="240" text-anchor="middle" fill="#86efac" font-size="12" font-weight="700">最大并行 = Worker 数(可 100s)</text>
+  <text x="670" y="262" text-anchor="middle" fill="#86efac" font-size="11">扩容只加 Worker,不动 partition</text>
+  <text x="670" y="285" text-anchor="middle" fill="#dcfce7" font-size="11">慢 record 不阻塞其他 record</text>
+  <text x="670" y="310" text-anchor="middle" fill="#dcfce7" font-size="11">throughput ≫ Consumer Group</text>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s19-2">19.2 Record Lock 机制</h2>
+<!-- ============================================================ -->
+
+<p>Share Group 的核心数据结构是 <strong>Record Lock Table</strong>:每条被分发的 record 都有一个锁条目,记录"<em>当前被谁拿走、什么时候到期、已投递几次</em>"。</p>
+
+<pre><code class="language-java">// Coordinator 内的 Lock 条目(概念)
+class RecordLock {
+    long offset;           // partition 内 offset
+    String ownerMemberId;  // 当前 Worker member id
+    long lockExpiresAt;    // 锁到期时间(ms)
+    int deliveryCount;     // 已投递次数(从 1 开始)
+    LockState state;       // ACQUIRED / RELEASED / ACCEPTED / REJECTED
+}
+
+enum LockState {
+    ACQUIRED,   // Worker 正在处理
+    RELEASED,   // Worker 主动放弃 / 超时被收回, 等待重投
+    ACCEPTED,   // 终态: 成功
+    REJECTED    // 终态: 失败(超过 delivery limit 或显式 REJECT)
+}</code></pre>
+
+<h3>Lock 生命周期</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 19-2 · Record Lock 状态机</div>
+<svg viewBox="0 0 900 360" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="360" fill="#0f172a" rx="8"/>
+
+  <rect x="20" y="150" width="140" height="60" rx="30" fill="#0d1117" stroke="#94a3b8"/>
+  <text x="90" y="180" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">UNFETCHED</text>
+  <text x="90" y="198" text-anchor="middle" fill="#cbd5e1" font-size="10">未分发</text>
+
+  <rect x="220" y="150" width="140" height="60" rx="30" fill="url(#g-orange)" stroke="#f59e0b"/>
+  <text x="290" y="180" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">ACQUIRED</text>
+  <text x="290" y="198" text-anchor="middle" fill="#fef3c7" font-size="10">处理中</text>
+
+  <rect x="420" y="40" width="140" height="60" rx="30" fill="url(#g-green)" stroke="#22c55e"/>
+  <text x="490" y="70" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">ACCEPTED</text>
+  <text x="490" y="88" text-anchor="middle" fill="#dcfce7" font-size="10">终态成功</text>
+
+  <rect x="420" y="260" width="140" height="60" rx="30" fill="url(#g-red)" stroke="#ef4444"/>
+  <text x="490" y="290" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">REJECTED</text>
+  <text x="490" y="308" text-anchor="middle" fill="#fecaca" font-size="10">终态失败</text>
+
+  <rect x="620" y="150" width="160" height="60" rx="30" fill="url(#g-purple)" stroke="#a78bfa"/>
+  <text x="700" y="180" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">RELEASED</text>
+  <text x="700" y="198" text-anchor="middle" fill="#e9d5ff" font-size="10">等待重投</text>
+
+  <path d="M160 180 L220 180" stroke="#f59e0b" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="190" y="172" text-anchor="middle" fill="#fef3c7" font-size="10">ShareFetch</text>
+
+  <path d="M360 170 L420 80" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="395" y="120" fill="#dcfce7" font-size="10">ACCEPT</text>
+
+  <path d="M360 190 L420 280" stroke="#ef4444" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="395" y="245" fill="#fecaca" font-size="10">REJECT</text>
+
+  <path d="M360 180 L620 180" stroke="#a78bfa" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="490" y="172" text-anchor="middle" fill="#e9d5ff" font-size="10">RELEASE 或 timeout</text>
+
+  <path d="M700 150 Q500 100 360 150" stroke="#a78bfa" stroke-width="2" fill="none" marker-end="url(#arr)" stroke-dasharray="4 3"/>
+  <text x="500" y="125" text-anchor="middle" fill="#fbbf24" font-size="10">deliveryCount &lt; limit → 重投</text>
+
+  <path d="M700 210 Q600 280 560 290" stroke="#ef4444" stroke-width="2" fill="none" marker-end="url(#arr)" stroke-dasharray="4 3"/>
+  <text x="640" y="265" text-anchor="middle" fill="#fecaca" font-size="10">deliveryCount ≥ limit</text>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s19-3">19.3 ShareFetch RPC</h2>
+<!-- ============================================================ -->
+
+<p>客户端用一个新的 RPC <code>ShareFetch</code>(替代普通 <code>Fetch</code>)。它返回的不是"<em>从 offset X 起的 N 条记录</em>",而是"<em>当前可用的、未被锁的、还在 delivery limit 内的记录子集</em>"。响应里每条 record 都带一个 <code>deliveryCount</code> 和 <code>acquisitionLockTimeout</code>。</p>
+
+<pre><code class="language-java">// 客户端使用 ShareConsumer
+ShareConsumer&lt;String, Order&gt; consumer = new KafkaShareConsumer&lt;&gt;(props);
+consumer.subscribe(List.of("orders"));
+
+while (running) {
+    ConsumerRecords&lt;String, Order&gt; records = consumer.poll(Duration.ofSeconds(1));
+    for (ConsumerRecord&lt;String, Order&gt; rec : records) {
+        try {
+            process(rec.value());
+            consumer.acknowledge(rec, AcknowledgeType.ACCEPT);  // 成功
+        } catch (TransientException e) {
+            consumer.acknowledge(rec, AcknowledgeType.RELEASE); // 重投
+        } catch (PoisonPillException e) {
+            consumer.acknowledge(rec, AcknowledgeType.REJECT);  // 死信
+        }
+    }
+    consumer.commitSync();  // 批量提交 ACK
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s19-4">19.4 三态 ACK</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>ACK 类型</th><th>含义</th><th>下次该 record 行为</th></tr></thead>
+  <tbody>
+    <tr><td><code>ACCEPT</code></td><td>成功</td><td>状态 → ACCEPTED,不再分发</td></tr>
+    <tr><td><code>RELEASE</code></td><td>主动放弃(瞬时失败)</td><td>状态 → RELEASED,等下次 ShareFetch 重投(deliveryCount++)</td></tr>
+    <tr><td><code>REJECT</code></td><td>显式失败(永久问题,如 schema 解析错)</td><td>状态 → REJECTED,送 DLQ 或丢弃</td></tr>
+    <tr><td>(无 ACK 直到 timeout)</td><td>Worker 挂了或慢</td><td>锁到期,等同 RELEASE</td></tr>
+  </tbody>
+</table>
+
+<div class="warning">
+<strong>Delivery limit</strong> 是 Share Group 的"<em>第二道防线</em>"。默认 5:同一条 record 被 RELEASE / timeout 5 次后,即使没 REJECT 也会自动 → REJECTED 防止毒丸消息无限重试。生产建议:配 DLQ topic + delivery limit = 3-5。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s19-5">19.5 Coordinator 状态机</h2>
+<!-- ============================================================ -->
+
+<p>Share Group 仍由 <strong>Group Coordinator</strong>(同 Consumer Group)托管,但用一个新的 internal topic <code>__share_group_state</code> 持久化 Lock Table。这个 topic 是 <strong>compacted</strong>(同第 13 章),key = <code>(groupId, topicPartition, offset)</code>,value = 最新 Lock 状态。</p>
+
+<pre><code class="language-text">__share_group_state record (key, value):
+
+  KEY:   GroupId="fulfillment", TopicPartition="orders-0", Offset=12345
+  VALUE: { ownerMemberId="worker-a-7f3e",
+           deliveryCount=2,
+           lockExpiresAt=1715432100000,
+           state=ACQUIRED }
+
+每个 broker 都消费这个 topic, 在内存里维护 Lock Table view.
+broker 重启后, replay 该 topic 重建 Lock 状态.</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s19-6">19.6 顺序退化与去重</h2>
+<!-- ============================================================ -->
+
+<div class="key-insight">
+Share Group <strong>不保证</strong>分区内顺序。同一 partition 的 record 100 和 101 可能被不同 Worker 同时处理,甚至 101 可能先完成。如果业务依赖顺序(如"先创建订单再修改"),不要用 Share Group,继续用 Consumer Group。<br><br>
+<strong>去重仍是 at-least-once</strong>:RELEASE / timeout 后重投,业务侧仍可能看到同一 record 两次(Worker 处理成功但 ACK 未到达 Coordinator 时崩溃)。需要业务侧幂等保证。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s19-7">19.7 监控指标</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>JMX</th><th>含义</th><th>异常</th></tr></thead>
+  <tbody>
+    <tr><td>ShareGroupCoordinator.LocksAcquired</td><td>当前锁数</td><td>持续涨 = Worker 处理慢</td></tr>
+    <tr><td>ShareGroupCoordinator.LockTimeoutsPerSec</td><td>锁超时 QPS</td><td>持续 &gt; 0 = Worker 处理超时</td></tr>
+    <tr><td>ShareGroupCoordinator.RejectedRecordsPerSec</td><td>REJECT QPS</td><td>含 delivery limit 触发</td></tr>
+    <tr><td>ShareGroup.DeliveryCountAvg</td><td>平均投递次数</td><td>&gt; 2 = retry 过多</td></tr>
+    <tr><td>__share_group_state.Lag</td><td>topic 滞后</td><td>Coordinator 写入瓶颈</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s19-8">19.8 设计取舍</h2>
+<!-- ============================================================ -->
+
+<div class="compare-grid">
+  <div>
+    <h4>① per-record lock vs offset commit</h4>
+    <p>per-record 提供细粒度但代价是 Coordinator 状态爆炸:1k record/s × 60s lock = 60k 活动锁条目。需要 compacted topic + 内存索引兜底。</p>
+  </div>
+  <div>
+    <h4>② 失去顺序换取吞吐</h4>
+    <p>不依赖 partition 数扩并行,Worker 1000 个都能跑。代价是分区内顺序不保证。补救:业务保证幂等,或对顺序关键 topic 不用 Share Group。</p>
+  </div>
+  <div>
+    <h4>③ DLQ 由业务实现</h4>
+    <p>REJECT 之后 Kafka 不自动入 DLQ。业务在 catch 块里把 record 写 dlq topic + REJECT,逻辑显式。优点是 DLQ 格式自由,缺点是业务多一步代码。</p>
+  </div>
+  <div>
+    <h4>④ 与 EOS 不兼容</h4>
+    <p>Share Group 是 at-least-once,与 read_committed transactional consumer 不兼容(KIP-932 v1)。EOS 流处理继续用 Consumer Group。</p>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s19-9">19.9 陷阱</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>#</th><th>陷阱</th><th>现象</th><th>修复</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>认为分区内有序</td><td>"先创建订单后修改"乱序</td><td>顺序场景用 Consumer Group</td></tr>
+    <tr><td>2</td><td>忘了幂等</td><td>RELEASE 重投后业务双写</td><td>业务侧加 idempotency key</td></tr>
+    <tr><td>3</td><td>delivery limit 设无限</td><td>毒丸消息无限循环</td><td>设 3-5 + DLQ</td></tr>
+    <tr><td>4</td><td>lock timeout 太短</td><td>慢任务全 RELEASE</td><td>调整到业务 P99 + 30s</td></tr>
+    <tr><td>5</td><td>Coordinator 单点压力</td><td>__share_group_state 写入瓶颈</td><td>分散到多 group</td></tr>
+    <tr><td>6</td><td>事务读取场景误用</td><td>EOS 失效</td><td>用 Consumer Group + read_committed</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s19-summary">19.10 本章要点</h2>
+<!-- ============================================================ -->
+
+<div class="chapter-summary">
+  <h3>本章小结</h3>
+  <p>Share Group(KIP-932)是 Kafka 4.x 一次重要的架构扩展 — 它在不破坏现有 Consumer Group 的基础上,补齐了"<em>记录级竞争消费 / 工作池 / 慢任务</em>"场景。核心机制是 <strong>Record Lock</strong>(每条 record 在 Coordinator 上有 owner + deadline + count)+ <strong>三态 ACK</strong>(ACCEPT / RELEASE / REJECT)+ <strong>delivery limit</strong>(毒丸防御)。它<strong>不是替代 Consumer Group</strong>,而是覆盖 RabbitMQ / SQS / ActiveMQ 之前占据的场景。</p>
+  <p>用好 Share Group 需要记住:① 没有顺序保证;② 仍然是 at-least-once,需要业务幂等;③ Coordinator 是状态热点,压测必看 <code>__share_group_state</code> 写入延迟;④ 与 EOS 不兼容。下一章我们讲 <strong>Quotas</strong> — broker 怎样限流 Producer / Consumer / Replication 流量,避免噪声邻居问题。</p>
+</div>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script>hljs.highlightAll();</script>
+
+</body>
+</html>

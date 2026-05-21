@@ -1,0 +1,1574 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 12 章 · SQLDialect 与方言引擎 — 图解 jOOQ</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 jOOQ</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="ch11-multiset.html">上一章 ch11-multiset</a>
+  <a href="ch13-listener.html">下一章 ch13-listener</a>
+</nav>
+
+<aside class="toc">
+<a href="#12.0-章首速览">12.0 章首速览</a>
+<a href="#12.1-sqldialect-与渲染管线">12.1 SQLDialect 与渲染管线</a>
+<a href="#12.2-方言差异矩阵">12.2 方言差异矩阵</a>
+<a href="#12.3-emulation-模拟">12.3 Emulation 模拟</a>
+<a href="#12.4-visitlistener-与-sql-改写">12.4 VisitListener 与 SQL 改写</a>
+<a href="#12.5-parser">12.5 Parser</a>
+<a href="#12.6-陷阱与限制">12.6 陷阱与限制</a>
+<a href="#12.7-生产守卫">12.7 生产守卫</a>
+<a href="#12.8-测试护栏">12.8 测试护栏</a>
+<a href="#12.9-源码深潜">12.9 源码深潜</a>
+<a href="#12.10-本章要点">12.10 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 12 章 · SQLDialect 与方言引擎</h1>
+<p class="subtitle">v7 图解版 · 自动从 v6 markdown 生成 · Mermaid 图原样保留</p>
+<div class="chapter-intro"><p><code>SQLDialect</code> 是 jOOQ "一次编写,多库适配" 的核心机制。同一段 DSL 在 PostgreSQL 上生成 <code>LIMIT 10 OFFSET 20</code>,在 Oracle 12c 上变成 <code>OFFSET 20 ROWS FETCH NEXT 10 ROWS ONLY</code>,在 SQL Server 上又是另一种语法 — 这背后由一棵 <code>QueryPart</code> AST 与一个 <code>Context.visit()</code> 深度优先遍历驱动,每个节点根据当前 <code>SQLDialect</code> 选择渲染分支。当目标方言缺少某项特性时,jOOQ 通过 emulation(模拟)填补,使业务代码无需感知数据库差异。</p>
+<p>本章按"原理 → 方言差异矩阵 → emulation → VisitListener → Parser → 陷阱 → 生产守卫 → 测试 → 源码深潜"展开。<code>SQLDialect</code> 的关键设计是分层判断:方言族(family)→ 数据库版本能力 → 部署环境能力,每层都需要不同的验证手段(快照测试、Testcontainers、生产 smoke test)。</p>
+</div>
+<h2 id="12.0-章首速览">12.0 章首速览</h2>
+<h3>图 12-0:方言引擎全景</h3>
+<div class="diagram">
+  <div class="diagram-title">图 12-0 · 方言引擎全景 — 7 大主题</div>
+  <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#240d38"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0d0d"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="340" y="20" width="240" height="56" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="460" y="46" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">SQLDialect 与方言引擎</text>
+    <text x="460" y="64" text-anchor="middle" fill="#8b949e" font-size="11">一次编写 · 多库适配</text>
+
+    <rect x="20"  y="120" width="200" height="42" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="120" y="146" text-anchor="middle" fill="#c9d1d9" font-size="11">§12.1 SQLDialect 与渲染管线</text>
+
+    <rect x="240" y="120" width="200" height="42" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="340" y="146" text-anchor="middle" fill="#c9d1d9" font-size="11">§12.2 方言差异矩阵</text>
+
+    <rect x="460" y="120" width="200" height="42" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="560" y="146" text-anchor="middle" fill="#c9d1d9" font-size="11">§12.3 Emulation 模拟</text>
+
+    <rect x="680" y="120" width="220" height="42" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="790" y="146" text-anchor="middle" fill="#c9d1d9" font-size="11">§12.4 VisitListener 改写</text>
+
+    <rect x="20"  y="195" width="200" height="42" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="120" y="221" text-anchor="middle" fill="#c9d1d9" font-size="11">§12.5 Parser 跨方言迁移</text>
+
+    <rect x="240" y="195" width="200" height="42" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="340" y="221" text-anchor="middle" fill="#c9d1d9" font-size="11">§12.6 陷阱与限制</text>
+
+    <rect x="460" y="195" width="440" height="42" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="680" y="221" text-anchor="middle" fill="#c9d1d9" font-size="11">§12.7-12.10 生产守卫 / 测试护栏 / 源码深潜</text>
+
+    <path d="M 460 76 L 120 120" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 76 L 340 120" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 76 L 560 120" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 76 L 790 120" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 76 L 120 195" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 76 L 340 195" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 76 L 680 195" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="20"  y="290" width="200" height="36" rx="6" fill="#161b22" stroke="#bc8cff"/>
+    <text x="120" y="313" text-anchor="middle" fill="#c9d1d9" font-size="11">AST + 方言分支</text>
+    <path d="M 120 162 L 120 290" stroke="#bc8cff" stroke-width="1" fill="none" stroke-dasharray="3 3"/>
+
+    <rect x="240" y="290" width="200" height="36" rx="6" fill="#161b22" stroke="#3fb950"/>
+    <text x="340" y="313" text-anchor="middle" fill="#c9d1d9" font-size="11">LIMIT / UPSERT / Bool / JSON</text>
+    <path d="M 340 162 L 340 290" stroke="#3fb950" stroke-width="1" fill="none" stroke-dasharray="3 3"/>
+
+    <rect x="460" y="290" width="200" height="36" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="560" y="313" text-anchor="middle" fill="#c9d1d9" font-size="11">MERGE → ON DUPLICATE KEY</text>
+    <path d="M 560 162 L 560 290" stroke="#d29922" stroke-width="1" fill="none" stroke-dasharray="3 3"/>
+
+    <rect x="680" y="290" width="220" height="36" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="790" y="313" text-anchor="middle" fill="#c9d1d9" font-size="11">多租户 / Schema 切换</text>
+    <path d="M 790 162 L 790 290" stroke="#d29922" stroke-width="1" fill="none" stroke-dasharray="3 3"/>
+
+    <rect x="20"  y="345" width="200" height="36" rx="6" fill="#161b22" stroke="#bc8cff"/>
+    <text x="120" y="368" text-anchor="middle" fill="#c9d1d9" font-size="11">Oracle → PostgreSQL 迁移</text>
+    <path d="M 120 237 L 120 345" stroke="#bc8cff" stroke-width="1" fill="none" stroke-dasharray="3 3"/>
+
+    <rect x="40" y="410" width="840" height="36" rx="8" fill="#0d1117" stroke="#30363d"/>
+    <text x="460" y="433" text-anchor="middle" fill="#8b949e" font-size="11">关键设计:方言族 family → 数据库版本能力 → 部署环境能力 — 三层判断,三种验证手段</text>
+  </svg>
+</div>
+<h3>图 12-0a:渲染主线</h3>
+<div class="diagram">
+  <div class="diagram-title">图 12-0a · 渲染主线 — DSL → AST → RenderContext → 方言分支 → SQL</div>
+  <svg viewBox="0 0 920 280" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#240d38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+      <marker id="arrD" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#d29922"/></marker>
+    </defs>
+
+    <rect x="20"  y="90" width="155" height="80" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="97"  y="116" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">业务 DSL</text>
+    <text x="97"  y="134" text-anchor="middle" fill="#8b949e" font-size="11">limit / returning</text>
+    <text x="97"  y="150" text-anchor="middle" fill="#8b949e" font-size="11">multiset</text>
+
+    <rect x="195" y="90" width="155" height="80" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="272" y="116" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">QueryPart AST</text>
+    <text x="272" y="134" text-anchor="middle" fill="#8b949e" font-size="11">Select / Field</text>
+    <text x="272" y="150" text-anchor="middle" fill="#8b949e" font-size="11">Condition</text>
+
+    <rect x="370" y="90" width="165" height="80" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="452" y="116" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">RenderContext</text>
+    <text x="452" y="134" text-anchor="middle" fill="#8b949e" font-size="11">dialect + settings</text>
+    <text x="452" y="150" text-anchor="middle" fill="#8b949e" font-size="11">+ listeners</text>
+
+    <rect x="555" y="90" width="165" height="80" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="637" y="116" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">深度优先 visit</text>
+    <text x="637" y="134" text-anchor="middle" fill="#8b949e" font-size="11">node.accept(ctx)</text>
+    <text x="637" y="150" text-anchor="middle" fill="#8b949e" font-size="11">分支选择</text>
+
+    <rect x="740" y="90" width="160" height="80" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="820" y="116" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">方言分支</text>
+    <text x="820" y="134" text-anchor="middle" fill="#8b949e" font-size="11">native / emulation</text>
+    <text x="820" y="150" text-anchor="middle" fill="#8b949e" font-size="11">/ unsupported</text>
+
+    <rect x="380" y="210" width="160" height="44" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="460" y="237" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">SQL + bind values</text>
+
+    <rect x="200" y="20" width="200" height="44" rx="8" fill="#161b22" stroke="#d29922" stroke-dasharray="5 3"/>
+    <text x="300" y="47" text-anchor="middle" fill="#c9d1d9" font-size="11">VisitListener — 观察或局部改写</text>
+
+    <path d="M 175 130 L 195 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 350 130 L 370 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 535 130 L 555 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 720 130 L 740 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 820 170 L 460 210" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 300 64 L 452 90" stroke="#d29922" stroke-width="1.2" fill="none" stroke-dasharray="4 3" marker-end="url(#arrD)"/>
+  </svg>
+</div>
+<h2 id="12.1-sqldialect-与渲染管线">12.1 SQLDialect 与渲染管线</h2>
+<h3>12.1.1 方言族层级</h3>
+<div class="diagram">
+  <div class="diagram-title">图 12-1-1 · 方言族层级 — 开源族 vs 商业族</div>
+  <svg viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="340" y="20" width="240" height="56" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="460" y="46" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">SQLDialect</text>
+    <text x="460" y="64" text-anchor="middle" fill="#8b949e" font-size="11">org.jooq.SQLDialect</text>
+
+    <rect x="20"  y="130" width="220" height="50" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="130" y="152" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">DEFAULT (ANSI)</text>
+    <text x="130" y="170" text-anchor="middle" fill="#8b949e" font-size="11">仅占位,生产禁用</text>
+
+    <rect x="260" y="130" width="220" height="50" rx="10" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="370" y="152" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">POSTGRES 族 (开源)</text>
+    <text x="370" y="170" text-anchor="middle" fill="#8b949e" font-size="11">JSONB · RETURNING · MERGE 15+</text>
+
+    <rect x="500" y="130" width="220" height="50" rx="10" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="610" y="152" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">MYSQL / MARIADB 族 (开源)</text>
+    <text x="610" y="170" text-anchor="middle" fill="#8b949e" font-size="11">JSON 5.7+ · CTE 8+ · WINDOW 8+</text>
+
+    <rect x="20"  y="200" width="220" height="50" rx="10" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="130" y="222" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">ORACLE 族 (商业)</text>
+    <text x="130" y="240" text-anchor="middle" fill="#8b949e" font-size="11">FETCH FIRST 12c+ · 23c BOOLEAN</text>
+
+    <rect x="260" y="200" width="220" height="50" rx="10" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="370" y="222" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">SQLSERVER 族 (商业)</text>
+    <text x="370" y="240" text-anchor="middle" fill="#8b949e" font-size="11">OFFSET 2012+ · STRING_AGG 2017+</text>
+
+    <rect x="500" y="200" width="220" height="50" rx="10" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="610" y="222" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">H2 (开源)</text>
+    <text x="610" y="240" text-anchor="middle" fill="#8b949e" font-size="11">兼容多方言模式 · 用于回归测试</text>
+
+    <rect x="20"  y="270" width="220" height="50" rx="10" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="130" y="292" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">SQLITE (开源)</text>
+    <text x="130" y="310" text-anchor="middle" fill="#8b949e" font-size="11">仅基础特性</text>
+
+    <rect x="260" y="270" width="460" height="50" rx="10" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="490" y="292" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">DB2 / Snowflake / BigQuery 等 (商业)</text>
+    <text x="490" y="310" text-anchor="middle" fill="#8b949e" font-size="11">需付费 artifact</text>
+
+    <path d="M 460 76 L 130 130" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 76 L 370 130" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 76 L 610 130" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 76 L 130 200" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 76 L 370 200" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 76 L 610 200" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 76 L 130 270" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 76 L 490 270" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+<table>
+<thead>
+<tr>
+<th>方言族</th>
+<th>关键能力(随版本)</th>
+<th>商业 / 开源</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>POSTGRES</td>
+<td>JSONB / <code>RETURNING</code> / MERGE 15+</td>
+<td>开源</td>
+</tr>
+<tr>
+<td>MYSQL</td>
+<td>JSON 5.7+ / CTE 8+ / WINDOW 8+</td>
+<td>开源</td>
+</tr>
+<tr>
+<td>MARIADB</td>
+<td>JSON / CTE 10.2+</td>
+<td>开源</td>
+</tr>
+<tr>
+<td>ORACLE</td>
+<td>FETCH FIRST 12c+ / 23c BOOLEAN</td>
+<td>商业 artifact</td>
+</tr>
+<tr>
+<td>SQLSERVER</td>
+<td>OFFSET 2012+ / STRING_AGG 2017+</td>
+<td>商业 artifact</td>
+</tr>
+<tr>
+<td>H2</td>
+<td>兼容多方言模式</td>
+<td>开源</td>
+</tr>
+<tr>
+<td>SQLITE</td>
+<td>仅基础</td>
+<td>开源</td>
+</tr>
+</tbody>
+</table>
+<h3>12.1.2 渲染管线时序</h3>
+<div class="diagram">
+  <div class="diagram-title">图 12-1-2 · 渲染管线时序 — visitStart/End + 方言分支选择</div>
+  <svg viewBox="0 0 920 540" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#240d38"/></linearGradient>
+      <marker id="arr"  markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+      <marker id="arrG" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#3fb950"/></marker>
+    </defs>
+
+    <rect x="20"  y="20" width="160" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="100" y="46" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">应用代码 App</text>
+
+    <rect x="240" y="20" width="160" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="320" y="46" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">QueryPart AST</text>
+
+    <rect x="460" y="20" width="160" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="540" y="46" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">RenderContext</text>
+
+    <rect x="680" y="20" width="200" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="780" y="46" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">SQLDialect 分支</text>
+
+    <path d="M 100 60 L 100 510" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+    <path d="M 320 60 L 320 510" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+    <path d="M 540 60 L 540 510" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+    <path d="M 780 60 L 780 510" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+
+    <path d="M 100 90 L 320 90" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="210" y="84" text-anchor="middle" fill="#c9d1d9" font-size="11">① query.getSQL()</text>
+
+    <path d="M 320 120 L 540 120" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="430" y="114" text-anchor="middle" fill="#c9d1d9" font-size="11">② accept(ctx)</text>
+
+    <path d="M 540 150 L 320 150" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="430" y="144" text-anchor="middle" fill="#c9d1d9" font-size="11">③ visit 子节点</text>
+
+    <path d="M 320 180 L 540 180" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="430" y="174" text-anchor="middle" fill="#c9d1d9" font-size="11">④ visitStart(SELECT)</text>
+
+    <path d="M 540 210 L 780 210" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="660" y="204" text-anchor="middle" fill="#c9d1d9" font-size="11">⑤ dialect == ORACLE ?</text>
+
+    <path d="M 780 240 L 540 240" stroke="#3fb950" stroke-width="1.5" fill="none" stroke-dasharray="4 2" marker-end="url(#arrG)"/>
+    <text x="660" y="234" text-anchor="middle" fill="#3fb950" font-size="11">⑥ 选择 FETCH FIRST 渲染</text>
+
+    <path d="M 540 270 L 320 270" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="430" y="264" text-anchor="middle" fill="#c9d1d9" font-size="11">⑦ visitEnd(SELECT)</text>
+
+    <path d="M 320 300 L 540 300" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="430" y="294" text-anchor="middle" fill="#c9d1d9" font-size="11">⑧ visitStart(LIMIT)</text>
+
+    <path d="M 540 330 L 780 330" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="660" y="324" text-anchor="middle" fill="#c9d1d9" font-size="11">⑨ dialect == SQLSERVER ?</text>
+
+    <path d="M 780 360 L 540 360" stroke="#3fb950" stroke-width="1.5" fill="none" stroke-dasharray="4 2" marker-end="url(#arrG)"/>
+    <text x="660" y="354" text-anchor="middle" fill="#3fb950" font-size="11">⑩ 选择 OFFSET FETCH 渲染</text>
+
+    <path d="M 540 390 L 320 390" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="430" y="384" text-anchor="middle" fill="#c9d1d9" font-size="11">⑪ visitEnd(LIMIT)</text>
+
+    <path d="M 320 425 L 100 425" stroke="#3fb950" stroke-width="1.5" fill="none" stroke-dasharray="4 2" marker-end="url(#arrG)"/>
+    <text x="210" y="419" text-anchor="middle" fill="#3fb950" font-size="11">⑫ SQL 字符串 + bind values</text>
+
+    <rect x="40" y="460" width="840" height="44" rx="8" fill="#0d1117" stroke="#30363d"/>
+    <text x="460" y="487" text-anchor="middle" fill="#8b949e" font-size="11">每个节点都是 visitStart → 选分支 → 渲染 → visitEnd 的循环 — 方言决策在 visit 内联完成</text>
+  </svg>
+</div>
+<h3>12.1.3 同一 DSL,三种方言</h3>
+<pre><code class="language-java">var query = DSL.select(ORDERS.ID, ORDERS.AMOUNT)
+    .from(ORDERS)
+    .where(ORDERS.AMOUNT.gt(BigDecimal.TEN))
+    .orderBy(ORDERS.ID)
+    .limit(10).offset(20);
+
+String pg     = DSL.using(SQLDialect.POSTGRES).renderInlined(query);
+String oracle = DSL.using(SQLDialect.ORACLE).renderInlined(query);
+String mssql  = DSL.using(SQLDialect.SQLSERVER).renderInlined(query);
+</code></pre>
+<p>PostgreSQL 输出:</p>
+<pre><code class="language-sql">select orders.id, orders.amount
+from orders
+where orders.amount &gt; 10
+order by orders.id
+limit 10 offset 20
+</code></pre>
+<p>Oracle 12c+ 输出:</p>
+<pre><code class="language-sql">select orders.id, orders.amount
+from orders
+where orders.amount &gt; 10
+order by orders.id
+offset 20 rows fetch next 10 rows only
+</code></pre>
+<p>SQL Server 2012+ 输出:</p>
+<pre><code class="language-sql">select orders.id, orders.amount
+from orders
+where orders.amount &gt; 10
+order by orders.id
+offset 20 rows fetch next 10 rows only
+</code></pre>
+<h2 id="12.2-方言差异矩阵">12.2 方言差异矩阵</h2>
+<h3>图 12-2:六大功能维度</h3>
+<div class="diagram">
+  <div class="diagram-title">图 12-2 · 六大功能维度 — 同 API 不同方言渲染</div>
+  <svg viewBox="0 0 920 520" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#240d38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20"  y="220" width="160" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="100" y="246" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">jOOQ 统一 API</text>
+    <text x="100" y="266" text-anchor="middle" fill="#8b949e" font-size="11">DSL.limit/concat/...</text>
+
+    <rect x="240" y="20" width="180" height="44" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="330" y="46" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">LIMIT / OFFSET</text>
+
+    <rect x="240" y="80" width="180" height="44" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="330" y="106" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">UPSERT</text>
+
+    <rect x="240" y="140" width="180" height="44" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="330" y="166" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Boolean 类型</text>
+
+    <rect x="240" y="320" width="180" height="44" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="330" y="346" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">字符串拼接</text>
+
+    <rect x="240" y="380" width="180" height="44" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="330" y="406" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">日期截断</text>
+
+    <rect x="240" y="440" width="180" height="44" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="330" y="466" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">JSON 取值</text>
+
+    <path d="M 180 250 L 240 42"  stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 180 250 L 240 102" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 180 250 L 240 162" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 180 250 L 240 342" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 180 250 L 240 402" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 180 250 L 240 462" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="450" y="10" width="220" height="22" rx="4" fill="#161b22" stroke="#3fb950"/>
+    <text x="560" y="26" text-anchor="middle" fill="#c9d1d9" font-size="10">PG: LIMIT N OFFSET M</text>
+    <rect x="690" y="10" width="220" height="22" rx="4" fill="#161b22" stroke="#d29922"/>
+    <text x="800" y="26" text-anchor="middle" fill="#c9d1d9" font-size="10">Oracle 12c: FETCH FIRST</text>
+    <rect x="450" y="36" width="220" height="22" rx="4" fill="#161b22" stroke="#d29922"/>
+    <text x="560" y="52" text-anchor="middle" fill="#c9d1d9" font-size="10">Oracle 11g: ROWNUM 模拟</text>
+    <rect x="690" y="36" width="220" height="22" rx="4" fill="#161b22" stroke="#d29922"/>
+    <text x="800" y="52" text-anchor="middle" fill="#c9d1d9" font-size="10">SQL Server 2012+: OFFSET FETCH</text>
+
+    <rect x="450" y="70" width="220" height="22" rx="4" fill="#161b22" stroke="#3fb950"/>
+    <text x="560" y="86" text-anchor="middle" fill="#c9d1d9" font-size="10">PG: ON CONFLICT</text>
+    <rect x="690" y="70" width="220" height="22" rx="4" fill="#161b22" stroke="#3fb950"/>
+    <text x="800" y="86" text-anchor="middle" fill="#c9d1d9" font-size="10">MySQL: ON DUPLICATE KEY</text>
+    <rect x="450" y="96" width="460" height="22" rx="4" fill="#161b22" stroke="#d29922"/>
+    <text x="680" y="112" text-anchor="middle" fill="#c9d1d9" font-size="10">Oracle / SQL Server: MERGE</text>
+
+    <rect x="450" y="130" width="140" height="22" rx="4" fill="#161b22" stroke="#3fb950"/>
+    <text x="520" y="146" text-anchor="middle" fill="#c9d1d9" font-size="10">PG: BOOLEAN 原生</text>
+    <rect x="600" y="130" width="160" height="22" rx="4" fill="#161b22" stroke="#3fb950"/>
+    <text x="680" y="146" text-anchor="middle" fill="#c9d1d9" font-size="10">MySQL: TINYINT(1)</text>
+    <rect x="770" y="130" width="140" height="22" rx="4" fill="#161b22" stroke="#d29922"/>
+    <text x="840" y="146" text-anchor="middle" fill="#c9d1d9" font-size="10">Oracle: NUMBER(1)</text>
+    <rect x="450" y="156" width="460" height="22" rx="4" fill="#161b22" stroke="#d29922"/>
+    <text x="680" y="172" text-anchor="middle" fill="#c9d1d9" font-size="10">SQL Server: BIT</text>
+
+    <rect x="450" y="310" width="140" height="22" rx="4" fill="#161b22" stroke="#3fb950"/>
+    <text x="520" y="326" text-anchor="middle" fill="#c9d1d9" font-size="10">PG / Oracle: 双竖线 ||</text>
+    <rect x="600" y="310" width="160" height="22" rx="4" fill="#161b22" stroke="#3fb950"/>
+    <text x="680" y="326" text-anchor="middle" fill="#c9d1d9" font-size="10">MySQL: CONCAT()</text>
+    <rect x="770" y="310" width="140" height="22" rx="4" fill="#161b22" stroke="#d29922"/>
+    <text x="840" y="326" text-anchor="middle" fill="#c9d1d9" font-size="10">SQL Server: +</text>
+
+    <rect x="450" y="370" width="220" height="22" rx="4" fill="#161b22" stroke="#3fb950"/>
+    <text x="560" y="386" text-anchor="middle" fill="#c9d1d9" font-size="10">PG: DATE_TRUNC('month', d)</text>
+    <rect x="690" y="370" width="220" height="22" rx="4" fill="#161b22" stroke="#3fb950"/>
+    <text x="800" y="386" text-anchor="middle" fill="#c9d1d9" font-size="10">MySQL: DATE_FORMAT 模拟</text>
+    <rect x="450" y="396" width="460" height="22" rx="4" fill="#161b22" stroke="#d29922"/>
+    <text x="680" y="412" text-anchor="middle" fill="#c9d1d9" font-size="10">Oracle: TRUNC · SQL Server: DATETRUNC (2022+)</text>
+
+    <rect x="450" y="430" width="160" height="22" rx="4" fill="#161b22" stroke="#3fb950"/>
+    <text x="530" y="446" text-anchor="middle" fill="#c9d1d9" font-size="10">PG: col-&gt;&gt;'k'</text>
+    <rect x="620" y="430" width="160" height="22" rx="4" fill="#161b22" stroke="#3fb950"/>
+    <text x="700" y="446" text-anchor="middle" fill="#c9d1d9" font-size="10">MySQL: JSON_EXTRACT</text>
+    <rect x="790" y="430" width="120" height="22" rx="4" fill="#161b22" stroke="#d29922"/>
+    <text x="850" y="446" text-anchor="middle" fill="#c9d1d9" font-size="10">Oracle: JSON_VALUE</text>
+    <rect x="450" y="456" width="460" height="22" rx="4" fill="#161b22" stroke="#d29922"/>
+    <text x="680" y="472" text-anchor="middle" fill="#c9d1d9" font-size="10">SQL Server: JSON_VALUE / OPENJSON</text>
+
+    <path d="M 420 42  L 450 22"  stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 420 42  L 450 48"  stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 420 102 L 450 82"  stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 420 102 L 450 108" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 420 162 L 450 142" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 420 162 L 450 168" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 420 342 L 450 322" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 420 402 L 450 382" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 420 462 L 450 442" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+<h3>表 12-2:核心差异速查</h3>
+<table>
+<thead>
+<tr>
+<th>功能</th>
+<th>PostgreSQL</th>
+<th>MySQL</th>
+<th>Oracle</th>
+<th>SQL Server</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>LIMIT/OFFSET</td>
+<td><code>LIMIT N OFFSET M</code></td>
+<td>同左</td>
+<td>12c <code>FETCH FIRST</code></td>
+<td>2012+ <code>OFFSET FETCH</code></td>
+</tr>
+<tr>
+<td>UPSERT</td>
+<td><code>ON CONFLICT</code></td>
+<td><code>ON DUPLICATE KEY</code></td>
+<td><code>MERGE</code></td>
+<td><code>MERGE</code></td>
+</tr>
+<tr>
+<td>Boolean 类型</td>
+<td>BOOLEAN 原生</td>
+<td>TINYINT(1)</td>
+<td>NUMBER(1)</td>
+<td>BIT</td>
+</tr>
+<tr>
+<td>字符串拼接</td>
+<td><code>'a' || 'b'</code></td>
+<td><code>CONCAT</code></td>
+<td><code>'a' || 'b'</code></td>
+<td><code>'a' + 'b'</code></td>
+</tr>
+<tr>
+<td>当前时间戳</td>
+<td><code>NOW()</code></td>
+<td><code>NOW()</code></td>
+<td><code>SYSTIMESTAMP</code></td>
+<td><code>GETDATE()</code></td>
+</tr>
+<tr>
+<td>日期截断</td>
+<td><code>DATE_TRUNC</code></td>
+<td><code>DATE_FORMAT</code></td>
+<td><code>TRUNC</code></td>
+<td><code>DATETRUNC</code> (2022+)</td>
+</tr>
+<tr>
+<td>JSON 取值</td>
+<td><code>col-&gt;&gt;'k'</code></td>
+<td><code>JSON_EXTRACT</code></td>
+<td><code>JSON_VALUE</code></td>
+<td><code>JSON_VALUE</code></td>
+</tr>
+<tr>
+<td>自增</td>
+<td>IDENTITY</td>
+<td>AUTO_INCREMENT</td>
+<td>IDENTITY</td>
+<td>IDENTITY</td>
+</tr>
+</tbody>
+</table>
+<h3>12.2.1 UPSERT 同 DSL 不同 SQL</h3>
+<pre><code class="language-java">var upsert = DSL.insertInto(PRODUCTS)
+    .set(PRODUCTS.SKU, &quot;SKU-REDIS-001&quot;)
+    .set(PRODUCTS.NAME, &quot;Redis 实战课程&quot;)
+    .set(PRODUCTS.PRICE, new BigDecimal(&quot;128.00&quot;))
+    .onDuplicateKeyUpdate()
+    .set(PRODUCTS.NAME, excluded(PRODUCTS.NAME))
+    .set(PRODUCTS.PRICE, excluded(PRODUCTS.PRICE));
+</code></pre>
+<p>PostgreSQL:</p>
+<pre><code class="language-sql">insert into products (sku, name, price)
+values ('SKU-REDIS-001', 'Redis 实战课程', 128.00)
+on conflict (sku) do update
+set name = excluded.name,
+    price = excluded.price
+</code></pre>
+<p>MySQL:</p>
+<pre><code class="language-sql">insert into products (sku, name, price)
+values ('SKU-REDIS-001', 'Redis 实战课程', 128.00)
+on duplicate key update
+  name = values(name),
+  price = values(price)
+</code></pre>
+<p>Oracle:</p>
+<pre><code class="language-sql">merge into products
+using (
+  select 'SKU-REDIS-001' sku,
+         'Redis 实战课程' name,
+         128.00 price
+  from dual
+) src
+on (products.sku = src.sku)
+when matched then update
+  set products.name = src.name,
+      products.price = src.price
+when not matched then insert (sku, name, price)
+  values (src.sku, src.name, src.price)
+</code></pre>
+<p>H2:</p>
+<pre><code class="language-sql">merge into products (sku, name, price)
+key (sku)
+values ('SKU-REDIS-001', 'Redis 实战课程', 128.00)
+</code></pre>
+<h3>12.2.2 类型 / 函数差异组合</h3>
+<pre><code class="language-java">var typed = DSL.select(
+        ORDERS.ID,
+        ORDERS.PUBLISHED.eq(true).as(&quot;is_published&quot;),
+        DSL.concat(ORDERS.ID, inline(&quot; / &quot;), ORDERS.SKU).as(&quot;label&quot;),
+        DSL.trunc(ORDERS.ORDER_DATE, DatePart.MONTH).as(&quot;published_month&quot;),
+        DSL.jsonValue(ORDERS.METADATA, &quot;$.format&quot;).as(&quot;format&quot;))
+    .from(ORDERS)
+    .where(ORDERS.PUBLISHED.eq(true));
+</code></pre>
+<p>PostgreSQL:</p>
+<pre><code class="language-sql">select
+  orders.id,
+  orders.published = true as is_published,
+  orders.id || ' / ' || orders.sku as label,
+  date_trunc('month', orders.order_date) as published_month,
+  orders.metadata -&gt;&gt; 'format' as format
+from orders
+where orders.published = true
+</code></pre>
+<p>MySQL:</p>
+<pre><code class="language-sql">select
+  orders.id,
+  orders.published = 1 as is_published,
+  concat(orders.id, ' / ', orders.sku) as label,
+  str_to_date(date_format(orders.order_date, '%Y-%m-01'), '%Y-%m-%d') as published_month,
+  json_unquote(json_extract(orders.metadata, '$.format')) as format
+from orders
+where orders.published = 1
+</code></pre>
+<p>Oracle:</p>
+<pre><code class="language-sql">select
+  orders.id,
+  case when orders.published = 1 then 1 else 0 end as is_published,
+  orders.id || ' / ' || orders.sku as label,
+  trunc(orders.order_date, 'MM') as published_month,
+  json_value(orders.metadata, '$.format') as format
+from orders
+where orders.published = 1
+</code></pre>
+<p>业务代码使用 <code>DSL.concat / DSL.trunc / DSL.jsonValue</code> 等统一 API,渲染器自动选择方言函数;若改用 <code>DSL.field("col-&gt;&gt;'k'")</code> 注入原始 SQL 片段,则绕过方言适配,跨库即失败。</p>
+<h2 id="12.3-emulation-模拟">12.3 Emulation 模拟</h2>
+<h3>图 12-3:Emulation 决策</h3>
+<div class="diagram">
+  <div class="diagram-title">图 12-3 · Emulation 决策树 — native / emulation / unsupported 三路分流</div>
+  <svg viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0d0d"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="340" y="20" width="240" height="56" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="460" y="44" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">jOOQ AST 节点</text>
+    <text x="460" y="62" text-anchor="middle" fill="#8b949e" font-size="11">如 MERGE / LATERAL / RETURNING</text>
+
+    <path d="M 460 76 L 460 110" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <polygon points="460,110 600,160 460,210 320,160" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="460" y="155" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">目标方言原生支持?</text>
+    <text x="460" y="175" text-anchor="middle" fill="#8b949e" font-size="11">查询能力矩阵</text>
+
+    <path d="M 320 160 L 200 160" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="260" y="152" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">是</text>
+
+    <rect x="20"  y="135" width="180" height="50" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="110" y="158" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">✓ 直接渲染原生 SQL</text>
+    <text x="110" y="176" text-anchor="middle" fill="#8b949e" font-size="11">最优路径</text>
+
+    <path d="M 460 210 L 460 240" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="475" y="232" fill="#d29922" font-size="11" font-weight="bold">否</text>
+
+    <polygon points="460,240 600,290 460,340 320,290" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="460" y="285" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">有等效模拟方案?</text>
+
+    <path d="M 320 290 L 200 290" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="260" y="282" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">是</text>
+
+    <rect x="20"  y="265" width="180" height="50" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="110" y="288" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">↻ 渲染模拟 SQL</text>
+    <text x="110" y="306" text-anchor="middle" fill="#8b949e" font-size="11">如 MERGE → ON DUPLICATE</text>
+
+    <path d="M 600 290 L 720 290" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="660" y="282" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">否</text>
+
+    <rect x="720" y="265" width="180" height="50" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="810" y="288" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">✗ 抛异常</text>
+    <text x="810" y="306" text-anchor="middle" fill="#8b949e" font-size="11">SQLDialectNotSupportedException</text>
+  </svg>
+</div>
+<h3>表 12-3:常见 emulation</h3>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th>原生方言</th>
+<th>模拟方言 / 方案</th>
+<th>精度损失</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>BOOLEAN</td>
+<td>PG</td>
+<td>MySQL → 1/0,Oracle → 1/0</td>
+<td>无</td>
+</tr>
+<tr>
+<td>LIMIT/OFFSET</td>
+<td>PG / MySQL</td>
+<td>Oracle 11g → ROWNUM</td>
+<td>深分页性能差</td>
+</tr>
+<tr>
+<td>MERGE</td>
+<td>Oracle / PG 15+</td>
+<td>MySQL → ON DUPLICATE KEY</td>
+<td>复合唯一键语义不同</td>
+</tr>
+<tr>
+<td>RETURNING</td>
+<td>PG</td>
+<td>MySQL → SELECT LAST_INSERT_ID</td>
+<td>仅自增 ID</td>
+</tr>
+<tr>
+<td>LATERAL</td>
+<td>PG / Oracle 12c+</td>
+<td>MySQL 5.7 → 关联子查询</td>
+<td>多行场景受限</td>
+</tr>
+<tr>
+<td>ARRAY_AGG</td>
+<td>PG</td>
+<td>MySQL → JSON_ARRAYAGG</td>
+<td>类型映射</td>
+</tr>
+<tr>
+<td>MULTISET</td>
+<td>几无原生</td>
+<td>JSON / XML 载体</td>
+<td>反序列化成本</td>
+</tr>
+<tr>
+<td>CTE</td>
+<td>MySQL 8+ / PG / Oracle</td>
+<td>MySQL 5.7 → 派生表</td>
+<td>递归不可模拟</td>
+</tr>
+</tbody>
+</table>
+<h3>12.3.1 LATERAL 模拟示例</h3>
+<pre><code class="language-java">var lateral = DSL.select(CUSTOMERS.ID,
+        field(name(&quot;t&quot;, &quot;cnt&quot;), Integer.class))
+    .from(CUSTOMERS)
+    .crossApply(
+        select(count().as(&quot;cnt&quot;))
+        .from(ORDERS)
+        .where(ORDERS.CUSTOMER_ID.eq(CUSTOMERS.ID))
+        .asTable(&quot;t&quot;));
+</code></pre>
+<p>PostgreSQL:</p>
+<pre><code class="language-sql">select customers.id, t.cnt
+from customers
+cross join lateral (
+  select count(*) as cnt
+  from orders
+  where orders.customer_id = customers.id
+) as t
+</code></pre>
+<p>MySQL 5.7:</p>
+<pre><code class="language-sql">select customers.id,
+       (select count(*)
+        from orders
+        where orders.customer_id = customers.id) as cnt
+from customers
+</code></pre>
+<h3>12.3.2 RETURNING 模拟</h3>
+<pre><code class="language-java">var inserted = DSL.insertInto(CUSTOMERS)
+    .set(CUSTOMERS.NAME, &quot;Customer C1001&quot;)
+    .set(CUSTOMERS.EMAIL, &quot;c1001@example.com&quot;)
+    .returning(CUSTOMERS.ID, CUSTOMERS.NAME, CUSTOMERS.EMAIL);
+</code></pre>
+<p>PostgreSQL:</p>
+<pre><code class="language-sql">insert into customers (name, email)
+values ('Customer C1001', 'c1001@example.com')
+returning customers.id, customers.name, customers.email
+</code></pre>
+<p>MySQL 模拟:</p>
+<pre><code class="language-sql">insert into customers (name, email)
+values ('Customer C1001', 'c1001@example.com');
+select last_insert_id();
+</code></pre>
+<div class="warning"><p>Emulation ≠ 完美等效:必须为关键 emulation 路径建立真实数据库集成测试,覆盖唯一键冲突、复合主键、默认值返回、空集语义等边界。</p></div>
+<h2 id="12.4-visitlistener-与-sql-改写">12.4 VisitListener 与 SQL 改写</h2>
+<h3>12.4.1 在渲染管线中的位置</h3>
+<div class="diagram">
+  <div class="diagram-title">图 12-4-1 · VisitListener 在渲染管线中的位置 — 三种典型改写</div>
+  <svg viewBox="0 0 920 580" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#240d38"/></linearGradient>
+      <marker id="arr"  markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+      <marker id="arrG" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#3fb950"/></marker>
+    </defs>
+
+    <rect x="20"  y="20" width="140" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="90"  y="46" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">App</text>
+
+    <rect x="200" y="20" width="140" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="270" y="46" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">DSLContext</text>
+
+    <rect x="380" y="20" width="160" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="46" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">VisitListener</text>
+
+    <rect x="580" y="20" width="140" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="650" y="46" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">渲染引擎 R</text>
+
+    <rect x="760" y="20" width="140" height="40" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="830" y="46" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">数据库 DB</text>
+
+    <path d="M 90  60 L 90  550" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+    <path d="M 270 60 L 270 550" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+    <path d="M 460 60 L 460 550" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+    <path d="M 650 60 L 650 550" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+    <path d="M 830 60 L 830 550" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+
+    <path d="M 90 95 L 270 95" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="180" y="88" text-anchor="middle" fill="#c9d1d9" font-size="11">① execute()</text>
+
+    <path d="M 270 125 L 650 125" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="460" y="118" text-anchor="middle" fill="#c9d1d9" font-size="11">② 遍历 AST</text>
+
+    <path d="M 650 155 L 460 155" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="555" y="148" text-anchor="middle" fill="#c9d1d9" font-size="11">③ visitStart(ORDERS 表引用)</text>
+
+    <rect x="50" y="180" width="820" height="240" rx="10" fill="#0d1117" stroke="#bc8cff" stroke-dasharray="6 3"/>
+    <text x="70" y="204" fill="#bc8cff" font-size="12" font-weight="bold">alt — VisitListener 三种典型改写</text>
+
+    <path d="M 460 235 L 650 235" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="555" y="228" text-anchor="middle" fill="#c9d1d9" font-size="11">④a 多租户:注入 WHERE tenant_id = ?</text>
+
+    <path d="M 460 285 L 650 285" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="555" y="278" text-anchor="middle" fill="#c9d1d9" font-size="11">④b Schema 限定:替换 ORDERS → sales.ORDERS</text>
+
+    <path d="M 460 335 L 480 335 L 480 355 L 460 355" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="555" y="328" text-anchor="middle" fill="#c9d1d9" font-size="11">④c 审计日志:记录表访问(自循环,不改 SQL)</text>
+
+    <text x="555" y="395" text-anchor="middle" fill="#8b949e" font-size="11">三种改写互斥,由具体 Listener 实现决定</text>
+
+    <path d="M 650 450 L 460 450" stroke="#3fb950" stroke-width="1.5" fill="none" stroke-dasharray="4 2" marker-end="url(#arrG)"/>
+    <text x="555" y="443" text-anchor="middle" fill="#3fb950" font-size="11">⑤ visitEnd(ORDERS)</text>
+
+    <path d="M 650 485 L 270 485" stroke="#3fb950" stroke-width="1.5" fill="none" stroke-dasharray="4 2" marker-end="url(#arrG)"/>
+    <text x="460" y="478" text-anchor="middle" fill="#3fb950" font-size="11">⑥ 改写后 SQL</text>
+
+    <path d="M 270 520 L 830 520" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="550" y="513" text-anchor="middle" fill="#c9d1d9" font-size="11">⑦ JDBC 执行</text>
+  </svg>
+</div>
+<h3>12.4.2 多租户拦截示例</h3>
+<pre><code class="language-java">public class TenantVisitListener extends DefaultVisitListener {
+    private final String tenantId;
+
+    public TenantVisitListener(String tenantId) { this.tenantId = tenantId; }
+
+    @Override
+    public void visitStart(VisitContext ctx) {
+        if (ctx.queryPart() instanceof Table&lt;?&gt; table &amp;&amp; hasTenantColumn(table)) {
+            // 拦截挂点;真正条件注入应配合 QOM 或统一查询构造器
+        }
+    }
+}
+
+DSLContext dsl = DSL.using(
+    config.derive(new DefaultVisitListenerProvider(
+        new TenantVisitListener(currentTenantId()))));
+</code></pre>
+<h3>12.4.3 动态 Schema 优先用 renderMapping</h3>
+<pre><code class="language-java">Settings settings = new Settings()
+    .withRenderMapping(new RenderMapping()
+        .withSchemata(new MappedSchema()
+            .withInput(&quot;public&quot;)
+            .withOutput(&quot;region_&quot; + region.toLowerCase())));
+
+DSLContext routed = DSL.using(config.derive(settings));
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>推荐</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>静态 / 配置驱动 schema 切换</td>
+<td><code>Settings.renderMapping</code></td>
+</tr>
+<tr>
+<td>AST 形态规则改写</td>
+<td><code>VisitListener</code></td>
+</tr>
+<tr>
+<td>拦截执行流程(日志 / 重试)</td>
+<td><code>ExecuteListener</code> (第 13 章)</td>
+</tr>
+</tbody>
+</table>
+<h2 id="12.5-parser">12.5 Parser</h2>
+<h3>12.5.1 解析-重渲染管线</h3>
+<div class="diagram">
+  <div class="diagram-title">图 12-5-1 · 解析-重渲染管线 — 一份原始 SQL → 三种目标方言</div>
+  <svg viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#240d38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20"  y="140" width="170" height="80" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="105" y="166" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">原始 SQL</text>
+    <text x="105" y="184" text-anchor="middle" fill="#8b949e" font-size="11">Oracle 方言</text>
+    <text x="105" y="202" text-anchor="middle" fill="#8b949e" font-size="11">NVL / SYSDATE / ROWNUM</text>
+
+    <rect x="220" y="140" width="170" height="80" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="305" y="166" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">解析</text>
+    <text x="305" y="184" text-anchor="middle" fill="#8b949e" font-size="11">dsl.parser()</text>
+    <text x="305" y="202" text-anchor="middle" fill="#8b949e" font-size="11">.parseQuery()</text>
+
+    <rect x="420" y="140" width="170" height="80" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="505" y="166" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">jOOQ AST</text>
+    <text x="505" y="184" text-anchor="middle" fill="#8b949e" font-size="11">方言无关</text>
+    <text x="505" y="202" text-anchor="middle" fill="#8b949e" font-size="11">QueryPart 树</text>
+
+    <rect x="620" y="140" width="170" height="80" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="705" y="166" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">重渲染</text>
+    <text x="705" y="184" text-anchor="middle" fill="#8b949e" font-size="11">ctx.render(query)</text>
+    <text x="705" y="202" text-anchor="middle" fill="#8b949e" font-size="11">按目标方言</text>
+
+    <path d="M 190 180 L 220 180" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 390 180 L 420 180" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 590 180 L 620 180" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="820" y="50" width="80" height="60" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="860" y="78" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">PostgreSQL</text>
+    <text x="860" y="96" text-anchor="middle" fill="#8b949e" font-size="10">COALESCE</text>
+
+    <rect x="820" y="150" width="80" height="60" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="860" y="178" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">MySQL</text>
+    <text x="860" y="196" text-anchor="middle" fill="#8b949e" font-size="10">IFNULL</text>
+
+    <rect x="820" y="250" width="80" height="60" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="860" y="278" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">SQL Server</text>
+    <text x="860" y="296" text-anchor="middle" fill="#8b949e" font-size="10">ISNULL</text>
+
+    <path d="M 790 165 L 820 80"  stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 790 180 L 820 180" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 790 195 L 820 280" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+
+    <text x="460" y="30" text-anchor="middle" fill="#8b949e" font-size="11">parser 把任意方言 SQL 转回 AST · render 再换方言输出 — 跨库迁移利器</text>
+    <text x="460" y="335" text-anchor="middle" fill="#8b949e" font-size="11">局限:PL/SQL 包 / 存储过程 / 触发器 等过程式代码无法解析,需人工迁移</text>
+  </svg>
+</div>
+<h3>12.5.2 Oracle → PostgreSQL 迁移</h3>
+<pre><code class="language-java">DSLContext oracle = DSL.using(SQLDialect.ORACLE);
+DSLContext postgres = DSL.using(SQLDialect.POSTGRES);
+
+String oracleSQL = &quot;&quot;&quot;
+    SELECT NVL(customer_name, 'N/A') AS first_name,
+           SYSDATE AS exported_at
+    FROM customers
+    WHERE ROWNUM &lt;= 5
+    &quot;&quot;&quot;;
+
+Query parsed = oracle.parser().parseQuery(oracleSQL);
+String pgSQL = postgres.render(parsed);
+</code></pre>
+<p>PostgreSQL 输出:</p>
+<pre><code class="language-sql">select coalesce(customers.customer_name, 'N/A') as first_name,
+       current_timestamp as exported_at
+from customers
+limit 5
+</code></pre>
+<h3>12.5.3 转换映射</h3>
+<table>
+<thead>
+<tr>
+<th>Oracle 语法</th>
+<th>jOOQ 自动转换</th>
+<th>PostgreSQL 输出</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>NVL(a, b)</code></td>
+<td>→ <code>COALESCE</code></td>
+<td><code>coalesce(a, b)</code></td>
+</tr>
+<tr>
+<td><code>SYSDATE</code></td>
+<td>→ <code>CURRENT_TIMESTAMP</code></td>
+<td><code>current_timestamp</code></td>
+</tr>
+<tr>
+<td><code>ROWNUM &lt;= N</code></td>
+<td>→ <code>LIMIT N</code>(简单 Top-N)</td>
+<td><code>limit N</code></td>
+</tr>
+<tr>
+<td><code>DECODE(a,b,c,d)</code></td>
+<td>→ <code>CASE WHEN</code></td>
+<td><code>case when a = b then c else d end</code></td>
+</tr>
+<tr>
+<td><code>FROM dual</code></td>
+<td>→ 移除</td>
+<td>(无)</td>
+</tr>
+<tr>
+<td><code>FETCH FIRST N ROWS ONLY</code></td>
+<td>→ <code>LIMIT N</code></td>
+<td><code>limit N</code></td>
+</tr>
+</tbody>
+</table>
+<h3>12.5.4 批量迁移工具</h3>
+<pre><code class="language-java">List&lt;String&gt; oracleStmts = readSQLFile(&quot;oracle-app.sql&quot;);
+List&lt;String&gt; failed = new ArrayList&lt;&gt;();
+
+for (String sql : oracleStmts) {
+    try {
+        Queries parsed = oracle.parser().parse(sql);
+        for (Query q : parsed) {
+            String pgSQL = postgres.render(q);
+            writeToFile(&quot;pg-migration.sql&quot;, pgSQL + &quot;;\n&quot;);
+        }
+    } catch (ParserException e) {
+        failed.add(sql);
+        log.warn(&quot;Manual review needed: {}&quot;, sql);
+    }
+}
+log.info(&quot;Migrated {} stmts, {} need review&quot;,
+    oracleStmts.size() - failed.size(), failed.size());
+</code></pre>
+<div class="key-insight"><p>Parser 局限:PL/SQL 包(PACKAGE)、存储过程体、触发器等过程式代码超出解析范围,需人工迁移。Parser 解析成功不等于业务语义等价,目标库 smoke test 必不可少。</p></div>
+<h2 id="12.6-陷阱与限制">12.6 陷阱与限制</h2>
+<h3>图 12-6:陷阱分类</h3>
+<div class="diagram">
+  <div class="diagram-title">图 12-6 · 方言引擎陷阱分类 — 5 大类 / 9 个具体陷阱</div>
+  <svg viewBox="0 0 920 480" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0d0d"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#f85149"/></marker>
+    </defs>
+
+    <rect x="340" y="20" width="240" height="56" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="460" y="46" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">⚠ 方言引擎陷阱</text>
+    <text x="460" y="64" text-anchor="middle" fill="#8b949e" font-size="11">5 大类 · 9 个具体陷阱</text>
+
+    <rect x="20"  y="120" width="160" height="42" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="100" y="146" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Emulation 不完美</text>
+
+    <rect x="200" y="120" width="160" height="42" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="280" y="146" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">方言特有函数</text>
+
+    <rect x="380" y="120" width="160" height="42" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="460" y="146" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">商业版限制</text>
+
+    <rect x="560" y="120" width="160" height="42" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="640" y="146" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">版本能力差异</text>
+
+    <rect x="740" y="120" width="160" height="42" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="820" y="146" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Parser 局限</text>
+
+    <path d="M 460 76 L 100 120" stroke="#f85149" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 76 L 280 120" stroke="#f85149" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 76 L 460 120" stroke="#f85149" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 76 L 640 120" stroke="#f85149" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 76 L 820 120" stroke="#f85149" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="20"  y="200" width="160" height="36" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="100" y="223" text-anchor="middle" fill="#c9d1d9" font-size="11">① ON DUPLICATE 复合键</text>
+    <rect x="20"  y="246" width="160" height="36" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="100" y="269" text-anchor="middle" fill="#c9d1d9" font-size="11">② ROWNUM 深分页慢</text>
+    <rect x="20"  y="292" width="160" height="36" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="100" y="315" text-anchor="middle" fill="#c9d1d9" font-size="11">③ RETURNING 仅自增 ID</text>
+    <path d="M 100 162 L 100 200" stroke="#d29922" stroke-width="1" fill="none" stroke-dasharray="3 3"/>
+
+    <rect x="200" y="200" width="160" height="36" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="280" y="223" text-anchor="middle" fill="#c9d1d9" font-size="11">④ PG generate_series</text>
+    <rect x="200" y="246" width="160" height="36" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="280" y="269" text-anchor="middle" fill="#c9d1d9" font-size="11">⑤ Oracle CONNECT BY</text>
+    <path d="M 280 162 L 280 200" stroke="#d29922" stroke-width="1" fill="none" stroke-dasharray="3 3"/>
+
+    <rect x="380" y="200" width="160" height="36" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="460" y="223" text-anchor="middle" fill="#c9d1d9" font-size="11">⑥ 开源版无 Oracle/MSSQL</text>
+    <path d="M 460 162 L 460 200" stroke="#d29922" stroke-width="1" fill="none" stroke-dasharray="3 3"/>
+
+    <rect x="560" y="200" width="160" height="36" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="640" y="223" text-anchor="middle" fill="#c9d1d9" font-size="11">⑦ PG 12 vs 15 MERGE</text>
+    <rect x="560" y="246" width="160" height="36" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="640" y="269" text-anchor="middle" fill="#c9d1d9" font-size="11">⑧ MySQL 5.7 vs 8 CTE</text>
+    <path d="M 640 162 L 640 200" stroke="#d29922" stroke-width="1" fill="none" stroke-dasharray="3 3"/>
+
+    <rect x="740" y="200" width="160" height="36" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="820" y="223" text-anchor="middle" fill="#c9d1d9" font-size="11">⑨ PL/SQL 不可解析</text>
+    <path d="M 820 162 L 820 200" stroke="#d29922" stroke-width="1" fill="none" stroke-dasharray="3 3"/>
+
+    <rect x="40" y="350" width="840" height="110" rx="10" fill="#0d1117" stroke="#30363d"/>
+    <text x="60" y="378" fill="#c9d1d9" font-size="12" font-weight="bold">护栏要点:</text>
+    <text x="60" y="400" fill="#c9d1d9" font-size="11">· 三层能力验证:方言族 (renderInlined 快照) · 版本 (Testcontainers) · 部署环境 (生产 smoke test)</text>
+    <text x="60" y="418" fill="#c9d1d9" font-size="11">· 避免 DSL.field("raw SQL") 注入片段 — 改用统一 API(DSL.jsonValue / DSL.trunc 等)</text>
+    <text x="60" y="436" fill="#c9d1d9" font-size="11">· Parser 解析成功 ≠ 语义等价,必须 smoke test;PL/SQL 过程式代码需人工迁移</text>
+    <text x="60" y="454" fill="#c9d1d9" font-size="11">· 启动时断言 dialect != DEFAULT;复合唯一键、深分页等 emulation 路径必须有真实 DB 集成测试</text>
+  </svg>
+</div>
+<h3>表 12-6:陷阱明细</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">#</th>
+<th>陷阱</th>
+<th>现象</th>
+<th>根因</th>
+<th>修复</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">1</td>
+<td>ON DUPLICATE 语义</td>
+<td>错命中其他唯一键</td>
+<td>MySQL 不区分</td>
+<td>复合键集成测试</td>
+</tr>
+<tr>
+<td style="text-align: right;">2</td>
+<td>Oracle 11g 深分页慢</td>
+<td>性能急剧退化</td>
+<td>ROWNUM 嵌套</td>
+<td>改用 12c+ / KEYSET</td>
+</tr>
+<tr>
+<td style="text-align: right;">3</td>
+<td>RETURNING 退化</td>
+<td>拿不到默认值</td>
+<td>MySQL 仅 LAST_INSERT_ID</td>
+<td>插入后再查询</td>
+</tr>
+<tr>
+<td style="text-align: right;">4</td>
+<td>PG generate_series</td>
+<td>跨库失败</td>
+<td>仅 PG 支持</td>
+<td>改用 jOOQ 模拟</td>
+</tr>
+<tr>
+<td style="text-align: right;">5</td>
+<td>Oracle CONNECT BY</td>
+<td>跨库失败</td>
+<td>Oracle 专属</td>
+<td>改用递归 CTE</td>
+</tr>
+<tr>
+<td style="text-align: right;">6</td>
+<td>开源版方言缺失</td>
+<td>编译报错</td>
+<td>商业 artifact</td>
+<td>购买 license</td>
+</tr>
+<tr>
+<td style="text-align: right;">7</td>
+<td>PG MERGE 版本差</td>
+<td>模拟为 ON CONFLICT</td>
+<td>12 无 MERGE</td>
+<td>升级到 15+</td>
+</tr>
+<tr>
+<td style="text-align: right;">8</td>
+<td>MySQL 5.7 CTE</td>
+<td>模拟为派生表</td>
+<td>5.7 无 CTE</td>
+<td>升级到 8+</td>
+</tr>
+<tr>
+<td style="text-align: right;">9</td>
+<td>PL/SQL 不可解析</td>
+<td>ParserException</td>
+<td>过程式代码</td>
+<td>人工迁移</td>
+</tr>
+</tbody>
+</table>
+<h3>12.6.1 raw SQL 反例</h3>
+<pre><code class="language-java">DSL.field(&quot;orders.metadata -&gt;&gt; 'format'&quot;);  // 反模式
+</code></pre>
+<p>PostgreSQL 可运行,MySQL / Oracle 报错。改用统一 API:</p>
+<pre><code class="language-java">DSL.jsonValue(ORDERS.METADATA, &quot;$.format&quot;);
+</code></pre>
+<p>MySQL 输出:</p>
+<pre><code class="language-sql">json_unquote(json_extract(orders.metadata, '$.format'))
+</code></pre>
+<p>Oracle 输出:</p>
+<pre><code class="language-sql">json_value(orders.metadata, '$.format')
+</code></pre>
+<h2 id="12.7-生产守卫">12.7 生产守卫</h2>
+<h3>12.7.1 三层能力判断</h3>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>验证手段</th>
+<th>频率</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>方言族能力</td>
+<td><code>renderInlined</code> 快照</td>
+<td>每次构建</td>
+</tr>
+<tr>
+<td>数据库版本能力</td>
+<td>Testcontainers 指定版本</td>
+<td>CI</td>
+</tr>
+<tr>
+<td>部署环境能力</td>
+<td>生产 smoke test</td>
+<td>上线前</td>
+</tr>
+</tbody>
+</table>
+<h3>12.7.2 上线检查清单</h3>
+<table>
+<thead>
+<tr>
+<th>检查项</th>
+<th>验证</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>dialect 不是 DEFAULT</td>
+<td>启动断言</td>
+</tr>
+<tr>
+<td>商业 artifact 已购</td>
+<td>依赖 license</td>
+</tr>
+<tr>
+<td>版本能力</td>
+<td>renderInlined + 数据库版本</td>
+</tr>
+<tr>
+<td>Emulation 真实测试</td>
+<td>Testcontainers</td>
+</tr>
+<tr>
+<td>raw SQL 扫描</td>
+<td>静态扫描 <code>field("</code>、<code>condition("</code></td>
+</tr>
+<tr>
+<td>Parser 迁移</td>
+<td>smoke test + manual review</td>
+</tr>
+<tr>
+<td>renderMapping schema</td>
+<td>启动校验</td>
+</tr>
+<tr>
+<td>SQL 快照</td>
+<td>至少覆盖 PG / MySQL / 目标商业方言</td>
+</tr>
+</tbody>
+</table>
+<h3>12.7.3 启动校验</h3>
+<pre><code class="language-java">@PostConstruct
+void verifyDialect() {
+    SQLDialect dialect = config.dialect();
+    if (dialect == SQLDialect.DEFAULT) {
+        throw new IllegalStateException(&quot;DEFAULT dialect not allowed in production&quot;);
+    }
+    log.info(&quot;jOOQ dialect: {} family={}&quot;, dialect, dialect.family());
+}
+</code></pre>
+<h2 id="12.8-测试护栏">12.8 测试护栏</h2>
+<h3>12.8.1 SQL 快照守卫</h3>
+<pre><code class="language-java">@Test
+void limit_offset_renders_correctly_per_dialect() {
+    var page = DSL.select(ORDERS.ID).from(ORDERS)
+        .orderBy(ORDERS.ID).limit(10).offset(20);
+
+    assertThat(DSL.using(SQLDialect.POSTGRES).renderInlined(page))
+        .containsIgnoringCase(&quot;limit 10 offset 20&quot;);
+
+    assertThat(DSL.using(SQLDialect.ORACLE).renderInlined(page))
+        .containsIgnoringCase(&quot;offset 20 rows fetch next 10 rows only&quot;);
+
+    assertThat(DSL.using(SQLDialect.SQLSERVER).renderInlined(page))
+        .containsIgnoringCase(&quot;offset 20 rows fetch next 10 rows only&quot;);
+}
+
+@Test
+void upsert_renders_dialect_specific_sql() {
+    var upsert = DSL.insertInto(PRODUCTS)
+        .set(PRODUCTS.SKU, &quot;SKU-001&quot;)
+        .onDuplicateKeyUpdate()
+        .set(PRODUCTS.NAME, excluded(PRODUCTS.NAME));
+
+    assertThat(DSL.using(SQLDialect.MYSQL).renderInlined(upsert))
+        .containsIgnoringCase(&quot;on duplicate key update&quot;);
+
+    assertThat(DSL.using(SQLDialect.POSTGRES).renderInlined(upsert))
+        .containsIgnoringCase(&quot;on conflict&quot;);
+}
+</code></pre>
+<h3>12.8.2 真实数据库 emulation 测试</h3>
+<pre><code class="language-java">@Testcontainers
+class UpsertEmulationTest {
+    @Container
+    static MySQLContainer&lt;?&gt; mysql = new MySQLContainer&lt;&gt;(&quot;mysql:8.0&quot;);
+
+    @Test
+    void mysql_upsert_compound_unique_key_behavior() {
+        DSLContext dsl = DSL.using(mysql.getJdbcUrl(), mysql.getUsername(), mysql.getPassword());
+
+        dsl.insertInto(PRODUCTS)
+           .set(PRODUCTS.VENDOR, &quot;V1&quot;).set(PRODUCTS.SKU, &quot;S1&quot;)
+           .set(PRODUCTS.NAME, &quot;Original&quot;)
+           .execute();
+
+        int affected = dsl.insertInto(PRODUCTS)
+           .set(PRODUCTS.VENDOR, &quot;V1&quot;).set(PRODUCTS.SKU, &quot;S2&quot;)
+           .set(PRODUCTS.NAME, &quot;Conflict&quot;)
+           .onDuplicateKeyUpdate()
+           .set(PRODUCTS.NAME, excluded(PRODUCTS.NAME))
+           .execute();
+
+        assertThat(affected).isEqualTo(1);
+    }
+}
+</code></pre>
+<h3>12.8.3 Parser 回归</h3>
+<pre><code class="language-java">@Test
+void parser_translates_oracle_top_n_to_postgres_limit() {
+    DSLContext ora = DSL.using(SQLDialect.ORACLE);
+    DSLContext pg = DSL.using(SQLDialect.POSTGRES);
+
+    Query parsed = ora.parser().parseQuery(
+        &quot;SELECT id FROM customers ORDER BY id FETCH FIRST 5 ROWS ONLY&quot;);
+
+    assertThat(pg.render(parsed))
+        .containsIgnoringCase(&quot;limit 5&quot;);
+}
+</code></pre>
+<h2 id="12.9-源码深潜">12.9 源码深潜</h2>
+<h3>图 12-9:核心调用链</h3>
+<div class="diagram">
+  <div class="diagram-title">图 12-9 · 核心调用链 — DSL → AST → visit → accept → dialect 分支 → SQL</div>
+  <svg viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#240d38"/></linearGradient>
+      <marker id="arr"  markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+      <marker id="arrD" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#bc8cff"/></marker>
+    </defs>
+
+    <rect x="20"  y="80" width="155" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="97"  y="106" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">DSL / SelectImpl</text>
+    <text x="97"  y="124" text-anchor="middle" fill="#8b949e" font-size="11">API 入口</text>
+
+    <rect x="195" y="80" width="155" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="272" y="106" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">QueryPart AST</text>
+    <text x="272" y="124" text-anchor="middle" fill="#8b949e" font-size="11">org.jooq.QueryPart</text>
+
+    <rect x="370" y="80" width="160" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="450" y="106" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Context.visit(part)</text>
+    <text x="450" y="124" text-anchor="middle" fill="#8b949e" font-size="11">深度优先遍历</text>
+
+    <rect x="550" y="80" width="180" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="640" y="106" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">accept(ctx)</text>
+    <text x="640" y="124" text-anchor="middle" fill="#8b949e" font-size="11">AbstractQueryPart</text>
+
+    <rect x="750" y="80" width="150" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="825" y="106" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Configuration</text>
+    <text x="825" y="124" text-anchor="middle" fill="#8b949e" font-size="11">.dialect()</text>
+
+    <path d="M 175 110 L 195 110" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 350 110 L 370 110" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 530 110 L 550 110" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 730 110 L 750 110" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="750" y="190" width="150" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="825" y="216" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">方言分支</text>
+    <text x="825" y="234" text-anchor="middle" fill="#8b949e" font-size="11">switch / instanceof</text>
+
+    <rect x="550" y="190" width="180" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="640" y="216" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">RenderContext</text>
+    <text x="640" y="234" text-anchor="middle" fill="#8b949e" font-size="11">.sql() / .keyword()</text>
+
+    <rect x="370" y="190" width="160" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="450" y="216" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">BindContext</text>
+    <text x="450" y="234" text-anchor="middle" fill="#8b949e" font-size="11">.bind(value)</text>
+
+    <rect x="195" y="190" width="155" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="272" y="216" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">SQL + bind</text>
+    <text x="272" y="234" text-anchor="middle" fill="#8b949e" font-size="11">values</text>
+
+    <path d="M 825 140 L 825 190" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 750 220 L 730 220" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 550 220 L 530 220" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 370 220 L 350 220" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="20"  y="190" width="155" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="97"  y="216" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">VisitListener</text>
+    <text x="97"  y="234" text-anchor="middle" fill="#8b949e" font-size="11">visitStart / visitEnd</text>
+
+    <path d="M 450 140 L 97 190" stroke="#bc8cff" stroke-width="1.2" fill="none" stroke-dasharray="4 3" marker-end="url(#arrD)"/>
+
+    <text x="460" y="30" text-anchor="middle" fill="#8b949e" font-size="11">DSL → AST → visit/accept → dialect 分支(选择渲染策略)</text>
+    <text x="460" y="290" text-anchor="middle" fill="#8b949e" font-size="11">SPI 切入点:VisitListener(AST 观察 / 改写)、ExecuteListener(执行流 hook)</text>
+    <text x="460" y="316" text-anchor="middle" fill="#8b949e" font-size="11">核心源码:org.jooq.impl.AbstractContext.visit() · 各 QueryPart 实现的 accept()</text>
+  </svg>
+</div>
+<h3>表 12-9:源码入口</h3>
+<table>
+<thead>
+<tr>
+<th>入口</th>
+<th>包 / 类</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>方言</td>
+<td><code>org.jooq.SQLDialect</code></td>
+<td>方言 / 族</td>
+</tr>
+<tr>
+<td>配置</td>
+<td><code>org.jooq.Configuration.dialect()</code></td>
+<td>当前方言</td>
+</tr>
+<tr>
+<td>AST 接口</td>
+<td><code>org.jooq.QueryPart</code></td>
+<td>节点契约</td>
+</tr>
+<tr>
+<td>抽象基类</td>
+<td><code>org.jooq.impl.AbstractQueryPart</code></td>
+<td>accept 模板</td>
+</tr>
+<tr>
+<td>上下文</td>
+<td><code>org.jooq.Context</code> / <code>RenderContext</code></td>
+<td>visit 状态</td>
+</tr>
+<tr>
+<td>节点</td>
+<td><code>SelectQueryImpl</code> / <code>InsertQueryImpl</code> / <code>MergeImpl</code> / <code>Limit</code></td>
+<td>具体渲染</td>
+</tr>
+<tr>
+<td>类型</td>
+<td><code>DataType</code> / <code>Field&lt;T&gt;</code></td>
+<td>函数能力</td>
+</tr>
+<tr>
+<td>解析器</td>
+<td><code>ParserImpl</code> / <code>ParserContext</code></td>
+<td>SQL → AST</td>
+</tr>
+<tr>
+<td>拦截</td>
+<td><code>VisitListener</code> / <code>VisitContext</code></td>
+<td>渲染观察</td>
+</tr>
+<tr>
+<td>映射</td>
+<td><code>Settings.renderMapping</code></td>
+<td>schema / table 映射</td>
+</tr>
+</tbody>
+</table>
+<h3>设计取舍</h3>
+<p><strong>取舍 1:统一 AST + 方言分支,而非每方言独立生成器</strong></p>
+<p>每方言独立生成器隔离清晰但重复严重,新增 DSL 特性需改 N 套实现。jOOQ 选择统一 <code>QueryPart</code> AST,在 <code>accept(Context)</code> 内部根据方言切换分支,新特性只需在节点级别加分支。</p>
+<p><strong>取舍 2:Emulation 而非"最低公分母 SQL"</strong></p>
+<p>最低公分母放弃 PG <code>RETURNING</code>、MySQL upsert、Oracle 分析函数等强能力,业务无法用到方言原生优势。jOOQ 选择"原生优先,emulation 兜底",再用集成测试验证模拟语义。</p>
+<p><strong>取舍 3:不做"运行时检测数据库版本自动改写"</strong></p>
+<p>JDBC metadata 不完全可靠,版本能力还受兼容模式、权限、发行版影响。jOOQ 让用户显式声明 <code>SQLDialect</code>,版本差异由 SQL 快照与集成测试守住,而非运行时猜测。</p>
+<p><strong>取舍 4:Parser 与 Renderer 解耦</strong></p>
+<p>Parser 把 SQL 还原为方言无关 AST,Renderer 再渲染到任意目标方言。该设计使 Oracle → PostgreSQL 迁移、SQL 标准化、跨库重写等场景共享同一套 AST 接口。</p>
+<p><strong>取舍 5:VisitListener 限于观察,不替代 QOM / Settings</strong></p>
+<p>VisitListener 是"观察 / 局部改写"挂点,而非完整 SQL 重写器。复杂多租户应使用 Query Object Model 或 Policy(商业版),动态 schema 应使用 <code>renderMapping</code>。这避免 listener 成为业务逻辑黑洞。</p>
+<div class="chapter-summary">
+<h2>12.10 本章要点</h2>
+
+<table>
+<thead>
+<tr>
+<th>要点</th>
+<th>验证依据</th>
+<th>易错点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>方言族稳定,版本能力要测</td>
+<td>renderInlined + Testcontainers</td>
+<td>假设 SQLDialect 一刀切</td>
+</tr>
+<tr>
+<td>AST + visit 渲染</td>
+<td>源码 accept</td>
+<td>期望字符串模板</td>
+</tr>
+<tr>
+<td>Emulation 不完美</td>
+<td>集成测试</td>
+<td>仅看 SQL 快照</td>
+</tr>
+<tr>
+<td>商业方言需 license</td>
+<td>依赖检查</td>
+<td>误用开源 artifact</td>
+</tr>
+<tr>
+<td>raw SQL 绕过引擎</td>
+<td>静态扫描</td>
+<td><code>field("col-&gt;&gt;'k'")</code></td>
+</tr>
+<tr>
+<td>Parser 用于迁移</td>
+<td>smoke test</td>
+<td>处理 PL/SQL</td>
+</tr>
+<tr>
+<td>renderMapping 优先</td>
+<td>Settings</td>
+<td>误用 VisitListener</td>
+</tr>
+<tr>
+<td>启动断言 dialect ≠ DEFAULT</td>
+<td>@PostConstruct</td>
+<td>配置缺失静默退化</td>
+</tr>
+</tbody>
+</table>
+<p>最小回归:</p>
+<pre><code class="language-text">mvn -q test -Dtest=Dialect*Test,*EmulationTest
+</code></pre>
+<pre><code class="language-log">[INFO] Tests run: 18, Failures: 0
+</code></pre>
+<hr>
+<p>下一章讨论 <code>ExecuteListener</code>:在 SQL 执行的六个阶段(prepare / bind / execute / fetch / record / close)挂载日志、指标、慢查询、敏感字段脱敏与重试逻辑。</p>
+</div>
+
+
+<div class="chapter-nav">
+  <a href="ch11-multiset.html">&larr; ch11-multiset · 第 11 章 · MULTISET 与嵌套集合</a>
+  <a href="ch13-listener.html">ch13-listener · 第 13 章 · ExecuteListener 与性能调优 &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 jOOQ &middot; 第 12 章 · SQLDialect 与方言引擎</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){setTimeout(function(){document.querySelectorAll('.mermaid svg,.diagram svg').forEach(function(svg){var h=parseInt(svg.getAttribute('height')||svg.getBoundingClientRect().height);if(h>500){svg.style.maxHeight='500px';svg.style.width='auto';var p=svg.closest('.diagram');if(p)p.style.overflowX='auto';}});},1500);});</script>
+</body>
+</html>

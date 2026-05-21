@@ -1,0 +1,1696 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lucene 图解 - 第28章 .fdt Stored Fields Data 文件</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="g-blue" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1f6feb"/><stop offset="100%" stop-color="#0d2d61"/>
+    </linearGradient>
+    <linearGradient id="g-green" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#238636"/><stop offset="100%" stop-color="#0f4520"/>
+    </linearGradient>
+    <linearGradient id="g-orange" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#d97706"/><stop offset="100%" stop-color="#7c3a02"/>
+    </linearGradient>
+    <linearGradient id="g-red" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#da3633"/><stop offset="100%" stop-color="#7d1d1b"/>
+    </linearGradient>
+    <linearGradient id="g-purple" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#8b5cf6"/><stop offset="100%" stop-color="#4c1d95"/>
+    </linearGradient>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8b949e"/>
+    </marker>
+    <marker id="arr-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3fb950"/>
+    </marker>
+    <marker id="arr-o" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#f0883e"/>
+    </marker>
+    <marker id="arr-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#f85149"/>
+    </marker>
+    <marker id="arr-p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#a371f7"/>
+    </marker>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Lucene</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="27-fdm-stored-fields-meta-file.html">上一章</a>
+  <a href="29-fdx-stored-fields-index-file.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s28-1">28.1 用途与触发条件</a>
+  <a href="#s28-2">28.2 文件命名与定位</a>
+  <a href="#s28-3">28.3 整体字节布局</a>
+  <a href="#s28-4">28.4 Chunk Block 字节布局</a>
+  <a href="#s28-5">28.5 Stored Field Token 编码</a>
+  <a href="#s28-6">28.6 Chunk 切分策略</a>
+  <a href="#s28-7">28.7 LZ4 与 DEFLATE 压缩</a>
+  <a href="#s28-8">28.8 写入路径</a>
+  <a href="#s28-9">28.9 读取路径</a>
+  <a href="#s28-10">28.10 性能基线</a>
+  <a href="#s28-11">28.11 版本演进与兼容性</a>
+  <a href="#s28-12">28.12 陷阱与限制</a>
+  <a href="#s28-13">28.13 最小回归验证</a>
+  <a href="#s28-summary">28.14 本章小结</a>
+</aside>
+
+<div class="article">
+
+<h1>第 28 章 · .fdt Stored Fields Data 文件</h1>
+<p class="subtitle">行存数据通道 · Field.Store.YES · chunk + LZ4/DEFLATE · 16 KiB/64 KiB · StoredFieldsWriter / StoredFieldVisitor · 与 .fdx/.fdm 三件套 · fetch 5-500 μs</p>
+
+<div class="chapter-intro">
+  <p class="lead"><code>.fdt</code> 是 Lucene 的<strong>行存数据通道</strong>。当你写下 <code>doc.add(new StringField("id", "ORD123", Field.Store.YES))</code>,这串 <code>"ORD123"</code> 字节最终落到 <code>.fdt</code>;当你写 <code>doc.add(new StoredField("payload", jsonBytes))</code>,整个 JSON 字节流也落在 <code>.fdt</code>。<code>.fdt</code> 服务于 fetch 阶段——查询命中 docID 后,<code>IndexSearcher</code> 通过 <code>storedFields().document(docID)</code> 经 <code>.fdx</code> 跳转表定位 chunk,解压 chunk 后返回该 docID 对应的字段。</p>
+  <p>与列存的 <code>.dvd</code> 形成鲜明对比:<code>.fdt</code> 按 docID 顺序<strong>连续存放整行</strong>,以 chunk 为单位用 <strong>LZ4 (BEST_SPEED)</strong> 或 <strong>DEFLATE (BEST_COMPRESSION)</strong> 压缩。fetch 一个 doc 需要解压整 chunk(典型 16 KiB / 128 doc),然后按字段 token 流式解码。这种设计以 chunk 解压成本(5-10 μs)换 chunk 内随机访问能力——TopK 排序后的 K 个 doc fetch 几乎一定命中不同 chunk,所以 fetch 的延迟主要由 chunk 数决定,而非字段大小。</p>
+  <p>本章按文件结构(Header → 多个 Chunk Block → Dirty Chunks Trailer → Footer)拆解 <code>.fdt</code>,逐一展示字节布局、token 编码(typeBits + fieldNumber + value)、压缩选择(LZ4 vs DEFLATE)、写入路径(<code>Lucene90CompressingStoredFieldsWriter</code>)、读取路径(<code>StoredFieldVisitor</code>)与性能特征。</p>
+  <ul class="will-learn">
+    <li><code>Field.Store.YES</code> 在哪些场景<strong>必须</strong>使用,与 DocValues / Points / 倒排的关系——四种独立通道,正交不重叠</li>
+    <li><code>.fdt</code> 的<strong>三段字节布局</strong>:Header(magic + codecName + objectID + chunkSize) → Chunk Blocks(docBase + numDocs + lengths + compressedData) → Footer(CRC32)</li>
+    <li>单 chunk 内部的<strong>字段 token 编码</strong>:<code>fieldNumberInfo (VInt) = (fieldNumber &lt;&lt; 3) | typeBits</code>,6 种 typeBits(STRING / BINARY / NUMERIC_INT / NUMERIC_FLOAT / NUMERIC_LONG / NUMERIC_DOUBLE)与各自的 value 编码</li>
+    <li>chunk <strong>切分策略</strong>:bytes ≥ chunkSize 或 docs ≥ MAX_DOCS_PER_CHUNK 任一满足即 flush,BEST_SPEED 16 KiB/128 doc vs BEST_COMPRESSION 64 KiB/512 doc</li>
+    <li><code>BEST_SPEED</code> 与 <code>BEST_COMPRESSION</code> 的<strong>权衡矩阵</strong>:LZ4 ~ 1 GB/s 解压 / 2-4× 压缩比 vs DEFLATE ~ 100 MB/s / 4-8× 压缩比</li>
+    <li>超大文档触发的 <strong>sliced chunk</strong>:单 doc &gt; chunkSize 时如何切分,以及失去单 doc 随机访问能力的代价</li>
+    <li>写入路径:<code>StoredFieldsWriter.startDocument / writeField / finishDocument / flush</code>,内部如何累积 buffer、判断阈值、压缩、写 .fdt + .fdx 双流</li>
+    <li>读取路径:<code>StoredFieldsReader.visitDocument(docID, visitor)</code> + <code>.fdx</code> 跳转表 + 解压 + 字段流式解码 + visitor 回调</li>
+    <li><code>StoredFieldVisitor</code> 的 7 种回调(<code>needsField / stringField / binaryField / intField / longField / floatField / doubleField</code>)与 <code>fieldsToLoad</code> 白名单的优化空间</li>
+    <li>性能基线:单 doc fetch 热路径 5-10 μs(LZ4),冷路径 100-500 μs(含 4 KiB I/O + 解压);跨 chunk 批量 fetch 1000 doc 5-10 ms vs 同 chunk 500 μs</li>
+    <li>9 类生产<strong>陷阱</strong>:大字段误进 stored、用 stored 替代 DocValues 排序、单 doc &gt; chunkSize 触发 slice、跨 chunk fetch、Visitor 全字段加载、压缩模式误用、三件套缺失等</li>
+  </ul>
+  <p class="prereq">前置知识:第 17 章压缩与 stored fields codec(本章假设你了解 LZ4/DEFLATE 的基本压缩原理与 Lucene compressing codec 框架);第 21 章 <code>.si</code> Segment Info(<code>.fdt</code> 文件名前缀来自 segment 名);第 31 章 <code>.dvd</code> DocValues(对比理解行存 vs 列存的访问模式差异);第 6 章 <code>IndexWriter</code> 写入路径(<code>StoredFieldsWriter</code> 是 <code>DocumentsWriterPerThread</code> 调用链的一环)。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s28-1">28.1 用途与触发条件</h2>
+<!-- ============================================================ -->
+
+<p><code>.fdt</code> 与倒排索引(<code>.tim</code>/<code>.tip</code>/<code>.doc</code>/<code>.pos</code>)、列存 DocValues(<code>.dvd</code>/<code>.dvm</code>)、Points(<code>.dim</code>/<code>.dii</code>)是<strong>四条独立的访问路径</strong>。倒排回答"哪些 doc 含 term X",DocValues 回答"doc Y 在字段 F 上的值",Points 回答"哪些 doc 的字段在范围 [a,b]",而 <code>.fdt</code> 回答"docID Y 当初保存了什么原始字段值"。本节先把 <code>.fdt</code> 的触发条件、字段类型映射讲清楚。</p>
+
+<h3>28.1.1 Field.Store.YES 触发判定</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-1-1 · .fdt 触发判定流程</div>
+  <svg viewBox="0 0 920 460" width="100%" style="max-width:920px;display:block;margin:0 auto" font-family="-apple-system,Segoe UI,sans-serif" font-size="13">
+    <rect x="340" y="20" width="240" height="50" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="460" y="50" text-anchor="middle" fill="#fff" font-weight="600">addDocument 时字段配置</text>
+
+    <polygon points="460,110 580,150 460,190 340,150" fill="url(#g-orange)" stroke="#f0883e"/>
+    <text x="460" y="155" text-anchor="middle" fill="#fff" font-weight="600">Field.Store</text>
+
+    <line x1="460" y1="70" x2="460" y2="108" stroke="#8b949e" stroke-width="2" marker-end="url(#arr)"/>
+
+    <rect x="180" y="220" width="200" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="280" y="250" text-anchor="middle" fill="#fff" font-weight="600">写入 .fdt</text>
+
+    <rect x="540" y="220" width="240" height="60" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="660" y="245" text-anchor="middle" fill="#fff" font-weight="600">不进 .fdt</text>
+    <text x="660" y="265" text-anchor="middle" fill="#fff" font-size="12">仅参与倒排</text>
+
+    <line x1="380" y1="170" x2="290" y2="218" stroke="#3fb950" stroke-width="2" marker-end="url(#arr-g)"/>
+    <text x="295" y="200" fill="#3fb950" font-size="12" font-weight="600">YES</text>
+    <line x1="540" y1="170" x2="640" y2="218" stroke="#f85149" stroke-width="2" marker-end="url(#arr-r)"/>
+    <text x="615" y="200" fill="#f85149" font-size="12" font-weight="600">NO</text>
+
+    <polygon points="280,310 380,340 280,370 180,340" fill="url(#g-purple)" stroke="#a371f7"/>
+    <text x="280" y="345" text-anchor="middle" fill="#fff" font-weight="600">字段类型</text>
+    <line x1="280" y1="270" x2="280" y2="308" stroke="#8b949e" stroke-width="2" marker-end="url(#arr)"/>
+
+    <g font-size="11">
+      <rect x="20" y="400" width="120" height="40" rx="6" fill="#161b22" stroke="#58a6ff"/>
+      <text x="80" y="425" text-anchor="middle" fill="#79c0ff">UTF-8 byte</text>
+      <text x="80" y="395" text-anchor="middle" fill="#8b949e" font-size="10">StringField</text>
+
+      <rect x="155" y="400" width="120" height="40" rx="6" fill="#161b22" stroke="#58a6ff"/>
+      <text x="215" y="425" text-anchor="middle" fill="#79c0ff">UTF-8 byte</text>
+      <text x="215" y="395" text-anchor="middle" fill="#8b949e" font-size="10">TextField</text>
+
+      <rect x="290" y="400" width="120" height="40" rx="6" fill="#161b22" stroke="#3fb950"/>
+      <text x="350" y="425" text-anchor="middle" fill="#56d364">raw byte</text>
+      <text x="350" y="395" text-anchor="middle" fill="#8b949e" font-size="10">BinaryField</text>
+
+      <rect x="425" y="400" width="120" height="40" rx="6" fill="#161b22" stroke="#f0883e"/>
+      <text x="485" y="425" text-anchor="middle" fill="#f0883e">VLong</text>
+      <text x="485" y="395" text-anchor="middle" fill="#8b949e" font-size="10">Numeric Int/Long</text>
+
+      <rect x="560" y="400" width="140" height="40" rx="6" fill="#161b22" stroke="#a371f7"/>
+      <text x="630" y="425" text-anchor="middle" fill="#bc8cff">IEEE 754</text>
+      <text x="630" y="395" text-anchor="middle" fill="#8b949e" font-size="10">Float/DoubleField</text>
+    </g>
+
+    <line x1="220" y1="370" x2="80" y2="398" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="245" y1="372" x2="215" y2="398" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="280" y1="370" x2="350" y2="398" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="320" y1="370" x2="485" y2="398" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="350" y1="370" x2="620" y2="398" stroke="#8b949e" stroke-width="1.5" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<h3>28.1.2 Field.Store 与 .fdt 写入对照</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-1-1 · Field.Store 与 .fdt 写入</div>
+  <table>
+    <thead><tr><th>字段类型</th><th>Store.YES 行为</th><th>Store.NO 行为</th></tr></thead>
+    <tbody>
+      <tr><td><code>StringField</code> (keyword)</td><td>索引 + .fdt 存原值</td><td>仅索引</td></tr>
+      <tr><td><code>TextField</code></td><td>索引(分词) + .fdt 存原值</td><td>仅索引</td></tr>
+      <tr><td><code>StoredField</code></td><td>仅 .fdt,不索引</td><td>不存在</td></tr>
+      <tr><td><code>IntPoint</code> / <code>LongPoint</code></td><td>.dim Points 索引</td><td>仅 Points,不进 .fdt</td></tr>
+      <tr><td><code>NumericDocValuesField</code></td><td>.dvd 列存</td><td>不存在</td></tr>
+      <tr><td><code>BinaryDocValuesField</code></td><td>.dvd 列存</td><td>不存在</td></tr>
+      <tr><td><code>KnnVectorField</code></td><td>.vec 向量数据</td><td>不存在</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key-insight">
+  <strong>StoredField 是仅写 .fdt 不索引的快捷类</strong>。<code>Field.Store.YES</code> 标志位决定是否进 <code>.fdt</code>;DocValues / Points / KnnVector 是<strong>独立的存储通道</strong>,与 stored fields 路径正交——同一字段可以同时进多条通道(例如 <code>price</code> 同时配 <code>LongPoint</code> 索引、<code>NumericDocValuesField</code> 列存、<code>StoredField</code> 行存),四套数据互不依赖。这种解耦让 reader 按需选择最优访问路径,而不是在一个 monolithic 字段表里找所有信息。
+</div>
+
+<h3>28.1.3 stored fields 在文档生命周期中的位置</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-1-2 · stored fields 写入时序</div>
+  <svg viewBox="0 0 980 540" width="100%" style="max-width:980px;display:block;margin:0 auto" font-family="-apple-system,Segoe UI,sans-serif" font-size="12">
+    <g font-weight="600" font-size="13">
+      <rect x="20" y="20" width="120" height="32" rx="6" fill="url(#g-blue)"/>
+      <text x="80" y="41" text-anchor="middle" fill="#fff">业务代码 App</text>
+      <rect x="180" y="20" width="120" height="32" rx="6" fill="url(#g-green)"/>
+      <text x="240" y="41" text-anchor="middle" fill="#fff">IndexWriter</text>
+      <rect x="340" y="20" width="160" height="32" rx="6" fill="url(#g-purple)"/>
+      <text x="420" y="41" text-anchor="middle" fill="#fff">DWPT</text>
+      <rect x="540" y="20" width="180" height="32" rx="6" fill="url(#g-orange)"/>
+      <text x="630" y="41" text-anchor="middle" fill="#fff">StoredFieldsWriter</text>
+      <rect x="760" y="20" width="100" height="32" rx="6" fill="url(#g-red)"/>
+      <text x="810" y="41" text-anchor="middle" fill="#fff">.fdt</text>
+    </g>
+
+    <g stroke="#30363d" stroke-dasharray="4 4">
+      <line x1="80" y1="55" x2="80" y2="510"/>
+      <line x1="240" y1="55" x2="240" y2="510"/>
+      <line x1="420" y1="55" x2="420" y2="510"/>
+      <line x1="630" y1="55" x2="630" y2="510"/>
+      <line x1="810" y1="55" x2="810" y2="510"/>
+    </g>
+
+    <g font-size="11" fill="#c9d1d9">
+      <line x1="80" y1="80" x2="240" y2="80" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+      <text x="160" y="74" text-anchor="middle" fill="#79c0ff">1: doc = new Document()</text>
+
+      <line x1="80" y1="115" x2="240" y2="115" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+      <text x="160" y="109" text-anchor="middle" fill="#79c0ff">2: doc.add(StringField "id"=ORD123, Store.YES)</text>
+
+      <line x1="80" y1="150" x2="240" y2="150" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+      <text x="160" y="144" text-anchor="middle" fill="#79c0ff">3: doc.add(TextField "title", Store.YES)</text>
+
+      <line x1="80" y1="185" x2="240" y2="185" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+      <text x="160" y="179" text-anchor="middle" fill="#79c0ff">4: w.addDocument(doc)</text>
+
+      <line x1="240" y1="220" x2="420" y2="220" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="330" y="214" text-anchor="middle" fill="#56d364">5: 缓冲到 perThread state</text>
+
+      <line x1="420" y1="255" x2="630" y2="255" stroke="#a371f7" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="525" y="249" text-anchor="middle" fill="#bc8cff">6: writeField(field) × N</text>
+
+      <line x1="630" y1="290" x2="630" y2="310" stroke="#f0883e" stroke-width="1.5"/>
+      <rect x="615" y="290" width="30" height="20" fill="url(#g-orange)" rx="4"/>
+      <text x="700" y="304" fill="#f0883e">7: 累积到 chunkBuffer</text>
+
+      <line x1="420" y1="345" x2="630" y2="345" stroke="#a371f7" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="525" y="339" text-anchor="middle" fill="#bc8cff">8: finishDocument()</text>
+    </g>
+
+    <rect x="535" y="380" width="320" height="125" rx="6" fill="rgba(248,81,73,0.06)" stroke="#f85149" stroke-dasharray="4 3"/>
+    <text x="555" y="400" fill="#f85149" font-weight="700" font-size="12">alt buffer 满 16 KiB 或 128 doc</text>
+    <line x1="630" y1="420" x2="630" y2="445" stroke="#f0883e" stroke-width="1.5"/>
+    <rect x="615" y="420" width="30" height="25" fill="url(#g-orange)" rx="4"/>
+    <text x="700" y="437" fill="#f0883e" font-size="11">9: 压缩 chunk</text>
+
+    <line x1="630" y1="475" x2="810" y2="475" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    <text x="720" y="469" text-anchor="middle" fill="#f85149" font-size="11">10: 写入 chunk header + compressed bytes</text>
+  </svg>
+</div>
+
+<h3>28.1.4 典型字段进 .fdt 的字节估算</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-1-2 · 典型字段进 .fdt 的字节估算</div>
+  <table>
+    <thead><tr><th>字段类型与值</th><th>.fdt 占用</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr><td>StringField <code>"ORD123"</code> (Store)</td><td>6 byte + 1 VInt</td><td>UTF-8 + 长度</td></tr>
+      <tr><td>TextField 200 字 中文</td><td>~ 600 byte</td><td>UTF-8 多字节</td></tr>
+      <tr><td>StoredField <code>long 12345</code></td><td>1-2 byte VLong</td><td>ZigZag 编码</td></tr>
+      <tr><td>StoredField <code>byte[1024]</code></td><td>1024 byte + VInt</td><td>不压缩前</td></tr>
+      <tr><td>整 chunk 16 KiB 压缩后 (LZ4)</td><td>4-8 KiB</td><td>典型压缩比 2-4×</td></tr>
+      <tr><td>整 chunk 16 KiB 压缩后 (DEFLATE)</td><td>2-4 KiB</td><td>典型压缩比 4-8×</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="real-world">
+  <h5>电商订单索引:stored fields 体积估算</h5>
+  <p>典型电商订单文档:<code>id</code>(20 byte) + <code>title</code>(80 byte) + <code>summary</code>(300 byte) + <code>price</code>(8 byte numeric) ≈ 410 byte/doc 原始字节。1M doc 索引 = 410 MB 原始。LZ4 压缩比 3× → <code>.fdt</code> 约 137 MB。换 DEFLATE 压缩比 5× → <code>.fdt</code> 约 82 MB。如果业务把整个 1 KB JSON 都塞进 <code>StoredField("payload", ...)</code>,1M doc = 1 GB 原始 → LZ4 后 ~ 333 MB,DEFLATE 后 ~ 200 MB。<strong>注意:DocValues / Points 字段是独立通道,不计入 <code>.fdt</code> 体积</strong>——同一份 <code>price</code> 字段如果同时配 <code>StoredField</code> + <code>NumericDocValuesField</code>,在 <code>.fdt</code> 占 8 byte,在 <code>.dvd</code> 又占 1-3 byte,总开销翻倍。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s28-2">28.2 文件命名与定位</h2>
+<!-- ============================================================ -->
+
+<p><code>.fdt</code> 与 <code>.fdx</code>(chunk 索引)、<code>.fdm</code>(元信息)三者构成 <strong>stored fields 体系</strong>。三者命名相同前缀 <code>_&lt;segment&gt;_Lucene90_0</code>,扩展名分别为 <code>.fdt</code> / <code>.fdx</code> / <code>.fdm</code>。任一文件缺失会导致 segment 无法打开。本节展示三件套在目录中的位置与命名拆解。</p>
+
+<h3>28.2.1 目录中 stored fields 三件套</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-2-1 · 目录中 stored fields 三件套</div>
+<pre class="ascii-art"><code>单 segment 索引(非 compound):
+
+  _0.si                     segment metadata
+  segments_2                 commit metadata
+
+  _0_Lucene90_0.fdt          stored fields 数据  ← 本章主角
+  _0_Lucene90_0.fdx          stored fields chunk 索引
+  _0_Lucene90_0.fdm          stored fields 元信息
+
+  _0_Lucene90_0.doc          倒排 docID/freq
+  _0_Lucene90_0.pos          倒排位置
+  _0_Lucene90_0.tim          term dict
+  _0_Lucene90_0.tip          FST term index
+
+文件命名拆解:
+  _0           segment 名
+  _Lucene90    codec 名
+  _0           codec 实例号
+  .fdt         stored fields data
+  .fdx         stored fields index (chunk 跳转表)
+  .fdm         stored fields meta</code></pre>
+</div>
+
+<h3>28.2.2 Lucene90StoredFieldsFormat 文件常量</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-2-1 · Lucene90StoredFieldsFormat 文件常量</div>
+  <table>
+    <thead><tr><th>常量</th><th>值</th><th>用途</th></tr></thead>
+    <tbody>
+      <tr><td><code>Lucene90CompressingStoredFieldsFormat.FIELDS_EXTENSION</code></td><td><code>"fdt"</code></td><td>字段数据</td></tr>
+      <tr><td><code>Lucene90CompressingStoredFieldsFormat.INDEX_EXTENSION</code></td><td><code>"fdx"</code></td><td>chunk 跳转表</td></tr>
+      <tr><td><code>Lucene90CompressingStoredFieldsFormat.META_EXTENSION</code></td><td><code>"fdm"</code></td><td>元信息</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="warning">
+  <strong>三件套必须配套</strong>:<code>.fdt</code> 总是与同名 <code>.fdx</code> 与 <code>.fdm</code> 一起出现。reader 打开 segment 时先读 <code>.fdm</code> 拿到 chunk 总数与压缩参数,然后通过 <code>.fdx</code> 把 docID 映射到 <code>.fdt</code> 中的 chunk 起始偏移。任一文件缺失会导致 <code>FieldsReader</code> 抛 <code>NoSuchFileException</code>,segment 无法打开。CheckIndex 会校验三者一致性。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s28-3">28.3 整体字节布局</h2>
+<!-- ============================================================ -->
+
+<p>本节给出 <code>.fdt</code> 自顶向下的字节蓝图:Header(~50 byte,含 magic + codecName + objectID + chunkSize)→ 多个 Chunk Block(每 chunk 含 docBase + numDocs + lengths + compressedData)→ Dirty Chunks Trailer(numDirtyChunks + numDirtyDocs)→ Footer(16 byte CRC32)。整个文件按 chunk 串行排列,chunk 间无填充。</p>
+
+<h3>28.3.1 .fdt 文件总览</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-3-1 · .fdt 文件自顶向下布局</div>
+<pre class="ascii-art"><code>.fdt 文件结构(自顶向下):
+
+  ┌────────────────────────────────────────────────────┐
+  │ Header                                              │
+  │   magic        : 4 byte (0x3FD76C17)                │
+  │   codecName    : string                             │
+  │                  "Lucene90StoredFieldsFastData" 或   │
+  │                  "Lucene90StoredFieldsHighData"     │
+  │   version      : VInt   (currently 0)               │
+  │   objectId     : 16 byte (segment ID)               │
+  │   suffix       : string                             │
+  │   chunkSize    : VInt   (默认 16384 byte)           │
+  │   packedIntsVer : VInt                              │
+  ├────────────────────────────────────────────────────┤
+  │ Per-Chunk Blocks                                    │
+  │                                                     │
+  │   Chunk 0:                                          │
+  │     docBase        : VInt                           │
+  │     numDocs        : VInt (1..128)                  │
+  │     fieldNumsPacked: long[]                         │
+  │     numStoredFields[]: int[numDocs]                 │
+  │     lengths[]      : int[numDocs]                   │
+  │     compressedLen  : VInt                           │
+  │     compressedData : LZ4/DEFLATE bytes              │
+  │                                                     │
+  │   Chunk 1: ...                                      │
+  │   ...                                               │
+  │   Chunk N-1                                         │
+  ├────────────────────────────────────────────────────┤
+  │ Dirty Chunks Trailer                                 │
+  │   numDirtyChunks   : VInt                           │
+  │   numDirtyDocs     : VInt                           │
+  ├────────────────────────────────────────────────────┤
+  │ Footer                                              │
+  │   magic            : 4 byte (0xC02893E8)            │
+  │   algorithmID      : 4 byte                         │
+  │   checksum         : 8 byte                         │
+  └────────────────────────────────────────────────────┘</code></pre>
+</div>
+
+<h3>28.3.2 .fdt Header 字节网格</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-3-2 · .fdt Header 字节网格(BEST_SPEED 模式,前 80 byte)</div>
+<pre class="ascii-art"><code>.fdt Header 字节网格(BEST_SPEED 模式,前 80 byte):
+
+偏移   0    1    2    3    4    5    6    7    8    9    a    b    c    d    e    f
+0x000 | 3F | D7 | 6C | 17 | 1F | 4C | 75 | 63 | 65 | 6E | 65 | 39 | 30 | 53 | 74 | 6F |
+      | magic 0x3FD76C17  |strLn=31|  L     u    c    e    n    e    9    0    S    t    o |
+0x010 | 72 | 65 | 64 | 46 | 69 | 65 | 6C | 64 | 73 | 46 | 61 | 73 | 74 | 44 | 61 | 74 |
+      |  r    e    d    F    i    e    l    d    s    F    a    s    t    D    a    t |
+0x020 | 61 | 00 | 00 | 00 | A8 | 1F | 73 | 32 | 4B | F7 | 22 | 91 | C0 | DD | 4F | 1A |
+      |  a |   ver=0       | objectID (16 byte)                                          |
+0x030 | 5C | 88 | 36 | 03 | 00 | 80 | 80 | 01 | 02 | XX | XX | ...
+      | objId 续        |suffLn=0| chunkSize=16384 (VInt 3 byte) | packedV=2 |  开始 chunks |
+
+Header 字段:
+  magic       : 0x3FD76C17 固定
+  codecName   : "Lucene90StoredFieldsFastData" (BEST_SPEED)
+                "Lucene90StoredFieldsHighData" (BEST_COMPRESSION)
+  version     : VInt = 0
+  objectID    : 16 byte segment ID
+  suffix      : 通常空
+  chunkSize   : VInt,默认 16384 (16 KiB)
+  packedIntsVer: VInt = PackedInts.VERSION_CURRENT (2)</code></pre>
+</div>
+
+<h3>28.3.3 Header 字段宽度对照</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-3-1 · Header 字段宽度</div>
+  <table>
+    <thead><tr><th>字段</th><th>字节宽度</th><th>取值</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr><td><code>magic</code></td><td>4</td><td><code>0x3FD76C17</code></td><td>CodecUtil 通用</td></tr>
+      <tr><td><code>codecName</code></td><td>1 + 28-31</td><td>UTF-8</td><td>"Fast" 或 "High" 区分压缩</td></tr>
+      <tr><td><code>version</code></td><td>1 (VInt)</td><td>0</td><td>Codec 版本</td></tr>
+      <tr><td><code>objectID</code></td><td>16</td><td>byte[]</td><td>segment 唯一标识</td></tr>
+      <tr><td><code>suffix</code></td><td>1</td><td>通常 0</td><td>实例后缀</td></tr>
+      <tr><td><code>chunkSize</code></td><td>1-3 (VInt)</td><td>BEST_SPEED 16384, BEST_COMPRESSION 65536</td><td>chunk 大小阈值</td></tr>
+      <tr><td><code>packedIntsVer</code></td><td>1 (VInt)</td><td>2</td><td>PackedInts 版本</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>28.3.4 两种压缩模式 codec 名对比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-3-3 · 两种压缩模式 codec 名对比</div>
+  <svg viewBox="0 0 1000 320" width="100%" style="max-width:1000px;display:block;margin:0 auto" font-family="-apple-system,Segoe UI,sans-serif" font-size="12">
+    <rect x="20" y="130" width="200" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="120" y="155" text-anchor="middle" fill="#fff" font-weight="700" font-size="13">StoredFieldsFormat</text>
+    <text x="120" y="175" text-anchor="middle" fill="#fff" font-size="11">.Mode</text>
+
+    <rect x="280" y="40" width="180" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="370" y="65" text-anchor="middle" fill="#fff" font-weight="700">BEST_SPEED</text>
+    <text x="370" y="85" text-anchor="middle" fill="#d2f4d8" font-size="11">在线低延迟首选</text>
+
+    <rect x="280" y="220" width="180" height="60" rx="10" fill="url(#g-orange)" stroke="#f0883e"/>
+    <text x="370" y="245" text-anchor="middle" fill="#fff" font-weight="700">BEST_COMPRESSION</text>
+    <text x="370" y="265" text-anchor="middle" fill="#fff3e0" font-size="11">归档/磁盘紧张</text>
+
+    <line x1="220" y1="155" x2="280" y2="75" stroke="#3fb950" stroke-width="2" marker-end="url(#arr-g)"/>
+    <line x1="220" y1="170" x2="280" y2="245" stroke="#f0883e" stroke-width="2" marker-end="url(#arr-o)"/>
+
+    <rect x="510" y="20" width="220" height="100" rx="10" fill="rgba(63,185,80,0.1)" stroke="#3fb950"/>
+    <text x="620" y="44" text-anchor="middle" fill="#56d364" font-weight="700">Lucene90StoredFields</text>
+    <text x="620" y="62" text-anchor="middle" fill="#56d364" font-weight="700">FastData</text>
+    <text x="620" y="84" text-anchor="middle" fill="#c9d1d9" font-size="11">chunk 16 KiB</text>
+    <text x="620" y="103" text-anchor="middle" fill="#c9d1d9" font-size="11">LZ4</text>
+
+    <rect x="510" y="200" width="220" height="100" rx="10" fill="rgba(240,136,62,0.1)" stroke="#f0883e"/>
+    <text x="620" y="224" text-anchor="middle" fill="#f0883e" font-weight="700">Lucene90StoredFields</text>
+    <text x="620" y="242" text-anchor="middle" fill="#f0883e" font-weight="700">HighData</text>
+    <text x="620" y="264" text-anchor="middle" fill="#c9d1d9" font-size="11">chunk 64 KiB</text>
+    <text x="620" y="283" text-anchor="middle" fill="#c9d1d9" font-size="11">DEFLATE</text>
+
+    <line x1="460" y1="70" x2="510" y2="70" stroke="#3fb950" stroke-width="2" marker-end="url(#arr-g)"/>
+    <line x1="460" y1="250" x2="510" y2="250" stroke="#f0883e" stroke-width="2" marker-end="url(#arr-o)"/>
+
+    <rect x="780" y="20" width="200" height="100" rx="10" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="880" y="56" text-anchor="middle" fill="#fff" font-weight="700">~ 1 GiB/s 解压</text>
+    <text x="880" y="80" text-anchor="middle" fill="#fff" font-size="13">压缩比</text>
+    <text x="880" y="100" text-anchor="middle" fill="#fff" font-weight="700" font-size="14">2-4×</text>
+
+    <rect x="780" y="200" width="200" height="100" rx="10" fill="url(#g-orange)" stroke="#f0883e"/>
+    <text x="880" y="236" text-anchor="middle" fill="#fff" font-weight="700">~ 100 MiB/s 解压</text>
+    <text x="880" y="260" text-anchor="middle" fill="#fff" font-size="13">压缩比</text>
+    <text x="880" y="280" text-anchor="middle" fill="#fff" font-weight="700" font-size="14">4-8×</text>
+
+    <line x1="730" y1="70" x2="780" y2="70" stroke="#3fb950" stroke-width="2" marker-end="url(#arr-g)"/>
+    <line x1="730" y1="250" x2="780" y2="250" stroke="#f0883e" stroke-width="2" marker-end="url(#arr-o)"/>
+  </svg>
+</div>
+
+<div class="key-insight">
+  <strong>codecName 决定压缩算法</strong>:Lucene 通过 codecName 字符串区分 BEST_SPEED 与 BEST_COMPRESSION——reader 打开 <code>.fdt</code> 时,<code>CodecUtil.checkIndexHeader</code> 会用字符串匹配选定 <code>LZ4Decompressor</code> 或 <code>DeflateDecompressor</code>。这两种压缩模式使用<strong>不同的 codec 名</strong>而非同一 codec 加 flag,便于将来引入 zstd / brotli 等新算法时直接新增 codec 而不破坏向后兼容。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s28-4">28.4 Chunk Block 字节布局</h2>
+<!-- ============================================================ -->
+
+<p>chunk 是 <code>.fdt</code> 的<strong>物理压缩单位</strong>。每个 chunk 内部独立,reader 可以从任意 chunk 开始解码而不依赖前后 chunk 状态。本节展示单 chunk 的字节布局、字段宽度、以及超大文档的 sliced chunk 处理。</p>
+
+<h3>28.4.1 单 Chunk 内部结构</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-4-1 · 单 Chunk 字节布局</div>
+<pre class="ascii-art"><code>单 Chunk 字节布局(典型 16 KiB 压缩前):
+
+  ┌────────────────────────────────────┐
+  │ docBase (VInt)                      │
+  │   chunk 中第一个文档的 docID        │
+  ├────────────────────────────────────┤
+  │ numDocs (VInt)                      │
+  │   chunk 中文档数 (1..128)           │
+  ├────────────────────────────────────┤
+  │ token (VInt = sliced+isDirty)       │
+  │   bit 0    : isSliced               │
+  │   bit 1+   : numStoredFieldsBits    │
+  ├────────────────────────────────────┤
+  │ numStoredFields[numDocs] (packed)   │
+  │   每 doc 的字段数                    │
+  ├────────────────────────────────────┤
+  │ lengths[numDocs] (packed)           │
+  │   每 doc 解压后的总字节数             │
+  ├────────────────────────────────────┤
+  │ compressedLen (VInt)                │
+  │   压缩后字节数                        │
+  ├────────────────────────────────────┤
+  │ compressedData (raw)                 │
+  │   LZ4 或 DEFLATE 字节流              │
+  │                                      │
+  │   解压后:                            │
+  │     for each doc:                    │
+  │       for each stored field:        │
+  │         fieldNumber + bits (VInt)   │
+  │         value bytes                 │
+  └────────────────────────────────────┘</code></pre>
+</div>
+
+<h3>28.4.2 Chunk 字节网格</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-4-2 · Chunk 字节网格(典型: 1 doc, 3 stored field)</div>
+<pre class="ascii-art"><code>单 Chunk 字节网格(典型: 1 doc, 3 stored field):
+
+偏移   0    1    2    3    4    5    6    7    8    9    a    b    c    d    e    f
+0x100 | 64 | 01 | 02 | 03 | 14 | 96 | 7A | 02 | 78 | 9C | 4B | 4C | 49 | 4E | 49 | 04 |
+      |docBase=100|numDocs=1|token|numFields=3|len=20480|cmpLen=378|  LZ4 stream 开始     |
+      |  VInt     |  VInt   |bits=2|packed     |VInt 3 byte|VInt 2 byte|                  |
+0x110 | 00 | 00 | 51 | 02 | 7B | 22 | 22 | 22 | 22 | 5D | E9 | 12 | 47 | 5C | ...        |
+      |  压缩字节流(LZ4 块)                                                                |
+...
+0x290 | (压缩流末尾)
+
+token (1 byte = 0x02):
+  bit 0 = 0  → isSliced = false (单 chunk 完整存放)
+  bit 1+ = 1 → bitsPerValue 字段元数据 1 bit
+
+解压后(20480 byte) 包含:
+  per doc:
+    per stored field:
+      fieldNumberInfo (VInt) | encoded value</code></pre>
+</div>
+
+<h3>28.4.3 Chunk Block 字段宽度</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-4-1 · Chunk Block 字段宽度</div>
+  <table>
+    <thead><tr><th>字段</th><th>类型</th><th>用途</th></tr></thead>
+    <tbody>
+      <tr><td><code>docBase</code></td><td>VInt</td><td>chunk 起始 docID</td></tr>
+      <tr><td><code>numDocs</code></td><td>VInt</td><td>1..128(BEST_SPEED)或 1..512(BEST_COMPRESSION)</td></tr>
+      <tr><td><code>token</code></td><td>VInt</td><td>bit 0 isSliced, bit 1+ bitsPerValue</td></tr>
+      <tr><td><code>numStoredFields</code></td><td>packed</td><td>每 doc 字段数</td></tr>
+      <tr><td><code>lengths</code></td><td>packed</td><td>每 doc 解压字节数</td></tr>
+      <tr><td><code>compressedLen</code></td><td>VInt</td><td>压缩字节数</td></tr>
+      <tr><td><code>compressedData</code></td><td>raw</td><td>LZ4 / DEFLATE 字节流</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>28.4.4 Sliced Chunk(超大文档处理)</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-4-3 · Sliced Chunk:超大文档跨多 chunk</div>
+<pre class="ascii-art"><code>超大文档(单 doc &gt; chunkSize)的 sliced chunk:
+
+  Doc 500 stored fields 共 512 KiB(原始未压缩)
+  chunkSize = 16 KiB
+
+  写出布局:
+    Slice 0: docBase=500, numDocs=1, isSliced=1, sliceID=0, totalSlices=32
+      压缩 16 KiB 子块
+    Slice 1: docBase=500, numDocs=1, isSliced=1, sliceID=1, totalSlices=32
+      压缩 16 KiB 子块
+    ...
+    Slice 31: 末尾子块
+
+  读取协议:
+    .fdx 跳转表中,docID=500 对应起始 slice 偏移
+    StoredFieldsReader 顺序读全部 32 个 slice
+    解压并拼接成完整 doc 字段流
+
+  注意:
+    - 单 doc 跨多 chunk 不支持随机访问中间字段
+    - 必须从 slice 0 开始顺序解压</code></pre>
+</div>
+
+<div class="warning">
+  <strong>sliced chunk 是性能陷阱</strong>:正常 chunk 一次解压可服务 1-128 doc,sliced chunk 一次只服务 1 doc 但要解压 N 个子块(N = ceil(docSize / chunkSize))。一个 512 KiB 的 doc 需要解压 32 次 → fetch 时延飙到 250-500 μs。生产中如果发现 <code>.fdt</code> 中有大量 sliced chunk(可通过 CheckIndex 输出 <code>max chunk docs = 1</code> 间接发现),应当<strong>拆分大字段</strong>(例如把 1 MB JSON 改为外存 + ID 引用),或干脆把字段从 stored 改为外部对象存储。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s28-5">28.5 Stored Field Token 编码</h2>
+<!-- ============================================================ -->
+
+<p>解压后的字节流是按字段顺序排列的 token 流。每个字段由 <code>fieldNumberInfo</code>(VInt 同时编码 typeBits 与 fieldNumber)+ value bytes 组成。本节展示这套 token 编码,以及 6 种 typeBits 对应的 value 编码格式。</p>
+
+<h3>28.5.1 单字段在解压流中的编码</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-5-1 · 单 stored field 编码格式</div>
+<pre class="ascii-art"><code>解压后字节流中的单 stored field:
+
+  ┌──────────────────┬──────────────────┐
+  │ fieldNumberInfo  │ value bytes      │
+  │ (VInt)            │ (按 typeBits 解析)│
+  └──────────────────┴──────────────────┘
+
+fieldNumberInfo 结构:
+  bit 0-2 : typeBits (3 bit)
+  bit 3+  : fieldNumber (剩余 bit)
+
+typeBits 取值:
+  000 (0)  : STRING       (UTF-8 byte 序列)
+  001 (1)  : BINARY       (raw byte 序列)
+  010 (2)  : NUMERIC_INT
+  011 (3)  : NUMERIC_FLOAT
+  100 (4)  : NUMERIC_LONG
+  101 (5)  : NUMERIC_DOUBLE
+
+各类型 value 编码:
+  STRING        : VInt(byteLen) + UTF-8 bytes
+  BINARY        : VInt(byteLen) + raw bytes
+  NUMERIC_INT   : ZigZag VInt
+  NUMERIC_FLOAT : 4 byte little-endian
+  NUMERIC_LONG  : ZigZag VLong
+  NUMERIC_DOUBLE: 8 byte little-endian</code></pre>
+</div>
+
+<h3>28.5.2 typeBits 与编码对照</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-5-1 · typeBits 与 value 编码</div>
+  <table>
+    <thead><tr><th>typeBits</th><th>类型</th><th>value 编码</th><th>平均字节宽度</th></tr></thead>
+    <tbody>
+      <tr><td>0</td><td>STRING</td><td>VInt + UTF-8</td><td>字符数 × 1.5-3</td></tr>
+      <tr><td>1</td><td>BINARY</td><td>VInt + raw</td><td>实际字节数 + 1-3 VInt</td></tr>
+      <tr><td>2</td><td>NUMERIC_INT</td><td>ZigZag VInt</td><td>1-5 byte</td></tr>
+      <tr><td>3</td><td>NUMERIC_FLOAT</td><td>4 byte LE</td><td>4 byte</td></tr>
+      <tr><td>4</td><td>NUMERIC_LONG</td><td>ZigZag VLong</td><td>1-9 byte</td></tr>
+      <tr><td>5</td><td>NUMERIC_DOUBLE</td><td>8 byte LE</td><td>8 byte</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>28.5.3 示例 doc 解压后字节流</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-5-2 · 示例 doc 解压后字节流</div>
+<pre class="ascii-art"><code>示例文档:
+  doc 100:
+    fieldNumber 0: id = "ORD123"   (StringField, Store.YES)
+    fieldNumber 1: title = "iPhone 15" (TextField)
+    fieldNumber 2: price = 9999    (NumericInt)
+
+解压后字节流(简化):
+
+偏移   字节                    含义
+─────────────────────────────────────────────────
+0x00   0x00                    fieldNumberInfo: typeBits=0(STRING), fieldNum=0
+0x01   0x06                    VInt length=6
+0x02   "ORD123"  (6 byte)      UTF-8 字符
+0x08   0x08                    fieldNumberInfo: typeBits=0(STRING), fieldNum=1
+0x09   0x09                    VInt length=9
+0x0A   "iPhone 15" (9 byte)    UTF-8 字符
+0x13   0x12                    fieldNumberInfo: typeBits=2(NUMERIC_INT), fieldNum=2
+0x14   0x9E 0x9C 0x01           ZigZag VInt: 9999 → encoded
+─────────────────────────────────────────────────
+原始字节数: 23 byte
+若 LZ4 压缩(单 doc 压缩比有限): ~ 24 byte
+若批量 chunk 中(共 128 doc): 压缩比 3-5×</code></pre>
+</div>
+
+<div class="key-insight">
+  <strong>fieldNumber 与 typeBits 编码进同一 VInt</strong>:Lucene 把字段号和类型 tag 合并到一个 VInt(<code>(fieldNumber &lt;&lt; 3) | typeBits</code>)而不是两个独立 VInt,目的是<strong>节省 1 byte</strong>。绝大部分字段号 &lt; 32(段内字段数有限),fieldNumberInfo 整体只占 1 byte;若分开两个 VInt 至少 2 byte。1M doc × 5 字段 × 1 byte 节省 = 5 MB——对于 100 MB 级 <code>.fdt</code> 是 5% 的省空间。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s28-6">28.6 Chunk 切分策略</h2>
+<!-- ============================================================ -->
+
+<p>chunk 切分由<strong>两个阈值</strong>控制:bytes ≥ chunkSize(16 KiB BEST_SPEED / 64 KiB BEST_COMPRESSION)或 docs ≥ MAX_DOCS_PER_CHUNK(128 / 512)。任一满足即触发 flush。本节展示切分时序、阈值矩阵、以及 chunk 大小决策权衡。</p>
+
+<h3>28.6.1 Chunk 切分的两个阈值</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-6-1 · Chunk 切分流程</div>
+  <svg viewBox="0 0 900 540" width="100%" style="max-width:900px;display:block;margin:0 auto" font-family="-apple-system,Segoe UI,sans-serif" font-size="13">
+    <rect x="340" y="20" width="220" height="50" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="450" y="50" text-anchor="middle" fill="#fff" font-weight="700">docBuffer.bytes</text>
+
+    <polygon points="450,110 580,165 450,220 320,165" fill="url(#g-orange)" stroke="#f0883e"/>
+    <text x="450" y="170" text-anchor="middle" fill="#fff" font-weight="700">满足任一阈值?</text>
+    <line x1="450" y1="70" x2="450" y2="108" stroke="#8b949e" stroke-width="2" marker-end="url(#arr)"/>
+
+    <rect x="40" y="240" width="240" height="70" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="160" y="265" text-anchor="middle" fill="#fff" font-weight="700">flush chunk</text>
+    <text x="160" y="285" text-anchor="middle" fill="#d2f4d8" font-size="11">bytes ≥ chunkSize</text>
+    <text x="160" y="300" text-anchor="middle" fill="#d2f4d8" font-size="11">(16 KiB BEST_SPEED)</text>
+
+    <rect x="620" y="240" width="240" height="70" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="740" y="265" text-anchor="middle" fill="#fff" font-weight="700">flush chunk</text>
+    <text x="740" y="285" text-anchor="middle" fill="#d2f4d8" font-size="11">docs ≥ MAX_DOCS</text>
+    <text x="740" y="300" text-anchor="middle" fill="#d2f4d8" font-size="11">(默认 128)</text>
+
+    <rect x="345" y="245" width="210" height="55" rx="8" fill="url(#g-purple)" stroke="#a371f7"/>
+    <text x="450" y="278" text-anchor="middle" fill="#fff" font-weight="700">继续累积</text>
+
+    <line x1="320" y1="180" x2="200" y2="238" stroke="#3fb950" stroke-width="2" marker-end="url(#arr-g)"/>
+    <line x1="580" y1="180" x2="700" y2="238" stroke="#3fb950" stroke-width="2" marker-end="url(#arr-g)"/>
+    <line x1="450" y1="220" x2="450" y2="243" stroke="#a371f7" stroke-width="2" marker-end="url(#arr-p)"/>
+    <text x="450" y="237" text-anchor="middle" fill="#a371f7" font-size="11">否</text>
+
+    <rect x="340" y="345" width="220" height="50" rx="8" fill="url(#g-orange)" stroke="#f0883e"/>
+    <text x="450" y="375" text-anchor="middle" fill="#fff" font-weight="700">LZ4/DEFLATE 压缩</text>
+
+    <line x1="160" y1="310" x2="380" y2="343" stroke="#3fb950" stroke-width="2" marker-end="url(#arr-g)"/>
+    <line x1="740" y1="310" x2="520" y2="343" stroke="#3fb950" stroke-width="2" marker-end="url(#arr-g)"/>
+
+    <rect x="240" y="425" width="200" height="50" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="340" y="455" text-anchor="middle" fill="#fff" font-weight="700">写入 .fdt</text>
+
+    <rect x="460" y="425" width="240" height="50" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="580" y="455" text-anchor="middle" fill="#fff" font-weight="700">更新 .fdx 跳转表</text>
+
+    <line x1="400" y1="395" x2="340" y2="423" stroke="#f0883e" stroke-width="2" marker-end="url(#arr-o)"/>
+    <line x1="440" y1="450" x2="458" y2="450" stroke="#f85149" stroke-width="2" marker-end="url(#arr-r)"/>
+  </svg>
+</div>
+
+<h3>28.6.2 Chunk 切分阈值对照</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-6-1 · Chunk 切分阈值</div>
+  <table>
+    <thead><tr><th>模式</th><th>chunkSize</th><th>MAX_DOCS_PER_CHUNK</th><th>触发条件</th></tr></thead>
+    <tbody>
+      <tr><td>BEST_SPEED</td><td>16,384 byte</td><td>128</td><td>任一满即 flush</td></tr>
+      <tr><td>BEST_COMPRESSION</td><td>65,536 byte</td><td>512</td><td>同上</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>28.6.3 Chunk 切分流程时序</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-6-2 · Chunk 切分时序</div>
+  <svg viewBox="0 0 1100 620" width="100%" style="max-width:1100px;display:block;margin:0 auto" font-family="-apple-system,Segoe UI,sans-serif" font-size="12">
+    <g font-weight="600" font-size="12">
+      <rect x="20" y="20" width="100" height="32" rx="6" fill="url(#g-blue)"/>
+      <text x="70" y="41" text-anchor="middle" fill="#fff">App</text>
+      <rect x="160" y="20" width="220" height="32" rx="6" fill="url(#g-orange)"/>
+      <text x="270" y="41" text-anchor="middle" fill="#fff">CompressingStoredFieldsWriter</text>
+      <rect x="420" y="20" width="140" height="32" rx="6" fill="url(#g-purple)"/>
+      <text x="490" y="41" text-anchor="middle" fill="#fff">chunkBuffer</text>
+      <rect x="600" y="20" width="200" height="32" rx="6" fill="url(#g-green)"/>
+      <text x="700" y="41" text-anchor="middle" fill="#fff">Compressor (LZ4/DEFLATE)</text>
+      <rect x="840" y="20" width="100" height="32" rx="6" fill="url(#g-red)"/>
+      <text x="890" y="41" text-anchor="middle" fill="#fff">.fdt</text>
+      <rect x="970" y="20" width="100" height="32" rx="6" fill="url(#g-red)"/>
+      <text x="1020" y="41" text-anchor="middle" fill="#fff">.fdx</text>
+    </g>
+
+    <g stroke="#30363d" stroke-dasharray="4 4">
+      <line x1="70" y1="55" x2="70" y2="600"/>
+      <line x1="270" y1="55" x2="270" y2="600"/>
+      <line x1="490" y1="55" x2="490" y2="600"/>
+      <line x1="700" y1="55" x2="700" y2="600"/>
+      <line x1="890" y1="55" x2="890" y2="600"/>
+      <line x1="1020" y1="55" x2="1020" y2="600"/>
+    </g>
+
+    <rect x="50" y="70" width="1010" height="450" rx="6" fill="rgba(63,185,80,0.05)" stroke="#3fb950" stroke-dasharray="4 3"/>
+    <text x="70" y="92" fill="#3fb950" font-weight="700" font-size="13">loop 每 doc</text>
+
+    <g font-size="11">
+      <line x1="70" y1="115" x2="270" y2="115" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+      <text x="170" y="109" text-anchor="middle" fill="#79c0ff">1: writeField(field) × N</text>
+
+      <line x1="270" y1="150" x2="490" y2="150" stroke="#a371f7" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="380" y="144" text-anchor="middle" fill="#bc8cff">2: 累积字段字节</text>
+
+      <line x1="270" y1="185" x2="270" y2="205" stroke="#f0883e" stroke-width="1.5"/>
+      <rect x="255" y="185" width="30" height="20" fill="url(#g-orange)" rx="4"/>
+      <text x="345" y="199" fill="#f0883e">3: bufferedDocs++</text>
+
+      <rect x="220" y="230" width="800" height="270" rx="6" fill="rgba(248,81,73,0.06)" stroke="#f85149" stroke-dasharray="4 3"/>
+      <text x="240" y="252" fill="#f85149" font-weight="700">alt buffer 达阈值</text>
+
+      <line x1="270" y1="275" x2="700" y2="275" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="485" y="269" text-anchor="middle" fill="#56d364">4: compress(buffer.bytes)</text>
+
+      <line x1="700" y1="310" x2="270" y2="310" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#arr-g)"/>
+      <text x="485" y="304" text-anchor="middle" fill="#56d364">5: compressedBytes</text>
+
+      <line x1="270" y1="345" x2="890" y2="345" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+      <text x="580" y="339" text-anchor="middle" fill="#f85149">6: 写 docBase + numDocs + lengths + cmpData</text>
+
+      <line x1="270" y1="395" x2="1020" y2="395" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+      <text x="645" y="389" text-anchor="middle" fill="#f85149">7: 写 chunkStartFP + numDocs</text>
+
+      <line x1="270" y1="445" x2="490" y2="445" stroke="#a371f7" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="380" y="439" text-anchor="middle" fill="#bc8cff">8: reset</text>
+    </g>
+
+    <line x1="270" y1="565" x2="890" y2="565" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    <text x="580" y="559" text-anchor="middle" fill="#f85149" font-size="12" font-weight="600">9: writeFooter (CRC32)</text>
+  </svg>
+</div>
+
+<h3>28.6.4 不同 chunk 大小的权衡</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-6-3 · chunk 大小权衡矩阵</div>
+<pre class="ascii-art"><code>chunk 大小决策矩阵:
+
+  小 chunk (4 KiB)         大 chunk (64 KiB)
+  ┌────────────────┐      ┌────────────────┐
+  │ 解压块小:快     │      │ 解压块大:慢     │
+  │ 压缩比低       │      │ 压缩比高       │
+  │ 单 doc fetch 快 │      │ 单 doc fetch 慢 │
+  │ 批量解码慢     │      │ 批量解码摊销开销 │
+  │ chunk meta 占空间│     │ chunk meta 占比小 │
+  └────────────────┘      └────────────────┘
+
+  典型选择:
+    BEST_SPEED:     16 KiB  → 每文档 fetch 平均 100 μs
+    BEST_COMPRESSION: 64 KiB → 每文档 fetch 平均 500 μs,压缩比高 50%</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s28-7">28.7 LZ4 与 DEFLATE 压缩</h2>
+<!-- ============================================================ -->
+
+<p>LZ4 (BEST_SPEED) 与 DEFLATE (BEST_COMPRESSION) 是 Lucene 90 codec 内置的两种压缩算法。LZ4 是字典-字面值 hybrid 编码,优势是解压速度;DEFLATE = LZ77 + Huffman,优势是压缩比。本节展示算法对比、LZ4 流程、典型内容压缩比。</p>
+
+<h3>28.7.1 压缩算法对比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-7-1 · LZ4 vs DEFLATE 对比</div>
+  <table>
+    <thead><tr><th>维度</th><th>LZ4 (BEST_SPEED)</th><th>DEFLATE (BEST_COMPRESSION)</th></tr></thead>
+    <tbody>
+      <tr><td>压缩比</td><td>2-4×</td><td>4-8×</td></tr>
+      <tr><td>压缩速度</td><td>~ 500 MB/s</td><td>~ 50 MB/s</td></tr>
+      <tr><td>解压速度</td><td>~ 1 GB/s</td><td>~ 100 MB/s</td></tr>
+      <tr><td>CPU 占用</td><td>低</td><td>中</td></tr>
+      <tr><td>内存</td><td>64 KB</td><td>32 KB + window</td></tr>
+      <tr><td>适用文档</td><td>大量短文档</td><td>长文本/JSON</td></tr>
+      <tr><td>默认 chunkSize</td><td>16 KiB</td><td>64 KiB</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>28.7.2 LZ4 压缩流程</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-7-1 · LZ4 压缩流程</div>
+  <svg viewBox="0 0 1100 360" width="100%" style="max-width:1100px;display:block;margin:0 auto" font-family="-apple-system,Segoe UI,sans-serif" font-size="12">
+    <rect x="20" y="150" width="140" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="90" y="180" text-anchor="middle" fill="#fff" font-weight="700">原始 16 KiB</text>
+    <text x="90" y="198" text-anchor="middle" fill="#a5d6ff" font-size="11">stored bytes</text>
+
+    <rect x="200" y="150" width="180" height="60" rx="10" fill="url(#g-purple)" stroke="#a371f7"/>
+    <text x="290" y="178" text-anchor="middle" fill="#fff" font-weight="700">4 byte hash 表</text>
+    <text x="290" y="195" text-anchor="middle" fill="#d8c5ff" font-size="11">查找匹配</text>
+    <line x1="160" y1="180" x2="200" y2="180" stroke="#a371f7" stroke-width="2" marker-end="url(#arr-p)"/>
+
+    <polygon points="500,180 620,130 740,180 620,230" fill="url(#g-orange)" stroke="#f0883e"/>
+    <text x="620" y="180" text-anchor="middle" fill="#fff" font-weight="700">找到匹配?</text>
+    <line x1="380" y1="180" x2="498" y2="180" stroke="#a371f7" stroke-width="2" marker-end="url(#arr-p)"/>
+
+    <rect x="800" y="40" width="280" height="80" rx="10" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="940" y="70" text-anchor="middle" fill="#fff" font-weight="700">写 (literalLen,</text>
+    <text x="940" y="90" text-anchor="middle" fill="#fff" font-weight="700">matchOffset, matchLen)</text>
+    <text x="940" y="108" text-anchor="middle" fill="#d2f4d8" font-size="11">match token</text>
+
+    <rect x="800" y="240" width="280" height="80" rx="10" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="940" y="270" text-anchor="middle" fill="#fff" font-weight="700">写 raw byte 入</text>
+    <text x="940" y="290" text-anchor="middle" fill="#fff" font-weight="700">literal buffer</text>
+    <text x="940" y="308" text-anchor="middle" fill="#fbd9d8" font-size="11">字面值原样</text>
+
+    <line x1="700" y1="148" x2="800" y2="80" stroke="#3fb950" stroke-width="2" marker-end="url(#arr-g)"/>
+    <text x="730" y="115" fill="#3fb950" font-size="11" font-weight="600">是 (≥4 byte)</text>
+    <line x1="700" y1="212" x2="800" y2="280" stroke="#f85149" stroke-width="2" marker-end="url(#arr-r)"/>
+    <text x="730" y="260" fill="#f85149" font-size="11" font-weight="600">否</text>
+
+    <rect x="430" y="290" width="280" height="50" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="570" y="320" text-anchor="middle" fill="#fff" font-weight="700">前进 matchLen / 1 byte</text>
+
+    <line x1="940" y1="120" x2="710" y2="295" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+    <line x1="940" y1="240" x2="710" y2="320" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+
+    <path d="M 430,315 Q 290,315 290,212" stroke="#79c0ff" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<h3>28.7.3 LZ4 解压字节流示例</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-7-2 · LZ4 解压指令格式</div>
+<pre class="ascii-art"><code>LZ4 解压指令格式:
+
+  Token (1 byte):
+    bit 0-3 : matchLen - 4 (高 4 bit)
+    bit 4-7 : literalLen (低 4 bit)
+
+  若 literalLen = 15: 后续 1+ byte 累加
+  若 matchLen = 15: 后续 1+ byte 累加
+
+  literal bytes (literalLen 个)
+  matchOffset (2 byte LE)
+  扩展 matchLen bytes (若需要)
+
+  解压时:
+    1. 输出 literal bytes 到 outBuf
+    2. 从 outBuf[outPos - matchOffset] 复制 matchLen byte 到 outBuf
+    3. 重复直到字节流末尾</code></pre>
+</div>
+
+<h3>28.7.4 典型 stored fields 内容压缩比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-7-2 · 典型内容压缩比</div>
+  <table>
+    <thead><tr><th>内容类型</th><th>LZ4 压缩比</th><th>DEFLATE 压缩比</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr><td>短 ID (UUID)</td><td>1.1×</td><td>1.2×</td><td>几乎无重复</td></tr>
+      <tr><td>中文标题 (50 字)</td><td>1.5×</td><td>2.0×</td><td>UTF-8 多字节</td></tr>
+      <tr><td>长英文文本 (1000 字)</td><td>2.5×</td><td>4.5×</td><td>词汇重复多</td></tr>
+      <tr><td>JSON 商品详情</td><td>3.5×</td><td>6.0×</td><td>key 重复 + 结构化</td></tr>
+      <tr><td>HTML 网页</td><td>3.0×</td><td>5.0×</td><td>标签重复</td></tr>
+      <tr><td>Base64 编码 + JSON</td><td>1.8×</td><td>2.2×</td><td>半随机 + 结构化</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4>❌ 反例: 全部用 BEST_COMPRESSION 求最小磁盘</h4>
+<pre><code class="language-java">IndexWriterConfig cfg = new IndexWriterConfig(analyzer);
+cfg.setCodec(new Lucene90Codec(
+    Lucene90Codec.Mode.BEST_COMPRESSION));
+</code></pre>
+    <p style="font-size:13px;color:var(--text-muted);margin-top:8px"><strong>问题</strong>:在线 fetch P99 从 8 μs 飙到 120 μs,服务延迟翻倍。DEFLATE 解压 ~ 100 MB/s,16 KiB 块需 ~ 160 μs 解压。每次 TopK fetch 都要解压新 chunk → fetch 延迟主要被解压主导。</p>
+  </div>
+  <div class="compare-good">
+    <h4>✅ 正例: 在线用 BEST_SPEED,离线归档用 BEST_COMPRESSION</h4>
+<pre><code class="language-java">IndexWriterConfig cfg = new IndexWriterConfig(analyzer);
+cfg.setCodec(new Lucene90Codec(
+    Lucene90Codec.Mode.BEST_SPEED));
+
+</code></pre>
+    <p style="font-size:13px;color:var(--text-muted);margin-top:8px"><strong>收益</strong>:LZ4 解压 ~ 1 GB/s,16 KiB 块仅 ~ 16 μs。fetch P99 维持在 8-15 μs(热)/ 200-800 μs(冷)。生产场景如果 P99 fetch 必须 &lt; 50 μs,只能选 BEST_SPEED;只有在<strong>归档</strong>(查询频率 &lt; 1 次/天)或<strong>磁盘紧张</strong>(成本远大于 CPU)才考虑 BEST_COMPRESSION。</p>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s28-8">28.8 写入路径</h2>
+<!-- ============================================================ -->
+
+<p><code>Lucene90CompressingStoredFieldsWriter</code> 是 <code>.fdt</code> 写入的核心。它在 <code>DocumentsWriterPerThread</code> 内部维护一个 chunk buffer,每个 doc 调 <code>startDocument</code> → <code>writeField</code> × N → <code>finishDocument</code>,buffer 满 16 KiB / 128 doc 触发 <code>flush</code>。本节展示完整调用链与核心代码。</p>
+
+<h3>28.8.1 写入调用链</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-8-1 · .fdt 写入调用链</div>
+  <svg viewBox="0 0 1200 760" width="100%" style="max-width:1200px;display:block;margin:0 auto" font-family="-apple-system,Segoe UI,sans-serif" font-size="11">
+    <g font-weight="600" font-size="12">
+      <rect x="20" y="20" width="80" height="32" rx="6" fill="url(#g-blue)"/>
+      <text x="60" y="41" text-anchor="middle" fill="#fff">App</text>
+      <rect x="140" y="20" width="120" height="32" rx="6" fill="url(#g-green)"/>
+      <text x="200" y="41" text-anchor="middle" fill="#fff">IndexWriter</text>
+      <rect x="300" y="20" width="100" height="32" rx="6" fill="url(#g-purple)"/>
+      <text x="350" y="41" text-anchor="middle" fill="#fff">DWPT</text>
+      <rect x="440" y="20" width="240" height="32" rx="6" fill="url(#g-orange)"/>
+      <text x="560" y="41" text-anchor="middle" fill="#fff">CompressingStoredFieldsWriter</text>
+      <rect x="720" y="20" width="120" height="32" rx="6" fill="url(#g-green)"/>
+      <text x="780" y="41" text-anchor="middle" fill="#fff">Compressor</text>
+      <rect x="880" y="20" width="80" height="32" rx="6" fill="url(#g-red)"/>
+      <text x="920" y="41" text-anchor="middle" fill="#fff">.fdt</text>
+      <rect x="1000" y="20" width="80" height="32" rx="6" fill="url(#g-red)"/>
+      <text x="1040" y="41" text-anchor="middle" fill="#fff">.fdx</text>
+      <rect x="1110" y="20" width="80" height="32" rx="6" fill="url(#g-red)"/>
+      <text x="1150" y="41" text-anchor="middle" fill="#fff">.fdm</text>
+    </g>
+
+    <g stroke="#30363d" stroke-dasharray="4 4">
+      <line x1="60" y1="55" x2="60" y2="745"/>
+      <line x1="200" y1="55" x2="200" y2="745"/>
+      <line x1="350" y1="55" x2="350" y2="745"/>
+      <line x1="560" y1="55" x2="560" y2="745"/>
+      <line x1="780" y1="55" x2="780" y2="745"/>
+      <line x1="920" y1="55" x2="920" y2="745"/>
+      <line x1="1040" y1="55" x2="1040" y2="745"/>
+      <line x1="1150" y1="55" x2="1150" y2="745"/>
+    </g>
+
+    <g font-size="11" fill="#c9d1d9">
+      <line x1="60" y1="80" x2="200" y2="80" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+      <text x="130" y="74" text-anchor="middle" fill="#79c0ff">1: addDocument(doc)</text>
+
+      <line x1="200" y1="115" x2="350" y2="115" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="275" y="109" text-anchor="middle" fill="#56d364">2: addDocument</text>
+
+      <line x1="350" y1="150" x2="560" y2="150" stroke="#a371f7" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="455" y="144" text-anchor="middle" fill="#bc8cff">3: startDocument()</text>
+
+      <rect x="330" y="175" width="320" height="100" rx="6" fill="rgba(63,185,80,0.05)" stroke="#3fb950" stroke-dasharray="4 3"/>
+      <text x="350" y="195" fill="#3fb950" font-weight="700">loop 每 stored field</text>
+      <line x1="350" y1="215" x2="560" y2="215" stroke="#a371f7" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="455" y="209" text-anchor="middle" fill="#bc8cff">4: writeField(info, value)</text>
+      <line x1="560" y1="245" x2="560" y2="265" stroke="#f0883e" stroke-width="1.5"/>
+      <rect x="545" y="245" width="30" height="20" fill="url(#g-orange)" rx="4"/>
+      <text x="660" y="259" fill="#f0883e">5: 写 fieldNumberInfo + value</text>
+
+      <line x1="350" y1="295" x2="560" y2="295" stroke="#a371f7" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="455" y="289" text-anchor="middle" fill="#bc8cff">6: finishDocument()</text>
+
+      <line x1="560" y1="325" x2="560" y2="345" stroke="#f0883e" stroke-width="1.5"/>
+      <rect x="545" y="325" width="30" height="20" fill="url(#g-orange)" rx="4"/>
+      <text x="660" y="339" fill="#f0883e">7: bufferedDocs++; fieldCounts[i]</text>
+
+      <rect x="510" y="370" width="690" height="240" rx="6" fill="rgba(248,81,73,0.06)" stroke="#f85149" stroke-dasharray="4 3"/>
+      <text x="530" y="390" fill="#f85149" font-weight="700">alt buffer 达阈值</text>
+
+      <line x1="560" y1="410" x2="560" y2="430" stroke="#f0883e" stroke-width="1.5"/>
+      <rect x="545" y="410" width="30" height="20" fill="url(#g-orange)" rx="4"/>
+      <text x="660" y="424" fill="#f0883e">8: flush()</text>
+
+      <line x1="560" y1="455" x2="780" y2="455" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="670" y="449" text-anchor="middle" fill="#56d364">9: compress(chunkBuffer)</text>
+
+      <line x1="780" y1="485" x2="560" y2="485" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#arr-g)"/>
+      <text x="670" y="479" text-anchor="middle" fill="#56d364">10: compressedBytes</text>
+
+      <line x1="560" y1="515" x2="920" y2="515" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+      <text x="745" y="509" text-anchor="middle" fill="#f85149">11: 写 docBase + numDocs + lengths + cmpData</text>
+
+      <line x1="560" y1="565" x2="1040" y2="565" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+      <text x="800" y="559" text-anchor="middle" fill="#f85149">12: writeIndex(chunkFP, docBase, numDocs)</text>
+    </g>
+
+    <line x1="350" y1="635" x2="560" y2="635" stroke="#a371f7" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <text x="455" y="629" text-anchor="middle" fill="#bc8cff" font-size="11">13: finish()</text>
+
+    <g font-size="11">
+      <line x1="560" y1="665" x2="920" y2="665" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+      <text x="740" y="659" text-anchor="middle" fill="#f85149">14: writeFooter (CRC32)</text>
+      <line x1="560" y1="695" x2="1040" y2="695" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+      <text x="800" y="689" text-anchor="middle" fill="#f85149">15: writeFooter</text>
+      <line x1="560" y1="725" x2="1150" y2="725" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+      <text x="855" y="719" text-anchor="middle" fill="#f85149">16: writeFooter</text>
+    </g>
+  </svg>
+</div>
+
+<h3>28.8.2 核心写入源码定位</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-8-1 · 核心写入源码</div>
+  <table>
+    <thead><tr><th>文件</th><th>方法</th><th>职责</th></tr></thead>
+    <tbody>
+      <tr><td><code>Lucene90CompressingStoredFieldsWriter.java</code></td><td><code>startDocument()</code></td><td>开新 doc,bufferedDocs++</td></tr>
+      <tr><td><code>Lucene90CompressingStoredFieldsWriter.java</code></td><td><code>writeField(FieldInfo, Field)</code></td><td>写 fieldNumberInfo + value</td></tr>
+      <tr><td><code>Lucene90CompressingStoredFieldsWriter.java</code></td><td><code>finishDocument()</code></td><td>完成 doc,触发 chunk flush 检查</td></tr>
+      <tr><td><code>Lucene90CompressingStoredFieldsWriter.java</code></td><td><code>flush()</code></td><td>压缩 + 写 .fdt + 更新 .fdx</td></tr>
+      <tr><td><code>LZ4.compress(byte[], int, int, DataOutput)</code></td><td>(静态方法)</td><td>LZ4 压缩</td></tr>
+      <tr><td><code>Deflater.deflate()</code></td><td>JDK 内置</td><td>DEFLATE 压缩</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>28.8.3 flush() 关键代码</h3>
+
+<pre><code class="language-java">private void flush(boolean force) throws IOException {
+    int chunkDocs = numBufferedDocs;
+    indexWriter.writeIndex(chunkDocs, fieldsStream.getFilePointer());
+
+    final int[] lengths = new int[chunkDocs];
+    int totalLen = 0;
+    for (int i = 0; i < chunkDocs; i++) {
+        lengths[i] = endOffsets[i] - startOffsets[i];
+        totalLen += lengths[i];
+    }
+    fieldsStream.writeVInt(docBase);
+    fieldsStream.writeVInt(chunkDocs);
+    saveInts(numStoredFieldsInDoc, chunkDocs, fieldsStream);
+    saveInts(lengths, chunkDocs, fieldsStream);
+
+    compressor.compress(bufferedDocs.toArrayCopy(), 0, totalLen, fieldsStream);
+
+    docBase += chunkDocs;
+    numBufferedDocs = 0;
+    bufferedDocs.reset();
+}
+</code></pre>
+
+<h3>28.8.4 写入阶段成本</h3>
+
+<div class="metric-row">
+  <div class="metric"><div class="value">100 ns</div><div class="label">writeField 简单字段</div></div>
+  <div class="metric"><div class="value">30 μs</div><div class="label">flush chunk 16 KiB LZ4</div></div>
+  <div class="metric"><div class="value">600 μs</div><div class="label">flush chunk 64 KiB DEFLATE</div></div>
+  <div class="metric"><div class="value">~ 500 MB/s</div><div class="label">LZ4 压缩吞吐</div></div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s28-9">28.9 读取路径</h2>
+<!-- ============================================================ -->
+
+<p>读取由 <code>StoredFieldsReader</code> + <code>StoredFieldVisitor</code> 组合驱动。<code>IndexSearcher.storedFields().document(docID)</code> 内部:经 <code>.fdx</code> 跳转表定位 chunk → 从 <code>.fdt</code> 读 chunk header → 解压 compressedData → 跳过 <code>(docID - docBase)</code> 个 doc 的字节 → 按 token 流解析字段 → 回调 visitor。</p>
+
+<h3>28.9.1 读取调用链</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-9-1 · .fdt 读取调用链</div>
+  <svg viewBox="0 0 1100 660" width="100%" style="max-width:1100px;display:block;margin:0 auto" font-family="-apple-system,Segoe UI,sans-serif" font-size="12">
+    <g font-weight="600" font-size="12">
+      <rect x="20" y="20" width="100" height="32" rx="6" fill="url(#g-blue)"/>
+      <text x="70" y="41" text-anchor="middle" fill="#fff">App</text>
+      <rect x="160" y="20" width="160" height="32" rx="6" fill="url(#g-green)"/>
+      <text x="240" y="41" text-anchor="middle" fill="#fff">IndexSearcher</text>
+      <rect x="380" y="20" width="200" height="32" rx="6" fill="url(#g-orange)"/>
+      <text x="480" y="41" text-anchor="middle" fill="#fff">StoredFieldsReader</text>
+      <rect x="640" y="20" width="100" height="32" rx="6" fill="url(#g-red)"/>
+      <text x="690" y="41" text-anchor="middle" fill="#fff">.fdx</text>
+      <rect x="800" y="20" width="100" height="32" rx="6" fill="url(#g-red)"/>
+      <text x="850" y="41" text-anchor="middle" fill="#fff">.fdt</text>
+      <rect x="960" y="20" width="120" height="32" rx="6" fill="url(#g-purple)"/>
+      <text x="1020" y="41" text-anchor="middle" fill="#fff">Decompressor</text>
+    </g>
+
+    <g stroke="#30363d" stroke-dasharray="4 4">
+      <line x1="70" y1="55" x2="70" y2="640"/>
+      <line x1="240" y1="55" x2="240" y2="640"/>
+      <line x1="480" y1="55" x2="480" y2="640"/>
+      <line x1="690" y1="55" x2="690" y2="640"/>
+      <line x1="850" y1="55" x2="850" y2="640"/>
+      <line x1="1020" y1="55" x2="1020" y2="640"/>
+    </g>
+
+    <g font-size="11" fill="#c9d1d9">
+      <line x1="70" y1="85" x2="240" y2="85" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+      <text x="155" y="79" text-anchor="middle" fill="#79c0ff">1: storedFields().document(docID)</text>
+
+      <line x1="240" y1="120" x2="480" y2="120" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="360" y="114" text-anchor="middle" fill="#56d364">2: visitDocument(docID, visitor)</text>
+
+      <line x1="480" y1="155" x2="690" y2="155" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+      <text x="585" y="149" text-anchor="middle" fill="#f85149">3: lookup(docID)</text>
+
+      <line x1="690" y1="190" x2="480" y2="190" stroke="#f85149" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#arr-r)"/>
+      <text x="585" y="184" text-anchor="middle" fill="#f85149">4: chunkStartFP, docBase, numDocs</text>
+
+      <line x1="480" y1="225" x2="850" y2="225" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+      <text x="665" y="219" text-anchor="middle" fill="#f85149">5: seek(chunkStartFP)</text>
+
+      <line x1="480" y1="260" x2="850" y2="260" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+      <text x="665" y="254" text-anchor="middle" fill="#f85149">6: read docBase + numDocs + lengths + cmpLen</text>
+
+      <line x1="480" y1="295" x2="850" y2="295" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+      <text x="665" y="289" text-anchor="middle" fill="#f85149">7: read compressedData (cmpLen byte)</text>
+
+      <line x1="480" y1="330" x2="1020" y2="330" stroke="#a371f7" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="750" y="324" text-anchor="middle" fill="#bc8cff">8: decompress(cmpData)</text>
+
+      <line x1="1020" y1="365" x2="480" y2="365" stroke="#a371f7" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#arr-p)"/>
+      <text x="750" y="359" text-anchor="middle" fill="#bc8cff">9: rawDocBytes</text>
+
+      <line x1="480" y1="395" x2="480" y2="415" stroke="#f0883e" stroke-width="1.5"/>
+      <rect x="465" y="395" width="30" height="20" fill="url(#g-orange)" rx="4"/>
+      <text x="580" y="409" fill="#f0883e">10: 跳过 (docID - docBase) 个 doc 的字节</text>
+
+      <line x1="480" y1="445" x2="480" y2="465" stroke="#f0883e" stroke-width="1.5"/>
+      <rect x="465" y="445" width="30" height="20" fill="url(#g-orange)" rx="4"/>
+      <text x="580" y="459" fill="#f0883e">11: 解析 fieldNumberInfo + value</text>
+
+      <line x1="480" y1="500" x2="70" y2="500" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="275" y="494" text-anchor="middle" fill="#56d364">12: visitor.stringField/binaryField/intField/...</text>
+
+      <line x1="70" y1="540" x2="70" y2="560" stroke="#58a6ff" stroke-width="1.5"/>
+      <rect x="55" y="540" width="30" height="20" fill="url(#g-blue)" rx="4"/>
+      <text x="180" y="554" fill="#79c0ff">13: 拼装 Document 对象</text>
+    </g>
+  </svg>
+</div>
+
+<h3>28.9.2 StoredFieldVisitor 回调</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-9-1 · StoredFieldVisitor 回调</div>
+  <table>
+    <thead><tr><th>回调</th><th>触发条件</th><th>用途</th></tr></thead>
+    <tbody>
+      <tr><td><code>needsField(FieldInfo)</code></td><td>每字段开始前判定</td><td>决定是否解析该字段</td></tr>
+      <tr><td><code>binaryField(FieldInfo, byte[])</code></td><td>typeBits=BINARY</td><td>二进制字段</td></tr>
+      <tr><td><code>stringField(FieldInfo, String)</code></td><td>typeBits=STRING</td><td>UTF-8 字符串</td></tr>
+      <tr><td><code>intField(FieldInfo, int)</code></td><td>typeBits=NUMERIC_INT</td><td>整数字段</td></tr>
+      <tr><td><code>longField(FieldInfo, long)</code></td><td>typeBits=NUMERIC_LONG</td><td>长整数</td></tr>
+      <tr><td><code>floatField(FieldInfo, float)</code></td><td>typeBits=NUMERIC_FLOAT</td><td>浮点</td></tr>
+      <tr><td><code>doubleField(FieldInfo, double)</code></td><td>typeBits=NUMERIC_DOUBLE</td><td>双精度</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>28.9.3 DocumentStoredFieldVisitor 类示例</h3>
+
+<pre><code class="language-java">public class DocumentStoredFieldVisitor extends StoredFieldVisitor {
+    private final Document doc = new Document();
+    private final Set&lt;String&gt; fieldsToLoad;
+
+    @Override
+    public Status needsField(FieldInfo fieldInfo) {
+        return fieldsToLoad == null || fieldsToLoad.contains(fieldInfo.name)
+            ? Status.YES : Status.NO;
+    }
+
+    @Override
+    public void stringField(FieldInfo fi, String value) {
+        doc.add(new StoredField(fi.name, value));
+    }
+
+    @Override
+    public void intField(FieldInfo fi, int value) {
+        doc.add(new StoredField(fi.name, value));
+    }
+}
+</code></pre>
+
+<div class="key-insight">
+  <strong>needsField 是最重要的优化点</strong>:每个字段开始前 reader 都会调 <code>needsField(FieldInfo)</code>。返回 <code>Status.NO</code> 时,reader 会读 VInt(length) 然后 <code>seek(skip)</code> 跳过该字段 value bytes,完全不解析。如果业务只需要 <code>id</code> 与 <code>title</code> 两个字段(其余 5 字段不要),把这两个字段名放进 <code>fieldsToLoad</code> 白名单可以省 60-70% 解析 CPU。<strong>典型生产代码经常踩这个坑</strong>——直接传 <code>null</code>(全部加载)而不实现白名单。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s28-10">28.10 性能基线</h2>
+<!-- ============================================================ -->
+
+<p><code>.fdt</code> 性能由<strong>三个变量</strong>主导:压缩模式(LZ4 vs DEFLATE)、缓存状态(热 vs 冷,page cache 命中)、跨 chunk 程度(同 chunk 摊销 vs 跨 chunk 重复解压)。本节给出生产环境实测的延迟曲线与索引体积对比。</p>
+
+<h3>28.10.1 .fdt 操作性能</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-10-1 · .fdt 操作性能基线</div>
+  <table>
+    <thead><tr><th>操作</th><th>典型时延</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr><td><code>writeField</code>(简单字段)</td><td>100 ns</td><td>内存 buffer 写入</td></tr>
+      <tr><td>flush chunk (16 KiB, LZ4)</td><td>30 μs</td><td>压缩 ~ 500 MB/s</td></tr>
+      <tr><td>flush chunk (64 KiB, DEFLATE)</td><td>600 μs</td><td>压缩 ~ 50 MB/s</td></tr>
+      <tr><td>单 doc fetch (热, LZ4)</td><td>5-10 μs</td><td>chunk 已在 page cache</td></tr>
+      <tr><td>单 doc fetch (冷, LZ4)</td><td>100-500 μs</td><td>含 4 KiB I/O + 解压</td></tr>
+      <tr><td>单 doc fetch (DEFLATE)</td><td>50-150 μs</td><td>解压更慢</td></tr>
+      <tr><td>批量 fetch 1024 doc (LZ4 同 chunk)</td><td>500 μs</td><td>1 次解压摊销</td></tr>
+      <tr><td>批量 fetch 1024 doc (跨 chunk)</td><td>5-10 ms</td><td>多次解压</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>28.10.2 fetch 延迟与压缩模式</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-10-1 · fetch 延迟分布(P50/P99)</div>
+<pre class="ascii-art"><code>fetch 延迟分布(P50/P99,典型生产环境):
+
+  操作               BEST_SPEED       BEST_COMPRESSION
+  ───────────────────────────────────────────────────
+  单 doc 热 P50         8 μs            45 μs
+  单 doc 热 P99         15 μs           120 μs
+  单 doc 冷 P50         200 μs          500 μs
+  单 doc 冷 P99         800 μs          2.5 ms
+  100 doc 批量          2 ms            8 ms
+  1000 doc 批量          15 ms           70 ms
+
+观察:
+  - BEST_SPEED 在 P99 上优势显著
+  - BEST_COMPRESSION 节省磁盘 30-50%,代价是延迟翻倍
+  - 选型依赖业务: TopK fetch ≤ 100 → BEST_SPEED;离线分析 → BEST_COMPRESSION</code></pre>
+</div>
+
+<h3>28.10.3 索引体积对比(Wikipedia EN 1M doc)</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-10-2 · 索引体积对比</div>
+  <table>
+    <thead><tr><th>模式</th><th>.fdt 大小</th><th>占索引比例</th><th>平均 fetch 延迟</th></tr></thead>
+    <tbody>
+      <tr><td>不存 (Store.NO)</td><td>0</td><td>0%</td><td>-</td></tr>
+      <tr><td>BEST_SPEED</td><td>950 MB</td><td>45%</td><td>8 μs</td></tr>
+      <tr><td>BEST_COMPRESSION</td><td>480 MB</td><td>30%</td><td>45 μs</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p>测试条件:Wikipedia EN 1M 文档,平均 stored 内容 2 KiB / doc。</p>
+
+<div class="metric-row">
+  <div class="metric"><div class="value">5-10 μs</div><div class="label">单 doc 热 fetch (LZ4)</div></div>
+  <div class="metric"><div class="value">100-500 μs</div><div class="label">单 doc 冷 fetch</div></div>
+  <div class="metric"><div class="value">500 μs</div><div class="label">同 chunk 1024 doc 批量</div></div>
+  <div class="metric"><div class="value">2×</div><div class="label">压缩节省磁盘 (LZ4 → DEFLATE)</div></div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s28-11">28.11 版本演进与兼容性</h2>
+<!-- ============================================================ -->
+
+<p>从 Lucene 4.0 到 9.x,<code>.fdt</code> 经历了 5 次主要演进:从单 doc 一段无 chunk → 引入 CompressingStoredFields + LZ4 → 加入 BEST_COMPRESSION → chunk 切分优化 → 9.0 codec 名重命名。本节展示版本时间线与关键变化。</p>
+
+<h3>28.11.1 .fdt Codec 演进</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-11-1 · .fdt Codec 演进</div>
+  <svg viewBox="0 0 1180 220" width="100%" style="max-width:1180px;display:block;margin:0 auto" font-family="-apple-system,Segoe UI,sans-serif" font-size="12">
+    <line x1="80" y1="110" x2="1100" y2="110" stroke="#30363d" stroke-width="2"/>
+
+    <g>
+      <circle cx="120" cy="110" r="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+      <rect x="40" y="135" width="180" height="65" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+      <text x="130" y="155" text-anchor="middle" fill="#fff" font-weight="700">Lucene 4.1</text>
+      <text x="130" y="172" text-anchor="middle" fill="#a5d6ff" font-size="11">CompressingStored</text>
+      <text x="130" y="187" text-anchor="middle" fill="#a5d6ff" font-size="11">引入 chunk + LZ4</text>
+      <text x="130" y="80" text-anchor="middle" fill="#79c0ff" font-weight="600">起步</text>
+    </g>
+
+    <g>
+      <circle cx="350" cy="110" r="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+      <rect x="260" y="40" width="180" height="60" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+      <text x="350" y="60" text-anchor="middle" fill="#fff" font-weight="700">Lucene 5.0</text>
+      <text x="350" y="80" text-anchor="middle" fill="#d2f4d8" font-size="11">统一 BEST_SPEED</text>
+      <text x="350" y="95" text-anchor="middle" fill="#d2f4d8" font-size="11">默认</text>
+    </g>
+
+    <g>
+      <circle cx="580" cy="110" r="10" fill="url(#g-orange)" stroke="#f0883e" stroke-width="2"/>
+      <rect x="490" y="135" width="180" height="65" rx="8" fill="url(#g-orange)" stroke="#f0883e"/>
+      <text x="580" y="155" text-anchor="middle" fill="#fff" font-weight="700">Lucene 7.0</text>
+      <text x="580" y="172" text-anchor="middle" fill="#fff3e0" font-size="11">BEST_COMPRESSION</text>
+      <text x="580" y="187" text-anchor="middle" fill="#fff3e0" font-size="11">DEFLATE 引入</text>
+    </g>
+
+    <g>
+      <circle cx="810" cy="110" r="10" fill="url(#g-purple)" stroke="#a371f7" stroke-width="2"/>
+      <rect x="720" y="40" width="180" height="60" rx="8" fill="url(#g-purple)" stroke="#a371f7"/>
+      <text x="810" y="60" text-anchor="middle" fill="#fff" font-weight="700">Lucene 8.7</text>
+      <text x="810" y="80" text-anchor="middle" fill="#d8c5ff" font-size="11">chunk 切分优化</text>
+      <text x="810" y="95" text-anchor="middle" fill="#d8c5ff" font-size="11">merge 性能提升</text>
+    </g>
+
+    <g>
+      <circle cx="1040" cy="110" r="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+      <rect x="950" y="135" width="180" height="65" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+      <text x="1040" y="155" text-anchor="middle" fill="#fff" font-weight="700">Lucene 9.0</text>
+      <text x="1040" y="172" text-anchor="middle" fill="#fbd9d8" font-size="11">FastData / HighData</text>
+      <text x="1040" y="187" text-anchor="middle" fill="#fbd9d8" font-size="11">稳定至今</text>
+      <text x="1040" y="80" text-anchor="middle" fill="#f85149" font-weight="600">当前</text>
+    </g>
+  </svg>
+</div>
+
+<h3>28.11.2 版本关键变化</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-11-1 · .fdt 版本关键变化</div>
+  <table>
+    <thead><tr><th>版本</th><th>.fdt 关键变更</th><th>兼容方向</th></tr></thead>
+    <tbody>
+      <tr><td>4.0</td><td>单 doc 一段,无 chunk</td><td>-</td></tr>
+      <tr><td>4.1</td><td>引入 CompressingStoredFields + LZ4</td><td>不兼容 4.0</td></tr>
+      <tr><td>5.0</td><td>统一 BEST_SPEED 默认</td><td>与 4.1 兼容</td></tr>
+      <tr><td>7.0</td><td>加入 BEST_COMPRESSION (DEFLATE,chunk 64 KiB)</td><td>与 5.x 兼容</td></tr>
+      <tr><td>8.7</td><td>chunk 边界优化,merge 性能提升</td><td>与 7.x 兼容</td></tr>
+      <tr><td>9.0</td><td>codec 名改为 StoredFieldsFastData / HighData</td><td>不兼容 8.x</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>28.11.3 Codec 选择决策</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-11-2 · Codec 选择决策树</div>
+  <svg viewBox="0 0 980 540" width="100%" style="max-width:980px;display:block;margin:0 auto" font-family="-apple-system,Segoe UI,sans-serif" font-size="13">
+    <rect x="380" y="20" width="220" height="50" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="490" y="50" text-anchor="middle" fill="#fff" font-weight="700">业务场景</text>
+
+    <polygon points="490,110 640,160 490,210 340,160" fill="url(#g-orange)" stroke="#f0883e"/>
+    <text x="490" y="158" text-anchor="middle" fill="#fff" font-weight="700">P99 fetch</text>
+    <text x="490" y="175" text-anchor="middle" fill="#fff" font-weight="700" font-size="11">&lt; 50 μs?</text>
+    <line x1="490" y1="70" x2="490" y2="108" stroke="#8b949e" stroke-width="2" marker-end="url(#arr)"/>
+
+    <rect x="60" y="240" width="200" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="160" y="270" text-anchor="middle" fill="#fff" font-weight="700">BEST_SPEED</text>
+    <text x="160" y="288" text-anchor="middle" fill="#d2f4d8" font-size="11">LZ4 + 16 KiB chunk</text>
+
+    <line x1="340" y1="180" x2="200" y2="240" stroke="#3fb950" stroke-width="2" marker-end="url(#arr-g)"/>
+    <text x="240" y="220" fill="#3fb950" font-size="12" font-weight="600">是</text>
+
+    <polygon points="490,250 640,300 490,350 340,300" fill="url(#g-orange)" stroke="#f0883e"/>
+    <text x="490" y="305" text-anchor="middle" fill="#fff" font-weight="700">磁盘紧张?</text>
+    <line x1="490" y1="210" x2="490" y2="248" stroke="#8b949e" stroke-width="2" marker-end="url(#arr)"/>
+    <text x="510" y="232" fill="#f85149" font-size="12" font-weight="600">否</text>
+
+    <rect x="730" y="270" width="220" height="60" rx="10" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="840" y="300" text-anchor="middle" fill="#fff" font-weight="700">BEST_COMPRESSION</text>
+    <text x="840" y="318" text-anchor="middle" fill="#fbd9d8" font-size="11">DEFLATE + 64 KiB</text>
+    <line x1="640" y1="300" x2="730" y2="300" stroke="#f85149" stroke-width="2" marker-end="url(#arr-r)"/>
+    <text x="680" y="290" fill="#f85149" font-size="12" font-weight="600">是</text>
+
+    <polygon points="490,390 640,440 490,490 340,440" fill="url(#g-purple)" stroke="#a371f7"/>
+    <text x="490" y="445" text-anchor="middle" fill="#fff" font-weight="700">主要用途</text>
+    <line x1="490" y1="350" x2="490" y2="388" stroke="#8b949e" stroke-width="2" marker-end="url(#arr)"/>
+    <text x="510" y="372" fill="#bc8cff" font-size="12" font-weight="600">否</text>
+
+    <line x1="340" y1="440" x2="200" y2="300" stroke="#3fb950" stroke-width="2" marker-end="url(#arr-g)"/>
+    <text x="245" y="380" fill="#3fb950" font-size="12" font-weight="600">在线检索</text>
+
+    <line x1="640" y1="440" x2="730" y2="335" stroke="#f85149" stroke-width="2" marker-end="url(#arr-r)"/>
+    <text x="700" y="405" fill="#f85149" font-size="12" font-weight="600">离线/归档</text>
+  </svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s28-12">28.12 陷阱与限制</h2>
+<!-- ============================================================ -->
+
+<p>本节集中讨论 <code>.fdt</code> 的<strong>9 类生产陷阱</strong>:建模(大字段进 stored、用 stored 替代 DocValues)、性能(跨 chunk fetch、Visitor 全字段加载)、体积(未启用压缩、压缩模式误用)、运维(三件套缺失、compoundFile 嵌入)。</p>
+
+<h3>28.12.1 .fdt 陷阱分类</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 28-12-1 · .fdt 陷阱分类</div>
+  <svg viewBox="0 0 1200 540" width="100%" style="max-width:1200px;display:block;margin:0 auto" font-family="-apple-system,Segoe UI,sans-serif" font-size="12">
+    <rect x="500" y="20" width="200" height="50" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="600" y="50" text-anchor="middle" fill="#fff" font-weight="700">.fdt 陷阱(9 项)</text>
+
+    <rect x="40" y="120" width="200" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="140" y="145" text-anchor="middle" fill="#fff" font-weight="700">建模类</text>
+
+    <rect x="320" y="120" width="200" height="40" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="420" y="145" text-anchor="middle" fill="#fff" font-weight="700">性能类</text>
+
+    <rect x="600" y="120" width="200" height="40" rx="8" fill="url(#g-orange)" stroke="#f0883e"/>
+    <text x="700" y="145" text-anchor="middle" fill="#fff" font-weight="700">体积类</text>
+
+    <rect x="880" y="120" width="200" height="40" rx="8" fill="url(#g-purple)" stroke="#a371f7"/>
+    <text x="980" y="145" text-anchor="middle" fill="#fff" font-weight="700">运维类</text>
+
+    <line x1="550" y1="70" x2="140" y2="118" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="580" y1="70" x2="420" y2="118" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+    <line x1="620" y1="70" x2="700" y2="118" stroke="#f0883e" stroke-width="1.5" marker-end="url(#arr-o)"/>
+    <line x1="650" y1="70" x2="980" y2="118" stroke="#a371f7" stroke-width="1.5" marker-end="url(#arr-p)"/>
+
+    <g font-size="11">
+      <rect x="20" y="200" width="240" height="38" rx="6" fill="#161b22" stroke="#58a6ff"/>
+      <text x="140" y="223" text-anchor="middle" fill="#79c0ff">1. 大字段进 stored</text>
+      <rect x="20" y="250" width="240" height="38" rx="6" fill="#161b22" stroke="#58a6ff"/>
+      <text x="140" y="273" text-anchor="middle" fill="#79c0ff">2. 用 stored 替代 DocValues</text>
+      <rect x="20" y="300" width="240" height="38" rx="6" fill="#161b22" stroke="#58a6ff"/>
+      <text x="140" y="323" text-anchor="middle" fill="#79c0ff">3. 单文档 stored &gt; 1 MiB</text>
+
+      <rect x="300" y="200" width="240" height="38" rx="6" fill="#161b22" stroke="#3fb950"/>
+      <text x="420" y="223" text-anchor="middle" fill="#56d364">4. 跨 chunk fetch 大量 doc</text>
+      <rect x="300" y="250" width="240" height="38" rx="6" fill="#161b22" stroke="#3fb950"/>
+      <text x="420" y="273" text-anchor="middle" fill="#56d364">5. Visitor 全字段加载</text>
+
+      <rect x="580" y="200" width="240" height="38" rx="6" fill="#161b22" stroke="#f0883e"/>
+      <text x="700" y="223" text-anchor="middle" fill="#f0883e">6. 大量重复 JSON 未压缩</text>
+      <rect x="580" y="250" width="240" height="38" rx="6" fill="#161b22" stroke="#f0883e"/>
+      <text x="700" y="273" text-anchor="middle" fill="#f0883e">7. BEST_COMPRESSION 误用</text>
+
+      <rect x="860" y="200" width="240" height="38" rx="6" fill="#161b22" stroke="#a371f7"/>
+      <text x="980" y="223" text-anchor="middle" fill="#bc8cff">8. .fdt/.fdx/.fdm 缺失</text>
+      <rect x="860" y="250" width="240" height="38" rx="6" fill="#161b22" stroke="#a371f7"/>
+      <text x="980" y="273" text-anchor="middle" fill="#bc8cff">9. compoundFile 定位困难</text>
+    </g>
+
+    <line x1="140" y1="160" x2="140" y2="198" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="100" y1="160" x2="100" y2="248" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+    <line x1="180" y1="160" x2="180" y2="298" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+
+    <line x1="420" y1="160" x2="420" y2="198" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+    <line x1="380" y1="160" x2="380" y2="248" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+
+    <line x1="700" y1="160" x2="700" y2="198" stroke="#f0883e" stroke-width="1.5" marker-end="url(#arr-o)"/>
+    <line x1="660" y1="160" x2="660" y2="248" stroke="#f0883e" stroke-width="1.5" marker-end="url(#arr-o)"/>
+
+    <line x1="980" y1="160" x2="980" y2="198" stroke="#a371f7" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <line x1="940" y1="160" x2="940" y2="248" stroke="#a371f7" stroke-width="1.5" marker-end="url(#arr-p)"/>
+
+    <rect x="100" y="380" width="1000" height="120" rx="10" fill="rgba(248,81,73,0.06)" stroke="#f85149" stroke-dasharray="4 3"/>
+    <text x="600" y="408" text-anchor="middle" fill="#f85149" font-weight="700" font-size="14">9 类陷阱共同根因</text>
+    <text x="600" y="438" text-anchor="middle" fill="#c9d1d9" font-size="12">•把不该进 .fdt 的内容放进 stored — 用 DocValues / Points / 外存替换</text>
+    <text x="600" y="460" text-anchor="middle" fill="#c9d1d9" font-size="12">•在线场景误用 BEST_COMPRESSION 或 Visitor 全字段加载 — 压垮 P99</text>
+    <text x="600" y="482" text-anchor="middle" fill="#c9d1d9" font-size="12">•三件套(.fdt/.fdx/.fdm)缺一不可,CheckIndex 必须周期性运行</text>
+  </svg>
+</div>
+
+<h3>28.12.2 陷阱明细</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-12-1 · .fdt 9 大陷阱</div>
+  <table>
+    <thead><tr><th>#</th><th>陷阱</th><th>症状</th><th>根因</th><th>影响范围</th><th>修复</th><th>监控</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>大字段进 stored</td><td>.fdt GB+,fetch 慢</td><td>把 1 MiB JSON 全存 stored</td><td>磁盘 + 延迟</td><td>切分字段或外存</td><td>.fdt 大小</td></tr>
+      <tr><td>2</td><td>用 stored 替代 DocValues 排序</td><td>sort 性能差</td><td>TopN sort 反复 fetch</td><td>sort 慢</td><td>字段加 NumericDocValuesField</td><td>sort latency</td></tr>
+      <tr><td>3</td><td>单 doc stored &gt; chunkSize</td><td>sliced chunk</td><td>大文档触发 slice</td><td>fetch 慢</td><td>拆分文档或字段</td><td>-</td></tr>
+      <tr><td>4</td><td>跨 chunk 批量 fetch 1000 doc</td><td>多次解压</td><td>TopK 排序后 docID 离散</td><td>延迟翻倍</td><td>客户端按 docID 排序后 fetch</td><td>fetch P99</td></tr>
+      <tr><td>5</td><td>Visitor 全字段加载 但只用部分</td><td>CPU 浪费</td><td>needsField 全返 YES</td><td>CPU 高</td><td>实现 fieldsToLoad 白名单</td><td>profile</td></tr>
+      <tr><td>6</td><td>大量结构化 JSON 但未启用压缩</td><td>.fdt 巨大</td><td>Store.YES 默认 BEST_SPEED</td><td>磁盘耗尽</td><td>切 BEST_COMPRESSION</td><td>索引大小</td></tr>
+      <tr><td>7</td><td>BEST_COMPRESSION 用于在线 fetch</td><td>P99 抖动</td><td>DEFLATE 解压慢</td><td>在线延迟</td><td>切 BEST_SPEED</td><td>fetch P99</td></tr>
+      <tr><td>8</td><td>.fdx 缺失但 .fdt 在</td><td>segment 不可读</td><td>文件被误删</td><td>segment 损坏</td><td>重建索引</td><td>CheckIndex</td></tr>
+      <tr><td>9</td><td>compoundFile 嵌入 .fdt</td><td>调试困难</td><td>useCompoundFile=true</td><td>-</td><td>临时关闭</td><td>-</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>28.12.3 反例与正例</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4>❌ 反例: 把整个 JSON 文档存进 stored</h4>
+<pre><code class="language-java">Document doc = new Document();
+doc.add(new StringField("id", id, Store.YES));
+doc.add(new StoredField("payload", jsonBytes));
+</code></pre>
+    <p style="font-size:13px;color:var(--text-muted);margin-top:8px"><strong>现象</strong>:.fdt 占索引 80%,fetch 单 doc 1-5 ms (P99),page cache 利用率低。1M doc × 1 MB JSON = 1 TB 原始 → 300 GB 压缩后,内存装不下,每次 fetch 都打盘。</p>
+  </div>
+  <div class="compare-good">
+    <h4>✅ 正例: stored 仅存 ID + 短摘要,大字段外存</h4>
+<pre><code class="language-java">Document doc = new Document();
+doc.add(new StringField("id", id, Store.YES));
+doc.add(new StoredField("title", title));
+doc.add(new StoredField("summary", summary));
+
+
+</code></pre>
+    <p style="font-size:13px;color:var(--text-muted);margin-top:8px"><strong>收益</strong>:.fdt 占索引 10-15%,fetch 单 doc 5-10 μs,实际大字段(<code>jsonBytes</code>)按需从 S3/HDFS 拉取(通过 <code>id</code> 二次查询)。1M doc × 250 byte stored ≈ 80 MB 压缩后,完全装得进 page cache。</p>
+  </div>
+</div>
+
+<div class="real-world">
+  <h5>生产案例:从 stored 大字段改外存解决磁盘耗尽</h5>
+  <p>某新闻搜索索引把每条新闻的<strong>全文 HTML</strong>(平均 50 KB)塞进 <code>StoredField("content", html)</code>,3M doc × 50 KB ≈ 150 GB 原始,LZ4 压缩 3× 后约 50 GB 占用磁盘的 70%。fetch 一篇文章正文 P99 1.5 ms。重构方案:<code>.fdt</code> 仅存 <code>id</code> + <code>title</code> + <code>summary</code>(共 ~ 300 byte),正文 HTML 存 S3,key 用 <code>id</code>。<code>.fdt</code> 缩到 800 MB(磁盘占比 8%),fetch <code>.fdt</code> P99 12 μs;正文需要时由前端发起异步 S3 GET(P99 30 ms,但延迟不阻塞搜索结果展示)。</p>
+</div>
+
+<div class="warning">
+  <strong>用 stored 排序是反模式</strong>:绝对不要为了 sort 而在 stored 字段上做"先 fetch 再排序"——这是 O(N) fetch + O(N log K) 比较,N = 命中数。正确做法:为排序字段单独配 <code>NumericDocValuesField("price", 99)</code>,sort by 直接走 <code>.dvd</code> 列存的 advance + 比较,N=1M 时 sort 80 ms vs fetch + sort 5-10 秒。stored 字段只负责 fetch 阶段的"展示数据",不参与 score / sort / facet。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s28-13">28.13 最小回归验证</h2>
+<!-- ============================================================ -->
+
+<p>本节给出 <code>.fdt</code> 的最小回归验证流程:文件存在性、CheckIndex 输出关键指标、压缩比与 chunk count 的合理范围。</p>
+
+<h3>28.13.1 .fdt 校验脚本</h3>
+
+<pre><code class="language-bash"># 1. 文件存在
+ls -la /path/to/index | grep -E '\.fd[tmx]$'
+
+# 期望(每 segment 三件套):
+# _0_Lucene90_0.fdt
+# _0_Lucene90_0.fdx
+# _0_Lucene90_0.fdm
+
+# 2. CheckIndex 验证
+java -cp lucene-core.jar org.apache.lucene.index.CheckIndex /path/to/index | \
+    grep -E 'stored fields|chunks|.fdt'
+
+# 期望:
+# test: stored fields.......OK [10000 total field count]
+# segment _0:
+#   .fdt size = 200 MB
+#   chunk count = 12345
+#   max chunk docs = 128
+</code></pre>
+
+<h3>28.13.2 验证关键指标</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-13-1 · 验证关键指标</div>
+  <table>
+    <thead><tr><th>指标</th><th>正常值</th><th>异常值</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td>.fdt size</td><td>与 stored 内容匹配</td><td>0 或 巨大</td><td>写入异常或全字段 stored</td></tr>
+      <tr><td>chunk count</td><td>numDocs / 128 量级</td><td>与 numDocs 同</td><td>chunk 切分异常</td></tr>
+      <tr><td>max chunk docs</td><td>128 (BEST_SPEED)</td><td>1</td><td>文档过大触发 sliced</td></tr>
+      <tr><td>compression ratio</td><td>2-8×</td><td>&lt; 1.2×</td><td>内容随机或加密</td></tr>
+      <tr><td>total field count</td><td>与预期匹配</td><td>偏低</td><td>字段未 Store.YES</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>28.13.3 正常输出示例</h3>
+
+<pre class="ascii-art"><code>正常输出:
+  segment _0:
+    field "id":         StringField, Store.YES
+    field "title":      TextField,   Store.YES
+    field "price":      IntPoint + DocValues, Store.NO
+    .fdt size = 250 MB (BEST_SPEED, LZ4)
+    chunk count = 12,345
+    avg docs per chunk = 128
+    avg compression ratio = 3.2×
+  test: stored fields.......OK</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s28-summary">28.14 本章小结</h2>
+<!-- ============================================================ -->
+
+<div class="chapter-summary">
+
+<h3>关键事实</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-14-1 · .fdt 关键事实速查</div>
+  <table>
+    <thead><tr><th>要点</th><th>关键依据</th><th>易错点</th></tr></thead>
+    <tbody>
+      <tr><td>.fdt 仅在字段 <code>Field.Store.YES</code> 时写入</td><td><code>StoredFieldsWriter.writeField</code></td><td>DocValues 是独立通道</td></tr>
+      <tr><td>chunk 是物理压缩单位</td><td><code>flush()</code> 触发</td><td>chunk 跨 doc 不对齐 docID</td></tr>
+      <tr><td>BEST_SPEED = LZ4 + 16 KiB chunk</td><td>StoredFieldsFastData</td><td>在线主流选择</td></tr>
+      <tr><td>BEST_COMPRESSION = DEFLATE + 64 KiB chunk</td><td>StoredFieldsHighData</td><td>离线/归档场景</td></tr>
+      <tr><td>单 doc 字段流: typeBits + fieldNum + value</td><td>TypeBits 3 bit</td><td>字段顺序与 add 顺序一致</td></tr>
+      <tr><td>.fdt 必须配套 .fdx 与 .fdm</td><td>Lucene90StoredFieldsFormat</td><td>任一缺失 segment 无法打开</td></tr>
+      <tr><td>单 doc &gt; chunkSize 触发 sliced chunk</td><td>大文档场景</td><td>失去单 doc 随机访问能力</td></tr>
+      <tr><td>Footer = magic + algId + CRC32</td><td><code>CodecUtil.writeFooter</code></td><td>校验失败抛 CorruptIndexException</td></tr>
+      <tr><td>跨 chunk 批量 fetch 性能差</td><td>多次解压</td><td>客户端按 docID 排序</td></tr>
+      <tr><td>大字段进 stored 易致 .fdt 巨大</td><td>业务建模问题</td><td>拆字段或外存</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>性能速查</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-14-2 · .fdt 性能速查</div>
+  <table>
+    <thead><tr><th>操作</th><th>时延</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr><td><code>writeField</code> 简单字段</td><td>100 ns</td><td>内存 buffer</td></tr>
+      <tr><td>flush chunk 16 KiB LZ4</td><td>30 μs</td><td>~ 500 MB/s</td></tr>
+      <tr><td>flush chunk 64 KiB DEFLATE</td><td>600 μs</td><td>~ 50 MB/s</td></tr>
+      <tr><td>单 doc fetch (热, LZ4)</td><td>5-10 μs</td><td>page cache 命中</td></tr>
+      <tr><td>单 doc fetch (冷, LZ4)</td><td>100-500 μs</td><td>含 4 KiB I/O</td></tr>
+      <tr><td>单 doc fetch (DEFLATE)</td><td>50-150 μs</td><td>解压慢</td></tr>
+      <tr><td>批量 1024 doc 同 chunk</td><td>500 μs</td><td>1 次解压</td></tr>
+      <tr><td>批量 1024 doc 跨 chunk</td><td>5-10 ms</td><td>多次解压</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>类型选型速查</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 28-14-3 · 字段类型 → 通道选型</div>
+  <table>
+    <thead><tr><th>字段用途</th><th>推荐通道</th><th>反例</th></tr></thead>
+    <tbody>
+      <tr><td>fetch 展示数据</td><td>Field.Store.YES → .fdt</td><td>—</td></tr>
+      <tr><td>排序/聚合</td><td>NumericDocValuesField → .dvd</td><td>不要用 stored 排序</td></tr>
+      <tr><td>范围过滤</td><td>IntPoint/LongPoint → .dim</td><td>不要用 stored 过滤</td></tr>
+      <tr><td>大字段(&gt; 1 MB)</td><td>外部对象存储 + ID 引用</td><td>不要塞进 stored</td></tr>
+      <tr><td>低频归档查询</td><td>BEST_COMPRESSION 节磁盘</td><td>不要用于在线 P99 &lt; 50 μs</td></tr>
+      <tr><td>高频在线 fetch</td><td>BEST_SPEED + 白名单字段</td><td>不要用 BEST_COMPRESSION</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>陷阱速查</h3>
+
+<div class="metric-row">
+  <div class="metric"><div class="value">9</div><div class="label">主要陷阱类</div></div>
+  <div class="metric"><div class="value">5×</div><div class="label">大字段误用导致体积膨胀</div></div>
+  <div class="metric"><div class="value">10×</div><div class="label">跨 chunk fetch 延迟劣化</div></div>
+  <div class="metric"><div class="value">60-70%</div><div class="label">Visitor 白名单可省 CPU</div></div>
+</div>
+
+<h3>下一章预告</h3>
+
+<p>下一章讨论 <strong><code>.fdx</code> 文件</strong>,即 stored fields 的 <strong>chunk 跳转表</strong>。<code>.fdx</code> 提供 <code>docID → chunk file pointer</code> 的<strong>粗粒度映射</strong>,使得 <code>.fdt</code> 可以以 16 KiB 为单位被随机定位。下一章拆解 <code>.fdx</code> 的字节布局(每 1024 doc 一个 block,内含 docBase + startPointers 用 MonotonicBlockPackedWriter 编码)、跳转表查找算法(二分查找 block → 定位 chunk)、与 <code>.fdt</code> chunk 切分的对应关系、以及 <code>.fdx</code> 在打开 segment 时的 mmap 缓存策略。</p>
+
+</div>
+
+<p class="footer">&copy; 2026 图解 Lucene &middot; 第 28 章 &middot; .fdt Stored Fields Data 文件</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+</body>
+</html>

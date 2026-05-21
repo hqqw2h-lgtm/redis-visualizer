@@ -1,0 +1,1581 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.01 JPA 全局架构 — 图解 JPA &amp; Hibernate</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 JPA &amp; Hibernate</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="index.html">上一章</a>
+  <a href="02-entity-lifecycle.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s1-0">1.0 章首速览</a>
+  <a href="#s1-1">1.1 三大核心职责</a>
+  <a href="#s1-2">1.2 运行时调用链</a>
+  <a href="#s1-3">1.3 核心对象生命周期</a>
+  <a href="#s1-4">1.4 PersistenceContext</a>
+  <a href="#s1-5">1.5 SQL 生成路径</a>
+  <a href="#s1-6">1.6 配置入口</a>
+  <a href="#s1-7">1.7 观测与生产边界</a>
+  <a href="#s1-8">1.8 陷阱与限制</a>
+  <a href="#s1-9">1.9 源码深潜</a>
+  <a href="#s1-summary">1.10 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 1 章 · JPA 全局架构</h1>
+<p class="subtitle">对象状态机 · SQL 生成器 · 事务协调器 · 调用链 · PersistenceContext · 配置 · 可观测</p>
+
+<div class="chapter-intro">
+  <p class="lead">JPA 是一组运行在 <strong>Java 对象世界</strong>与<strong>关系数据库</strong>之间的中间层规范。它由三类核心责任构成:对实体对象进行<strong>状态跟踪</strong>,在合适时机将状态变化<strong>翻译为 SQL</strong>,并在事务边界内将这些 SQL 通过 JDBC 发送到数据库。理解 JPA 的关键不在于背 <code>EntityManager</code> 的方法清单,而在于掌握<strong>三条主线</strong>:实体在何时进入哪种状态、Provider 在何时生成何种 SQL、SQL 在何时通过事务真正落库。</p>
+  <p>JPA 规范本身只定义 API 与语义,具体执行由 <strong>Provider</strong> 完成。Hibernate 是当前主流实现,EclipseLink 是参考实现。本书后续章节默认以 <strong>Hibernate 6.x</strong> 为参照,JPA 规范以 <strong>Jakarta Persistence 3.1</strong> 为基准。本章建立的"状态决定 SQL"抽象贯穿全书,后续每一章都是这个模型在某个具体场景下的展开:第 2 章把状态机展开为完整生命周期,第 3 章把 PersistenceContext 拆开看缓存与脏检查,第 8 章解读 JPQL 编译,第 17 章潜入 Hibernate 源码看真实实现。</p>
+  <ul class="will-learn">
+    <li>JPA 的三类运行时职责:对象状态机 / SQL 生成器 / 事务协调器 — 它们之间的耦合而非孤立理解</li>
+    <li>从 Service → EntityManager → PersistenceContext → Provider → JDBC → DB 的完整六层调用链</li>
+    <li>EntityManagerFactory / EntityManager / EntityTransaction 的线程安全语义与生命周期归属</li>
+    <li>PersistenceContext 内部的四类数据:Identity Map / Snapshot / ActionQueue / Collection 跟踪表</li>
+    <li>JPQL → AST → Dialect → SQL 的三入口模型,以及 PostgreSQL / MySQL / Oracle / H2 的方言差异</li>
+    <li><code>persistence.xml</code> 与 Spring Boot <code>application.yml</code> 两条配置路径的等价映射</li>
+    <li>如何用 Hibernate <code>Statistics</code> 把 SQL 数量、事务时长、缓存命中率变成可观测信号与回归护栏</li>
+    <li>七类入口章典型陷阱:EMF 重复创建 / EM 跨线程 / flush 当 commit / IDENTITY 误解 / JPQL 等同 SQL 等</li>
+    <li>Hibernate 启动调用链:从 <code>Persistence.createEntityManagerFactory</code> 到 <code>SessionFactoryImpl</code></li>
+    <li>RESOURCE_LOCAL 与 JTA 的边界、JPQL 中间层的取舍、状态机分层的设计动机</li>
+  </ul>
+  <p class="prereq">前置知识:Java 集合与反射基础、JDBC <code>Connection</code> / <code>PreparedStatement</code> / <code>ResultSet</code> 的事务语义、关系型数据库的 ACID 与隔离级别、Maven / Gradle 的依赖管理。本章是后续 28 章的"地图",建议至少通读一遍——后面看到 PersistenceContext 一级缓存(第 3 章)、Identity Map 主键查找(第 5 章)、JPQL 编译(第 8 章)、N+1(第 12 章)、二级缓存(第 13 章)、批处理(第 14 章)、事务隔离(第 15 章)、锁(第 16 章)时,都会回到本章建立的"状态 → SQL → 事务"抽象。</p>
+</div>
+
+<h2 id="s1-0">1.0 章首速览</h2>
+
+<p>本章按"<strong>职责 → 调用链 → 对象 → 上下文 → SQL → 配置 → 观测</strong>"七层组织。前四节建立运行时模型,中间两节连通 SQL 生成与配置入口,最后一节把架构边界映射到生产可观测信号——架构图不只是给开发者看的,更是给监控仪表盘看的。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 1-0 · 本章导览 — 3 大模块 10 节</div>
+  <svg viewBox="0 0 920 440" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <!-- Root -->
+    <rect x="360" y="14" width="200" height="44" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="42" text-anchor="middle" fill="#bc8cff" font-size="14" font-weight="bold">第 1 章 · JPA 全局架构</text>
+
+    <!-- Edges root -> groups -->
+    <path d="M 420 58 L 175 95" stroke="#8b949e" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 58 L 460 95" stroke="#8b949e" fill="none" marker-end="url(#arr)"/>
+    <path d="M 500 58 L 745 95" stroke="#8b949e" fill="none" marker-end="url(#arr)"/>
+
+    <!-- Group 1: 运行时模型 (蓝) §1.1-1.5 -->
+    <rect x="30" y="100" width="290" height="38" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="175" y="124" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">§1.1 — 1.5 · 运行时模型</text>
+    <g font-size="11" fill="#c9d1d9">
+      <rect x="30"  y="150" width="140" height="38" rx="6" fill="#161b22" stroke="#58a6ff"/>
+      <text x="100" y="165" text-anchor="middle" fill="#58a6ff" font-weight="bold">§1.1 三大职责</text>
+      <text x="100" y="180" text-anchor="middle">状态机/SQL/事务</text>
+      <rect x="180" y="150" width="140" height="38" rx="6" fill="#161b22" stroke="#58a6ff"/>
+      <text x="250" y="165" text-anchor="middle" fill="#58a6ff" font-weight="bold">§1.2 调用链</text>
+      <text x="250" y="180" text-anchor="middle">App→EM→PC→DB</text>
+      <rect x="30"  y="195" width="140" height="38" rx="6" fill="#161b22" stroke="#58a6ff"/>
+      <text x="100" y="210" text-anchor="middle" fill="#58a6ff" font-weight="bold">§1.3 核心对象</text>
+      <text x="100" y="225" text-anchor="middle">EMF / EM / Tx</text>
+      <rect x="180" y="195" width="140" height="38" rx="6" fill="#161b22" stroke="#58a6ff"/>
+      <text x="250" y="210" text-anchor="middle" fill="#58a6ff" font-weight="bold">§1.4 PC</text>
+      <text x="250" y="225" text-anchor="middle">Identity Map</text>
+      <rect x="30"  y="240" width="290" height="38" rx="6" fill="#161b22" stroke="#58a6ff"/>
+      <text x="175" y="255" text-anchor="middle" fill="#58a6ff" font-weight="bold">§1.5 SQL 生成路径</text>
+      <text x="175" y="270" text-anchor="middle">JPQL/Criteria/Dirty → AST → Dialect</text>
+    </g>
+
+    <!-- Group 2: 配置与观测 (橙) §1.6-1.7 -->
+    <rect x="345" y="100" width="230" height="38" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="460" y="124" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">§1.6 — 1.7 · 配置与观测</text>
+    <g font-size="11" fill="#c9d1d9">
+      <rect x="345" y="150" width="230" height="50" rx="6" fill="#161b22" stroke="#d29922"/>
+      <text x="460" y="168" text-anchor="middle" fill="#d29922" font-weight="bold">§1.6 配置入口</text>
+      <text x="460" y="186" text-anchor="middle">persistence.xml</text>
+      <text x="460" y="198" text-anchor="middle">application.yml</text>
+      <rect x="345" y="210" width="230" height="68" rx="6" fill="#161b22" stroke="#d29922"/>
+      <text x="460" y="228" text-anchor="middle" fill="#d29922" font-weight="bold">§1.7 观测与边界</text>
+      <text x="460" y="246" text-anchor="middle">Statistics · SQL 数</text>
+      <text x="460" y="260" text-anchor="middle">慢事务 · L1/L2 命中</text>
+      <text x="460" y="274" text-anchor="middle">回归护栏</text>
+    </g>
+
+    <!-- Group 3: 陷阱·源码·要点 (紫) §1.8-1.10 -->
+    <rect x="600" y="100" width="290" height="38" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="745" y="124" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">§1.8 — 1.10 · 陷阱·源码·要点</text>
+    <g font-size="11" fill="#c9d1d9">
+      <rect x="600" y="150" width="290" height="38" rx="6" fill="#161b22" stroke="#f85149"/>
+      <text x="745" y="165" text-anchor="middle" fill="#f85149" font-weight="bold">§1.8 陷阱与限制</text>
+      <text x="745" y="180" text-anchor="middle">7 类入口陷阱</text>
+      <rect x="600" y="195" width="290" height="38" rx="6" fill="#161b22" stroke="#bc8cff"/>
+      <text x="745" y="210" text-anchor="middle" fill="#bc8cff" font-weight="bold">§1.9 源码深潜</text>
+      <text x="745" y="225" text-anchor="middle">Hibernate 启动链 · 3 个设计取舍</text>
+      <rect x="600" y="240" width="290" height="38" rx="6" fill="#161b22" stroke="#3fb950"/>
+      <text x="745" y="255" text-anchor="middle" fill="#3fb950" font-weight="bold">§1.10 本章要点</text>
+      <text x="745" y="270" text-anchor="middle">8 条要点 + 最小回归用例</text>
+    </g>
+
+    <!-- 三层抽象注脚 -->
+    <rect x="60" y="320" width="800" height="90" rx="10" fill="#0d1117" stroke="#30363d"/>
+    <text x="460" y="340" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">三句话心智模型</text>
+    <text x="80"  y="364" fill="#58a6ff" font-size="11" font-weight="bold">① 对象状态机</text>
+    <text x="80"  y="380" fill="#8b949e" font-size="10">Transient → Managed → Detached → Removed</text>
+    <text x="80"  y="394" fill="#8b949e" font-size="10">由 API 触发,不直接对应 SQL</text>
+    <text x="340" y="364" fill="#d29922" font-size="11" font-weight="bold">② SQL 生成器</text>
+    <text x="340" y="380" fill="#8b949e" font-size="10">flush 阶段比对 Snapshot 与当前字段</text>
+    <text x="340" y="394" fill="#8b949e" font-size="10">差异 → INSERT/UPDATE/DELETE</text>
+    <text x="600" y="364" fill="#3fb950" font-size="11" font-weight="bold">③ 事务协调器</text>
+    <text x="600" y="380" fill="#8b949e" font-size="10">flush 仅发送 SQL ≠ commit</text>
+    <text x="600" y="394" fill="#8b949e" font-size="10">commit/rollback 决定是否落库</text>
+  </svg>
+</div>
+
+<div class="key-insight">
+  <strong>核心结论:</strong>JPA 的运行时本质 = <strong>对象状态机 + SQL 生成器 + 事务协调器</strong>。三类职责相互耦合:状态决定 SQL 类型,SQL 类型决定事务的提交语义。任何一个被孤立理解,都会导致"为什么我改了对象数据库却没变""为什么 persist 后立即出现 INSERT""为什么 flush 后 rollback 仍能撤销"这类问题。
+</div>
+
+<div class="real-world">
+  <strong>真实事故:</strong>某团队的报表服务在容器化部署后 RT P99 从 80ms 飙升到 1.2s。链路追踪显示每次请求都在 Hibernate 启动阶段耗时 180-300ms。<strong>根因:</strong>开发者在 <code>@RestController</code> 方法内直接调用 <code>Persistence.createEntityManagerFactory("demoPU")</code>,EMF 是<strong>应用级单例</strong>(创建包含元模型扫描、方言探测、连接池初始化),每请求新建一次相当于每请求重做应用启动。<strong>修复:</strong>把 EMF 抽为 Spring Bean 或静态字段,单例化后 P99 回落到 95ms。<strong>教训:</strong>本章 §1.3 与 §1.8 强调 "EMF 单例 / EM 请求级 / Tx 跟随 EM" 不是教条,而是性能护栏。
+</div>
+
+<h2 id="s1-1">1.1 三大核心职责</h2>
+
+<p>JPA 在运行时同时扮演三类角色,任何一个角色被孤立理解,都会导致对运行时行为的误判。这三类角色之间的<strong>耦合关系</strong>是:对象状态决定 SQL 类型,SQL 类型决定事务的提交语义。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 1-1-1 · JPA 的三类运行时角色及它们之间的关系</div>
+  <svg viewBox="0 0 920 420" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <!-- 对象世界 -->
+    <rect x="20" y="20" width="260" height="380" rx="14" fill="none" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="6 4"/>
+    <text x="150" y="44" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">① 对象世界</text>
+    <text x="150" y="60" text-anchor="middle" fill="#8b949e" font-size="10">JVM 堆内对象 + 状态标签</text>
+
+    <rect x="50" y="84" width="200" height="48" rx="8" fill="#0d1117" stroke="#8b949e"/>
+    <text x="150" y="105" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Transient</text>
+    <text x="150" y="122" text-anchor="middle" fill="#8b949e" font-size="11">new Customer() · 未受管</text>
+
+    <rect x="50" y="148" width="200" height="48" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="150" y="169" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">Managed</text>
+    <text x="150" y="186" text-anchor="middle" fill="#c9d1d9" font-size="11">受 PC 跟踪 · 进入 Identity Map</text>
+
+    <rect x="50" y="212" width="200" height="48" rx="8" fill="#0d1117" stroke="#8b949e"/>
+    <text x="150" y="233" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Detached</text>
+    <text x="150" y="250" text-anchor="middle" fill="#8b949e" font-size="11">close / clear / em.detach</text>
+
+    <rect x="50" y="276" width="200" height="48" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="150" y="297" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">Removed</text>
+    <text x="150" y="314" text-anchor="middle" fill="#c9d1d9" font-size="11">em.remove(managed)</text>
+
+    <text x="150" y="358" text-anchor="middle" fill="#8b949e" font-size="10">状态转换由 API 触发</text>
+    <text x="150" y="372" text-anchor="middle" fill="#8b949e" font-size="10">≠ SQL 执行时机</text>
+
+    <!-- JPA 运行时 -->
+    <rect x="320" y="20" width="280" height="380" rx="14" fill="none" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="6 4"/>
+    <text x="460" y="44" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">② JPA 运行时</text>
+    <text x="460" y="60" text-anchor="middle" fill="#8b949e" font-size="10">Provider 持有的核心数据结构</text>
+
+    <rect x="350" y="84" width="220" height="62" rx="9" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="106" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">PersistenceContext</text>
+    <text x="460" y="124" text-anchor="middle" fill="#c9d1d9" font-size="11">Identity Map</text>
+    <text x="460" y="138" text-anchor="middle" fill="#c9d1d9" font-size="11">+ Snapshot</text>
+
+    <rect x="350" y="170" width="220" height="62" rx="9" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="460" y="192" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">Flush</text>
+    <text x="460" y="210" text-anchor="middle" fill="#c9d1d9" font-size="11">脏检查 · 差异计算</text>
+    <text x="460" y="224" text-anchor="middle" fill="#c9d1d9" font-size="11">生成 SQL 写出队列</text>
+
+    <rect x="350" y="256" width="220" height="62" rx="9" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="460" y="278" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">Transaction</text>
+    <text x="460" y="296" text-anchor="middle" fill="#c9d1d9" font-size="11">commit / rollback</text>
+    <text x="460" y="310" text-anchor="middle" fill="#c9d1d9" font-size="11">决定数据是否落库</text>
+
+    <text x="460" y="358" text-anchor="middle" fill="#8b949e" font-size="10">PC 是状态的容器</text>
+    <text x="460" y="372" text-anchor="middle" fill="#8b949e" font-size="10">Flush 是状态 → SQL 的翻译</text>
+
+    <!-- SQL 世界 -->
+    <rect x="640" y="20" width="260" height="380" rx="14" fill="none" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 4"/>
+    <text x="770" y="44" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">③ SQL 世界</text>
+    <text x="770" y="60" text-anchor="middle" fill="#8b949e" font-size="10">JDBC 发出的 Prepared SQL</text>
+
+    <rect x="670" y="84" width="200" height="44" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="770" y="111" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">INSERT</text>
+
+    <rect x="670" y="142" width="200" height="44" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="770" y="169" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">UPDATE</text>
+
+    <rect x="670" y="200" width="200" height="44" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="770" y="227" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">SELECT</text>
+
+    <rect x="670" y="258" width="200" height="44" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="770" y="285" text-anchor="middle" fill="#f85149" font-size="13" font-weight="bold">DELETE</text>
+
+    <text x="770" y="358" text-anchor="middle" fill="#8b949e" font-size="10">SQL 形状由 Provider + Dialect</text>
+    <text x="770" y="372" text-anchor="middle" fill="#8b949e" font-size="10">决定,与对象 API 解耦</text>
+
+    <!-- 连线 对象 -> JPA -->
+    <path d="M 250 108 L 350 108" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="300" y="100" text-anchor="middle" fill="#3fb950" font-size="10">persist</text>
+    <path d="M 250 172 L 350 110" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <text x="298" y="138" text-anchor="middle" fill="#8b949e" font-size="10">tracked</text>
+    <path d="M 250 236 L 350 130" stroke="#8b949e" stroke-width="1.2" fill="none" stroke-dasharray="3 3"/>
+    <text x="296" y="216" text-anchor="middle" fill="#8b949e" font-size="10">detach</text>
+    <path d="M 250 300 L 350 200" stroke="#f85149" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <text x="296" y="270" text-anchor="middle" fill="#f85149" font-size="10">remove</text>
+
+    <!-- 连线 PC -> Flush -> Tx -->
+    <path d="M 460 146 L 460 170" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="488" y="162" fill="#8b949e" font-size="10">dirty</text>
+    <path d="M 460 232 L 460 256" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="488" y="248" fill="#8b949e" font-size="10">commit</text>
+
+    <!-- 连线 Flush/Tx -> SQL -->
+    <path d="M 570 200 L 670 108" stroke="#3fb950" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M 570 200 L 670 164" stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M 570 200 L 670 280" stroke="#f85149" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M 670 222 L 570 110" stroke="#58a6ff" stroke-width="1.3" fill="none" marker-end="url(#arr)" stroke-dasharray="4 3"/>
+    <text x="624" y="166" fill="#8b949e" font-size="10">hydrate</text>
+  </svg>
+</div>
+
+<h3>1.1.1 对象状态机</h3>
+
+<p>JPA 实体在运行时必然处于以下四种状态之一:<strong>Transient</strong>(临时,未与 PC 关联)、<strong>Managed</strong>(受管,被 PC 跟踪)、<strong>Detached</strong>(游离,曾受管现已脱离)、<strong>Removed</strong>(已移除,等待 flush 删除)。状态切换由 <code>EntityManager</code> 上的 API 触发,并不直接对应 SQL 执行——这一点是新手最常见的误区。</p>
+
+<pre><code class="language-java">import jakarta.persistence.*;
+
+@Entity
+@Table(name = "customers")
+public class Customer {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false)
+    private String name;
+
+    @Column(nullable = false, unique = true)
+    private String email;
+
+    protected Customer() {}
+
+    public Customer(String name, String email) {
+        this.name = name;
+        this.email = email;
+    }
+
+    public Long getId() { return id; }
+    public String getEmail() { return email; }
+    public void changeEmail(String email) { this.email = email; }
+}</code></pre>
+
+<p>对应的表结构:</p>
+
+<pre><code class="language-sql">create table customers (
+    id     bigint generated by default as identity primary key,
+    name   varchar(100) not null,
+    email  varchar(200) not null unique
+);</code></pre>
+
+<p>最小生命周期演示:</p>
+
+<pre><code class="language-java">EntityManager em = emf.createEntityManager();
+EntityTransaction tx = em.getTransaction();
+
+tx.begin();
+Customer c = new Customer("C1001", "alice@example.com"); // Transient
+em.persist(c);                                           // Transient → Managed
+tx.commit();                                             // flush + commit
+em.close();                                              // Managed → Detached</code></pre>
+
+<p><code>persist()</code> 的语义是<em>"将 Transient 对象纳入当前 PersistenceContext 管理"</em>,并不直接发出 INSERT。SQL 何时发送由 ID 生成策略、flush 模式与事务提交点共同决定。<code>IDENTITY</code> 策略下 Provider 必须执行 INSERT 才能拿到自增主键,因此该策略下 INSERT 在 <code>persist()</code> 调用内即时发出;<code>SEQUENCE</code> 与 <code>TABLE</code> 策略允许 Provider 推迟 INSERT 到 flush 时机。</p>
+
+<h3>1.1.2 SQL 生成器</h3>
+
+<p>JPA 的 <code>UPDATE</code> 不依赖显式调用。当 Managed 实体的字段被修改后,Provider 在 flush 阶段比对当前对象与加载快照,将差异翻译为 UPDATE SQL。该机制称为<strong>脏检查 (Dirty Checking)</strong>。</p>
+
+<pre><code class="language-java">tx.begin();
+Customer c = em.find(Customer.class, 1L);   // SELECT + 加入 PC
+c.changeEmail("alice.new@example.com");      // 仅修改 Java 对象
+tx.commit();                                  // flush 阶段检测差异 + UPDATE</code></pre>
+
+<p>Hibernate 生成的 SQL:</p>
+
+<pre><code class="language-sql">select c1_0.id, c1_0.email, c1_0.name
+from customers c1_0
+where c1_0.id = ?
+
+update customers
+set email = ?, name = ?
+where id = ?</code></pre>
+
+<p>业务代码只表达对象意图,Provider 负责差异计算与 SQL 生成。该抽象层带来的代价是:开发者必须能阅读底层 SQL,因为<strong>唯一键冲突、锁等待、慢查询</strong>等问题最终都发生在 SQL 层,而不是对象层。这条原则贯穿全书——任何"看起来是对象问题"的故障,根源都在它最终翻译出来的 SQL 上。</p>
+
+<h3>1.1.3 事务协调器</h3>
+
+<p>flush 与 commit 是<strong>两个不同概念</strong>。<code>flush()</code> 将待写入的 SQL 发送给 JDBC,<code>commit()</code> 才真正提交事务。一个未提交的事务即使已 flush,数据库仍可在 rollback 时撤销。</p>
+
+<pre><code class="language-java">tx.begin();
+Customer c = em.find(Customer.class, 1L);
+c.changeEmail("rollback@example.com");
+em.flush();      // SQL 已发往数据库,事务尚未提交
+tx.rollback();   // 数据库回滚,修改不生效
+
+em.clear();
+tx.begin();
+Customer reloaded = em.find(Customer.class, 1L);
+String emailNow = reloaded.getEmail();   // 仍为旧值
+tx.commit();</code></pre>
+
+<p>预期 SQL 与状态:</p>
+
+<pre><code class="language-text">[SQL] select c1_0.id, c1_0.email, c1_0.name from customers c1_0 where c1_0.id=?
+[SQL] update customers set email=?, name=? where id=?
+[ROLLBACK]
+[SQL] select c1_0.id, c1_0.email, c1_0.name from customers c1_0 where c1_0.id=?
+[email] alice.new@example.com</code></pre>
+
+<h3>表 1-1-1 · 三大职责对照</h3>
+
+<table>
+<thead><tr><th>职责</th><th>触发点</th><th>输出</th><th>易错点</th></tr></thead>
+<tbody>
+<tr><td>状态机</td><td>API 调用 (persist / find / remove)</td><td>状态转换</td><td>误以为状态切换 = SQL 执行</td></tr>
+<tr><td>SQL 生成器</td><td>flush (commit / 显式 / 查询前)</td><td>INSERT / UPDATE / DELETE</td><td>误以为 setter 后立即发 SQL</td></tr>
+<tr><td>事务协调器</td><td>tx.commit / tx.rollback</td><td>持久化或撤销</td><td>误以为 flush 等于 commit</td></tr>
+</tbody>
+</table>
+
+<h2 id="s1-2">1.2 运行时调用链</h2>
+
+<p>从应用代码的一行 <code>em.persist(customer)</code> 到数据库的一行 INSERT,中间经过六层抽象。理解这条调用链,才能在生产事故里准确定位"<strong>故障发生在哪一层</strong>"——是业务代码、ORM、JDBC 还是数据库。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 1-2-1 · 从应用代码到数据库的完整路径(时序图)</div>
+  <svg viewBox="0 0 920 500" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <!-- Lifelines headers -->
+    <rect x="40"  y="20" width="100" height="32" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="90"  y="40" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">App</text>
+    <rect x="180" y="20" width="100" height="32" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="230" y="40" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">EntityManager</text>
+    <rect x="320" y="20" width="100" height="32" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="370" y="40" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">PC</text>
+    <rect x="460" y="20" width="120" height="32" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="520" y="40" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">Hibernate</text>
+    <rect x="620" y="20" width="100" height="32" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="670" y="40" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">JDBC</text>
+    <rect x="760" y="20" width="100" height="32" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="810" y="40" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">Database</text>
+
+    <!-- Lifelines -->
+    <line x1="90"  y1="58" x2="90"  y2="490" stroke="#bc8cff" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="230" y1="58" x2="230" y2="490" stroke="#58a6ff" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="370" y1="58" x2="370" y2="490" stroke="#bc8cff" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="520" y1="58" x2="520" y2="490" stroke="#3fb950" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="670" y1="58" x2="670" y2="490" stroke="#d29922" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="810" y1="58" x2="810" y2="490" stroke="#f85149" stroke-width="1" stroke-dasharray="4 4"/>
+
+    <!-- 1: persist -->
+    <path d="M 95 88 L 225 88" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="160" y="82" text-anchor="middle" fill="#c9d1d9" font-size="11">1. persist(customer)</text>
+    <!-- 2: register Managed -->
+    <path d="M 235 112 L 365 112" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="300" y="106" text-anchor="middle" fill="#c9d1d9" font-size="11">2. register Managed</text>
+    <!-- 3: ok (dashed back) -->
+    <path d="M 365 136 L 235 136" stroke="#3fb950" stroke-width="1.3" fill="none" stroke-dasharray="4 3" marker-end="url(#arr)"/>
+    <text x="300" y="130" text-anchor="middle" fill="#3fb950" font-size="11">3. ok</text>
+
+    <!-- 4: tx.commit -->
+    <path d="M 95 174 L 225 174" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="160" y="168" text-anchor="middle" fill="#c9d1d9" font-size="11">4. tx.commit()</text>
+    <!-- 5: flush -->
+    <path d="M 235 198 L 365 198" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="300" y="192" text-anchor="middle" fill="#c9d1d9" font-size="11">5. flush()</text>
+    <!-- 6: scan dirty -->
+    <path d="M 385 222 L 510 222" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="445" y="216" text-anchor="middle" fill="#c9d1d9" font-size="11">6. scan dirty entities</text>
+
+    <!-- 7: self-call on Hibernate -->
+    <path d="M 520 246 L 580 246 L 580 270 L 525 270" stroke="#3fb950" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <text x="606" y="260" fill="#8b949e" font-size="11">7. build INSERT (Dialect)</text>
+
+    <!-- 8: bind -->
+    <path d="M 535 298 L 665 298" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="600" y="292" text-anchor="middle" fill="#c9d1d9" font-size="11">8. PreparedStatement.setXxx</text>
+    <!-- 9: execute -->
+    <path d="M 680 322 L 805 322" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="742" y="316" text-anchor="middle" fill="#3fb950" font-size="11">9. executeUpdate</text>
+    <!-- 10: rowcount back -->
+    <path d="M 805 346 L 680 346" stroke="#3fb950" stroke-width="1.3" fill="none" stroke-dasharray="4 3" marker-end="url(#arr)"/>
+    <text x="742" y="340" text-anchor="middle" fill="#3fb950" font-size="11">10. row count = 1</text>
+
+    <!-- 11: commit -->
+    <path d="M 535 380 L 665 380" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="600" y="374" text-anchor="middle" fill="#c9d1d9" font-size="11">11. commit</text>
+    <!-- 12: COMMIT to DB -->
+    <path d="M 680 404 L 805 404" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="742" y="398" text-anchor="middle" fill="#3fb950" font-size="11">12. COMMIT</text>
+
+    <!-- 13: ok back to app -->
+    <path d="M 805 444 L 95 444" stroke="#3fb950" stroke-width="1.3" fill="none" stroke-dasharray="4 3" marker-end="url(#arr)"/>
+    <text x="450" y="438" text-anchor="middle" fill="#3fb950" font-size="11">13. ok 沿原路返回</text>
+
+    <!-- Layer caption at bottom -->
+    <text x="90"  y="478" text-anchor="middle" fill="#8b949e" font-size="10">业务层</text>
+    <text x="230" y="478" text-anchor="middle" fill="#8b949e" font-size="10">JPA API</text>
+    <text x="370" y="478" text-anchor="middle" fill="#8b949e" font-size="10">缓存层</text>
+    <text x="520" y="478" text-anchor="middle" fill="#8b949e" font-size="10">ORM</text>
+    <text x="670" y="478" text-anchor="middle" fill="#8b949e" font-size="10">驱动</text>
+    <text x="810" y="478" text-anchor="middle" fill="#8b949e" font-size="10">存储</text>
+  </svg>
+</div>
+
+<h3>表 1-2-1 · 六层职责对应</h3>
+
+<table>
+<thead><tr><th>层次</th><th>应用代码所见</th><th>运行时责任</th><th>典型故障模式</th></tr></thead>
+<tbody>
+<tr><td>Application</td><td>Service / Repository / 实体对象</td><td>表达业务意图</td><td>事务边界过大或过小</td></tr>
+<tr><td>EntityManager</td><td>persist / find / query / remove</td><td>管理 PC 与事务</td><td>EM 跨线程使用</td></tr>
+<tr><td>PersistenceContext</td><td>Managed 实体与字段快照</td><td>一级缓存与脏检查</td><td>内存膨胀</td></tr>
+<tr><td>Provider</td><td>Hibernate / EclipseLink</td><td>SQL 生成与加载计划</td><td>N+1 与方言差异</td></tr>
+<tr><td>JDBC</td><td>PreparedStatement</td><td>参数绑定与网络传输</td><td>连接泄漏与慢 SQL</td></tr>
+<tr><td>Database</td><td>Tables / Indexes / Constraints</td><td>持久化与并发控制</td><td>死锁与扫描过多</td></tr>
+</tbody>
+</table>
+
+<p>层与层之间的接口是固定的,具体实现可替换。该分层使得"切换 Provider 不修改业务代码"在理论上成立,但<strong>缓存配置、批处理策略、SQL 形状</strong>仍依赖 Provider 的具体行为。</p>
+
+<h3>1.2.1 控制权传递时序</h3>
+
+<p><code>tx.commit()</code> 触发的时序较为隐式:EntityManager 先调用 PersistenceContext 的 flush 方法,后者扫描所有 Managed 实体的脏字段,生成 INSERT/UPDATE/DELETE 语句的执行队列,再委托给 Provider 转换为目标方言下的 SQL,最后由 JDBC 发送到数据库。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 1-2-2 · 单事务内的应用线程时间轴</div>
+  <svg viewBox="0 0 920 280" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <!-- 主时间轴 -->
+    <line x1="40" y1="170" x2="880" y2="170" stroke="#58a6ff" stroke-width="2.5" marker-end="url(#arr)"/>
+    <text x="880" y="195" text-anchor="end" fill="#8b949e" font-size="11">时间 →</text>
+
+    <!-- t0 tx.begin -->
+    <circle cx="100" cy="170" r="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <line x1="100" y1="170" x2="100" y2="80" stroke="#bc8cff" stroke-width="1.2" stroke-dasharray="3 3"/>
+    <rect x="40" y="40" width="120" height="40" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="100" y="58" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">t0</text>
+    <text x="100" y="74" text-anchor="middle" fill="#c9d1d9" font-size="11">tx.begin</text>
+
+    <!-- t1 em.persist -->
+    <circle cx="240" cy="170" r="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <line x1="240" y1="170" x2="240" y2="215" stroke="#58a6ff" stroke-width="1.2" stroke-dasharray="3 3"/>
+    <text x="240" y="234" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">t1</text>
+    <text x="240" y="250" text-anchor="middle" fill="#c9d1d9" font-size="11">em.persist(c)</text>
+
+    <!-- t2 c.changeEmail -->
+    <circle cx="380" cy="170" r="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <line x1="380" y1="170" x2="380" y2="80" stroke="#58a6ff" stroke-width="1.2" stroke-dasharray="3 3"/>
+    <rect x="320" y="40" width="120" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="380" y="58" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">t2</text>
+    <text x="380" y="74" text-anchor="middle" fill="#c9d1d9" font-size="11">c.changeEmail</text>
+
+    <!-- t3 flush -->
+    <circle cx="520" cy="170" r="9" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <line x1="520" y1="170" x2="520" y2="215" stroke="#d29922" stroke-width="1.2" stroke-dasharray="3 3"/>
+    <text x="520" y="234" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">t3</text>
+    <text x="520" y="250" text-anchor="middle" fill="#c9d1d9" font-size="11">em.flush (UPDATE)</text>
+
+    <!-- t4 commit -->
+    <circle cx="680" cy="170" r="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <line x1="680" y1="170" x2="680" y2="80" stroke="#3fb950" stroke-width="1.2" stroke-dasharray="3 3"/>
+    <rect x="620" y="40" width="120" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="680" y="58" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">t4</text>
+    <text x="680" y="74" text-anchor="middle" fill="#c9d1d9" font-size="11">tx.commit</text>
+
+    <!-- t5 close -->
+    <circle cx="820" cy="170" r="9" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <line x1="820" y1="170" x2="820" y2="215" stroke="#f85149" stroke-width="1.2" stroke-dasharray="3 3"/>
+    <text x="820" y="234" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">t5</text>
+    <text x="820" y="250" text-anchor="middle" fill="#c9d1d9" font-size="11">em.close</text>
+
+    <!-- 段标注 (轴上方) -->
+    <text x="170" y="152" text-anchor="middle" fill="#8b949e" font-size="10">PC 创建</text>
+    <text x="310" y="152" text-anchor="middle" fill="#8b949e" font-size="10">无 SQL</text>
+    <text x="450" y="152" text-anchor="middle" fill="#8b949e" font-size="10">仍无 SQL · 仅改字段</text>
+    <text x="600" y="152" text-anchor="middle" fill="#8b949e" font-size="10">SQL 已发到 DB</text>
+    <text x="750" y="152" text-anchor="middle" fill="#8b949e" font-size="10">事务真正落库</text>
+  </svg>
+</div>
+
+<h3>1.2.2 异常路径</h3>
+
+<p>事务异常路径中,任一步失败均触发回滚。Provider 在 flush 阶段检测到唯一键冲突时,会抛出 <code>PersistenceException</code> 并将事务标记为<strong>仅可回滚</strong> (rollback-only)。后续 <code>commit()</code> 调用将转为隐式 rollback,并抛出 <code>RollbackException</code>。</p>
+
+<div class="warning">
+  <strong>常见误区:</strong>看到 <code>RollbackException</code> 就以为"我没显式 rollback,框架自己回滚了"——实际是 commit 阶段触发隐式回滚。<strong>正确的诊断顺序:</strong>① 看完整 SQL 日志(开 <code>show_sql</code>),② 找到第一个抛异常的 SQL,③ 检查它涉及的唯一约束 / 外键 / 非空字段。一旦确认是脏检查阶段的 SQL 报错,就<strong>不要再去看上层业务代码</strong>——上层只是触发器,真正的原因在 SQL 层。
+</div>
+
+<h2 id="s1-3">1.3 核心对象的生命周期</h2>
+
+<p>JPA 核心类不多,但每一个都有<strong>明确的生命周期归属</strong>:谁创建、谁销毁、是否线程安全、是否可共享。把这张图熟记于心,可以避免 80% 的入门陷阱。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 1-3-1 · JPA 核心对象关系树</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <!-- Persistence -->
+    <rect x="370" y="14" width="180" height="50" rx="9" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="36" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">Persistence</text>
+    <text x="460" y="52" text-anchor="middle" fill="#c9d1d9" font-size="11">静态启动入口</text>
+
+    <!-- EMF -->
+    <rect x="330" y="106" width="260" height="58" rx="9" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="460" y="130" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">EntityManagerFactory</text>
+    <text x="460" y="148" text-anchor="middle" fill="#c9d1d9" font-size="11">thread-safe · 重量级 · 应用级单例</text>
+
+    <!-- 3 EMs -->
+    <rect x="60"  y="210" width="200" height="50" rx="9" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="160" y="232" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">EntityManager #1</text>
+    <text x="160" y="250" text-anchor="middle" fill="#c9d1d9" font-size="11">请求级 · 非线程安全</text>
+
+    <rect x="360" y="210" width="200" height="50" rx="9" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="460" y="232" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">EntityManager #2</text>
+    <text x="460" y="250" text-anchor="middle" fill="#c9d1d9" font-size="11">请求级 · 非线程安全</text>
+
+    <rect x="660" y="210" width="200" height="50" rx="9" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="760" y="232" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">EntityManager #N</text>
+    <text x="760" y="250" text-anchor="middle" fill="#c9d1d9" font-size="11">请求级 · 非线程安全</text>
+
+    <!-- Tx + PC pairs -->
+    <rect x="60"  y="300" width="92" height="40" rx="7" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="106" y="324" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">Tx #1</text>
+    <rect x="168" y="300" width="92" height="40" rx="7" fill="#0d1117" stroke="#bc8cff"/>
+    <text x="214" y="324" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">PC #1</text>
+
+    <rect x="360" y="300" width="92" height="40" rx="7" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="406" y="324" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">Tx #2</text>
+    <rect x="468" y="300" width="92" height="40" rx="7" fill="#0d1117" stroke="#bc8cff"/>
+    <text x="514" y="324" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">PC #2</text>
+
+    <rect x="660" y="300" width="92" height="40" rx="7" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="706" y="324" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">Tx #N</text>
+    <rect x="768" y="300" width="92" height="40" rx="7" fill="#0d1117" stroke="#bc8cff"/>
+    <text x="814" y="324" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">PC #N</text>
+
+    <!-- arrows -->
+    <path d="M 460 64 L 460 106" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 400 164 L 160 210" stroke="#8b949e" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 164 L 460 210" stroke="#8b949e" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M 520 164 L 760 210" stroke="#8b949e" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M 130 260 L 106 300" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 190 260 L 214 300" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 430 260 L 406 300" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 490 260 L 514 300" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 730 260 L 706 300" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 790 260 L 814 300" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+
+    <!-- legend -->
+    <text x="60"  y="360" fill="#8b949e" font-size="10">📌 EMF 创建 N 个 EM,每个 EM 拥有自己的 Tx + PC,互不串扰</text>
+  </svg>
+</div>
+
+<p><code>Persistence</code> 是静态启动入口,<code>EntityManagerFactory</code> 是应用级单例,<code>EntityManager</code> 与 <code>EntityTransaction</code> 跟随单次请求或事务存活,<code>Managed</code> 实体只在所属 PC 内有效。</p>
+
+<h3>1.3.1 RESOURCE_LOCAL 启动样例</h3>
+
+<pre><code class="language-java">EntityManagerFactory emf =
+    Persistence.createEntityManagerFactory("demoPU");
+
+EntityManager em = emf.createEntityManager();
+EntityTransaction tx = em.getTransaction();
+
+try {
+    tx.begin();
+    Customer found = em.find(Customer.class, 1L);
+    tx.commit();
+} catch (RuntimeException ex) {
+    if (tx.isActive()) tx.rollback();
+    throw ex;
+} finally {
+    em.close();
+}</code></pre>
+
+<p>应用结束时 <code>emf.close()</code>。容器化环境中由 Spring 或 Jakarta EE 容器接管该生命周期。</p>
+
+<h3>表 1-3-1 · 核心对象生命周期速查</h3>
+
+<table>
+<thead><tr><th>对象</th><th>线程安全</th><th>创建成本</th><th>推荐生命周期</th><th>反模式</th></tr></thead>
+<tbody>
+<tr><td>EntityManagerFactory</td><td>是</td><td>高,需解析元数据</td><td>应用级单例</td><td>每请求创建</td></tr>
+<tr><td>EntityManager</td><td>否</td><td>低</td><td>每请求或每事务一个</td><td>全局共享</td></tr>
+<tr><td>EntityTransaction</td><td>否</td><td>极低</td><td>跟随 EM</td><td>跨 EM 复用</td></tr>
+<tr><td>Managed Entity</td><td>否</td><td>业务对象成本</td><td>仅当前 PC 内可信</td><td>跨线程传递</td></tr>
+</tbody>
+</table>
+
+<h3>1.3.2 EntityManagerFactory 的内部结构</h3>
+
+<p>EMF 内部持有以下组件:<strong>实体元模型 (Metamodel)、SQL 生成器、二级缓存 (L2Cache,可选)、查询计划缓存、连接池配置、Dialect 实例</strong>。EMF 的初始化包含扫描注解、构建元模型、创建会话工厂等步骤,在生产环境中典型耗时为 200-2000 ms,具体值取决于实体数量与方言探测开销。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 1-3-2 · EntityManagerFactory 内部 8 个核心组件</div>
+  <svg viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <!-- 容器 -->
+    <rect x="20" y="20" width="880" height="320" rx="14" fill="#0d1117" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="50" text-anchor="middle" fill="#bc8cff" font-size="15" font-weight="bold">EntityManagerFactory(单例 · 线程安全)</text>
+
+    <!-- Row 1: 元模型与 SQL -->
+    <rect x="50"  y="80" width="240" height="60" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="170" y="102" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">Metamodel</text>
+    <text x="170" y="120" text-anchor="middle" fill="#c9d1d9" font-size="11">@Entity 注解扫描结果</text>
+    <text x="170" y="133" text-anchor="middle" fill="#8b949e" font-size="10">字段映射 + 关系 + 主键策略</text>
+
+    <rect x="340" y="80" width="240" height="60" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="460" y="102" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">SqlAstFactory</text>
+    <text x="460" y="120" text-anchor="middle" fill="#c9d1d9" font-size="11">JPQL → SQL AST 转换器</text>
+    <text x="460" y="133" text-anchor="middle" fill="#8b949e" font-size="10">解析 / 校验 / 优化</text>
+
+    <rect x="630" y="80" width="240" height="60" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="750" y="102" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">Dialect</text>
+    <text x="750" y="120" text-anchor="middle" fill="#c9d1d9" font-size="11">H2 / MySQL / PG 方言</text>
+    <text x="750" y="133" text-anchor="middle" fill="#8b949e" font-size="10">分页 / 函数 / 类型映射</text>
+
+    <!-- Row 2: 缓存与连接 -->
+    <rect x="50"  y="160" width="240" height="60" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="170" y="182" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">L2 Cache</text>
+    <text x="170" y="200" text-anchor="middle" fill="#c9d1d9" font-size="11">跨会话二级缓存(可选)</text>
+    <text x="170" y="213" text-anchor="middle" fill="#8b949e" font-size="10">EHCache / Infinispan</text>
+
+    <rect x="340" y="160" width="240" height="60" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="460" y="182" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">QueryPlanCache</text>
+    <text x="460" y="200" text-anchor="middle" fill="#c9d1d9" font-size="11">JPQL / Criteria 计划缓存</text>
+    <text x="460" y="213" text-anchor="middle" fill="#8b949e" font-size="10">默认 2048 条</text>
+
+    <rect x="630" y="160" width="240" height="60" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="750" y="182" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">ConnectionPool</text>
+    <text x="750" y="200" text-anchor="middle" fill="#c9d1d9" font-size="11">HikariCP 实例(常见)</text>
+    <text x="750" y="213" text-anchor="middle" fill="#8b949e" font-size="10">物理连接复用</text>
+
+    <!-- Row 3: 观测与事件 -->
+    <rect x="190" y="240" width="240" height="60" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="310" y="262" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">Statistics</text>
+    <text x="310" y="280" text-anchor="middle" fill="#c9d1d9" font-size="11">命中率 / SQL 计数(可选)</text>
+    <text x="310" y="293" text-anchor="middle" fill="#8b949e" font-size="10">Micrometer 桥接</text>
+
+    <rect x="490" y="240" width="240" height="60" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="610" y="262" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">EventListenerGroups</text>
+    <text x="610" y="280" text-anchor="middle" fill="#c9d1d9" font-size="11">@PrePersist / @PostLoad 等</text>
+    <text x="610" y="293" text-anchor="middle" fill="#8b949e" font-size="10">生命周期回调入口</text>
+  </svg>
+</div>
+
+<h2 id="s1-4">1.4 PersistenceContext</h2>
+
+<p>PersistenceContext 是 EntityManager 内部维护的<strong>内存区域</strong>,包含四类数据:Identity Map (主键到对象的映射)、Snapshot (实体加载时的字段值副本)、ActionQueue (待 flush 的 SQL 操作)、Collection 跟踪表 (受管集合代理及其状态)。理解 PC 是理解一级缓存、脏检查、级联、批处理的基础。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 1-4-1 · PersistenceContext 内部 4 子结构 + 4 可观察行为</div>
+  <svg viewBox="0 0 920 440" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <!-- EM -->
+    <rect x="370" y="14" width="180" height="44" rx="9" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="460" y="42" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">EntityManager</text>
+
+    <!-- PC -->
+    <rect x="270" y="90" width="380" height="50" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="122" text-anchor="middle" fill="#bc8cff" font-size="14" font-weight="bold">PersistenceContext</text>
+
+    <!-- 4 sub-structures -->
+    <rect x="30"  y="180" width="200" height="80" rx="9" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="130" y="204" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">Identity Map</text>
+    <text x="130" y="222" text-anchor="middle" fill="#c9d1d9" font-size="11">Class+Id → Java Object</text>
+    <text x="130" y="238" text-anchor="middle" fill="#c9d1d9" font-size="11">同主键返回同实例</text>
+    <text x="130" y="252" text-anchor="middle" fill="#8b949e" font-size="10">一级缓存核心</text>
+
+    <rect x="250" y="180" width="200" height="80" rx="9" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="350" y="204" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">Snapshot</text>
+    <text x="350" y="222" text-anchor="middle" fill="#c9d1d9" font-size="11">加载时字段值副本</text>
+    <text x="350" y="238" text-anchor="middle" fill="#c9d1d9" font-size="11">flush 差异比对</text>
+    <text x="350" y="252" text-anchor="middle" fill="#8b949e" font-size="10">脏检查的数据基础</text>
+
+    <rect x="470" y="180" width="200" height="80" rx="9" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="570" y="204" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">ActionQueue</text>
+    <text x="570" y="222" text-anchor="middle" fill="#c9d1d9" font-size="11">insert / update / delete</text>
+    <text x="570" y="238" text-anchor="middle" fill="#c9d1d9" font-size="11">按依赖顺序写出</text>
+    <text x="570" y="252" text-anchor="middle" fill="#8b949e" font-size="10">外键约束安全</text>
+
+    <rect x="690" y="180" width="200" height="80" rx="9" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="790" y="204" text-anchor="middle" fill="#f85149" font-size="13" font-weight="bold">Collection 跟踪表</text>
+    <text x="790" y="222" text-anchor="middle" fill="#c9d1d9" font-size="11">持久化集合代理</text>
+    <text x="790" y="238" text-anchor="middle" fill="#c9d1d9" font-size="11">懒加载边界</text>
+    <text x="790" y="252" text-anchor="middle" fill="#8b949e" font-size="10">N+1 风险高发区</text>
+
+    <!-- 4 behaviors -->
+    <rect x="30"  y="320" width="200" height="50" rx="8" fill="#0d1117" stroke="#3fb950"/>
+    <text x="130" y="342" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">重复 find 返回同一实例</text>
+    <text x="130" y="358" text-anchor="middle" fill="#8b949e" font-size="10">第二次无 SQL</text>
+
+    <rect x="250" y="320" width="200" height="50" rx="8" fill="#0d1117" stroke="#d29922"/>
+    <text x="350" y="342" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">脏检查触发 UPDATE</text>
+    <text x="350" y="358" text-anchor="middle" fill="#8b949e" font-size="10">仅改字段不调 setter</text>
+
+    <rect x="470" y="320" width="200" height="50" rx="8" fill="#0d1117" stroke="#58a6ff"/>
+    <text x="570" y="342" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">flush 按依赖排序</text>
+    <text x="570" y="358" text-anchor="middle" fill="#8b949e" font-size="10">父表 INSERT 先于子表</text>
+
+    <rect x="690" y="320" width="200" height="50" rx="8" fill="#0d1117" stroke="#f85149"/>
+    <text x="790" y="342" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">事务外访问报异常</text>
+    <text x="790" y="358" text-anchor="middle" fill="#8b949e" font-size="10">LazyInitializationException</text>
+
+    <!-- arrows -->
+    <path d="M 460 58 L 460 90" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 380 140 L 130 180" stroke="#8b949e" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M 420 140 L 350 180" stroke="#8b949e" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M 500 140 L 570 180" stroke="#8b949e" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M 540 140 L 790 180" stroke="#8b949e" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M 130 260 L 130 320" stroke="#3fb950" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M 350 260 L 350 320" stroke="#d29922" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M 570 260 L 570 320" stroke="#58a6ff" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M 790 260 L 790 320" stroke="#f85149" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+
+    <text x="60" y="402" fill="#8b949e" font-size="10">📌 PC = "线程私有的一级缓存 + 脏检查 + SQL 写出队列"</text>
+    <text x="60" y="418" fill="#8b949e" font-size="10">    EM 关闭(close) 或 clear() 会一次性释放 PC 中的全部 4 类数据</text>
+  </svg>
+</div>
+
+<h3>1.4.1 Identity Map 的可观察行为</h3>
+
+<pre><code class="language-java">tx.begin();
+Customer a = em.find(Customer.class, 1L);
+Customer b = em.find(Customer.class, 1L);
+boolean same = (a == b);                   // 必为 true
+tx.commit();</code></pre>
+
+<p>仅第一次 <code>find()</code> 触发 SELECT。第二次直接命中 Identity Map,返回同一 Java 对象引用。该机制保证同一 PC 内对同一主键的所有访问都获得<strong>一致视图</strong>。</p>
+
+<pre><code class="language-sql">-- 第一次 find:
+select c1_0.id, c1_0.email, c1_0.name from customers c1_0 where c1_0.id=?
+-- 第二次 find:无 SQL</code></pre>
+
+<h3>1.4.2 PersistenceContext 清空与跨上下文比较</h3>
+
+<pre><code class="language-java">tx.begin();
+Customer a = em.find(Customer.class, 1L);
+em.clear();                                  // PC 清空,所有 Managed → Detached
+Customer b = em.find(Customer.class, 1L);    // 重新 SELECT
+boolean same = (a == b);                     // false
+tx.commit();</code></pre>
+
+<pre><code class="language-sql">select c1_0.id, c1_0.email, c1_0.name from customers c1_0 where c1_0.id=?
+select c1_0.id, c1_0.email, c1_0.name from customers c1_0 where c1_0.id=?</code></pre>
+
+<p><code>em.clear()</code> 后 PC 中所有实体进入 Detached 状态,持久化代理 (集合 / 关联) 被切断。后续 <code>find()</code> 重新触发 SELECT 并构建新的 Managed 实体。</p>
+
+<h3>表 1-4-1 · PersistenceContext 关键行为</h3>
+
+<table>
+<thead><tr><th>行为</th><th>触发 API</th><th>影响</th></tr></thead>
+<tbody>
+<tr><td>加入 PC</td><td>persist / merge / find / query</td><td>进入 Identity Map</td></tr>
+<tr><td>从 PC 移除</td><td>remove / detach</td><td>标记为 Removed 或 Detached</td></tr>
+<tr><td>全量清空</td><td>clear</td><td>所有实体进入 Detached</td></tr>
+<tr><td>flush 触发</td><td>commit / 显式 flush / 查询前 (AUTO)</td><td>扫描脏实体并生成 SQL</td></tr>
+<tr><td>关闭 PC</td><td>close</td><td>释放所有资源</td></tr>
+</tbody>
+</table>
+
+<h3>1.4.3 PC 范围:transaction 范围 vs extended 范围</h3>
+
+<p>JPA 规范定义两种 PC 范围。<code>PersistenceContextType.TRANSACTION</code> (默认) 中 PC 跟随事务边界,事务结束即清空;<code>PersistenceContextType.EXTENDED</code> 中 PC 跨多个事务存活,常用于 Stateful Session Bean 与 Spring 的 OpenEntityManagerInView 模式。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 1-4-2 · TRANSACTION vs EXTENDED 两种 PC 范围对比</div>
+  <svg viewBox="0 0 920 340" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <!-- TRANSACTION -->
+    <text x="80" y="40" fill="#58a6ff" font-size="14" font-weight="bold">TRANSACTION 范围(默认)</text>
+    <text x="80" y="58" fill="#8b949e" font-size="11">PersistenceContextType.TRANSACTION · 一次事务 = 一个 PC</text>
+    <line x1="80" y1="100" x2="840" y2="100" stroke="#58a6ff" stroke-width="2.5"/>
+
+    <rect x="120" y="76" width="100" height="48" rx="7" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="170" y="106" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">tx.begin</text>
+
+    <rect x="320" y="76" width="180" height="48" rx="7" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="410" y="100" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">PC 创建</text>
+    <text x="410" y="116" text-anchor="middle" fill="#c9d1d9" font-size="11">单事务内有效</text>
+
+    <rect x="600" y="76" width="100" height="48" rx="7" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="650" y="106" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">tx.commit</text>
+
+    <rect x="730" y="76" width="100" height="48" rx="7" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="780" y="106" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">PC 销毁</text>
+
+    <text x="410" y="158" text-anchor="middle" fill="#8b949e" font-size="11">下一次事务 → 全新 PC,不复用</text>
+
+    <!-- 分隔线 -->
+    <line x1="40" y1="180" x2="880" y2="180" stroke="#30363d" stroke-width="1" stroke-dasharray="4 4"/>
+
+    <!-- EXTENDED -->
+    <text x="80" y="210" fill="#bc8cff" font-size="14" font-weight="bold">EXTENDED 范围(Stateful / OSIV)</text>
+    <text x="80" y="228" fill="#8b949e" font-size="11">PersistenceContextType.EXTENDED · 一个 PC 跨多个事务</text>
+    <line x1="80" y1="278" x2="840" y2="278" stroke="#bc8cff" stroke-width="2.5"/>
+
+    <rect x="80"  y="254" width="80" height="48" rx="7" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="120" y="284" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">PC 创建</text>
+
+    <rect x="200" y="254" width="120" height="48" rx="7" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="260" y="284" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">tx1</text>
+
+    <rect x="360" y="254" width="120" height="48" rx="7" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="420" y="284" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">tx2</text>
+
+    <rect x="520" y="254" width="120" height="48" rx="7" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="580" y="284" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">tx3</text>
+
+    <rect x="700" y="254" width="120" height="48" rx="7" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="760" y="284" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">PC 销毁</text>
+
+    <text x="450" y="328" text-anchor="middle" fill="#8b949e" font-size="11">实体在事务之间保持 Managed,显式 close 或 EJB 生命周期结束才销毁</text>
+  </svg>
+</div>
+
+<h2 id="s1-5">1.5 SQL 生成路径</h2>
+
+<p>Provider 将三类输入 (JPQL 文本、Criteria 程序对象、PersistenceContext 中的脏实体) 统一转换为 SQL AST,再由 Dialect 渲染为目标数据库特定的 SQL 文本。AST 是中间表示,使得不同输入可共享后续的 SQL 优化与方言渲染逻辑。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 1-5-1 · 三条入口(JPQL / Criteria / Dirty) 汇合于 AST</div>
+  <svg viewBox="0 0 920 340" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <!-- 三入口 -->
+    <rect x="20"  y="50"  width="200" height="56" rx="9" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="120" y="74" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">JPQL 字符串</text>
+    <text x="120" y="92" text-anchor="middle" fill="#c9d1d9" font-size="11">em.createQuery(&quot;select ... &quot;)</text>
+
+    <rect x="20"  y="138" width="200" height="56" rx="9" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="120" y="162" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">Criteria Builder</text>
+    <text x="120" y="180" text-anchor="middle" fill="#c9d1d9" font-size="11">CriteriaQuery&lt;T&gt; 程序对象</text>
+
+    <rect x="20"  y="226" width="200" height="56" rx="9" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="120" y="250" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">Dirty 实体</text>
+    <text x="120" y="268" text-anchor="middle" fill="#c9d1d9" font-size="11">脏检查产物(自动)</text>
+
+    <!-- AST 双节点 -->
+    <rect x="290" y="78" width="200" height="56" rx="9" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="390" y="102" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">Query AST</text>
+    <text x="390" y="120" text-anchor="middle" fill="#c9d1d9" font-size="11">SELECT 语法树</text>
+
+    <rect x="290" y="200" width="200" height="56" rx="9" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="390" y="224" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">Mutation Model</text>
+    <text x="390" y="242" text-anchor="middle" fill="#c9d1d9" font-size="11">INSERT / UPDATE / DELETE</text>
+
+    <!-- Dialect -->
+    <rect x="560" y="138" width="180" height="56" rx="9" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="650" y="162" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">SQL Dialect</text>
+    <text x="650" y="180" text-anchor="middle" fill="#c9d1d9" font-size="11">PG / MySQL / Oracle / H2</text>
+
+    <!-- Prepared SQL -->
+    <rect x="770" y="138" width="130" height="56" rx="9" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="835" y="162" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">Prepared SQL</text>
+    <text x="835" y="180" text-anchor="middle" fill="#c9d1d9" font-size="11">+ 参数列表</text>
+
+    <!-- arrows in -->
+    <path d="M 220 78  L 290 100" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 220 166 L 290 112" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 220 254 L 290 222" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <!-- AST -> Dialect -->
+    <path d="M 490 106 L 560 158" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 490 228 L 560 178" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <!-- Dialect -> SQL -->
+    <path d="M 740 166 L 770 166" stroke="#3fb950" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+
+    <text x="120" y="316" text-anchor="middle" fill="#8b949e" font-size="10">3 个不同入口</text>
+    <text x="390" y="316" text-anchor="middle" fill="#8b949e" font-size="10">汇合于 2 类 AST</text>
+    <text x="650" y="316" text-anchor="middle" fill="#8b949e" font-size="10">方言渲染</text>
+    <text x="835" y="316" text-anchor="middle" fill="#8b949e" font-size="10">出口 SQL</text>
+  </svg>
+</div>
+
+<h3>1.5.1 JPQL 到 SQL 的转换样例</h3>
+
+<pre><code class="language-java">List&lt;Customer&gt; result = em.createQuery("""
+    select c
+    from Customer c
+    where c.email like :domain
+    order by c.id
+    """, Customer.class)
+    .setParameter("domain", "%@example.com")
+    .setMaxResults(10)
+    .getResultList();</code></pre>
+
+<p>PostgreSQL Dialect 输出:</p>
+
+<pre><code class="language-sql">select c1_0.id, c1_0.email, c1_0.name
+from customers c1_0
+where c1_0.email like ? escape ''
+order by c1_0.id
+fetch first ? rows only</code></pre>
+
+<p>MySQL Dialect 输出:</p>
+
+<pre><code class="language-sql">select c1_0.id, c1_0.email, c1_0.name
+from customers c1_0
+where c1_0.email like ? escape ''
+order by c1_0.id
+limit ?</code></pre>
+
+<p>JPQL 语法对开发者一致,但分页关键字 (<code>fetch first</code> 与 <code>limit</code>)、字符串函数、日期函数、布尔类型等在不同方言下的渲染存在差异。生产部署前需对关键查询进行集成测试,避免方言切换导致行为漂移。</p>
+
+<h3>表 1-5-1 · 常见 SQL 差异点</h3>
+
+<table>
+<thead><tr><th>维度</th><th>PostgreSQL</th><th>MySQL</th><th>Oracle</th><th>H2</th></tr></thead>
+<tbody>
+<tr><td>分页</td><td>offset / fetch first</td><td>limit</td><td>rownum / fetch first</td><td>limit</td></tr>
+<tr><td>自增</td><td>sequence / serial</td><td>auto_increment</td><td>sequence</td><td>identity</td></tr>
+<tr><td>布尔</td><td>boolean</td><td>tinyint(1)</td><td>number(1)</td><td>boolean</td></tr>
+<tr><td>字符串拼接</td><td><code>||</code></td><td>concat()</td><td><code>||</code></td><td><code>||</code> 或 concat</td></tr>
+<tr><td>大小写</td><td>区分</td><td>不区分 (Linux 区分)</td><td>区分</td><td>可配置</td></tr>
+</tbody>
+</table>
+
+<div class="warning">
+  <strong>方言陷阱:</strong>开发期用 H2 + <code>MySQLDialect</code> 模拟,生产是真 MySQL,因隐式类型转换不同导致 P99 查询走全表扫描。<strong>护栏:</strong>① 集成测试用 Testcontainers 启真实 MySQL/PG;② 关键查询打 SQL 计数 + EXPLAIN 断言;③ 方言切换时单独拉一个回归任务跑全部 Repository 测试。
+</div>
+
+<h2 id="s1-6">1.6 配置入口</h2>
+
+<p>JPA 标准启动方式通过 <code>META-INF/persistence.xml</code> 声明 Persistence Unit。Spring Boot 项目通过 <code>application.yml</code> + 自动配置生成等价的 EMF。两条路径汇合于同一类对象,后续运行时无差异。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 1-6-1 · 两种配置路径汇合于 EMF</div>
+  <svg viewBox="0 0 920 300" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <!-- 配置文件输入 -->
+    <rect x="40" y="40" width="220" height="56" rx="9" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="150" y="64" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">persistence.xml</text>
+    <text x="150" y="82" text-anchor="middle" fill="#c9d1d9" font-size="11">META-INF · 标准 JPA</text>
+
+    <rect x="40" y="190" width="220" height="56" rx="9" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="150" y="214" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">application.yml</text>
+    <text x="150" y="232" text-anchor="middle" fill="#c9d1d9" font-size="11">Spring Boot 自动配置</text>
+
+    <!-- 中间层 -->
+    <rect x="340" y="40" width="200" height="56" rx="9" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="440" y="64" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">Persistence Unit</text>
+    <text x="440" y="82" text-anchor="middle" fill="#c9d1d9" font-size="11">PU 描述符</text>
+
+    <rect x="340" y="190" width="200" height="56" rx="9" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="440" y="214" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">JpaBaseConfiguration</text>
+    <text x="440" y="232" text-anchor="middle" fill="#c9d1d9" font-size="11">LocalContainerEMFB</text>
+
+    <!-- EMF -->
+    <rect x="620" y="115" width="240" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="740" y="140" text-anchor="middle" fill="#58a6ff" font-size="14" font-weight="bold">EntityManagerFactory</text>
+    <text x="740" y="158" text-anchor="middle" fill="#c9d1d9" font-size="11">统一运行时入口</text>
+
+    <!-- 连线 -->
+    <path d="M 260 68  L 340 68"  stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 260 218 L 340 218" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 540 68  L 620 132" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 540 218 L 620 158" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <text x="450" y="280" text-anchor="middle" fill="#8b949e" font-size="11">两条配置路径产出等价 EMF · 运行时无差异</text>
+  </svg>
+</div>
+
+<h3>1.6.1 标准 JPA 配置</h3>
+
+<pre><code class="language-xml">&lt;persistence xmlns="https://jakarta.ee/xml/ns/persistence"
+             version="3.1"&gt;
+  &lt;persistence-unit name="demoPU" transaction-type="RESOURCE_LOCAL"&gt;
+    &lt;provider&gt;org.hibernate.jpa.HibernatePersistenceProvider&lt;/provider&gt;
+    &lt;class&gt;com.example.Customer&lt;/class&gt;
+    &lt;properties&gt;
+      &lt;property name="jakarta.persistence.jdbc.url"
+                value="jdbc:h2:mem:demo"/&gt;
+      &lt;property name="jakarta.persistence.jdbc.user" value="sa"/&gt;
+      &lt;property name="jakarta.persistence.jdbc.password" value=""/&gt;
+      &lt;property name="hibernate.hbm2ddl.auto" value="create-drop"/&gt;
+      &lt;property name="hibernate.show_sql" value="true"/&gt;
+      &lt;property name="hibernate.format_sql" value="true"/&gt;
+    &lt;/properties&gt;
+  &lt;/persistence-unit&gt;
+&lt;/persistence&gt;</code></pre>
+
+<p>启动验证:</p>
+
+<pre><code class="language-java">EntityManagerFactory emf =
+    Persistence.createEntityManagerFactory("demoPU");
+boolean alive = emf.isOpen();
+emf.close();</code></pre>
+
+<h3>1.6.2 Spring Boot 等价配置</h3>
+
+<pre><code class="language-yaml">spring:
+  datasource:
+    url: jdbc:h2:mem:demo
+    username: sa
+    password:
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    show-sql: true
+    properties:
+      hibernate.format_sql: true</code></pre>
+
+<p>Spring Boot 在 <code>LocalContainerEntityManagerFactoryBean</code> 中读取上述配置,创建 EMF 并暴露为 Bean。开发者通过 <code>@PersistenceContext</code> 注入 EM,事务由 <code>@Transactional</code> 接管。</p>
+
+<h3>表 1-6-1 · 配置项映射</h3>
+
+<table>
+<thead><tr><th>概念</th><th>标准 JPA 属性</th><th>Spring Boot 属性</th></tr></thead>
+<tbody>
+<tr><td>JDBC URL</td><td><code>jakarta.persistence.jdbc.url</code></td><td><code>spring.datasource.url</code></td></tr>
+<tr><td>Driver</td><td><code>jakarta.persistence.jdbc.driver</code></td><td><code>spring.datasource.driver-class-name</code></td></tr>
+<tr><td>User</td><td><code>jakarta.persistence.jdbc.user</code></td><td><code>spring.datasource.username</code></td></tr>
+<tr><td>DDL 模式</td><td><code>hibernate.hbm2ddl.auto</code></td><td><code>spring.jpa.hibernate.ddl-auto</code></td></tr>
+<tr><td>SQL 输出</td><td><code>hibernate.show_sql</code></td><td><code>spring.jpa.show-sql</code></td></tr>
+<tr><td>方言</td><td><code>hibernate.dialect</code></td><td><code>spring.jpa.database-platform</code></td></tr>
+</tbody>
+</table>
+
+<h2 id="s1-7">1.7 观测与生产边界</h2>
+
+<p>JPA 的运行时行为对生产可观测性提出明确要求。每一层职责均应映射到具体指标,避免线上问题仅依赖代码审视。Hibernate 的 <code>Statistics</code> 接口提供 SQL 计数、查询耗时、缓存命中、二级缓存大小等核心指标,可通过 Micrometer 桥接到 Prometheus / Grafana。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 1-7-1 · 从架构层到生产指标再到告警动作的映射</div>
+  <svg viewBox="0 0 920 400" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <!-- 入口 -->
+    <rect x="40" y="20" width="200" height="50" rx="9" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="140" y="44" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">Repository 方法</text>
+    <text x="140" y="60" text-anchor="middle" fill="#c9d1d9" font-size="11">业务调用入口</text>
+
+    <!-- 列头 -->
+    <text x="410" y="14" text-anchor="middle" fill="#8b949e" font-size="11" font-weight="bold">5 类观测维度</text>
+    <text x="720" y="14" text-anchor="middle" fill="#8b949e" font-size="11" font-weight="bold">对应落地动作</text>
+
+    <!-- 5 个观测维度 -->
+    <rect x="310" y="30"  width="200" height="46" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="410" y="58" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">SQL 计数</text>
+    <rect x="310" y="100" width="200" height="46" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="410" y="128" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">事务耗时</text>
+    <rect x="310" y="170" width="200" height="46" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="410" y="198" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">连接占用时长</text>
+    <rect x="310" y="240" width="200" height="46" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="410" y="268" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">L1 / L2 命中率</text>
+    <rect x="310" y="310" width="200" height="46" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="410" y="338" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">锁等待 / 死锁</text>
+
+    <!-- 落地动作 -->
+    <rect x="600" y="30"  width="260" height="46" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="730" y="58" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">回归护栏(单元测试断言)</text>
+    <rect x="600" y="100" width="260" height="46" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="730" y="128" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">慢事务告警</text>
+    <rect x="600" y="170" width="260" height="46" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="730" y="198" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">连接池饱和告警</text>
+    <rect x="600" y="240" width="260" height="46" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="730" y="268" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">缓存命中率调优</text>
+    <rect x="600" y="310" width="260" height="46" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="730" y="338" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">阻塞链路追踪</text>
+
+    <!-- 连线 -->
+    <path d="M 240 45  L 310 50"  stroke="#8b949e" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M 240 45  L 310 120" stroke="#8b949e" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M 240 45  L 310 190" stroke="#8b949e" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M 240 45  L 310 260" stroke="#8b949e" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M 240 45  L 310 330" stroke="#8b949e" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+
+    <path d="M 510 53  L 600 53"  stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 510 123 L 600 123" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 510 193 L 600 193" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 510 263 L 600 263" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 510 333 L 600 333" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <text x="450" y="386" text-anchor="middle" fill="#8b949e" font-size="10">📌 每条 Repository 方法都应能在告警面板看到对应指标 — "可观测性即护栏"</text>
+  </svg>
+</div>
+
+<h3>1.7.1 SQL 数量护栏</h3>
+
+<pre><code class="language-java">@Test
+void findCustomerById_issuesOneSelect() {
+    Statistics statistics = sessionFactory.getStatistics();
+    statistics.clear();
+
+    txTemplate.executeWithoutResult(status -&gt; {
+        Customer found = em.find(Customer.class, 1L);
+        assertThat(found.getId()).isEqualTo(1L);
+    });
+
+    long sqlCount = statistics.getPrepareStatementCount();
+    assertThat(sqlCount).isEqualTo(1L);
+}</code></pre>
+
+<p>该测试将 SQL 数量编码为可执行约束,任何后续改动若导致 SQL 数量偏离预期,均会在 CI 中显式失败。该护栏对防止 <strong>N+1 退化</strong>尤为有效——本书第 12 章会展开这条护栏在 N+1 检测中的全部细节。</p>
+
+<h3>表 1-7-1 · 典型监控指标</h3>
+
+<table>
+<thead><tr><th>指标</th><th>含义</th><th>异常阈值</th></tr></thead>
+<tbody>
+<tr><td><code>Hibernate.statements</code></td><td>单事务 SQL 数</td><td>超过预期 2 倍</td></tr>
+<tr><td><code>Hibernate.entities.loads</code></td><td>单事务实体加载数</td><td>与 SQL 数比例 &lt; 1 表明 N+1</td></tr>
+<tr><td><code>Hibernate.queries.executions</code></td><td>JPQL / HQL 执行次数</td><td>短时间内剧烈增长</td></tr>
+<tr><td><code>HikariCP.connections.usage</code></td><td>平均连接占用时长</td><td>P99 &gt; 100 ms 通常异常</td></tr>
+<tr><td><code>L2Cache.hit.ratio</code></td><td>二级缓存命中率</td><td>低于 70% 需检查配置</td></tr>
+</tbody>
+</table>
+
+<div class="real-world">
+  <strong>实战:</strong>某物流团队通过 Micrometer 把 <code>Hibernate.statements / Hibernate.entities.loads</code> 比例做成 Grafana 单变量看板。<strong>策略:</strong>当 5 分钟均值 &lt; 0.8 时告警,代表"<strong>SQL 数明显多于实体数</strong>",大概率发生 N+1。<strong>价值:</strong>三个月内捕获 4 次回归(其中一次是开发者新加 <code>@OneToMany</code> 关联但忘了改 fetch 策略),全部在灰度阶段被拦截,从未进入生产。
+</div>
+
+<h2 id="s1-8">1.8 陷阱与限制</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 1-8-1 · 入口章典型陷阱的四层分类</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <!-- Root -->
+    <rect x="370" y="14" width="180" height="48" rx="9" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="460" y="44" text-anchor="middle" fill="#f85149" font-size="13" font-weight="bold">JPA 入口章陷阱</text>
+
+    <!-- 4 categories -->
+    <rect x="40"  y="106" width="180" height="44" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="130" y="134" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">① 对象层</text>
+
+    <rect x="270" y="106" width="180" height="44" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="360" y="134" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">② 上下文层</text>
+
+    <rect x="500" y="106" width="180" height="44" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="590" y="134" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">③ 事务层</text>
+
+    <rect x="730" y="106" width="180" height="44" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="820" y="134" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">④ Provider 层</text>
+
+    <!-- 子项 -->
+    <rect x="20"  y="190" width="220" height="44" rx="7" fill="#0d1117" stroke="#58a6ff"/>
+    <text x="130" y="208" text-anchor="middle" fill="#c9d1d9" font-size="11">Detached 实体修改丢失</text>
+    <text x="130" y="222" text-anchor="middle" fill="#8b949e" font-size="10">PC 关闭后 setter 不生效</text>
+    <rect x="20"  y="244" width="220" height="44" rx="7" fill="#0d1117" stroke="#58a6ff"/>
+    <text x="130" y="262" text-anchor="middle" fill="#c9d1d9" font-size="11">跨线程共享 Managed</text>
+    <text x="130" y="276" text-anchor="middle" fill="#8b949e" font-size="10">PC 非线程安全</text>
+
+    <rect x="260" y="190" width="200" height="44" rx="7" fill="#0d1117" stroke="#3fb950"/>
+    <text x="360" y="208" text-anchor="middle" fill="#c9d1d9" font-size="11">每请求新建 EMF</text>
+    <text x="360" y="222" text-anchor="middle" fill="#8b949e" font-size="10">RT P99 飙升</text>
+    <rect x="260" y="244" width="200" height="44" rx="7" fill="#0d1117" stroke="#3fb950"/>
+    <text x="360" y="262" text-anchor="middle" fill="#c9d1d9" font-size="11">EM 跨请求复用</text>
+    <text x="360" y="276" text-anchor="middle" fill="#8b949e" font-size="10">数据串扰</text>
+
+    <rect x="490" y="190" width="200" height="44" rx="7" fill="#0d1117" stroke="#d29922"/>
+    <text x="590" y="208" text-anchor="middle" fill="#c9d1d9" font-size="11">flush 当作 commit</text>
+    <text x="590" y="222" text-anchor="middle" fill="#8b949e" font-size="10">rollback 仍可撤销</text>
+    <rect x="490" y="244" width="200" height="44" rx="7" fill="#0d1117" stroke="#d29922"/>
+    <text x="590" y="262" text-anchor="middle" fill="#c9d1d9" font-size="11">事务边界过大</text>
+    <text x="590" y="276" text-anchor="middle" fill="#8b949e" font-size="10">连接池告罄</text>
+
+    <rect x="710" y="190" width="200" height="44" rx="7" fill="#0d1117" stroke="#bc8cff"/>
+    <text x="810" y="208" text-anchor="middle" fill="#c9d1d9" font-size="11">IDENTITY 立即 INSERT</text>
+    <text x="810" y="222" text-anchor="middle" fill="#8b949e" font-size="10">无法批处理</text>
+    <rect x="710" y="244" width="200" height="44" rx="7" fill="#0d1117" stroke="#bc8cff"/>
+    <text x="810" y="262" text-anchor="middle" fill="#c9d1d9" font-size="11">JPQL 等同 SQL</text>
+    <text x="810" y="276" text-anchor="middle" fill="#8b949e" font-size="10">方言切换行为漂移</text>
+
+    <!-- arrows root -> categories -->
+    <path d="M 460 62 L 460 86 L 130 86 L 130 106" stroke="#8b949e" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 62 L 460 86 L 360 86 L 360 106" stroke="#8b949e" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 62 L 460 86 L 590 86 L 590 106" stroke="#8b949e" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 62 L 460 86 L 820 86 L 820 106" stroke="#8b949e" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+
+    <!-- category -> items -->
+    <path d="M 130 150 L 130 190" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 360 150 L 360 190" stroke="#3fb950" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 590 150 L 590 190" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 820 150 L 820 190" stroke="#bc8cff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+
+    <text x="460" y="332" text-anchor="middle" fill="#8b949e" font-size="11" font-weight="bold">7 类常见入口陷阱(详见表 1-8-1)</text>
+    <text x="460" y="352" text-anchor="middle" fill="#8b949e" font-size="10">监控指标 + 单元测试断言 = 两条防线,缺一不可</text>
+  </svg>
+</div>
+
+<h3>表 1-8-1 · 七类陷阱明细</h3>
+
+<table>
+<thead><tr><th>#</th><th>陷阱</th><th>典型症状</th><th>根因</th><th>修复</th><th>监控指标</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>EMF 重复创建</td><td>启动慢,连接池反复初始化</td><td>EMF 是重量级单例</td><td>应用启动时单例化</td><td>EMF init 日志计数</td></tr>
+<tr><td>2</td><td>EM 跨线程</td><td>随机异常,数据串扰</td><td>EM 与 PC 非线程安全</td><td>每请求一个 EM</td><td>异常 / 并发错乱</td></tr>
+<tr><td>3</td><td>flush ≠ commit</td><td>数据未生效</td><td>flush 仅发送 SQL</td><td>区分两者语义</td><td>事务统计</td></tr>
+<tr><td>4</td><td>IDENTITY 误解</td><td>persist 立即出 INSERT</td><td>主键策略约束</td><td>批量场景改 SEQUENCE</td><td>SQL 计数</td></tr>
+<tr><td>5</td><td>JPQL 等同 SQL</td><td>方言切换后行为变化</td><td>Provider 按方言渲染</td><td>关键查询集成测试</td><td>查询审计</td></tr>
+<tr><td>6</td><td>长事务持锁</td><td>连接池告罄</td><td>事务跨网络 / IO 边界</td><td>拆分事务边界</td><td>连接占用时长</td></tr>
+<tr><td>7</td><td>一级缓存幻读</td><td>修改后看似未生效</td><td>PC Identity Map</td><td>em.refresh / em.clear</td><td>PC 命中分析</td></tr>
+</tbody>
+</table>
+
+<h3>1.8.1 反例与修复</h3>
+
+<div class="compare-grid">
+<div class="compare-bad">
+<p><strong>每次方法调用都创建 EMF</strong></p>
+<pre><code class="language-java">public Customer wrongFind(Long id) {
+    EntityManagerFactory emf =
+        Persistence.createEntityManagerFactory("demoPU");
+    EntityManager em = emf.createEntityManager();
+    return em.find(Customer.class, id);
+}</code></pre>
+<p>执行日志中重复出现 <code>Processing PersistenceUnitInfo</code> 与 <code>Hibernate ORM core version</code>,启动开销在每次调用中累积。</p>
+</div>
+<div class="compare-good">
+<p><strong>EMF 静态单例化</strong></p>
+<pre><code class="language-java">public final class JpaBootstrap {
+    private static final EntityManagerFactory EMF =
+        Persistence.createEntityManagerFactory("demoPU");
+
+    private JpaBootstrap() {}
+
+    public static EntityManager createEntityManager() {
+        return EMF.createEntityManager();
+    }
+
+    public static void shutdown() {
+        EMF.close();
+    }
+}</code></pre>
+<p>Spring Boot 项目中由容器管理,无需手动单例。</p>
+</div>
+</div>
+
+<h2 id="s1-9">1.9 源码深潜</h2>
+
+<p>Hibernate 启动流程从 <code>jakarta.persistence.Persistence</code> 静态入口起步,经过 <code>HibernatePersistenceProvider</code> → <code>EntityManagerFactoryBuilderImpl</code> → <code>SessionFactoryImpl</code> 最终包装为 JPA EMF。理解这条链路有助于排查启动异常与元数据扫描问题。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 1-9-1 · Hibernate 启动调用链(8 步)</div>
+  <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <!-- step 1 -->
+    <rect x="240" y="14" width="440" height="46" rx="9" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="34" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">① jakarta.persistence</text>
+    <text x="460" y="50" text-anchor="middle" fill="#c9d1d9" font-size="12">Persistence.createEntityManagerFactory("demoPU")</text>
+
+    <!-- step 2 -->
+    <rect x="200" y="84" width="520" height="46" rx="9" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="460" y="104" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">② org.hibernate.jpa</text>
+    <text x="460" y="120" text-anchor="middle" fill="#c9d1d9" font-size="12">HibernatePersistenceProvider.createEntityManagerFactory</text>
+
+    <!-- step 3 -->
+    <rect x="240" y="154" width="440" height="46" rx="9" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="460" y="174" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">③ org.hibernate.jpa.boot.internal</text>
+    <text x="460" y="190" text-anchor="middle" fill="#c9d1d9" font-size="12">EntityManagerFactoryBuilderImpl</text>
+
+    <!-- step 4-6 row: 3 boxes -->
+    <rect x="40"  y="224" width="260" height="50" rx="9" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="170" y="244" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">④ MetadataSources 扫描</text>
+    <text x="170" y="262" text-anchor="middle" fill="#c9d1d9" font-size="11">读取 @Entity / orm.xml</text>
+
+    <rect x="330" y="224" width="260" height="50" rx="9" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="460" y="244" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">⑤ Metadata 构建</text>
+    <text x="460" y="262" text-anchor="middle" fill="#c9d1d9" font-size="11">构建 EntityPersister</text>
+
+    <rect x="620" y="224" width="260" height="50" rx="9" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="750" y="244" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">⑥ SessionFactoryBuilderImpl</text>
+    <text x="750" y="262" text-anchor="middle" fill="#c9d1d9" font-size="11">应用 service / 设置</text>
+
+    <!-- step 7 -->
+    <rect x="240" y="304" width="440" height="50" rx="9" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="460" y="324" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">⑦ org.hibernate.internal</text>
+    <text x="460" y="342" text-anchor="middle" fill="#c9d1d9" font-size="12">SessionFactoryImpl(Hibernate 会话工厂)</text>
+
+    <!-- step 8 -->
+    <rect x="240" y="384" width="440" height="50" rx="9" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="460" y="404" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">⑧ 包装并返回</text>
+    <text x="460" y="422" text-anchor="middle" fill="#c9d1d9" font-size="12">EntityManagerFactoryImpl → JPA EMF</text>
+
+    <!-- arrows -->
+    <path d="M 460 60  L 460 84"  stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 130 L 460 154" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 380 200 L 170 224" stroke="#8b949e" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 200 L 460 224" stroke="#8b949e" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M 540 200 L 750 224" stroke="#8b949e" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M 170 274 L 420 304" stroke="#8b949e" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 274 L 460 304" stroke="#8b949e" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M 750 274 L 500 304" stroke="#8b949e" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 354 L 460 384" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<h3>表 1-9-1 · 核心源码入口</h3>
+
+<table>
+<thead><tr><th>文件 / 类</th><th>职责</th></tr></thead>
+<tbody>
+<tr><td><code>jakarta.persistence.Persistence</code></td><td>JPA 静态入口</td></tr>
+<tr><td><code>HibernatePersistenceProvider</code></td><td>Hibernate 实现入口</td></tr>
+<tr><td><code>EntityManagerFactoryBuilderImpl</code></td><td>EMF 构建器</td></tr>
+<tr><td><code>MetadataSources</code></td><td>实体元数据收集</td></tr>
+<tr><td><code>SessionFactoryImpl</code></td><td>Hibernate 会话工厂</td></tr>
+<tr><td><code>EntityManagerFactoryImpl</code></td><td>JPA EMF 包装</td></tr>
+<tr><td><code>SessionImpl</code></td><td>EntityManager 实现</td></tr>
+<tr><td><code>StatefulPersistenceContext</code></td><td>PersistenceContext 实现</td></tr>
+<tr><td><code>ActionQueue</code></td><td>待 flush 的 SQL 操作队列</td></tr>
+<tr><td><code>MutationExecutor</code></td><td>INSERT / UPDATE / DELETE 执行器</td></tr>
+</tbody>
+</table>
+
+<h3>1.9.1 设计取舍</h3>
+
+<h4>取舍 1:状态机分层</h4>
+<p>JPA 将"对象状态"与"SQL 执行"显式分离。对象状态由 PC 维护,SQL 执行由 Provider 控制。该分离使得脏检查与批处理成为可能,代价是开发者必须理解状态切换与 SQL 时序之间的间接关系。直接调用 INSERT / UPDATE 的传统 DAO 模式简化了心智模型,但失去了批处理优化、一级缓存、级联与脏检查的运行时支持。</p>
+
+<h4>取舍 2:JPQL 中间层</h4>
+<p>JPQL 引入 AST 中间表示,使得不同方言可共享语法解析与查询优化逻辑。代价是 JPQL 与底层 SQL 语义并非完全对应:<code>fetch join</code> 在 JPQL 中是显式语法,在 SQL 中需结合具体方言渲染;子查询、窗口函数等高级特性在 JPQL 中支持有限。Native Query 与 Criteria API 是补充入口,本书第 9-10 章详细讨论。</p>
+
+<h4>取舍 3:RESOURCE_LOCAL 与 JTA</h4>
+<p>RESOURCE_LOCAL 由 EntityManager 自身管理事务,适用于单数据源场景;JTA 由容器管理,支持多数据源 XA 事务。容器化部署中默认采用 JTA,但 XA 协议引入两阶段提交开销。Spring Boot 默认采用单数据源 + RESOURCE_LOCAL 模拟,保留事务管理器抽象,该方案在多数业务场景下性能与一致性兼得。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 1-9-2 · 被拒绝 / 折衷 / 已采纳的演进路线</div>
+  <svg viewBox="0 0 920 300" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <!-- 拒绝 -->
+    <rect x="20" y="30" width="280" height="240" rx="11" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="160" y="56" text-anchor="middle" fill="#f85149" font-size="13" font-weight="bold">❌ 被拒绝</text>
+    <text x="160" y="74" text-anchor="middle" fill="#f85149" font-size="12">DAO 直写 SQL</text>
+    <line x1="40" y1="86" x2="280" y2="86" stroke="#f85149" stroke-width="1" stroke-dasharray="3 3"/>
+    <text x="40"  y="108" fill="#c9d1d9" font-size="11">优点</text>
+    <text x="60"  y="124" fill="#8b949e" font-size="10">• 心智模型最简单</text>
+    <text x="40"  y="146" fill="#c9d1d9" font-size="11">缺点</text>
+    <text x="60"  y="162" fill="#8b949e" font-size="10">• 无脏检查 / 无批处理</text>
+    <text x="60"  y="178" fill="#8b949e" font-size="10">• 无一级缓存</text>
+    <text x="60"  y="194" fill="#8b949e" font-size="10">• 无级联 / 无懒加载</text>
+    <text x="60"  y="210" fill="#8b949e" font-size="10">• SQL 散落各处难维护</text>
+    <text x="160" y="246" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">代价 &gt; 收益</text>
+
+    <!-- 折衷 -->
+    <rect x="320" y="30" width="280" height="240" rx="11" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="460" y="56" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">⚖ 折衷</text>
+    <text x="460" y="74" text-anchor="middle" fill="#d29922" font-size="12">JPQL 中间层</text>
+    <line x1="340" y1="86" x2="580" y2="86" stroke="#d29922" stroke-width="1" stroke-dasharray="3 3"/>
+    <text x="340" y="108" fill="#c9d1d9" font-size="11">优点</text>
+    <text x="360" y="124" fill="#8b949e" font-size="10">• 方言无关 / 优化共享</text>
+    <text x="360" y="140" fill="#8b949e" font-size="10">• AST 可复用</text>
+    <text x="340" y="162" fill="#c9d1d9" font-size="11">缺点</text>
+    <text x="360" y="178" fill="#8b949e" font-size="10">• 窗口函数支持有限</text>
+    <text x="360" y="194" fill="#8b949e" font-size="10">• 复杂查询表达力受限</text>
+    <text x="340" y="216" fill="#c9d1d9" font-size="11">补充</text>
+    <text x="360" y="232" fill="#8b949e" font-size="10">• NativeQuery / Criteria</text>
+    <text x="460" y="258" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">已采纳(章 9-10 详述)</text>
+
+    <!-- 采纳 -->
+    <rect x="620" y="30" width="280" height="240" rx="11" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="760" y="56" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">✓ 已采纳</text>
+    <text x="760" y="74" text-anchor="middle" fill="#3fb950" font-size="12">状态机 + AST + 双事务模型</text>
+    <line x1="640" y1="86" x2="880" y2="86" stroke="#3fb950" stroke-width="1" stroke-dasharray="3 3"/>
+    <text x="640" y="108" fill="#c9d1d9" font-size="11">核心</text>
+    <text x="660" y="124" fill="#8b949e" font-size="10">• 状态机:对象 ↔ SQL 解耦</text>
+    <text x="660" y="140" fill="#8b949e" font-size="10">• AST:方言可替换</text>
+    <text x="660" y="156" fill="#8b949e" font-size="10">• RL / JTA:单 / 多数据源</text>
+    <text x="640" y="180" fill="#c9d1d9" font-size="11">能力</text>
+    <text x="660" y="196" fill="#8b949e" font-size="10">• 脏检查 + 批处理</text>
+    <text x="660" y="212" fill="#8b949e" font-size="10">• 一级 / 二级缓存</text>
+    <text x="660" y="228" fill="#8b949e" font-size="10">• 级联 + 懒加载</text>
+    <text x="760" y="258" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">JPA 规范最终形态</text>
+  </svg>
+</div>
+
+<h2 id="s1-summary">1.10 本章要点</h2>
+
+<div class="chapter-summary">
+
+<table>
+<thead><tr><th>要点</th><th>源码 / API 依据</th><th>易错点</th></tr></thead>
+<tbody>
+<tr><td>JPA 由状态机 / SQL 生成器 / 事务协调器三类职责构成</td><td><code>EntityManager</code> API</td><td>仅记 API 不理解状态</td></tr>
+<tr><td><code>persist</code> 改变状态,SQL 由 flush 触发</td><td><code>StatefulPersistenceContext</code></td><td>误以为 persist 立即 INSERT</td></tr>
+<tr><td>脏检查由 Snapshot 与字段对比实现</td><td><code>EntityEntry.loadedState</code></td><td>误以为需手动 save</td></tr>
+<tr><td>EMF 单例,EM 请求级,Tx 跟随 EM</td><td><code>HibernatePersistenceProvider</code></td><td>EM 跨线程导致并发错乱</td></tr>
+<tr><td>PC 是一级缓存,基于 Identity Map</td><td><code>StatefulPersistenceContext</code></td><td>误以为查不到新数据</td></tr>
+<tr><td>flush 仅发送 SQL,commit 才提交事务</td><td><code>EntityTransaction.commit</code></td><td>flush 后 rollback 仍可撤销</td></tr>
+<tr><td>JPQL 由 Provider 按方言渲染</td><td><code>SqlAstTranslator</code></td><td>跨库分页与函数差异</td></tr>
+<tr><td>配置入口决定 Provider 与连接池</td><td><code>persistence.xml</code> / yml</td><td>DDL auto 在生产环境的风险</td></tr>
+</tbody>
+</table>
+
+<h3>最小回归用例</h3>
+
+<pre><code class="language-java">tx.begin();
+Customer c = new Customer("C1004", "dave@example.com");
+em.persist(c);
+em.flush();
+Long generatedId = c.getId();
+tx.rollback();
+
+em.clear();
+tx.begin();
+Long count = em.createQuery(
+    "select count(c) from Customer c where c.email = :email", Long.class)
+    .setParameter("email", "dave@example.com")
+    .getSingleResult();
+tx.commit();</code></pre>
+
+<p>期望输出:</p>
+
+<pre><code class="language-text">[SQL] insert into customers (email, name, id) values (?, ?, default)
+[generatedId] 4
+[ROLLBACK]
+[SQL] select count(c1_0.id) from customers c1_0 where c1_0.email=?
+[count] 0</code></pre>
+
+<p>执行日志中 INSERT 在 flush 时发出,rollback 阶段数据库撤销。后续 count 查询返回 0,验证 <strong>flush 不等于 commit</strong>。</p>
+
+<h3>本章收尾</h3>
+<p>下一章讨论<strong>实体生命周期</strong>。本章建立了"状态决定 SQL"的抽象,下一章将状态机展开为 Transient / Managed / Detached / Removed 的精确转换图,并给出每种 API 调用对应的状态轨迹与 SQL 时序。再后面的章节按"<strong>映射 → 关系 → 查询 → 性能 → 事务 → 生产</strong>"五大主题层层下钻——每次你看到 N+1、二级缓存、批处理、乐观锁这些具体话题时,都会回到本章建立的"<strong>状态机 + SQL 生成器 + 事务协调器</strong>"心智模型。</p>
+
+<p class="next-hint">下一章:<a href="02-entity-lifecycle.html">第 2 章 · 实体生命周期与状态机 →</a></p>
+
+</div>
+
+<div class="chapter-nav">
+  <a href="index.html">← 返回目录</a>
+  <a href="02-entity-lifecycle.html">第 2 章 实体生命周期 →</a>
+</div>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script>hljs.highlightAll();</script>
+
+</body>
+</html>

@@ -1,0 +1,818 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 8 章 · CTE 与集合操作 — 图解 Blaze-Persistence</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html">📖 图解 Blaze-Persistence</a>
+  <span class="sep">|</span>
+  <a href="ch07-join.html">← 第 7 章 · JOIN 与关联策略</a>
+  <span class="sep">|</span>
+  <a href="ch09-window.html">第 9 章 · 窗口函数与高级表达式 →</a>
+</nav>
+
+<aside class="toc">
+  <a href="#intro">章节导读</a>
+  <a href="#s8-1">8.1 CTE 基本概念</a>
+  <a href="#s8-1-1" class="depth-2">SQL 中的 CTE</a>
+  <a href="#s8-1-2" class="depth-2">JPA 的缺失与弥补</a>
+  <a href="#s8-2">8.2 CTE 实体定义</a>
+  <a href="#s8-2-1" class="depth-2">@CTE 注解</a>
+  <a href="#s8-2-2" class="depth-2">实体结构对比</a>
+  <a href="#s8-3">8.3 CTE 查询构建</a>
+  <a href="#s8-3-1" class="depth-2">with() API</a>
+  <a href="#s8-3-2" class="depth-2">完整示例</a>
+  <a href="#s8-4">8.4 递归 CTE</a>
+  <a href="#s8-4-1" class="depth-2">递归结构</a>
+  <a href="#s8-4-2" class="depth-2">循环检测</a>
+  <a href="#s8-5">8.5 集合操作</a>
+  <a href="#s8-5-1" class="depth-2">UNION / INTERSECT / EXCEPT</a>
+  <a href="#s8-5-2" class="depth-2">API 实战</a>
+  <a href="#s8-6">8.6 数据库支持矩阵</a>
+  <a href="#s8-7">8.7 陷阱与限制</a>
+  <a href="#summary">本章小结</a>
+</aside>
+
+<article class="article">
+
+<h1>第 8 章 · CTE 与集合操作</h1>
+<p class="subtitle">CTE · 递归 CTE · UNION · INTERSECT · EXCEPT · JPA 增强</p>
+
+<!-- ============================================================ -->
+<!-- CHAPTER INTRO                                                 -->
+<!-- ============================================================ -->
+<div class="chapter-intro" id="intro">
+  <p class="lead">
+    SQL 的 <code>WITH</code> 子句（Common Table Expression）是编写复杂查询的利器：
+    它把中间结果命名为临时表，让主查询逻辑清晰分层。然而 JPA / JPQL 规范完全不支持 CTE，
+    也不支持 <code>UNION</code> 等集合操作。本章演示 Blaze-Persistence 如何在 JPA 之上
+    补齐这两块关键拼图。
+  </p>
+  <ul class="will-learn">
+    <li>理解 CTE 在 SQL 中的定位以及 JPA 的缺失原因</li>
+    <li>用 <code>@CTE</code> 注解定义 CTE 实体并绑定子查询</li>
+    <li>掌握 <code>with()</code> API 构建 CTE 查询</li>
+    <li>实现递归 CTE（组织树、分类层级）</li>
+    <li>使用 UNION / INTERSECT / EXCEPT 组合查询结果</li>
+    <li>了解不同数据库对 CTE 和集合操作的支持情况</li>
+  </ul>
+  <p class="prereq">前置阅读：<a href="ch03-criteria.html">第 3 章 · CriteriaBuilder 查询引擎</a></p>
+</div>
+
+<!-- ============================================================ -->
+<!-- 8.1 CTE 基本概念                                              -->
+<!-- ============================================================ -->
+<h2 id="s8-1">8.1 CTE 基本概念</h2>
+
+<h3 id="s8-1-1">SQL 中的 CTE</h3>
+<p>
+  Common Table Expression（CTE）通过 <code>WITH</code> 关键字将子查询定义为具名临时结果集，
+  在主查询中可像表一样引用。它的最大价值在于<strong>消除子查询嵌套</strong>，
+  把"由内到外"的阅读顺序改为"从上到下"。
+</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-1 · CTE 将嵌套子查询展开为线性结构</div>
+  <svg viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg" style="width:100%;max-width:900px;margin:0 auto;display:block" font-family="Inter,'Microsoft YaHei',system-ui,sans-serif">
+    <rect width="900" height="300" rx="12" fill="#0d1117"/>
+    <!-- Left: nested subquery -->
+    <rect x="20" y="16" width="390" height="268" rx="10" fill="none" stroke="#f85149" stroke-width="1.5"/>
+    <rect x="20" y="16" width="390" height="36" rx="10" fill="#f8514920"/>
+    <text x="215" y="40" text-anchor="middle" font-size="15" font-weight="700" fill="#f85149">❌ 嵌套子查询</text>
+    <rect x="44" y="68" width="342" height="140" rx="8" fill="#3a1a1a" stroke="#f85149" stroke-width="1"/>
+    <text x="215" y="96" text-anchor="middle" font-size="13" fill="#e6edf3">SELECT ... FROM (</text>
+    <text x="215" y="118" text-anchor="middle" font-size="13" fill="#e6edf3">  SELECT ... FROM (</text>
+    <text x="215" y="140" text-anchor="middle" font-size="13" fill="#e6edf3">    SELECT ... FROM t3</text>
+    <text x="215" y="162" text-anchor="middle" font-size="13" fill="#e6edf3">  ) JOIN t2</text>
+    <text x="215" y="184" text-anchor="middle" font-size="13" fill="#e6edf3">) JOIN t1</text>
+    <rect x="80" y="222" width="230" height="36" rx="6" fill="#3d0f0f" stroke="#f85149" stroke-width="1"/>
+    <text x="195" y="245" text-anchor="middle" font-size="13" font-weight="600" fill="#f87171">由内到外阅读 · 嵌套 3 层</text>
+    <!-- VS -->
+    <circle cx="450" cy="150" r="24" fill="#161b22" stroke="#e6edf3" stroke-width="2"/>
+    <text x="450" y="156" text-anchor="middle" font-size="14" font-weight="800" fill="#e6edf3">VS</text>
+    <!-- Right: CTE -->
+    <rect x="490" y="16" width="390" height="268" rx="10" fill="none" stroke="#3fb950" stroke-width="1.5"/>
+    <rect x="490" y="16" width="390" height="36" rx="10" fill="#3fb95020"/>
+    <text x="685" y="40" text-anchor="middle" font-size="15" font-weight="700" fill="#3fb950">✅ CTE 线性展开</text>
+    <rect x="514" y="68" width="342" height="36" rx="8" fill="#0b1c0b" stroke="#3fb950" stroke-width="1"/>
+    <text x="685" y="91" text-anchor="middle" font-size="13" fill="#e6edf3">WITH step1 AS (SELECT ... FROM t3)</text>
+    <line x1="685" y1="104" x2="685" y2="120" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arrow8g)"/>
+    <rect x="514" y="120" width="342" height="36" rx="8" fill="#0b1c0b" stroke="#3fb950" stroke-width="1"/>
+    <text x="685" y="143" text-anchor="middle" font-size="13" fill="#e6edf3">step2 AS (... FROM step1 JOIN t2)</text>
+    <line x1="685" y1="156" x2="685" y2="172" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arrow8g)"/>
+    <rect x="514" y="172" width="342" height="36" rx="8" fill="#0b1c0b" stroke="#3fb950" stroke-width="1"/>
+    <text x="685" y="195" text-anchor="middle" font-size="13" fill="#e6edf3">SELECT ... FROM step2 JOIN t1</text>
+    <rect x="550" y="222" width="270" height="36" rx="6" fill="#0b2b0b" stroke="#3fb950" stroke-width="1"/>
+    <text x="685" y="245" text-anchor="middle" font-size="13" font-weight="600" fill="#4ade80">自上而下 · 线性结构</text>
+    <defs><marker id="arrow8g" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#3fb950"/></marker></defs>
+  </svg>
+</div>
+
+<h3 id="s8-1-2">JPA 为何不支持 CTE</h3>
+<p>
+  JPQL 的设计哲学是<strong>面向对象查询语言</strong>——它操作的是实体与关联路径，
+  而 CTE 本质是一种临时的"匿名表"，不属于 JPA 的实体元模型。因此 JPA 2.x 和
+  Jakarta Persistence 3.x 规范均未引入 CTE 支持。
+</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-2 · Blaze-Persistence CTE 渲染管线</div>
+  <div class="mermaid">
+flowchart TD
+    A["开发者: with(CTE.class)<br/>.bind('col').select(...)"] --> B["CriteriaBuilder<br/>注册 CTE 定义"]
+    B --> C["主查询引用 CTE 实体"]
+    C --> D["JPQL 生成管线"]
+    D --> E{"目标数据库<br/>支持 CTE?"}
+    E -- "是" --> F["WITH cte AS (...)<br/>SELECT ... FROM cte"]
+    E -- "否" --> G["内联子查询<br/>回退策略"]
+    F --> H["执行 SQL"]
+    G --> H
+    style A fill:#1e3a5f,stroke:#58a6ff
+    style B fill:#2d1f4e,stroke:#bc8cff
+    style D fill:#2d1f4e,stroke:#bc8cff
+    style F fill:#1a3a2a,stroke:#3fb950
+    style G fill:#3a2a1a,stroke:#d29922
+    style H fill:#1a3a2a,stroke:#3fb950
+  </div>
+</div>
+
+<div class="key-insight">
+  <strong>核心思路：</strong>Blaze-Persistence 把 CTE 建模为一种特殊的 JPA 实体（<code>@CTE</code>），
+  在 JPQL 生成阶段将其翻译为原生 SQL 的 <code>WITH</code> 子句——JPA Provider 只看到最终 SQL，
+  完全不感知 CTE 的存在。
+</div>
+
+<!-- ============================================================ -->
+<!-- 8.2 CTE 实体定义                                              -->
+<!-- ============================================================ -->
+<h2 id="s8-2">8.2 CTE 实体定义</h2>
+
+<h3 id="s8-2-1">@CTE 注解</h3>
+<p>
+  要使用 CTE，首先需要定义一个 <strong>CTE 实体类</strong>。
+  它用 <code>@CTE</code> 注解标记，看起来像普通 JPA 实体，但并不映射到真实数据库表。
+  CTE 实体的字段定义了 CTE 的"列"——主查询通过这些字段引用 CTE 结果。
+</p>
+
+<pre><code><span style="color:#bc8cff">@CTE</span>                          <span style="color:#8b949e">// Blaze-Persistence 标记</span>
+<span style="color:#bc8cff">@Entity</span>                       <span style="color:#8b949e">// JPA 要求</span>
+<span style="color:#ff7b72">public class</span> <span style="color:#58a6ff">TopCustomerCTE</span> {
+
+    <span style="color:#bc8cff">@Id</span>
+    <span style="color:#ff7b72">private</span> Long customerId;
+
+    <span style="color:#ff7b72">private</span> BigDecimal totalAmount;
+
+    <span style="color:#ff7b72">private</span> Long orderCount;
+
+    <span style="color:#8b949e">// getters & setters ...</span>
+}</code></pre>
+
+<h3 id="s8-2-2">CTE 实体 vs 普通实体</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-3 · CTE 实体与普通实体结构对比</div>
+  <div class="mermaid">
+classDiagram
+    class Customer {
+        &lt;&lt;Entity&gt;&gt;
+        +Long id
+        +String name
+        +String email
+        +List~Order~ orders
+        真实数据库表 customer
+    }
+    class Order {
+        &lt;&lt;Entity&gt;&gt;
+        +Long id
+        +BigDecimal amount
+        +LocalDate orderDate
+        +Customer customer
+        真实数据库表 orders
+    }
+    class TopCustomerCTE {
+        &lt;&lt;CTE Entity&gt;&gt;
+        +Long customerId
+        +BigDecimal totalAmount
+        +Long orderCount
+        无真实表 - 运行时 WITH 子句
+    }
+    Customer "1" --> "*" Order : has
+    TopCustomerCTE ..> Customer : 引用 customerId
+    TopCustomerCTE ..> Order : 聚合 amount/count
+
+    style TopCustomerCTE fill:#2d1f4e,stroke:#bc8cff
+    style Customer fill:#1e3a5f,stroke:#58a6ff
+    style Order fill:#1e3a5f,stroke:#58a6ff
+  </div>
+</div>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <p>JPA 无法表达"临时表"概念。要在纯 JPQL 中实现类似效果，只能写嵌套子查询或多次查询后在 Java 内存中拼合。</p>
+  </div>
+  <div class="compare-good">
+    <p>Blaze-Persistence 的 <code>@CTE</code> 实体让"WITH 子句"成为一等公民，
+    在编译期提供类型安全的列绑定。</p>
+  </div>
+</div>
+
+<div class="os-note">
+  <strong>注册要求：</strong>CTE 实体必须像普通 JPA 实体一样注册到 <code>persistence.xml</code>
+  （或 Spring Boot 的实体扫描路径中），否则 Blaze-Persistence 无法识别它。
+</div>
+
+<!-- ============================================================ -->
+<!-- 8.3 CTE 查询构建                                              -->
+<!-- ============================================================ -->
+<h2 id="s8-3">8.3 CTE 查询构建</h2>
+
+<h3 id="s8-3-1">with() API 工作流</h3>
+<p>
+  CTE 查询的核心 API 是 <code>with(CTEEntity.class)</code>。调用后进入 CTE 绑定模式，
+  使用 <code>.bind("column")</code> 将 CTE 实体的各列绑定到子查询的 SELECT 项。
+</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-4 · CTE 查询构建时序</div>
+  <div class="mermaid">
+sequenceDiagram
+    participant Dev as 开发者
+    participant CB as CriteriaBuilder
+    participant CTE as CTE 注册器
+    participant SQL as SQL 渲染器
+
+    Dev->>CB: cbf.create(em, Customer.class)
+    Dev->>CB: .with(TopCustomerCTE.class)
+    CB->>CTE: 注册 CTE 定义
+    Dev->>CTE: .from(Order.class, "o")
+    Dev->>CTE: .bind("customerId").select("o.customer.id")
+    Dev->>CTE: .bind("totalAmount").select("SUM(o.amount)")
+    Dev->>CTE: .bind("orderCount").select("COUNT(o.id)")
+    Dev->>CTE: .groupBy("o.customer.id")
+    CTE-->>CB: CTE 绑定完成（end）
+    Dev->>CB: 主查询: .from(TopCustomerCTE.class)
+    Dev->>CB: .where("totalAmount").gt(10000)
+    Dev->>CB: .getResultList()
+    CB->>SQL: 合并 CTE + 主查询
+    SQL-->>Dev: WITH top_cust AS (...) SELECT ...
+  </div>
+</div>
+
+<h3 id="s8-3-2">完整代码示例</h3>
+<p>以下示例查询"订单总金额超过 10000 的顶级客户"：</p>
+
+<pre><code>CriteriaBuilder&lt;Customer&gt; cb = cbf.create(em, Customer.class);
+
+<span style="color:#8b949e">// Step 1: 定义 CTE —— 按客户汇总订单</span>
+cb.with(TopCustomerCTE.class)
+    .from(Order.class, <span style="color:#a5d6ff">"o"</span>)
+    .bind(<span style="color:#a5d6ff">"customerId"</span>).select(<span style="color:#a5d6ff">"o.customer.id"</span>)
+    .bind(<span style="color:#a5d6ff">"totalAmount"</span>).select(<span style="color:#a5d6ff">"SUM(o.amount)"</span>)
+    .bind(<span style="color:#a5d6ff">"orderCount"</span>).select(<span style="color:#a5d6ff">"COUNT(o.id)"</span>)
+    .groupBy(<span style="color:#a5d6ff">"o.customer.id"</span>)
+  .end();
+
+<span style="color:#8b949e">// Step 2: 主查询引用 CTE 进行过滤</span>
+cb.from(TopCustomerCTE.class, <span style="color:#a5d6ff">"tc"</span>)
+  .innerJoinOn(Customer.class, <span style="color:#a5d6ff">"c"</span>)
+    .on(<span style="color:#a5d6ff">"c.id"</span>).eqExpression(<span style="color:#a5d6ff">"tc.customerId"</span>)
+  .end()
+  .where(<span style="color:#a5d6ff">"tc.totalAmount"</span>).gt(<span style="color:#79c0ff">10000</span>)
+  .orderByDesc(<span style="color:#a5d6ff">"tc.totalAmount"</span>);
+
+List&lt;Customer&gt; topCustomers = cb.getResultList();</code></pre>
+
+<p>生成的 SQL：</p>
+<pre><code><span style="color:#ff7b72">WITH</span> top_cust <span style="color:#ff7b72">AS</span> (
+    <span style="color:#ff7b72">SELECT</span> o.customer_id, <span style="color:#79c0ff">SUM</span>(o.amount), <span style="color:#79c0ff">COUNT</span>(o.id)
+    <span style="color:#ff7b72">FROM</span> orders o
+    <span style="color:#ff7b72">GROUP BY</span> o.customer_id
+)
+<span style="color:#ff7b72">SELECT</span> c.*
+<span style="color:#ff7b72">FROM</span> top_cust tc
+<span style="color:#ff7b72">JOIN</span> customer c <span style="color:#ff7b72">ON</span> c.id = tc.customer_id
+<span style="color:#ff7b72">WHERE</span> tc.total_amount &gt; 10000
+<span style="color:#ff7b72">ORDER BY</span> tc.total_amount <span style="color:#ff7b72">DESC</span></code></pre>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-5 · CTE 数据流：从原始表到最终结果</div>
+  <div class="mermaid">
+flowchart LR
+    subgraph 原始数据
+        T_ORD["orders 表<br/>100,000 行"]
+        T_CUST["customer 表<br/>5,000 行"]
+    end
+    subgraph CTE ["WITH top_cust AS (...)"]
+        AGG["GROUP BY customer_id<br/>SUM(amount) / COUNT(id)"]
+    end
+    subgraph 主查询
+        FILT["WHERE total_amount > 10000"]
+        JOIN["JOIN customer"]
+        RES["结果集<br/>Top 客户列表"]
+    end
+    T_ORD --> AGG
+    AGG --> FILT
+    FILT --> JOIN
+    T_CUST --> JOIN
+    JOIN --> RES
+    style AGG fill:#2d1f4e,stroke:#bc8cff
+    style FILT fill:#1a3a2a,stroke:#3fb950
+    style RES fill:#1e3a5f,stroke:#58a6ff
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- 8.4 递归 CTE                                                  -->
+<!-- ============================================================ -->
+<h2 id="s8-4">8.4 递归 CTE</h2>
+
+<h3 id="s8-4-1">递归 CTE 的结构</h3>
+<p>
+  递归 CTE 由两部分组成：<strong>基础查询</strong>（锚点）和<strong>递归查询</strong>，
+  通过 <code>UNION ALL</code> 连接。每次递归迭代将上一轮的结果作为输入，直到不再产生新行。
+  这是遍历层级数据（组织架构、分类树、BOM 物料清单）的标准技术。
+</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-6 · 递归 CTE 执行模型</div>
+  <div class="mermaid">
+flowchart TD
+    START["递归 CTE 开始"] --> BASE["基础查询 (Anchor)<br/>SELECT root nodes<br/>WHERE parent_id IS NULL"]
+    BASE --> UNION["UNION ALL"]
+    UNION --> REC["递归查询<br/>SELECT children<br/>JOIN cte ON parent_id = cte.id"]
+    REC --> CHECK{"产生新行?"}
+    CHECK -- "是" --> UNION
+    CHECK -- "否" --> RESULT["最终结果集<br/>= 所有迭代行的并集"]
+    style BASE fill:#1a3a2a,stroke:#3fb950
+    style REC fill:#2d1f4e,stroke:#bc8cff
+    style RESULT fill:#1e3a5f,stroke:#58a6ff
+  </div>
+</div>
+
+<p>以组织架构为例——从 CEO 出发，递归展开所有下属：</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-7 · 组织架构树的递归展开过程</div>
+  <div style="display:flex;flex-wrap:wrap;gap:12px;justify-content:center;padding:16px 0;">
+    <div style="border:1px solid #3fb950;border-radius:8px;padding:12px 16px;min-width:140px;background:rgba(63,185,80,.08);text-align:center;">
+      <div style="font-weight:bold;color:#3fb950;margin-bottom:8px;font-size:13px;">第 0 轮: 基础查询</div>
+      <div style="color:#e6edf3;font-size:13px;">👤 CEO<br/>depth=0</div>
+    </div>
+    <span style="color:#8b949e;font-size:18px;align-self:center;">→</span>
+    <div style="border:1px solid #58a6ff;border-radius:8px;padding:12px 16px;min-width:160px;background:rgba(88,166,255,.08);text-align:center;">
+      <div style="font-weight:bold;color:#58a6ff;margin-bottom:8px;font-size:13px;">第 1 轮: 递归</div>
+      <div style="color:#e6edf3;font-size:13px;">👤 VP 研发 · 👤 VP 销售<br/>depth=1</div>
+    </div>
+    <span style="color:#8b949e;font-size:18px;align-self:center;">→</span>
+    <div style="border:1px solid #bc8cff;border-radius:8px;padding:12px 16px;min-width:180px;background:rgba(188,140,255,.08);text-align:center;">
+      <div style="font-weight:bold;color:#bc8cff;margin-bottom:8px;font-size:13px;">第 2 轮: 递归</div>
+      <div style="color:#e6edf3;font-size:13px;">👤 总监 A · 👤 总监 B · 👤 总监 C<br/>depth=2</div>
+    </div>
+    <span style="color:#8b949e;font-size:18px;align-self:center;">→</span>
+    <div style="border:1px solid #d29922;border-radius:8px;padding:12px 16px;min-width:160px;background:rgba(210,153,34,.08);text-align:center;">
+      <div style="font-weight:bold;color:#d29922;margin-bottom:8px;font-size:13px;">第 3 轮: 递归</div>
+      <div style="color:#e6edf3;font-size:13px;">👤 经理 1 · 👤 经理 2<br/>depth=3</div>
+    </div>
+  </div>
+</div>
+
+<p>首先定义 CTE 实体：</p>
+<pre><code><span style="color:#bc8cff">@CTE</span>
+<span style="color:#bc8cff">@Entity</span>
+<span style="color:#ff7b72">public class</span> <span style="color:#58a6ff">OrgHierarchyCTE</span> {
+    <span style="color:#bc8cff">@Id</span>
+    <span style="color:#ff7b72">private</span> Long employeeId;
+    <span style="color:#ff7b72">private</span> String employeeName;
+    <span style="color:#ff7b72">private</span> Long managerId;
+    <span style="color:#ff7b72">private</span> Integer depth;
+}</code></pre>
+
+<p>然后构建递归查询：</p>
+<pre><code>CriteriaBuilder&lt;OrgHierarchyCTE&gt; cb = cbf.create(em, OrgHierarchyCTE.class);
+
+cb.withRecursive(OrgHierarchyCTE.class)
+    <span style="color:#8b949e">// 基础查询: CEO（无上级）</span>
+    .from(Employee.class, <span style="color:#a5d6ff">"e"</span>)
+    .bind(<span style="color:#a5d6ff">"employeeId"</span>).select(<span style="color:#a5d6ff">"e.id"</span>)
+    .bind(<span style="color:#a5d6ff">"employeeName"</span>).select(<span style="color:#a5d6ff">"e.name"</span>)
+    .bind(<span style="color:#a5d6ff">"managerId"</span>).select(<span style="color:#a5d6ff">"e.manager.id"</span>)
+    .bind(<span style="color:#a5d6ff">"depth"</span>).select(<span style="color:#a5d6ff">"0"</span>)
+    .where(<span style="color:#a5d6ff">"e.manager"</span>).isNull()
+  <span style="color:#8b949e">// UNION ALL 连接递归部分</span>
+  .unionAll()
+    <span style="color:#8b949e">// 递归查询: 查找上一层结果的直接下属</span>
+    .from(Employee.class, <span style="color:#a5d6ff">"e"</span>)
+    .from(OrgHierarchyCTE.class, <span style="color:#a5d6ff">"parent"</span>)
+    .bind(<span style="color:#a5d6ff">"employeeId"</span>).select(<span style="color:#a5d6ff">"e.id"</span>)
+    .bind(<span style="color:#a5d6ff">"employeeName"</span>).select(<span style="color:#a5d6ff">"e.name"</span>)
+    .bind(<span style="color:#a5d6ff">"managerId"</span>).select(<span style="color:#a5d6ff">"e.manager.id"</span>)
+    .bind(<span style="color:#a5d6ff">"depth"</span>).select(<span style="color:#a5d6ff">"parent.depth + 1"</span>)
+    .where(<span style="color:#a5d6ff">"e.manager.id"</span>).eqExpression(<span style="color:#a5d6ff">"parent.employeeId"</span>)
+  .end();
+
+List&lt;OrgHierarchyCTE&gt; orgTree = cb.getResultList();</code></pre>
+
+<h3 id="s8-4-2">循环检测与深度限制</h3>
+
+<div class="warning">
+  <strong>无限递归风险：</strong>如果数据存在循环引用（例如 A 的上级是 B，B 的上级又是 A），
+  递归 CTE 将无限执行。不同数据库处理方式不同：
+</div>
+
+<table>
+<thead><tr><th>数据库</th><th>默认行为</th><th>限制手段</th></tr></thead>
+<tbody>
+  <tr>
+    <td><span class="provider-badge pg">PostgreSQL</span></td>
+    <td>无限递归直到 OOM</td>
+    <td><code>SET statement_timeout</code> 或应用层 <code>WHERE depth &lt; N</code></td>
+  </tr>
+  <tr>
+    <td><span class="provider-badge mysql">MySQL 8+</span></td>
+    <td>达到 <code>cte_max_recursion_depth</code> 后报错</td>
+    <td>默认 1000 次，可通过 <code>SET</code> 调整</td>
+  </tr>
+  <tr>
+    <td><span class="provider-badge oracle">Oracle</span></td>
+    <td>报 ORA-32044 错误</td>
+    <td><code>CYCLE</code> 子句检测循环</td>
+  </tr>
+  <tr>
+    <td><span class="provider-badge sqlserver">SQL Server</span></td>
+    <td>默认 100 次递归后报错</td>
+    <td><code>OPTION (MAXRECURSION N)</code></td>
+  </tr>
+</tbody>
+</table>
+
+<div class="key-insight">
+  <strong>最佳实践：</strong>在递归查询中始终加入 <code>depth</code> 字段并在
+  <code>WHERE</code> 中限制最大深度（如 <code>WHERE parent.depth &lt; 20</code>），
+  这比依赖数据库默认限制更可靠。
+</div>
+
+<!-- ============================================================ -->
+<!-- 8.5 集合操作                                                   -->
+<!-- ============================================================ -->
+<h2 id="s8-5">8.5 集合操作：UNION / INTERSECT / EXCEPT</h2>
+
+<h3 id="s8-5-1">四种集合操作</h3>
+<p>
+  集合操作将多个 SELECT 的结果按集合理论组合。JPA 规范同样不支持这些操作，
+  Blaze-Persistence 提供了完整的类型安全 API。
+</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-8 · 四种集合操作的语义</div>
+  <div style="display:flex;flex-wrap:wrap;gap:16px;justify-content:center;padding:16px 0;">
+    <div style="border:1px solid #3fb950;border-radius:8px;padding:14px 18px;min-width:190px;max-width:240px;background:rgba(63,185,80,.06);text-align:center;">
+      <div style="font-weight:bold;color:#3fb950;margin-bottom:6px;font-size:14px;">UNION ALL</div>
+      <div style="color:#e6edf3;font-size:13px;">集合 A: 1,2,3 &nbsp; 集合 B: 2,3,4</div>
+      <div style="color:#3fb950;font-size:12px;margin-top:6px;">结果: 1,2,3,2,3,4<br/>保留全部（含重复）</div>
+    </div>
+    <div style="border:1px solid #58a6ff;border-radius:8px;padding:14px 18px;min-width:190px;max-width:240px;background:rgba(88,166,255,.06);text-align:center;">
+      <div style="font-weight:bold;color:#58a6ff;margin-bottom:6px;font-size:14px;">UNION</div>
+      <div style="color:#e6edf3;font-size:13px;">集合 A: 1,2,3 &nbsp; 集合 B: 2,3,4</div>
+      <div style="color:#58a6ff;font-size:12px;margin-top:6px;">结果: 1,2,3,4<br/>去重合并</div>
+    </div>
+    <div style="border:1px solid #bc8cff;border-radius:8px;padding:14px 18px;min-width:190px;max-width:240px;background:rgba(188,140,255,.06);text-align:center;">
+      <div style="font-weight:bold;color:#bc8cff;margin-bottom:6px;font-size:14px;">INTERSECT</div>
+      <div style="color:#e6edf3;font-size:13px;">集合 A: 1,2,3 &nbsp; 集合 B: 2,3,4</div>
+      <div style="color:#bc8cff;font-size:12px;margin-top:6px;">结果: 2,3<br/>仅交集</div>
+    </div>
+    <div style="border:1px solid #d29922;border-radius:8px;padding:14px 18px;min-width:190px;max-width:240px;background:rgba(210,153,34,.06);text-align:center;">
+      <div style="font-weight:bold;color:#d29922;margin-bottom:6px;font-size:14px;">EXCEPT</div>
+      <div style="color:#e6edf3;font-size:13px;">集合 A: 1,2,3 &nbsp; 集合 B: 2,3,4</div>
+      <div style="color:#d29922;font-size:12px;margin-top:6px;">结果: 1<br/>A 中排除 B</div>
+    </div>
+  </div>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-9 · 集合操作 Venn 图示意</div>
+  <div style="display:flex;flex-wrap:wrap;gap:12px;justify-content:center;padding:16px 0;">
+    <div style="border:1px solid #58a6ff;border-radius:6px;padding:8px 14px;background:rgba(88,166,255,.06);color:#58a6ff;font-size:13px;">🔵 UNION = A ∪ B（全部元素，去重）</div>
+    <div style="border:1px solid #3fb950;border-radius:6px;padding:8px 14px;background:rgba(63,185,80,.06);color:#3fb950;font-size:13px;">🟢 UNION ALL = A + B（全部元素，保留重复）</div>
+    <div style="border:1px solid #bc8cff;border-radius:6px;padding:8px 14px;background:rgba(188,140,255,.06);color:#bc8cff;font-size:13px;">🟣 INTERSECT = A ∩ B（共有元素）</div>
+    <div style="border:1px solid #d29922;border-radius:6px;padding:8px 14px;background:rgba(210,153,34,.06);color:#d29922;font-size:13px;">🟠 EXCEPT = A − B（A 独有元素）</div>
+  </div>
+</div>
+
+<h3 id="s8-5-2">API 实战</h3>
+
+<p><strong>示例：合并 VIP 客户和高频客户名单</strong></p>
+<pre><code>CriteriaBuilder&lt;CustomerDTO&gt; cb = cbf.create(em, CustomerDTO.class);
+
+<span style="color:#8b949e">// 查询 1: VIP 客户（总金额 > 50000）</span>
+cb.startUnion()
+    .from(Customer.class, <span style="color:#a5d6ff">"c"</span>)
+    .innerJoin(<span style="color:#a5d6ff">"c.orders"</span>, <span style="color:#a5d6ff">"o"</span>)
+    .select(<span style="color:#a5d6ff">"c.id"</span>)
+    .select(<span style="color:#a5d6ff">"c.name"</span>)
+    .groupBy(<span style="color:#a5d6ff">"c.id"</span>, <span style="color:#a5d6ff">"c.name"</span>)
+    .having(<span style="color:#a5d6ff">"SUM(o.amount)"</span>).gt(<span style="color:#79c0ff">50000</span>)
+
+<span style="color:#8b949e">// 查询 2: 高频客户（订单数 > 100）</span>
+  .union()
+    .from(Customer.class, <span style="color:#a5d6ff">"c"</span>)
+    .innerJoin(<span style="color:#a5d6ff">"c.orders"</span>, <span style="color:#a5d6ff">"o"</span>)
+    .select(<span style="color:#a5d6ff">"c.id"</span>)
+    .select(<span style="color:#a5d6ff">"c.name"</span>)
+    .groupBy(<span style="color:#a5d6ff">"c.id"</span>, <span style="color:#a5d6ff">"c.name"</span>)
+    .having(<span style="color:#a5d6ff">"COUNT(o.id)"</span>).gt(<span style="color:#79c0ff">100</span>)
+  .endUnion();
+
+List&lt;CustomerDTO&gt; result = cb.getResultList();</code></pre>
+
+<p><strong>示例：查找"同时属于两个分类"的产品（INTERSECT）</strong></p>
+<pre><code>CriteriaBuilder&lt;Long&gt; cb = cbf.create(em, Long.class);
+
+cb.startUnion()
+    .from(Product.class, <span style="color:#a5d6ff">"p"</span>)
+    .select(<span style="color:#a5d6ff">"p.id"</span>)
+    .where(<span style="color:#a5d6ff">"p.category.name"</span>).eq(<span style="color:#a5d6ff">"Electronics"</span>)
+  .intersect()
+    .from(Product.class, <span style="color:#a5d6ff">"p"</span>)
+    .select(<span style="color:#a5d6ff">"p.id"</span>)
+    .where(<span style="color:#a5d6ff">"p.category.name"</span>).eq(<span style="color:#a5d6ff">"On Sale"</span>)
+  .endUnion();</code></pre>
+
+<p><strong>示例：查找"在 A 类别但不在 B 类别"的产品（EXCEPT）</strong></p>
+<pre><code>CriteriaBuilder&lt;Long&gt; cb = cbf.create(em, Long.class);
+
+cb.startUnion()
+    .from(Product.class, <span style="color:#a5d6ff">"p"</span>)
+    .select(<span style="color:#a5d6ff">"p.id"</span>)
+    .where(<span style="color:#a5d6ff">"p.category.name"</span>).eq(<span style="color:#a5d6ff">"Premium"</span>)
+  .except()
+    .from(Product.class, <span style="color:#a5d6ff">"p"</span>)
+    .select(<span style="color:#a5d6ff">"p.id"</span>)
+    .where(<span style="color:#a5d6ff">"p.discontinued"</span>).eq(<span style="color:#79c0ff">true</span>)
+  .endUnion();</code></pre>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-10 · 集合操作 API 调用流程</div>
+  <div class="mermaid">
+sequenceDiagram
+    participant Dev as 开发者
+    participant CB as CriteriaBuilder
+    participant SQL as SQL 渲染器
+
+    Dev->>CB: startUnion()
+    Note over CB: 进入第 1 个子查询
+    Dev->>CB: .from().select()...
+    Dev->>CB: .union() / .intersect() / .except()
+    Note over CB: 进入第 2 个子查询
+    Dev->>CB: .from().select()...
+    Dev->>CB: endUnion()
+    Note over CB: 合并所有子查询
+    CB->>SQL: 渲染 SELECT ... UNION SELECT ...
+    SQL-->>Dev: 返回组合结果
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- 8.6 数据库支持矩阵                                            -->
+<!-- ============================================================ -->
+<h2 id="s8-6">8.6 数据库支持矩阵</h2>
+
+<p>
+  不同数据库对 CTE 和集合操作的支持存在差异。
+  Blaze-Persistence 会在运行时检测目标数据库的能力，
+  对不支持的特性采用降级策略（如内联子查询替代 CTE）。
+</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-11 · 各数据库特性支持概览</div>
+  <div style="display:flex;flex-wrap:wrap;gap:16px;justify-content:center;padding:16px 0;">
+    <div style="border:1px solid #3fb950;border-radius:8px;padding:14px 18px;min-width:170px;max-width:220px;background:rgba(63,185,80,.06);text-align:center;">
+      <div style="font-weight:bold;color:#3fb950;margin-bottom:8px;">✅ 完整支持</div>
+      <div style="color:#e6edf3;font-size:13px;line-height:1.7;">PostgreSQL 9.1+<br>SQL Server 2005+</div>
+    </div>
+    <div style="border:1px solid #3fb950;border-radius:8px;padding:14px 18px;min-width:170px;max-width:220px;background:rgba(63,185,80,.06);text-align:center;">
+      <div style="font-weight:bold;color:#3fb950;margin-bottom:8px;">✅ 良好支持</div>
+      <div style="color:#e6edf3;font-size:13px;line-height:1.7;">Oracle 11g R2+<br>MySQL 8.0+</div>
+    </div>
+    <div style="border:1px solid #d29922;border-radius:8px;padding:14px 18px;min-width:170px;max-width:220px;background:rgba(210,153,34,.06);text-align:center;">
+      <div style="font-weight:bold;color:#d29922;margin-bottom:8px;">⚠️ 部分支持</div>
+      <div style="color:#e6edf3;font-size:13px;line-height:1.7;">H2 (1.4+)</div>
+    </div>
+    <div style="border:1px solid #f85149;border-radius:8px;padding:14px 18px;min-width:170px;max-width:220px;background:rgba(248,81,73,.06);text-align:center;">
+      <div style="font-weight:bold;color:#f85149;margin-bottom:8px;">❌ 不支持 CTE</div>
+      <div style="color:#e6edf3;font-size:13px;line-height:1.7;">MySQL 5.x</div>
+    </div>
+  </div>
+</div>
+
+<table>
+<thead>
+  <tr>
+    <th>特性</th>
+    <th><span class="provider-badge pg">PostgreSQL</span></th>
+    <th><span class="provider-badge mysql">MySQL 8+</span></th>
+    <th><span class="provider-badge mysql">MySQL 5.x</span></th>
+    <th><span class="provider-badge oracle">Oracle</span></th>
+    <th><span class="provider-badge sqlserver">SQL Server</span></th>
+    <th><span class="provider-badge h2">H2</span></th>
+  </tr>
+</thead>
+<tbody>
+  <tr>
+    <td>非递归 CTE</td>
+    <td>✅</td><td>✅</td><td>❌</td><td>✅</td><td>✅</td><td>✅</td>
+  </tr>
+  <tr>
+    <td>递归 CTE</td>
+    <td>✅</td><td>✅</td><td>❌</td><td>✅</td><td>✅</td><td>✅</td>
+  </tr>
+  <tr>
+    <td>UNION / UNION ALL</td>
+    <td>✅</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td>
+  </tr>
+  <tr>
+    <td>INTERSECT</td>
+    <td>✅</td><td>✅ <sup>(8.0.31+)</sup></td><td>❌</td><td>✅</td><td>✅</td><td>✅</td>
+  </tr>
+  <tr>
+    <td>EXCEPT</td>
+    <td>✅</td><td>✅ <sup>(8.0.31+)</sup></td><td>❌</td><td>✅ <sup>(MINUS)</sup></td><td>✅</td><td>✅</td>
+  </tr>
+  <tr>
+    <td>多 CTE 定义</td>
+    <td>✅</td><td>✅</td><td>❌</td><td>✅</td><td>✅</td><td>⚠️</td>
+  </tr>
+  <tr>
+    <td>CTE 中引用其它 CTE</td>
+    <td>✅</td><td>✅</td><td>❌</td><td>✅</td><td>✅</td><td>⚠️</td>
+  </tr>
+</tbody>
+</table>
+
+<div class="os-note">
+  <strong>降级策略：</strong>当目标数据库不支持 CTE 时（如 MySQL 5.x），
+  Blaze-Persistence 会尝试将 CTE 内联为子查询。但递归 CTE 无法降级——
+  如果数据库不支持递归，将抛出运行时异常。
+</div>
+
+<!-- ============================================================ -->
+<!-- 8.7 陷阱与限制                                                -->
+<!-- ============================================================ -->
+<h2 id="s8-7">8.7 陷阱与限制</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-12 · CTE 使用常见陷阱排查流程</div>
+  <div class="mermaid">
+flowchart TD
+    START["CTE 查询失败"] --> Q1{"CTE 实体是否<br/>注册到 persistence.xml?"}
+    Q1 -- "否" --> FIX1["添加 CTE 实体到<br/>persistence.xml 或<br/>@EntityScan 路径"]
+    Q1 -- "是" --> Q2{"数据库版本<br/>支持 CTE?"}
+    Q2 -- "否" --> FIX2["升级数据库<br/>或改用子查询"]
+    Q2 -- "是" --> Q3{"递归 CTE<br/>超时/OOM?"}
+    Q3 -- "是" --> FIX3["检查数据循环<br/>添加 depth 限制"]
+    Q3 -- "否" --> Q4{"CTE 列绑定<br/>类型匹配?"}
+    Q4 -- "否" --> FIX4["确保 bind() 的字段<br/>类型与 select() 匹配"]
+    Q4 -- "是" --> Q5{"Hibernate 版本<br/>兼容?"}
+    Q5 -- "否" --> FIX5["Hibernate 5.x 需要<br/>blaze-persistence-integration-hibernate-5"]
+    Q5 -- "是" --> FIX6["检查 Blaze-Persistence<br/>版本和 Issue Tracker"]
+
+    style START fill:#3a1a1a,stroke:#f85149
+    style FIX1 fill:#1a3a2a,stroke:#3fb950
+    style FIX2 fill:#1a3a2a,stroke:#3fb950
+    style FIX3 fill:#1a3a2a,stroke:#3fb950
+    style FIX4 fill:#1a3a2a,stroke:#3fb950
+    style FIX5 fill:#1a3a2a,stroke:#3fb950
+    style FIX6 fill:#3a2a1a,stroke:#d29922
+  </div>
+</div>
+
+<h3>陷阱 1：CTE 实体未注册</h3>
+<div class="warning">
+  <strong>ClassNotFoundException / Unknown entity：</strong>
+  CTE 实体虽然不对应真实表，但仍必须被 JPA 持久化单元管理。
+  在 <code>persistence.xml</code> 中添加 <code>&lt;class&gt;</code>，
+  或确保 Spring Boot 的 <code>@EntityScan</code> 覆盖 CTE 所在包。
+</div>
+
+<h3>陷阱 2：MySQL 5.x 不支持 CTE</h3>
+<p>
+  MySQL 在 8.0 版本才引入 CTE 支持。如果项目仍在使用 5.x，
+  所有 CTE 查询将失败。Blaze-Persistence 能将非递归 CTE 降级为内联子查询，
+  但递归 CTE 没有替代方案——必须升级到 MySQL 8.0+。
+</p>
+
+<h3>陷阱 3：Materialized vs Inline CTE 性能</h3>
+<p>
+  某些数据库（如 PostgreSQL 12+）允许显式控制 CTE 是否被物化（materialized）。
+  物化的 CTE 先执行并缓存结果，后续引用直接读取缓存；
+  内联的 CTE 在每次引用时重新计算。
+</p>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <p><strong>Materialized CTE（默认 PG &lt; 12）</strong></p>
+    <p>优化器无法将主查询的过滤条件下推到 CTE 内部，可能导致全表扫描后再过滤。</p>
+<pre><code>WITH big_cte AS MATERIALIZED (
+  SELECT ... FROM large_table
+)
+SELECT * FROM big_cte
+WHERE id = 42  <span style="color:#8b949e">-- 无法下推</span></code></pre>
+  </div>
+  <div class="compare-good">
+    <p><strong>Inline CTE（PG 12+ 默认）</strong></p>
+    <p>优化器可以将谓词下推，让 CTE 内的查询只扫描必要行。</p>
+<pre><code>WITH big_cte AS NOT MATERIALIZED (
+  SELECT ... FROM large_table
+)
+SELECT * FROM big_cte
+WHERE id = 42  <span style="color:#8b949e">-- 下推到内部</span></code></pre>
+  </div>
+</div>
+
+<h3>陷阱 4：Hibernate CTE 渲染问题</h3>
+
+<div class="paper-ref">
+  <strong>Hibernate 兼容性：</strong>Blaze-Persistence 的 CTE 渲染完全绕过 Hibernate 的
+  HQL 解析器——它在最终 SQL 层面注入 <code>WITH</code> 子句。因此需要匹配的
+  Hibernate 集成模块版本（<code>blaze-persistence-integration-hibernate-5.x</code> 或
+  <code>hibernate-6.x</code>），版本不匹配可能导致 SQL 注入位置错误。
+</div>
+
+<h3>陷阱 5：集合操作的列对齐</h3>
+<p>
+  使用 UNION / INTERSECT / EXCEPT 时，所有子查询必须返回<strong>相同数量和类型</strong>的列。
+  Blaze-Persistence 会在构建阶段做类型检查，但复杂表达式（如 CASE）
+  可能导致类型推断不一致——建议显式 cast。
+</p>
+
+<div class="real-world">
+  <h5>实战：多表统一搜索</h5>
+  <p>
+    电商系统中需要实现"全局搜索"——同时搜索产品名、订单号和客户名，
+    返回统一的搜索结果列表。使用 UNION 可以将三个独立查询合并：
+  </p>
+<pre><code>cb.startUnion()
+    .from(Product.class).select(<span style="color:#a5d6ff">"id"</span>).select(<span style="color:#a5d6ff">"'PRODUCT'"</span>)
+    .select(<span style="color:#a5d6ff">"name"</span>).where(<span style="color:#a5d6ff">"name"</span>).like().value(<span style="color:#a5d6ff">"%keyword%"</span>).noEscape()
+  .union()
+    .from(Order.class).select(<span style="color:#a5d6ff">"id"</span>).select(<span style="color:#a5d6ff">"'ORDER'"</span>)
+    .select(<span style="color:#a5d6ff">"orderNo"</span>).where(<span style="color:#a5d6ff">"orderNo"</span>).like().value(<span style="color:#a5d6ff">"%keyword%"</span>).noEscape()
+  .union()
+    .from(Customer.class).select(<span style="color:#a5d6ff">"id"</span>).select(<span style="color:#a5d6ff">"'CUSTOMER'"</span>)
+    .select(<span style="color:#a5d6ff">"name"</span>).where(<span style="color:#a5d6ff">"name"</span>).like().value(<span style="color:#a5d6ff">"%keyword%"</span>).noEscape()
+  .endUnion();</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<!-- CHAPTER SUMMARY                                               -->
+<!-- ============================================================ -->
+<div class="chapter-summary" id="summary">
+  <h2>本章小结</h2>
+  <ul>
+    <li><strong>CTE（WITH 子句）</strong>将复杂子查询扁平化为具名临时结果集，Blaze-Persistence 通过 <code>@CTE</code> 实体 + <code>with()</code> API 在 JPA 之上实现完整支持</li>
+    <li><strong>CTE 实体</strong>用 <code>@CTE @Entity</code> 标注，定义 CTE 的列结构，必须注册到持久化单元</li>
+    <li><strong>CTE 查询</strong>通过 <code>.bind("col").select(...)</code> 将子查询结果绑定到 CTE 列，主查询像引用普通实体一样引用 CTE</li>
+    <li><strong>递归 CTE</strong>使用 <code>withRecursive()</code> + <code>unionAll()</code> 实现层级遍历（组织树、分类树），务必加 <code>depth</code> 限制防止无限递归</li>
+    <li><strong>集合操作</strong>（UNION / INTERSECT / EXCEPT）通过 <code>startUnion()</code> / <code>endUnion()</code> API 组合多个查询结果</li>
+    <li><strong>数据库兼容性</strong>是核心关注点：MySQL 5.x 不支持 CTE，INTERSECT/EXCEPT 需要 MySQL 8.0.31+，Oracle 用 MINUS 替代 EXCEPT</li>
+    <li>常见陷阱包括 CTE 实体未注册、递归死循环、Materialized 性能问题、集合操作列不对齐</li>
+  </ul>
+  <p class="next-hint">
+    下一章 <a href="ch09-window.html">第 9 章 · 窗口函数与高级表达式</a>
+    将探索 ROW_NUMBER / RANK / LAG 等窗口函数在 Blaze-Persistence 中的使用，
+    以及自定义函数注册与 CASE 表达式。
+  </p>
+</div>
+
+<!-- chapter-nav -->
+<div class="chapter-nav">
+  <a href="ch07-join.html">← 第 7 章 · JOIN 与关联策略</a>
+  <a href="ch09-window.html">第 9 章 · 窗口函数与高级表达式 →</a>
+</div>
+
+<p class="footer">&copy; 2026 图解 Blaze-Persistence &middot; 第 8 章 · CTE 与集合操作</p>
+
+</article>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+mermaid.initialize({
+  theme: 'dark',
+  themeVariables: {
+    primaryColor: '#58a6ff', primaryTextColor: '#e6edf3', primaryBorderColor: '#30363d',
+    lineColor: '#8b949e', secondaryColor: '#161b22', tertiaryColor: '#0d1117',
+    background: '#161b22', mainBkg: '#161b22', nodeBorder: '#30363d',
+    clusterBkg: 'rgba(22,27,34,.5)', clusterBorder: '#30363d', titleColor: '#e6edf3',
+    edgeLabelBackground: '#161b22',
+  },
+  flowchart: { curve: 'basis', padding: 15 },
+  sequence: { actorMargin: 50, messageMargin: 30 },
+});
+</script>
+</body>
+</html>

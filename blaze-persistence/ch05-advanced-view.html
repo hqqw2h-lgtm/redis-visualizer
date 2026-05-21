@@ -1,0 +1,812 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 5 章 · 高级 Entity View — 图解 Blaze-Persistence</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html">📖 图解 Blaze-Persistence</a>
+  <span class="sep">|</span>
+  <a href="ch04-entityview.html">← 第 4 章 · Entity View 基础</a>
+  <span class="sep">|</span>
+  <a href="ch06-updatable.html">第 6 章 · 可更新与可创建视图 →</a>
+</nav>
+
+<aside class="toc">
+  <a href="#intro">章节导读</a>
+  <a href="#s5-1">5.1 子视图嵌套</a>
+  <a href="#s5-1-resolve" class="depth-2">嵌套解析流程</a>
+  <a href="#s5-1-sql" class="depth-2">SQL 优化</a>
+  <a href="#s5-2">5.2 继承映射</a>
+  <a href="#s5-2-class" class="depth-2">类层次结构</a>
+  <a href="#s5-2-resolve" class="depth-2">多态解析</a>
+  <a href="#s5-3">5.3 集合映射</a>
+  <a href="#s5-3-strategy" class="depth-2">抓取策略对比</a>
+  <a href="#s5-3-sql" class="depth-2">SQL 影响</a>
+  <a href="#s5-4">5.4 @MappingCorrelated</a>
+  <a href="#s5-4-seq" class="depth-2">执行时序</a>
+  <a href="#s5-4-provider" class="depth-2">CorrelationProvider</a>
+  <a href="#s5-5">5.5 Flat View</a>
+  <a href="#s5-5-compare" class="depth-2">嵌套 vs 扁平</a>
+  <a href="#s5-6">5.6 @MappingParameter</a>
+  <a href="#s5-6-flow" class="depth-2">参数流转</a>
+  <a href="#s5-7">5.7 陷阱与限制</a>
+  <a href="#summary">本章小结</a>
+</aside>
+
+<article class="article">
+
+<h1>第 5 章 · 高级 Entity View</h1>
+<p class="subtitle">子视图 · 继承映射 · 集合映射 · @MappingCorrelated · Flat View</p>
+
+<!-- ====== 章节导读 ====== -->
+<div class="chapter-intro" id="intro">
+  <p class="lead">
+    第 4 章掌握了 <code>@EntityView</code> 的基础映射后，本章深入探索高级投影能力：
+    <strong>子视图嵌套</strong>实现对象树投影、<strong>继承映射</strong>处理多态实体、
+    <strong>集合映射</strong>的三种抓取策略、<strong>关联子查询</strong>构建派生字段、
+    以及 <strong>Flat View</strong> 将嵌套结构拍平到一层。
+  </p>
+  <ul class="will-learn">
+    <li>用 Subview 构建嵌套对象图并自动优化为单条 SQL</li>
+    <li>通过继承映射投影多态 JPA 实体</li>
+    <li>掌握 JOIN / SUBSELECT / MULTISET 三种集合抓取策略</li>
+    <li>使用 <code>@MappingCorrelated</code> 嵌入关联子查询</li>
+    <li>Flat View 扁平化投影与常规子视图的取舍</li>
+    <li>用 <code>@MappingParameter</code> 向视图注入运行时参数</li>
+    <li>识别深层嵌套、集合分页冲突等常见陷阱</li>
+  </ul>
+  <p class="prereq">前置：<a href="ch04-entityview.html">第 4 章 · Entity View 基础</a></p>
+</div>
+
+<!-- ================================================ -->
+<!-- 5.1 子视图嵌套 -->
+<!-- ================================================ -->
+<h2 id="s5-1">5.1 子视图嵌套（Subview）</h2>
+
+<p>当 <code>@Mapping</code> 方法的返回类型本身也是一个 <code>@EntityView</code> 时，Blaze-Persistence 自动将其识别为<strong>子视图（Subview）</strong>。这是构建复杂 DTO 对象树的基础。</p>
+
+<div class="diagram" id="s5-1-resolve">
+<div class="diagram-title">子视图嵌套解析：OrderView → OrderItemView → ProductView</div>
+<div class="mermaid">
+graph TD
+    OV["OrderView<br/><i>@EntityView(Order.class)</i>"]
+    OIV["OrderItemView<br/><i>@EntityView(OrderItem.class)</i>"]
+    PV["ProductView<br/><i>@EntityView(Product.class)</i>"]
+
+    OV -- "@Mapping('items')<br/>List&lt;OrderItemView&gt;" --> OIV
+    OIV -- "@Mapping('product')<br/>ProductView" --> PV
+
+    OV -. "id, status, totalPrice" .-> OV_F["id · status · totalPrice"]
+    OIV -. "quantity, unitPrice" .-> OIV_F["quantity · unitPrice"]
+    PV -. "name, sku" .-> PV_F["name · sku"]
+
+    style OV fill:#1e3a5f,stroke:#58a6ff,color:#e6edf3
+    style OIV fill:#2d1f4e,stroke:#bc8cff,color:#e6edf3
+    style PV fill:#1a3a2a,stroke:#3fb950,color:#e6edf3
+    style OV_F fill:#161b22,stroke:#30363d,color:#8b949e
+    style OIV_F fill:#161b22,stroke:#30363d,color:#8b949e
+    style PV_F fill:#161b22,stroke:#30363d,color:#8b949e
+</div>
+</div>
+
+<p>三个 <code>@EntityView</code> 接口形成嵌套链。框架在<strong>编译期（EntityViewManager 初始化）</strong>就完成了嵌套解析，运行时直接生成优化后的单条查询。</p>
+
+<pre><code><span style="color:#bc8cff">@EntityView</span>(Product.class)
+<span style="color:#58a6ff">public interface</span> ProductView {
+    <span style="color:#58a6ff">@IdMapping</span>
+    Long getId();
+    String getName();
+    String getSku();
+}
+
+<span style="color:#bc8cff">@EntityView</span>(OrderItem.class)
+<span style="color:#58a6ff">public interface</span> OrderItemView {
+    <span style="color:#58a6ff">@IdMapping</span>
+    Long getId();
+    Integer getQuantity();
+    BigDecimal getUnitPrice();
+
+    <span style="color:#3fb950">// 返回类型是另一个 EntityView → 自动子视图</span>
+    ProductView getProduct();
+}
+
+<span style="color:#bc8cff">@EntityView</span>(Order.class)
+<span style="color:#58a6ff">public interface</span> OrderView {
+    <span style="color:#58a6ff">@IdMapping</span>
+    Long getId();
+    String getStatus();
+    BigDecimal getTotalPrice();
+
+    <span style="color:#3fb950">// List&lt;子视图&gt; → 自动嵌套集合投影</span>
+    List&lt;OrderItemView&gt; getItems();
+}</code></pre>
+
+<div class="diagram" id="s5-1-sql">
+<div class="diagram-title">Blaze-Persistence 将嵌套视图合并为单条优化 SQL</div>
+<div class="mermaid">
+flowchart LR
+    subgraph INPUT["视图定义"]
+        A["OrderView"]
+        B["OrderItemView"]
+        C["ProductView"]
+    end
+
+    subgraph ENGINE["EntityViewManager"]
+        D["解析 @Mapping 树"]
+        E["合并 SELECT 列"]
+        F["生成 JOIN 子句"]
+    end
+
+    subgraph OUTPUT["生成 SQL"]
+        G["SELECT o.id, o.status,<br/>oi.quantity, oi.unitPrice,<br/>p.name, p.sku<br/>FROM Order o<br/>JOIN o.items oi<br/>JOIN oi.product p"]
+    end
+
+    A --> D
+    B --> D
+    C --> D
+    D --> E --> F --> G
+
+    style INPUT fill:#161b22,stroke:#30363d,color:#e6edf3
+    style ENGINE fill:#1e3a5f,stroke:#58a6ff,color:#e6edf3
+    style OUTPUT fill:#1a3a2a,stroke:#3fb950,color:#e6edf3
+</div>
+</div>
+
+<div class="key-insight">
+  <strong>💡 关键优势：</strong>无论嵌套多少层，Blaze-Persistence 仅生成<strong>一条 SQL</strong>（默认 JOIN 策略）。
+  SELECT 子句只包含视图中实际声明的字段，避免 <code>SELECT *</code> 带来的多余列传输。
+</div>
+
+<!-- ================================================ -->
+<!-- 5.2 继承映射 -->
+<!-- ================================================ -->
+<h2 id="s5-2">5.2 继承映射（Inheritance）</h2>
+
+<p>JPA 实体可以有继承层次（<code>SINGLE_TABLE</code>、<code>JOINED</code>、<code>TABLE_PER_CLASS</code>）。Blaze-Persistence Entity View 同样支持<strong>多态投影</strong>：定义基础视图接口，派生子视图映射到不同实体子类。</p>
+
+<div class="diagram" id="s5-2-class">
+<div class="diagram-title">Entity View 继承层次：AnimalView → CatView / DogView</div>
+<div class="mermaid">
+classDiagram
+    class AnimalView {
+        &lt;&lt;@EntityView(Animal)&gt;&gt;
+        +Long getId()
+        +String getName()
+        +Double getWeight()
+    }
+    class CatView {
+        &lt;&lt;@EntityView(Cat)&gt;&gt;
+        +Boolean isIndoor()
+        +String getBreed()
+    }
+    class DogView {
+        &lt;&lt;@EntityView(Dog)&gt;&gt;
+        +String getBarkVolume()
+        +Boolean isTrained()
+    }
+
+    AnimalView <|-- CatView : @EntityViewInheritance
+    AnimalView <|-- DogView : @EntityViewInheritance
+
+    class Animal {
+        &lt;&lt;JPA Entity&gt;&gt;
+        -Long id
+        -String name
+        -Double weight
+        -String dtype
+    }
+    class Cat {
+        &lt;&lt;JPA Entity&gt;&gt;
+        -Boolean indoor
+        -String breed
+    }
+    class Dog {
+        &lt;&lt;JPA Entity&gt;&gt;
+        -String barkVolume
+        -Boolean trained
+    }
+
+    Animal <|-- Cat
+    Animal <|-- Dog
+</div>
+</div>
+
+<pre><code><span style="color:#bc8cff">@EntityView</span>(Animal.class)
+<span style="color:#bc8cff">@EntityViewInheritance</span>
+<span style="color:#58a6ff">public interface</span> AnimalView {
+    <span style="color:#58a6ff">@IdMapping</span>
+    Long getId();
+    String getName();
+    Double getWeight();
+}
+
+<span style="color:#bc8cff">@EntityView</span>(Cat.class)
+<span style="color:#bc8cff">@EntityViewInheritanceMapping</span>(<span style="color:#d29922">"TYPE(this) = Cat"</span>)
+<span style="color:#58a6ff">public interface</span> CatView <span style="color:#58a6ff">extends</span> AnimalView {
+    Boolean isIndoor();
+    String getBreed();
+}
+
+<span style="color:#bc8cff">@EntityView</span>(Dog.class)
+<span style="color:#bc8cff">@EntityViewInheritanceMapping</span>(<span style="color:#d29922">"TYPE(this) = Dog"</span>)
+<span style="color:#58a6ff">public interface</span> DogView <span style="color:#58a6ff">extends</span> AnimalView {
+    String getBarkVolume();
+    Boolean isTrained();
+}</code></pre>
+
+<div class="diagram" id="s5-2-resolve">
+<div class="diagram-title">多态视图解析流程</div>
+<div class="mermaid">
+flowchart TD
+    Q["查询 AnimalView"] --> EVM["EntityViewManager<br/>检查 @EntityViewInheritance"]
+    EVM --> DISC{"判别器<br/>TYPE(this)"}
+    DISC -- "= Cat" --> CAT["实例化 CatView<br/>填充 indoor, breed"]
+    DISC -- "= Dog" --> DOG["实例化 DogView<br/>填充 barkVolume, trained"]
+    DISC -- "未匹配" --> BASE["实例化 AnimalView<br/>仅基础字段"]
+
+    CAT --> RESULT["List&lt;AnimalView&gt;<br/>包含混合类型"]
+    DOG --> RESULT
+    BASE --> RESULT
+
+    style Q fill:#1e3a5f,stroke:#58a6ff,color:#e6edf3
+    style EVM fill:#2d1f4e,stroke:#bc8cff,color:#e6edf3
+    style DISC fill:#3a2a1a,stroke:#d29922,color:#e6edf3
+    style CAT fill:#1a3a2a,stroke:#3fb950,color:#e6edf3
+    style DOG fill:#1a3a2a,stroke:#3fb950,color:#e6edf3
+    style BASE fill:#161b22,stroke:#30363d,color:#8b949e
+    style RESULT fill:#1e3a5f,stroke:#58a6ff,color:#e6edf3
+</div>
+</div>
+
+<div class="os-note">
+  <strong>⚠️ 注意：</strong><code>@EntityViewInheritanceMapping</code> 的表达式使用 JPQL 语法。
+  <code>TYPE(this)</code> 对应 JPA 的类型判别函数，它会被翻译为数据库中的 <code>DTYPE</code> 列比较。
+</div>
+
+<!-- ================================================ -->
+<!-- 5.3 集合映射 -->
+<!-- ================================================ -->
+<h2 id="s5-3">5.3 集合映射</h2>
+
+<p>Entity View 可以映射 <code>List</code>、<code>Set</code>、<code>Map</code> 类型的关联集合。关键在于选择正确的<strong>抓取策略</strong>——不同策略产生截然不同的 SQL 形态和性能特征。</p>
+
+<div class="diagram" id="s5-3-strategy">
+<div class="diagram-title">三种集合抓取策略对比</div>
+<div style="display:flex;flex-wrap:wrap;gap:16px;justify-content:center;padding:16px 0;">
+  <div style="flex:1;min-width:200px;max-width:280px;border:1px solid #d29922;border-radius:8px;padding:14px 18px;background:rgba(210,153,34,.06);">
+    <div style="font-weight:bold;color:#d29922;margin-bottom:8px;">JOIN 策略</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.8;">
+      单条 SQL<br>LEFT JOIN 集合表<br><span style="color:#d29922;">⚠️ 主实体行重复</span><br><span style="color:#8b949e;">适合小集合</span>
+    </div>
+  </div>
+  <div style="flex:1;min-width:200px;max-width:280px;border:1px solid #58a6ff;border-radius:8px;padding:14px 18px;background:rgba(88,166,255,.06);">
+    <div style="font-weight:bold;color:#58a6ff;margin-bottom:8px;">SUBSELECT 策略</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.8;">
+      两条 SQL<br>主查询 + 子查询<br><span style="color:#3fb950;">✅ 无行重复</span><br><span style="color:#8b949e;">适合中等集合</span>
+    </div>
+  </div>
+  <div style="flex:1;min-width:200px;max-width:280px;border:1px solid #3fb950;border-radius:8px;padding:14px 18px;background:rgba(63,185,80,.06);">
+    <div style="font-weight:bold;color:#3fb950;margin-bottom:8px;">⭐ MULTISET 策略</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.8;">
+      单条 SQL<br>嵌套集合作为子列<br><span style="color:#3fb950;">✅ 无行重复</span><br><span style="color:#3fb950;font-weight:bold;">推荐策略</span>
+    </div>
+  </div>
+</div>
+</div>
+
+<table>
+<thead>
+  <tr><th>策略</th><th>SQL 条数</th><th>行重复</th><th>嵌套支持</th><th>适用场景</th></tr>
+</thead>
+<tbody>
+  <tr>
+    <td><code>FetchStrategy.JOIN</code></td>
+    <td>1</td>
+    <td>是（笛卡尔积风险）</td>
+    <td>多层 JOIN 可能爆炸</td>
+    <td>小集合、单层嵌套</td>
+  </tr>
+  <tr>
+    <td><code>FetchStrategy.SUBSELECT</code></td>
+    <td>N+1（但可批量）</td>
+    <td>否</td>
+    <td>良好</td>
+    <td>中等集合、需要分页</td>
+  </tr>
+  <tr>
+    <td><code>FetchStrategy.MULTISET</code></td>
+    <td>1</td>
+    <td>否</td>
+    <td>优秀</td>
+    <td>复杂嵌套、大集合 ⭐</td>
+  </tr>
+</tbody>
+</table>
+
+<pre><code><span style="color:#bc8cff">@EntityView</span>(Order.class)
+<span style="color:#58a6ff">public interface</span> OrderWithItemsView {
+    <span style="color:#58a6ff">@IdMapping</span>
+    Long getId();
+
+    <span style="color:#3fb950">// 默认 JOIN 策略</span>
+    List&lt;OrderItemView&gt; getItems();
+
+    <span style="color:#3fb950">// 显式指定 MULTISET 策略（推荐）</span>
+    <span style="color:#bc8cff">@Mapping</span>(fetch = FetchStrategy.MULTISET)
+    List&lt;OrderItemView&gt; getItemsMultiset();
+
+    <span style="color:#3fb950">// SUBSELECT 策略</span>
+    <span style="color:#bc8cff">@Mapping</span>(fetch = FetchStrategy.SUBSELECT)
+    Set&lt;TagView&gt; getTags();
+}</code></pre>
+
+<div class="diagram" id="s5-3-sql">
+<div class="diagram-title">抓取策略对生成 SQL 的影响</div>
+<div class="mermaid">
+sequenceDiagram
+    participant App as 应用代码
+    participant EVM as EntityViewManager
+    participant DB as 数据库
+
+    Note over App,DB: JOIN 策略
+    App->>EVM: applySetting(OrderView.class)
+    EVM->>DB: SELECT o.*, oi.* FROM orders o LEFT JOIN order_items oi ON ...
+    DB-->>EVM: N × M 行（笛卡尔积）
+    EVM-->>App: List&lt;OrderView&gt;（去重后）
+
+    Note over App,DB: MULTISET 策略
+    App->>EVM: applySetting(OrderView.class)
+    EVM->>DB: SELECT o.*, (SELECT ... FROM order_items) AS items FROM orders o
+    DB-->>EVM: N 行（集合内嵌为子列）
+    EVM-->>App: List&lt;OrderView&gt;（无重复）
+</div>
+</div>
+
+<div class="key-insight">
+  <strong>💡 最佳实践：</strong>优先使用 <code>MULTISET</code> 策略。它在单条 SQL 中内嵌子集合，避免笛卡尔积，
+  是 Blaze-Persistence 相比原生 JPA 的核心差异化特性之一。
+</div>
+
+<!-- ================================================ -->
+<!-- 5.4 @MappingCorrelated -->
+<!-- ================================================ -->
+<h2 id="s5-4">5.4 @MappingCorrelated 关联子查询</h2>
+
+<p>有些派生字段无法通过简单的路径映射表达——例如统计关联实体数量、计算聚合值、或引用不相关的实体。<code>@MappingCorrelated</code> 允许在视图中嵌入<strong>关联子查询</strong>。</p>
+
+<div class="diagram" id="s5-4-seq">
+<div class="diagram-title">@MappingCorrelated 执行时序</div>
+<div class="mermaid">
+sequenceDiagram
+    participant View as EntityView 定义
+    participant EVM as EntityViewManager
+    participant CP as CorrelationProvider
+    participant SQL as SQL 引擎
+
+    View->>EVM: @MappingCorrelated(correlationBasis = "id",<br/>correlator = OrderCountProvider.class)
+    EVM->>CP: 调用 provideCorrelation()
+    CP->>CP: cb.from(Order.class)<br/>.where("customerId").eqExpression("EMBEDDING_VIEW(id)")
+    CP-->>EVM: 返回关联查询片段
+    EVM->>SQL: 合并为主查询的<br/>关联子查询 (SELECT COUNT...)
+    SQL-->>EVM: 结果行
+    EVM-->>View: 填充 orderCount 字段
+</div>
+</div>
+
+<p><code>CorrelationProvider</code> 是关联子查询的核心接口。它接收一个 <code>CriteriaBuilder</code>，返回一个与主查询关联的子查询片段。</p>
+
+<div class="diagram" id="s5-4-provider">
+<div class="diagram-title">CorrelationProvider 接口与数据流</div>
+<div class="mermaid">
+flowchart LR
+    subgraph PROVIDER["CorrelationProvider"]
+        A["provideCorrelation(<br/>CorrelationBuilder cb)"]
+        B["cb.correlate(Entity.class)"]
+        C[".where('field')<br/>.eqExpression(<br/>'EMBEDDING_VIEW(id)')"]
+    end
+
+    subgraph RESULT["生成 SQL"]
+        D["SELECT COUNT(*)<br/>FROM orders o2<br/>WHERE o2.customer_id<br/>= c.id"]
+    end
+
+    A --> B --> C --> D
+
+    style PROVIDER fill:#2d1f4e,stroke:#bc8cff,color:#e6edf3
+    style RESULT fill:#1a3a2a,stroke:#3fb950,color:#e6edf3
+</div>
+</div>
+
+<pre><code><span style="color:#3fb950">// 1. 定义 CorrelationProvider</span>
+<span style="color:#58a6ff">public class</span> OrderCountProvider <span style="color:#58a6ff">implements</span> CorrelationProvider {
+    <span style="color:#58a6ff">@Override</span>
+    <span style="color:#58a6ff">public void</span> applyCorrelation(
+            CorrelationBuilder correlationBuilder,
+            String correlationExpression) {
+        correlationBuilder
+            .correlate(Order.class)
+            .on(<span style="color:#d29922">"customer.id"</span>)
+            .eqExpression(correlationExpression)
+            .end();
+    }
+}
+
+<span style="color:#3fb950">// 2. 在 EntityView 中使用关联子查询</span>
+<span style="color:#bc8cff">@EntityView</span>(Customer.class)
+<span style="color:#58a6ff">public interface</span> CustomerSummaryView {
+    <span style="color:#58a6ff">@IdMapping</span>
+    Long getId();
+    String getName();
+
+    <span style="color:#3fb950">// 关联子查询：统计该客户的订单数</span>
+    <span style="color:#bc8cff">@MappingCorrelated</span>(
+        correlationBasis = <span style="color:#d29922">"id"</span>,
+        correlator = OrderCountProvider.class,
+        correlationResult = <span style="color:#d29922">"id"</span>,
+        fetch = FetchStrategy.JOIN
+    )
+    Long getOrderCount();
+
+    <span style="color:#3fb950">// 关联子查询：计算总消费金额</span>
+    <span style="color:#bc8cff">@MappingCorrelated</span>(
+        correlationBasis = <span style="color:#d29922">"id"</span>,
+        correlator = TotalSpentProvider.class,
+        correlationResult = <span style="color:#d29922">"totalPrice"</span>,
+        fetch = FetchStrategy.JOIN
+    )
+    BigDecimal getTotalSpent();
+}</code></pre>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <pre><code><span style="color:#8b949e">// 原生方式：先查客户，再循环查订单数</span>
+List&lt;Customer&gt; customers = em
+    .createQuery("FROM Customer")
+    .getResultList();
+for (Customer c : customers) {
+    Long count = em.createQuery(
+        "SELECT COUNT(o) FROM Order o " +
+        "WHERE o.customer = :c", Long.class)
+        .setParameter("c", c)
+        .getSingleResult();
+    <span style="color:#f85149">// N+1 查询！</span>
+}</code></pre>
+  </div>
+  <div class="compare-good">
+    <pre><code><span style="color:#8b949e">// @MappingCorrelated 方式</span>
+<span style="color:#8b949e">// 生成单条 SQL：</span>
+<span style="color:#8b949e">// SELECT c.id, c.name,</span>
+<span style="color:#8b949e">//   (SELECT COUNT(*)</span>
+<span style="color:#8b949e">//    FROM orders o</span>
+<span style="color:#8b949e">//    WHERE o.customer_id = c.id)</span>
+<span style="color:#8b949e">//   AS orderCount</span>
+<span style="color:#8b949e">// FROM customers c</span>
+
+List&lt;CustomerSummaryView&gt; result =
+    evm.applySetting(
+        EntityViewSetting.create(
+            CustomerSummaryView.class),
+        cb)
+    .getResultList();</code></pre>
+  </div>
+</div>
+
+<div class="os-note">
+  <strong>⚠️ 何时使用关联 vs 常规映射：</strong>
+  如果目标属性可以通过 JPA 关联路径（如 <code>order.customer.name</code>）到达，使用 <code>@Mapping</code> 即可。
+  只有当需要<strong>聚合计算</strong>、<strong>跨无关联实体</strong>或<strong>复杂过滤</strong>时才需要 <code>@MappingCorrelated</code>。
+</div>
+
+<!-- ================================================ -->
+<!-- 5.5 Flat View -->
+<!-- ================================================ -->
+<h2 id="s5-5">5.5 Flat View</h2>
+
+<p>常规子视图会生成嵌套对象结构（如 <code>orderView.getAddress().getCity()</code>），而 <strong>Flat View</strong> 将关联实体的字段直接<strong>扁平化</strong>到父视图层级，省去中间层。</p>
+
+<div class="diagram" id="s5-5-compare">
+<div class="diagram-title">嵌套子视图 vs Flat View 的结构对比</div>
+<div style="display:flex;flex-wrap:wrap;gap:20px;justify-content:center;padding:16px 0;">
+  <div style="flex:1;min-width:240px;max-width:340px;border:1px solid #d29922;border-radius:10px;padding:18px;background:rgba(210,153,34,.06);">
+    <div style="font-weight:bold;color:#d29922;margin-bottom:10px;">常规子视图（嵌套结构）</div>
+    <div style="color:#e6edf3;font-size:13px;">
+      <div style="background:rgba(210,153,34,.08);border-radius:6px;padding:6px 10px;margin-bottom:4px;">OrderView</div>
+      <div style="color:#8b949e;padding-left:12px;">↳ <span style="color:#d29922;">getAddress()</span> → AddressView</div>
+      <div style="color:#8b949e;padding-left:32px;">↳ getStreet()</div>
+      <div style="color:#8b949e;padding-left:32px;">↳ getCity()</div>
+      <div style="color:#8b949e;padding-left:32px;">↳ getZipCode()</div>
+    </div>
+  </div>
+  <div style="flex:1;min-width:240px;max-width:340px;border:1px solid #3fb950;border-radius:10px;padding:18px;background:rgba(63,185,80,.06);">
+    <div style="font-weight:bold;color:#3fb950;margin-bottom:10px;">Flat View（扁平结构）</div>
+    <div style="color:#e6edf3;font-size:13px;">
+      <div style="background:rgba(63,185,80,.08);border-radius:6px;padding:6px 10px;margin-bottom:4px;">OrderView</div>
+      <div style="color:#8b949e;padding-left:12px;">↳ getAddressStreet()</div>
+      <div style="color:#8b949e;padding-left:12px;">↳ getAddressCity()</div>
+      <div style="color:#8b949e;padding-left:12px;">↳ getAddressZipCode()</div>
+    </div>
+  </div>
+</div>
+</div>
+
+<p>使用 <code>@MappingFlat</code> 或直接在 <code>@Mapping</code> 中指定路径表达式即可将关联属性拍平：</p>
+
+<pre><code><span style="color:#bc8cff">@EntityView</span>(Order.class)
+<span style="color:#58a6ff">public interface</span> OrderFlatView {
+    <span style="color:#58a6ff">@IdMapping</span>
+    Long getId();
+    String getStatus();
+
+    <span style="color:#3fb950">// 扁平化：直接映射关联实体 Address 的字段</span>
+    <span style="color:#bc8cff">@Mapping</span>(<span style="color:#d29922">"shippingAddress.street"</span>)
+    String getShippingStreet();
+
+    <span style="color:#bc8cff">@Mapping</span>(<span style="color:#d29922">"shippingAddress.city"</span>)
+    String getShippingCity();
+
+    <span style="color:#bc8cff">@Mapping</span>(<span style="color:#d29922">"shippingAddress.zipCode"</span>)
+    String getShippingZipCode();
+
+    <span style="color:#bc8cff">@Mapping</span>(<span style="color:#d29922">"shippingAddress.country.name"</span>)
+    String getShippingCountryName();
+}</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">Flat View 的 SQL 投影——JOIN 但不创建中间对象</div>
+<div class="mermaid">
+flowchart LR
+    subgraph SQL["生成 SQL"]
+        Q["SELECT o.id, o.status,<br/>a.street, a.city,<br/>a.zip_code, c.name<br/>FROM orders o<br/>JOIN addresses a ON ...<br/>JOIN countries c ON ..."]
+    end
+
+    subgraph RESULT["返回结果"]
+        R["OrderFlatView {<br/>  id: 1001<br/>  status: 'SHIPPED'<br/>  shippingStreet: '中关村大街1号'<br/>  shippingCity: '北京'<br/>  shippingZipCode: '100080'<br/>  shippingCountryName: '中国'<br/>}"]
+    end
+
+    SQL --> RESULT
+
+    style SQL fill:#1e3a5f,stroke:#58a6ff,color:#e6edf3
+    style RESULT fill:#1a3a2a,stroke:#3fb950,color:#e6edf3
+</div>
+</div>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <p style="font-size:13px"><strong>子视图嵌套：</strong>生成中间 AddressView 对象，需额外内存。JSON 序列化后为嵌套 JSON：</p>
+    <pre><code>{
+  "id": 1001,
+  "address": {
+    "street": "中关村大街1号",
+    "city": "北京"
+  }
+}</code></pre>
+  </div>
+  <div class="compare-good">
+    <p style="font-size:13px"><strong>Flat View：</strong>无中间对象，字段直接平铺。适合表格展示、CSV 导出：</p>
+    <pre><code>{
+  "id": 1001,
+  "shippingStreet": "中关村大街1号",
+  "shippingCity": "北京"
+}</code></pre>
+  </div>
+</div>
+
+<!-- ================================================ -->
+<!-- 5.6 @MappingParameter -->
+<!-- ================================================ -->
+<h2 id="s5-6">5.6 @MappingParameter 与上下文参数</h2>
+
+<p>某些映射需要运行时上下文——例如当前用户的 Locale 决定名称字段读取哪一列。<code>@MappingParameter</code> 允许在 <code>EntityViewSetting</code> 中传入参数，视图定义中引用。</p>
+
+<div class="diagram" id="s5-6-flow">
+<div class="diagram-title">参数从 Setting 流向 View 的完整路径</div>
+<div class="mermaid">
+flowchart LR
+    A["应用代码<br/>setting.withOptionalParameter(<br/>'locale', Locale.CHINESE)"] --> B["EntityViewSetting<br/>参数池"]
+    B --> C["EntityViewManager<br/>.applySetting()"]
+    C --> D["视图实例化<br/>@MappingParameter('locale')<br/>Locale locale"]
+    D --> E["CASE 表达式<br/>@Mapping(CASE WHEN :locale = 'zh'<br/>THEN nameZh ELSE nameEn)"]
+    E --> F["SQL 生成<br/>CASE WHEN ? = 'zh'<br/>THEN p.name_zh<br/>ELSE p.name_en END"]
+
+    style A fill:#2d1f4e,stroke:#bc8cff,color:#e6edf3
+    style B fill:#1e3a5f,stroke:#58a6ff,color:#e6edf3
+    style C fill:#1e3a5f,stroke:#58a6ff,color:#e6edf3
+    style D fill:#1a3a2a,stroke:#3fb950,color:#e6edf3
+    style E fill:#3a2a1a,stroke:#d29922,color:#e6edf3
+    style F fill:#161b22,stroke:#30363d,color:#8b949e
+</div>
+</div>
+
+<pre><code><span style="color:#bc8cff">@EntityView</span>(Product.class)
+<span style="color:#58a6ff">public interface</span> LocalizedProductView {
+    <span style="color:#58a6ff">@IdMapping</span>
+    Long getId();
+
+    <span style="color:#3fb950">// 根据运行时 locale 参数选择名称列</span>
+    <span style="color:#bc8cff">@Mapping</span>(<span style="color:#d29922">"CASE WHEN :locale = 'zh' THEN nameZh ELSE nameEn END"</span>)
+    String getDisplayName();
+
+    <span style="color:#3fb950">// 注入参数本身</span>
+    <span style="color:#bc8cff">@MappingParameter</span>(<span style="color:#d29922">"locale"</span>)
+    String getLocale();
+}
+
+<span style="color:#3fb950">// 调用方设置参数</span>
+EntityViewSetting&lt;LocalizedProductView, CriteriaBuilder&lt;LocalizedProductView&gt;&gt; setting =
+    EntityViewSetting.create(LocalizedProductView.class);
+setting.withOptionalParameter(<span style="color:#d29922">"locale"</span>, <span style="color:#d29922">"zh"</span>);
+
+List&lt;LocalizedProductView&gt; products =
+    evm.applySetting(setting, cb).getResultList();</code></pre>
+
+<div class="key-insight">
+  <strong>💡 参数类型：</strong><code>withOptionalParameter</code> 允许视图在未传参时使用默认值；
+  <code>withParameter</code> 则为必需参数——缺失时抛出异常。参数可以是任意 Java 对象，不限于基本类型。
+</div>
+
+<!-- ================================================ -->
+<!-- 5.7 陷阱与限制 -->
+<!-- ================================================ -->
+<h2 id="s5-7">5.7 陷阱与限制</h2>
+
+<p>高级 Entity View 功能强大但有边界。以下是实践中最常见的陷阱：</p>
+
+<div class="diagram">
+<div class="diagram-title">高级 Entity View 常见陷阱全景</div>
+<div style="display:flex;flex-wrap:wrap;gap:14px;justify-content:center;padding:16px 0;">
+  <div style="flex:1;min-width:170px;max-width:210px;border:1px solid #f85149;border-radius:8px;padding:12px 14px;background:rgba(248,81,73,.06);">
+    <div style="font-weight:bold;color:#f85149;font-size:13px;margin-bottom:6px;">🔴 深层嵌套</div>
+    <div style="color:#8b949e;font-size:12px;line-height:1.6;">3+ 层子视图 → 多重 JOIN、笛卡尔积风险</div>
+    <div style="color:#3fb950;font-size:12px;margin-top:6px;">✅ 解法：MULTISET</div>
+  </div>
+  <div style="flex:1;min-width:170px;max-width:210px;border:1px solid #f85149;border-radius:8px;padding:12px 14px;background:rgba(248,81,73,.06);">
+    <div style="font-weight:bold;color:#f85149;font-size:13px;margin-bottom:6px;">🔴 集合 + 分页</div>
+    <div style="color:#8b949e;font-size:12px;line-height:1.6;">集合 JOIN → 行重复导致分页数量不准</div>
+    <div style="color:#3fb950;font-size:12px;margin-top:6px;">✅ 解法：SUBSELECT 或 MULTISET</div>
+  </div>
+  <div style="flex:1;min-width:170px;max-width:210px;border:1px solid #f85149;border-radius:8px;padding:12px 14px;background:rgba(248,81,73,.06);">
+    <div style="font-weight:bold;color:#f85149;font-size:13px;margin-bottom:6px;">🔴 继承层数</div>
+    <div style="color:#8b949e;font-size:12px;line-height:1.6;">多层继承 → 判别逻辑复杂、SELECT 列爆炸</div>
+    <div style="color:#3fb950;font-size:12px;margin-top:6px;">✅ 解法：限制 2 层，用组合替代</div>
+  </div>
+  <div style="flex:1;min-width:170px;max-width:210px;border:1px solid #f85149;border-radius:8px;padding:12px 14px;background:rgba(248,81,73,.06);">
+    <div style="font-weight:bold;color:#f85149;font-size:13px;margin-bottom:6px;">🔴 Correlated N+1</div>
+    <div style="color:#8b949e;font-size:12px;line-height:1.6;">@MappingCorrelated + JOIN → 默认单行执行</div>
+    <div style="color:#3fb950;font-size:12px;margin-top:6px;">✅ 解法：设置 batchSize 或 SUBSELECT</div>
+  </div>
+  <div style="flex:1;min-width:170px;max-width:210px;border:1px solid #f85149;border-radius:8px;padding:12px 14px;background:rgba(248,81,73,.06);">
+    <div style="font-weight:bold;color:#f85149;font-size:13px;margin-bottom:6px;">🔴 Flat + Optional</div>
+    <div style="color:#8b949e;font-size:12px;line-height:1.6;">Flat View 映射可选关联 → NULL 时全部字段为空</div>
+    <div style="color:#3fb950;font-size:12px;margin-top:6px;">✅ 解法：子视图整体可空更清晰</div>
+  </div>
+</div>
+</div>
+
+<h3>5.7.1 深层嵌套与笛卡尔积</h3>
+
+<p>当子视图嵌套超过 3 层、且多层都包含集合映射时，默认 JOIN 策略会产生笛卡尔积——查询结果行数 = 各层集合大小之积。</p>
+
+<div class="warning">
+  <strong>🚨 危险模式：</strong>Order(10行) → Items(5/单) → Tags(3/单) = <strong>150 行</strong>结果。
+  切换为 <code>MULTISET</code> 后回到 <strong>10 行</strong>。
+</div>
+
+<h3>5.7.2 集合映射与分页冲突</h3>
+
+<p>使用 JOIN 抓取集合时，<code>LIMIT / OFFSET</code> 作用于 JOIN 后的行而非实体。10 个 Order 各含 5 个 Item，<code>LIMIT 10</code> 只返回 2 个 Order 的数据。</p>
+
+<pre><code><span style="color:#3fb950">// ❌ 错误：集合 JOIN + 分页导致数据截断</span>
+CriteriaBuilder&lt;OrderView&gt; cb = cbf.create(em, OrderView.class)
+    .orderByAsc(<span style="color:#d29922">"id"</span>)
+    .page(0, 10); <span style="color:#f85149">// LIMIT 10 作用于 JOIN 后的行！</span>
+
+<span style="color:#3fb950">// ✅ 正确：集合使用 MULTISET，分页作用于主实体</span>
+<span style="color:#3fb950">// 或将集合改为 SUBSELECT 策略</span></code></pre>
+
+<h3>5.7.3 @MappingCorrelated 的 N+1 风险</h3>
+
+<p>默认情况下关联子查询随主查询一起内联。但如果配合 <code>SUBSELECT</code> fetch 且未设置 <code>batchSize</code>，每行会触发一次独立的关联查询。</p>
+
+<div class="diagram">
+<div class="diagram-title">Correlated Subquery 批处理 vs 逐行执行</div>
+<svg viewBox="0 0 900 310" xmlns="http://www.w3.org/2000/svg" style="width:100%;max-width:900px;margin:0 auto;display:block" font-family="Inter,'Microsoft YaHei',system-ui,sans-serif">
+  <rect width="900" height="310" rx="12" fill="#0d1117"/>
+  <!-- Left: N+1 -->
+  <rect x="20" y="16" width="390" height="278" rx="10" fill="none" stroke="#f85149" stroke-width="1.5"/>
+  <rect x="20" y="16" width="390" height="36" rx="10" fill="#f8514920"/>
+  <text x="215" y="40" text-anchor="middle" font-size="15" font-weight="700" fill="#f85149">❌ 逐行执行 (N+1)</text>
+  <rect x="44" y="68" width="120" height="30" rx="6" fill="#3a1a1a" stroke="#f85149" stroke-width="1"/><text x="104" y="88" text-anchor="middle" font-size="13" fill="#e6edf3">Customer 1</text>
+  <line x1="164" y1="83" x2="190" y2="83" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr5r)"/>
+  <rect x="190" y="68" width="196" height="30" rx="6" fill="#3a1a1a" stroke="#f85149" stroke-width="1"/><text x="288" y="88" text-anchor="middle" font-size="13" fill="#e6edf3">SELECT COUNT … cid=1</text>
+  <rect x="44" y="110" width="120" height="30" rx="6" fill="#3a1a1a" stroke="#f85149" stroke-width="1"/><text x="104" y="130" text-anchor="middle" font-size="13" fill="#e6edf3">Customer 2</text>
+  <line x1="164" y1="125" x2="190" y2="125" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr5r)"/>
+  <rect x="190" y="110" width="196" height="30" rx="6" fill="#3a1a1a" stroke="#f85149" stroke-width="1"/><text x="288" y="130" text-anchor="middle" font-size="13" fill="#e6edf3">SELECT COUNT … cid=2</text>
+  <rect x="44" y="152" width="120" height="30" rx="6" fill="#3a1a1a" stroke="#f85149" stroke-width="1"/><text x="104" y="172" text-anchor="middle" font-size="13" fill="#e6edf3">Customer N</text>
+  <line x1="164" y1="167" x2="190" y2="167" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr5r)"/>
+  <rect x="190" y="152" width="196" height="30" rx="6" fill="#3a1a1a" stroke="#f85149" stroke-width="1"/><text x="288" y="172" text-anchor="middle" font-size="13" fill="#e6edf3">SELECT COUNT … cid=N</text>
+  <rect x="80" y="200" width="270" height="30" rx="6" fill="#3d0f0f" stroke="#f85149" stroke-width="1"/>
+  <text x="215" y="220" text-anchor="middle" font-size="13" font-weight="600" fill="#f87171">总计 N+1 条 SQL</text>
+  <!-- VS -->
+  <circle cx="450" cy="155" r="24" fill="#161b22" stroke="#e6edf3" stroke-width="2"/>
+  <text x="450" y="161" text-anchor="middle" font-size="14" font-weight="800" fill="#e6edf3">VS</text>
+  <!-- Right: batch/inline -->
+  <rect x="490" y="16" width="390" height="278" rx="10" fill="none" stroke="#3fb950" stroke-width="1.5"/>
+  <rect x="490" y="16" width="390" height="36" rx="10" fill="#3fb95020"/>
+  <text x="685" y="40" text-anchor="middle" font-size="15" font-weight="700" fill="#3fb950">✅ 批量 / 内联子查询</text>
+  <rect x="514" y="68" width="342" height="30" rx="6" fill="#0b1c0b" stroke="#3fb950" stroke-width="1"/><text x="685" y="88" text-anchor="middle" font-size="13" fill="#e6edf3">所有 Customer</text>
+  <line x1="685" y1="98" x2="685" y2="120" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr5g)"/>
+  <rect x="514" y="120" width="342" height="80" rx="6" fill="#0b1c0b" stroke="#3fb950" stroke-width="1"/>
+  <text x="685" y="143" text-anchor="middle" font-size="13" fill="#e6edf3">SELECT c.id,</text>
+  <text x="685" y="163" text-anchor="middle" font-size="13" fill="#e6edf3">  (SELECT COUNT(*) FROM orders</text>
+  <text x="685" y="183" text-anchor="middle" font-size="13" fill="#e6edf3">   WHERE cid = c.id)</text>
+  <rect x="550" y="218" width="270" height="30" rx="6" fill="#0b2b0b" stroke="#3fb950" stroke-width="1"/>
+  <text x="685" y="238" text-anchor="middle" font-size="13" font-weight="600" fill="#4ade80">总计 1 条 SQL</text>
+  <defs>
+    <marker id="arr5r" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#f85149"/></marker>
+    <marker id="arr5g" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6" fill="#3fb950"/></marker>
+  </defs>
+</svg>
+</div>
+
+<h3>5.7.4 Flat View 与可选关联</h3>
+
+<p>当被 Flat 映射的关联是 <code>@ManyToOne(optional = true)</code> 时，关联为 NULL 意味着所有扁平字段都是 NULL——无法区分"关联存在但字段为空"和"关联本身不存在"。此时使用可空的子视图更加语义明确。</p>
+
+<div class="real-world">
+  <h5>实战经验</h5>
+  <p>在电商系统中，订单的 <code>billingAddress</code> 可能为空（使用发货地址结算）。
+  如果对 billingAddress 使用 Flat View，当地址不存在时，<code>billingStreet</code>、<code>billingCity</code> 全部为 <code>null</code>，
+  客户端无法区分是"没有独立结算地址"还是"地址信息未填"。</p>
+  <p>推荐方案：使用 <code>@Mapping("billingAddress") AddressView getBillingAddress()</code>，关联不存在时整个子视图返回 <code>null</code>。</p>
+</div>
+
+<!-- ====== 本章小结 ====== -->
+<div class="chapter-summary" id="summary">
+  <h2>📋 本章小结</h2>
+  <ul>
+    <li><strong>子视图嵌套</strong>：返回类型为 <code>@EntityView</code> 时自动识别为子视图，合并为单条优化 SQL</li>
+    <li><strong>继承映射</strong>：<code>@EntityViewInheritance</code> + <code>@EntityViewInheritanceMapping</code> 实现多态 DTO 投影</li>
+    <li><strong>集合策略</strong>：JOIN（小集合）、SUBSELECT（需分页）、MULTISET（推荐，无笛卡尔积）</li>
+    <li><strong>关联子查询</strong>：<code>@MappingCorrelated</code> + <code>CorrelationProvider</code> 嵌入聚合计算，优于手动 N+1 循环</li>
+    <li><strong>Flat View</strong>：路径表达式扁平化嵌套结构，适合表格/CSV 场景，注意可选关联的语义陷阱</li>
+    <li><strong>@MappingParameter</strong>：运行时参数注入，实现 Locale 切换等动态逻辑</li>
+    <li><strong>陷阱警示</strong>：深层嵌套用 MULTISET、集合分页避免 JOIN、关联子查询注意批处理</li>
+  </ul>
+  <p class="next-hint">
+    下一章 <a href="ch06-updatable.html">第 6 章 · 可更新与可创建视图</a> 将介绍如何通过
+    <code>@UpdatableEntityView</code> 和 <code>@CreatableEntityView</code> 实现基于 DTO 的写操作，
+    包括脏检查、级联策略与乐观锁机制。
+  </p>
+</div>
+
+<!-- ====== 章节导航 ====== -->
+<div class="chapter-nav">
+  <a href="ch04-entityview.html">← 第 4 章 · Entity View 基础</a>
+  <a href="ch06-updatable.html">第 6 章 · 可更新与可创建视图 →</a>
+</div>
+
+<p class="footer">&copy; 2026 图解 Blaze-Persistence &middot; 第 5 章 &middot; 由 AI 辅助生成</p>
+
+</article>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+mermaid.initialize({
+  theme: 'dark',
+  themeVariables: {
+    primaryColor: '#58a6ff', primaryTextColor: '#e6edf3', primaryBorderColor: '#30363d',
+    lineColor: '#8b949e', secondaryColor: '#161b22', tertiaryColor: '#0d1117',
+    background: '#161b22', mainBkg: '#161b22', nodeBorder: '#30363d',
+    clusterBkg: 'rgba(22,27,34,.5)', clusterBorder: '#30363d', titleColor: '#e6edf3',
+    edgeLabelBackground: '#161b22',
+  },
+  flowchart: { curve: 'basis', padding: 15 },
+  sequence: { actorMargin: 50, messageMargin: 30 },
+});
+</script>
+</body>
+</html>

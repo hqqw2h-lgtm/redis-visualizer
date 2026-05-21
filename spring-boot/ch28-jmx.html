@@ -1,0 +1,1343 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 28 章 · JMX 管理与监控 — 图解 Spring Boot</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Spring Boot</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="ch27-jca.html">上一章 ch27-jca</a>
+  <a href="ch29-io.html">下一章 ch29-io</a>
+</nav>
+
+<aside class="toc">
+<a href="#28.0-章首速览">28.0 章首速览</a>
+<a href="#28.1-jmx-架构与-mbean-类型">28.1 JMX 架构与 MBean 类型</a>
+<a href="#28.2-spring-jmx-导出">28.2 Spring JMX 导出</a>
+<a href="#28.3-spring-boot-actuator-jmx">28.3 Spring Boot Actuator JMX</a>
+<a href="#28.4-远程访问">28.4 远程访问</a>
+<a href="#28.5-通知机制">28.5 通知机制</a>
+<a href="#28.6-陷阱与限制">28.6 陷阱与限制</a>
+<a href="#28.7-源码深潜">28.7 源码深潜</a>
+<a href="#28.8-本章要点">28.8 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 28 章 · JMX 管理与监控</h1>
+<p class="subtitle">v7 图解版 · 自动从 v6 markdown 生成 · Mermaid 图原样保留</p>
+<div class="chapter-intro"><p>JMX(Java Management Extensions,JSR-3 / JSR-160)是 Java 平台自 J2SE 5.0 起内置的标准管理框架。架构分三层:Instrumentation(MBean 定义属性、操作、通知)、Agent(<code>MBeanServer</code> 注册与代理)、Remote(RMI / HTTP 远程访问)。</p>
+<p><code>MBean</code> 通过 <code>ObjectName</code> 在 <code>MBeanServer</code> 中唯一标识。属性(attribute)由 getter / setter 暴露,操作(operation)由方法暴露,通知(notification)由 <code>NotificationBroadcaster</code> 发布。<code>ManagementFactory.getPlatformMBeanServer()</code> 返回 JVM 默认的平台 MBeanServer。</p>
+<p>Spring 提供 <code>@ManagedResource</code> / <code>@ManagedAttribute</code> / <code>@ManagedOperation</code> 三个注解,把普通 Spring Bean 导出为 MBean。<code>MBeanExporter</code> 在容器初始化完成后扫描、装配、注册。Spring Boot 2.0 起 <code>spring.jmx.enabled</code> 默认为 <code>false</code>。</p>
+<p>本章按「JMX 架构 → Spring 导出 → Actuator JMX → 远程访问 → 通知 → 陷阱 → 源码深潜」展开,聚焦运行时监控与管理操作的边界。</p>
+</div>
+<h2 id="28.0-章首速览">28.0 章首速览</h2>
+<h3>图 28-0-1:JMX 全景</h3>
+<div class="diagram"><div class="mermaid">
+flowchart LR
+    subgraph Inst["Instrumentation 插桩层"]
+        MB["MBean<br/>属性 / 操作 / 通知"]
+    end
+    subgraph Agent["Agent 代理层"]
+        MBS["MBeanServer"]
+    end
+    subgraph Remote["Remote 远程层"]
+        RMI["RMI Connector"]
+        Jolokia["Jolokia HTTP"]
+        Exp["Prometheus JMX Exporter"]
+    end
+    MB --> MBS
+    MBS --> RMI
+    MBS --> Jolokia
+    MBS --> Exp
+    RMI --> Tool["JConsole / VisualVM"]
+    Jolokia --> Curl["curl / Grafana"]
+    Exp --> Prom["Prometheus / Grafana"]
+
+</div></div>
+<h3>表 28-0-1:本章节次结构</h3>
+<table>
+<thead>
+<tr>
+<th>节次</th>
+<th>主题</th>
+<th>关键类</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>28.1</td>
+<td>JMX 架构</td>
+<td><code>MBean</code>、<code>MBeanServer</code>、<code>ObjectName</code></td>
+</tr>
+<tr>
+<td>28.2</td>
+<td>Spring JMX 导出</td>
+<td><code>@ManagedResource</code>、<code>MBeanExporter</code>、<code>AnnotationMBeanExporter</code></td>
+</tr>
+<tr>
+<td>28.3</td>
+<td>Actuator JMX</td>
+<td><code>JmxAutoConfiguration</code>、<code>JmxEndpointExporter</code></td>
+</tr>
+<tr>
+<td>28.4</td>
+<td>远程访问</td>
+<td><code>JMXConnectorServer</code>、<code>JMXServiceURL</code>、Jolokia</td>
+</tr>
+<tr>
+<td>28.5</td>
+<td>通知机制</td>
+<td><code>NotificationBroadcasterSupport</code>、<code>NotificationPublisher</code></td>
+</tr>
+<tr>
+<td>28.6</td>
+<td>陷阱</td>
+<td>5 类生产问题</td>
+</tr>
+<tr>
+<td>28.7</td>
+<td>源码深潜</td>
+<td><code>MBeanExporter</code> 调用链</td>
+</tr>
+</tbody>
+</table>
+<h2 id="28.1-jmx-架构与-mbean-类型">28.1 JMX 架构与 MBean 类型</h2>
+<h3>图 28-1-1:三层架构</h3>
+<div class="diagram"><div class="mermaid">
+flowchart LR
+    subgraph Inst["Instrumentation"]
+        Std["Standard MBean<br/>XxxMBean 接口约定"]
+        Dyn["Dynamic MBean<br/>运行时元数据"]
+        Model["Model MBean<br/>Spring 内部使用"]
+        MX["MXBean<br/>Open Type 互操作"]
+    end
+    subgraph Agent["Agent"]
+        MBS["MBeanServer"]
+        Reg["Registry<br/>注册 / 查询"]
+        Svc["Agent Services<br/>定时器 / 监视器"]
+    end
+    subgraph Remote["Remote"]
+        Conn["JMXConnectorServer<br/>RMI / JMXMP"]
+        Adapter["Protocol Adapter<br/>HTTP / SNMP"]
+    end
+    Std --> MBS
+    Dyn --> MBS
+    Model --> Reg
+    MX --> Reg
+    MBS --> Conn
+    Reg --> Adapter
+    Conn --> Tool["JConsole / VisualVM"]
+    Adapter --> HTTP["Jolokia / Prometheus"]
+
+</div></div>
+<h3>表 28-1-1:四种 MBean 类型</h3>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>元数据来源</th>
+<th>灵活性</th>
+<th>典型使用者</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Standard MBean</td>
+<td>接口命名约定(<code>XxxMBean</code>)</td>
+<td>低,编译期固定</td>
+<td>自定义业务 MBean</td>
+</tr>
+<tr>
+<td>Dynamic MBean</td>
+<td><code>getMBeanInfo()</code> 方法</td>
+<td>高,运行时动态</td>
+<td>Tomcat 内部组件</td>
+</tr>
+<tr>
+<td>Model MBean</td>
+<td>外部 <code>ModelMBeanInfo</code> 描述符</td>
+<td>最高,声明式</td>
+<td>Spring <code>MBeanExporter</code></td>
+</tr>
+<tr>
+<td>Open MBean / MXBean</td>
+<td>限制为 Open Types</td>
+<td>中,类型受限互操作好</td>
+<td>JVM 平台 MXBean</td>
+</tr>
+</tbody>
+</table>
+<h3>28.1.1 Standard MBean 示例</h3>
+<pre><code class="language-java">public interface OrderServiceMBean {
+    int getPendingOrderCount();
+    void setMaxConcurrentOrders(int n);
+    int getMaxConcurrentOrders();
+    void resetCounter();
+}
+
+public class OrderService implements OrderServiceMBean {
+    private final AtomicInteger pendingCount = new AtomicInteger(0);
+    private volatile int maxConcurrent = 100;
+
+    @Override
+    public int getPendingOrderCount() { return pendingCount.get(); }
+
+    @Override
+    public int getMaxConcurrentOrders() { return maxConcurrent; }
+
+    @Override
+    public void setMaxConcurrentOrders(int n) { this.maxConcurrent = n; }
+
+    @Override
+    public void resetCounter() { pendingCount.set(0); }
+}
+</code></pre>
+<p>接口名以 <code>MBean</code> 结尾,实现类去掉 <code>MBean</code> 后缀,这是 JMX 反射机制的命名约定。</p>
+<h3>28.1.2 ObjectName 命名</h3>
+<pre><code class="language-text">+----------------------------+----------------------------+
+| domain                      | property-list              |
++----------------------------+----------------------------+
+| java.lang                   | type=Memory                 |
+| java.lang                   | type=GarbageCollector,name=G1 Young Generation |
+| org.springframework.boot    | type=Endpoint,name=Health   |
+| com.zaxxer.hikari           | type=Pool (HikariPool-1)    |
+| com.example.order           | type=OrderService,name=main |
++----------------------------+----------------------------+
+</code></pre>
+<p><code>ObjectName</code> 格式为 <code>domain:key1=value1,key2=value2</code>。domain 通常用反向域名,property-list 描述类型与实例。包含 <code>=</code> / <code>:</code> / <code>,</code> / <code>"</code> 的 value 必须用双引号包裹,否则抛 <code>MalformedObjectNameException</code>。</p>
+<h3>28.1.3 平台 MXBean</h3>
+<pre><code class="language-java">MemoryMXBean memory = ManagementFactory.getMemoryMXBean();
+MemoryUsage heap = memory.getHeapMemoryUsage();
+log.info(&quot;heap used={}MB max={}MB usage={}%&quot;,
+    heap.getUsed() / 1024 / 1024,
+    heap.getMax() / 1024 / 1024,
+    heap.getUsed() * 100 / heap.getMax());
+
+ThreadMXBean threading = ManagementFactory.getThreadMXBean();
+log.info(&quot;threads current={} peak={}&quot;,
+    threading.getThreadCount(),
+    threading.getPeakThreadCount());
+
+long[] deadlocked = threading.findDeadlockedThreads();
+if (deadlocked != null) {
+    ThreadInfo[] infos = threading.getThreadInfo(deadlocked, true, true);
+    for (ThreadInfo info : infos) {
+        log.error(&quot;deadlocked thread: {}&quot;, info.getThreadName());
+    }
+}
+
+for (GarbageCollectorMXBean gc : ManagementFactory.getGarbageCollectorMXBeans()) {
+    log.info(&quot;gc {} count={} time={}ms&quot;,
+        gc.getName(), gc.getCollectionCount(), gc.getCollectionTime());
+}
+</code></pre>
+<p>JVM 启动时自动注册 <code>Memory</code>、<code>Threading</code>、<code>GarbageCollector</code>、<code>OperatingSystem</code>、<code>Runtime</code>、<code>ClassLoading</code>、<code>MemoryPool</code> 等平台 MXBean。Prometheus JMX Exporter、Spring Boot Actuator 的 <code>jvm.*</code> 指标底层都从这些 MXBean 读取。</p>
+<h3>表 28-1-2:JVM 平台 MXBean</h3>
+<table>
+<thead>
+<tr>
+<th>MXBean</th>
+<th>ObjectName</th>
+<th>关键属性</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>MemoryMXBean</code></td>
+<td><code>java.lang:type=Memory</code></td>
+<td><code>HeapMemoryUsage</code>、<code>NonHeapMemoryUsage</code></td>
+</tr>
+<tr>
+<td><code>ThreadMXBean</code></td>
+<td><code>java.lang:type=Threading</code></td>
+<td><code>ThreadCount</code>、<code>PeakThreadCount</code></td>
+</tr>
+<tr>
+<td><code>GarbageCollectorMXBean</code></td>
+<td><code>java.lang:type=GarbageCollector,name=*</code></td>
+<td><code>CollectionCount</code>、<code>CollectionTime</code></td>
+</tr>
+<tr>
+<td><code>OperatingSystemMXBean</code></td>
+<td><code>java.lang:type=OperatingSystem</code></td>
+<td><code>SystemCpuLoad</code>、<code>ProcessCpuLoad</code></td>
+</tr>
+<tr>
+<td><code>RuntimeMXBean</code></td>
+<td><code>java.lang:type=Runtime</code></td>
+<td><code>Uptime</code>、<code>InputArguments</code></td>
+</tr>
+<tr>
+<td><code>ClassLoadingMXBean</code></td>
+<td><code>java.lang:type=ClassLoading</code></td>
+<td><code>LoadedClassCount</code>、<code>UnloadedClassCount</code></td>
+</tr>
+<tr>
+<td><code>MemoryPoolMXBean</code></td>
+<td><code>java.lang:type=MemoryPool,name=*</code></td>
+<td><code>Usage</code>、<code>PeakUsage</code>、<code>CollectionUsage</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="28.2-spring-jmx-导出">28.2 Spring JMX 导出</h2>
+<h3>图 28-2-1:Spring Bean 到 MBean 的注册流程</h3>
+<div class="diagram"><div class="mermaid">
+sequenceDiagram
+    participant Ctx as ApplicationContext
+    participant Exp as MBeanExporter
+    participant Asm as MetadataMBeanInfoAssembler
+    participant Ns as ObjectNamingStrategy
+    participant MBS as MBeanServer
+
+    Ctx->>Exp: afterPropertiesSet()
+    Exp->>Ctx: 扫描所有 Bean 定义
+    Ctx-->>Exp: 发现 @ManagedResource Bean 列表
+    loop 每个 @ManagedResource Bean
+        Exp->>Asm: getMBeanInfo(bean, beanKey)
+        Asm-->>Exp: ModelMBeanInfo
+        Exp->>Ns: getObjectName(bean, beanKey)
+        Ns-->>Exp: ObjectName
+        Exp->>Exp: 创建 RequiredModelMBean 包装
+        Exp->>MBS: registerMBean(modelMBean, objectName)
+        MBS-->>Exp: 注册成功
+    end
+
+</div></div>
+<h3>28.2.1 @ManagedResource 三注解</h3>
+<pre><code class="language-java">@Component
+@ManagedResource(
+    objectName = &quot;com.example:type=CacheManager,name=userCache&quot;,
+    description = &quot;用户缓存管理 MBean&quot;)
+public class UserCacheManager {
+
+    private volatile int maxSize = 10000;
+    private final AtomicLong hitCount = new AtomicLong(0);
+    private final AtomicLong missCount = new AtomicLong(0);
+
+    @ManagedAttribute(description = &quot;缓存最大容量&quot;)
+    public int getMaxSize() { return maxSize; }
+
+    @ManagedAttribute(description = &quot;设置缓存最大容量&quot;)
+    public void setMaxSize(int maxSize) { this.maxSize = maxSize; }
+
+    @ManagedAttribute(description = &quot;缓存命中次数&quot;)
+    public long getHitCount() { return hitCount.get(); }
+
+    @ManagedAttribute(description = &quot;缓存未命中次数&quot;)
+    public long getMissCount() { return missCount.get(); }
+
+    @ManagedAttribute(description = &quot;缓存命中率&quot;)
+    public double getHitRate() {
+        long total = hitCount.get() + missCount.get();
+        return total == 0 ? 0.0 : (double) hitCount.get() / total;
+    }
+
+    @ManagedOperation(description = &quot;清空缓存并重置统计&quot;)
+    public void clearCache() {
+        hitCount.set(0);
+        missCount.set(0);
+    }
+
+    @ManagedOperation(description = &quot;按前缀清除缓存条目&quot;)
+    @ManagedOperationParameter(name = &quot;prefix&quot;, description = &quot;key 前缀&quot;)
+    public int evictByPrefix(String prefix) {
+        return 0;
+    }
+}
+</code></pre>
+<h3>表 28-2-1:Spring JMX 注解</h3>
+<table>
+<thead>
+<tr>
+<th>注解</th>
+<th>作用目标</th>
+<th>关键属性</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>@ManagedResource</code></td>
+<td>类</td>
+<td><code>objectName</code>、<code>description</code>、<code>log</code>、<code>logFile</code></td>
+</tr>
+<tr>
+<td><code>@ManagedAttribute</code></td>
+<td>getter / setter</td>
+<td><code>description</code>、<code>defaultValue</code>、<code>currencyTimeLimit</code>(缓存秒数)</td>
+</tr>
+<tr>
+<td><code>@ManagedOperation</code></td>
+<td>方法</td>
+<td><code>description</code>、<code>impact</code>(<code>INFO</code> / <code>ACTION</code> / <code>ACTION_INFO</code> / <code>UNKNOWN</code>)</td>
+</tr>
+<tr>
+<td><code>@ManagedOperationParameter</code></td>
+<td>方法参数(组合)</td>
+<td><code>name</code>、<code>description</code></td>
+</tr>
+<tr>
+<td><code>@ManagedNotification</code></td>
+<td>类</td>
+<td><code>name</code>、<code>notificationTypes</code>、<code>description</code></td>
+</tr>
+</tbody>
+</table>
+<h3>28.2.2 启动验证</h3>
+<pre><code class="language-yaml">spring:
+  jmx:
+    enabled: true
+    default-domain: com.example.myapp
+</code></pre>
+<p>启动日志:</p>
+<pre><code class="language-log">2026-05-02T15:44:18.412 INFO  AnnotationMBeanExporter : Registering beans for JMX exposure on startup
+2026-05-02T15:44:18.427 INFO  AnnotationMBeanExporter : Located managed bean 'orderCacheManager': registering with JMX server as MBean [com.example:type=CacheManager,name=userCache]
+</code></pre>
+<p><code>jmxterm</code> 客户端验证:</p>
+<pre><code class="language-text">$&gt; bean com.example:type=CacheManager,name=userCache
+$&gt; info
+#mbean = com.example:type=CacheManager,name=userCache
+#class name = org.springframework.jmx.export.SpringModelMBean
+# attributes
+%0 - HitCount (long, r)
+%1 - HitRate (double, r)
+%2 - MaxSize (int, rw)
+%3 - MissCount (long, r)
+# operations
+%0 - clearCache() : void
+%1 - evictByPrefix(java.lang.String prefix) : int
+</code></pre>
+<h3>28.2.3 MBeanInfoAssembler 策略</h3>
+<div class="diagram"><div class="mermaid">
+flowchart LR
+    Root["MBeanInfoAssembler 接口"] --> Meta["MetadataMBeanInfoAssembler<br/>注解驱动(默认)"]
+    Root --> Iface["InterfaceBasedMBeanInfoAssembler<br/>接口驱动"]
+    Root --> Method["MethodNameBasedMBeanInfoAssembler<br/>方法名白名单"]
+    Root --> Excl["MethodExclusionMBeanInfoAssembler<br/>方法名黑名单"]
+    Meta --> R1["读取 @ManagedResource / @ManagedAttribute / @ManagedOperation"]
+    Iface --> R2["通过指定接口确定暴露成员"]
+    Method --> R3["白名单方法名"]
+    Excl --> R4["黑名单方法名"]
+
+</div></div>
+<pre><code class="language-java">@Bean
+public InterfaceBasedMBeanInfoAssembler interfaceAssembler() {
+    InterfaceBasedMBeanInfoAssembler assembler = new InterfaceBasedMBeanInfoAssembler();
+    assembler.setManagedInterfaces(OrderServiceMBean.class, CacheManagerMBean.class);
+    return assembler;
+}
+
+@Bean
+public MethodNameBasedMBeanInfoAssembler methodAssembler() {
+    MethodNameBasedMBeanInfoAssembler assembler = new MethodNameBasedMBeanInfoAssembler();
+    assembler.setManagedMethods(&quot;getHitCount&quot;, &quot;getMissCount&quot;, &quot;clearCache&quot;);
+    return assembler;
+}
+</code></pre>
+<h3>28.2.4 命名策略</h3>
+<table>
+<thead>
+<tr>
+<th>策略</th>
+<th>生成规则</th>
+<th>示例</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>MetadataNamingStrategy</code></td>
+<td>读取 <code>@ManagedResource(objectName=...)</code>,缺失则 fallback</td>
+<td><code>com.example:type=CacheManager,name=userCache</code></td>
+</tr>
+<tr>
+<td><code>KeyNamingStrategy</code></td>
+<td>配置中 key 映射表</td>
+<td>自定义映射</td>
+</tr>
+<tr>
+<td><code>IdentityNamingStrategy</code></td>
+<td><code>className:hashCode=xxx</code></td>
+<td><code>com.example.OrderService:hashCode=1a2b3c</code></td>
+</tr>
+</tbody>
+</table>
+<h3>28.2.5 HikariCP JMX 集成</h3>
+<pre><code class="language-yaml">spring:
+  datasource:
+    hikari:
+      register-mbeans: true
+      pool-name: OrderDB-Pool
+      maximum-pool-size: 20
+      minimum-idle: 5
+</code></pre>
+<p>注册的 ObjectName:<code>com.zaxxer.hikari:type=Pool (OrderDB-Pool)</code>,暴露 <code>ActiveConnections</code>、<code>IdleConnections</code>、<code>TotalConnections</code>、<code>ThreadsAwaitingConnection</code> 属性,以及 <code>softEvictConnections()</code>、<code>suspendPool()</code>、<code>resumePool()</code> 操作。</p>
+<pre><code class="language-java">@Autowired
+private DataSource dataSource;
+
+public void checkPool() {
+    HikariDataSource hds = (HikariDataSource) dataSource;
+    HikariPoolMXBean pool = hds.getHikariPoolMXBean();
+    log.info(&quot;pool active={} idle={} total={} waiting={}&quot;,
+        pool.getActiveConnections(),
+        pool.getIdleConnections(),
+        pool.getTotalConnections(),
+        pool.getThreadsAwaitingConnection());
+}
+</code></pre>
+<h2 id="28.3-spring-boot-actuator-jmx">28.3 Spring Boot Actuator JMX</h2>
+<h3>图 28-3-1:Boot JMX 自动配置</h3>
+<div class="diagram"><div class="mermaid">
+flowchart TD
+    Start["Spring Boot 启动"] --> Cond{"spring.jmx.enabled<br/>== true?"}
+    Cond -->|否(默认)| Skip["跳过 JMX 自动配置<br/>不创建 MBeanExporter"]
+    Cond -->|是| Auto["JmxAutoConfiguration 生效"]
+    Auto --> Exp["创建 AnnotationMBeanExporter"]
+    Exp --> Scan["扫描 @ManagedResource Bean<br/>注册到 MBeanServer"]
+    Auto --> Endp{"management.endpoints<br/>.jmx.exposure.include?"}
+    Endp -->|配置端点列表| EndpExp["JmxEndpointExporter<br/>注册 Actuator 端点为 MBean"]
+    Endp -->|未配置| Default["默认暴露所有 Actuator JMX 端点"]
+    EndpExp --> Done["MBean 注册完成"]
+    Default --> Done
+
+</div></div>
+<h3>28.3.1 Actuator JMX 端点配置</h3>
+<pre><code class="language-yaml">spring:
+  jmx:
+    enabled: true
+    default-domain: com.example.myapp
+
+management:
+  endpoints:
+    jmx:
+      exposure:
+        include: health,metrics,info,env,beans
+  endpoint:
+    health:
+      show-details: always
+</code></pre>
+<p>启动日志同时确认 Spring JMX 与 Actuator JMX 都已注册:</p>
+<pre><code class="language-log">2026-05-02T15:46:03.118 INFO  JmxEndpointExporter : Registering beans for JMX exposure on startup
+2026-05-02T15:46:03.136 INFO  JmxEndpointExporter : Located managed bean 'healthEndpoint': registering with JMX server as MBean [org.springframework.boot:type=Endpoint,name=Health]
+2026-05-02T15:46:03.139 INFO  JmxEndpointExporter : Located managed bean 'metricsEndpoint': registering with JMX server as MBean [org.springframework.boot:type=Endpoint,name=Metrics]
+</code></pre>
+<h3>表 28-3-1:JMX vs HTTP 端点</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>JMX 端点</th>
+<th>HTTP 端点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Boot 2+ 默认</td>
+<td>禁用(显式启用)</td>
+<td>启用(仅 health + info 暴露)</td>
+</tr>
+<tr>
+<td>协议</td>
+<td>本地 MBeanServer / RMI</td>
+<td>HTTP / HTTPS</td>
+</tr>
+<tr>
+<td>额外端口</td>
+<td>不需要</td>
+<td>需 management 端口</td>
+</tr>
+<tr>
+<td>认证</td>
+<td>JMX 原生 + SSL</td>
+<td>Spring Security</td>
+</tr>
+<tr>
+<td>客户端</td>
+<td>JConsole / VisualVM / jmxterm</td>
+<td>浏览器 / curl / Prometheus</td>
+</tr>
+<tr>
+<td>适用</td>
+<td>内网运维 / 已有 JMX 基础设施</td>
+<td>云原生 / K8s Probe</td>
+</tr>
+</tbody>
+</table>
+<h3>28.3.2 Jolokia HTTP 桥接</h3>
+<p>Jolokia 是 JMX-HTTP 桥接代理,把 JMX MBean 操作转换为 RESTful JSON。Spring Boot 2.x 通过 Actuator 集成 Jolokia,3.x 需使用与 Jakarta Servlet 兼容的 Jolokia 2.x agent / servlet。</p>
+<pre><code class="language-http">GET /actuator/jolokia/read/java.lang:type=Memory/HeapMemoryUsage
+</code></pre>
+<pre><code class="language-json">{
+  &quot;request&quot;: {&quot;mbean&quot;: &quot;java.lang:type=Memory&quot;, &quot;type&quot;: &quot;read&quot;, &quot;attribute&quot;: &quot;HeapMemoryUsage&quot;},
+  &quot;status&quot;: 200,
+  &quot;value&quot;: {
+    &quot;init&quot;: 268435456,
+    &quot;used&quot;: 134217728,
+    &quot;committed&quot;: 268435456,
+    &quot;max&quot;: 4294967296
+  }
+}
+</code></pre>
+<pre><code class="language-http">POST /actuator/jolokia/exec/com.example:type=CacheManager,name=userCache/clearCache
+GET  /actuator/jolokia/search/com.example:*
+</code></pre>
+<h3>图 28-3-2:Jolokia 桥接架构</h3>
+<div class="diagram"><div class="mermaid">
+flowchart LR
+    Client["HTTP 客户端<br/>curl / 浏览器 / 监控"] --> J["Jolokia Agent<br/>Servlet Filter"]
+    J -->|"解析请求 → JMX 调用"| MBS["MBeanServer"]
+    MBS -->|"getAttribute / invoke"| MBean["目标 MBean"]
+    MBean -->|"返回值"| MBS
+    MBS -->|"Java Object"| J
+    J -->|"JSON 序列化"| Client
+
+</div></div>
+<h3>28.3.3 Prometheus JMX Exporter</h3>
+<pre><code class="language-bash">java -javaagent:/opt/jmx_prometheus_javaagent.jar=9404:/opt/config.yml -jar myapp.jar
+</code></pre>
+<pre><code class="language-yaml">rules:
+  - pattern: 'com.zaxxer.hikari&lt;type=Pool \((.+)\)&gt;&lt;&gt;(\w+)'
+    name: hikaricp_$2
+    labels:
+      pool: $1
+    type: GAUGE
+  - pattern: 'java.lang&lt;type=Memory&gt;&lt;&gt;HeapMemoryUsage'
+    name: jvm_memory_heap_bytes
+    type: GAUGE
+  - pattern: 'com.example&lt;type=CacheManager,name=(\w+)&gt;&lt;&gt;(\w+)'
+    name: app_cache_$2
+    labels:
+      cache_name: $1
+    type: GAUGE
+</code></pre>
+<pre><code class="language-text">hikaricp_ActiveConnections{pool=&quot;OrderDB-Pool&quot;} 5
+hikaricp_IdleConnections{pool=&quot;OrderDB-Pool&quot;} 15
+jvm_memory_heap_bytes{area=&quot;used&quot;} 134217728
+app_cache_HitRate{cache_name=&quot;userCache&quot;} 0.95
+</code></pre>
+<p>JMX Exporter Agent 在 JVM 内部采集 MBean,通过 HTTP 端点暴露 Prometheus 格式指标。Kubernetes 环境中比 RMI 更稳定。</p>
+<h2 id="28.4-远程访问">28.4 远程访问</h2>
+<h3>图 28-4-1:RMI 远程连接</h3>
+<div class="diagram"><div class="mermaid">
+sequenceDiagram
+    participant Client as JMX 客户端
+    participant Reg as RMI Registry(9999)
+    participant Conn as JMXConnectorServer
+    participant MBS as MBeanServer
+    participant MBean as 目标 MBean
+
+    Client->>Reg: lookup("jmxrmi")
+    Reg-->>Client: JMXConnector stub
+    Client->>Conn: connect(credentials)
+    Conn-->>Client: JMXConnector(已认证会话)
+    Client->>Conn: getMBeanServerConnection()
+    Conn-->>Client: MBeanServerConnection
+    Client->>Conn: getAttribute(Memory, HeapMemoryUsage)
+    Conn->>MBS: getAttribute(objectName, attribute)
+    MBS->>MBean: getHeapMemoryUsage()
+    MBean-->>MBS: MemoryUsage
+    MBS-->>Conn: 序列化 → 传输
+    Conn-->>Client: MemoryUsage(反序列化)
+
+</div></div>
+<h3>28.4.1 服务端启动</h3>
+<pre><code class="language-java">MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+JMXServiceURL url = new JMXServiceURL(
+    &quot;service:jmx:rmi:///jndi/rmi://0.0.0.0:9999/jmxrmi&quot;);
+JMXConnectorServer connectorServer = JMXConnectorServerFactory
+    .newJMXConnectorServer(url, null, mbs);
+connectorServer.start();
+</code></pre>
+<p>JVM 启动参数方式更常用:</p>
+<pre><code class="language-bash">java -jar myapp.jar \
+  -Dcom.sun.management.jmxremote.port=9999 \
+  -Dcom.sun.management.jmxremote.rmi.port=9999 \
+  -Dcom.sun.management.jmxremote.ssl=false \
+  -Dcom.sun.management.jmxremote.authenticate=true \
+  -Dcom.sun.management.jmxremote.password.file=/etc/jmx/jmxremote.password \
+  -Dcom.sun.management.jmxremote.access.file=/etc/jmx/jmxremote.access
+</code></pre>
+<h3>28.4.2 客户端连接</h3>
+<pre><code class="language-java">JMXServiceURL url = new JMXServiceURL(
+    &quot;service:jmx:rmi:///jndi/rmi://server-host:9999/jmxrmi&quot;);
+Map&lt;String, Object&gt; env = new HashMap&lt;&gt;();
+env.put(JMXConnector.CREDENTIALS,
+    new String[]{&quot;monitorUser&quot;, &quot;secretPassword&quot;});
+
+try (JMXConnector connector = JMXConnectorFactory.connect(url, env)) {
+    MBeanServerConnection conn = connector.getMBeanServerConnection();
+    ObjectName memoryName = new ObjectName(&quot;java.lang:type=Memory&quot;);
+    CompositeData heapUsage = (CompositeData) conn.getAttribute(memoryName, &quot;HeapMemoryUsage&quot;);
+    long used = (Long) heapUsage.get(&quot;used&quot;);
+    long max = (Long) heapUsage.get(&quot;max&quot;);
+    log.info(&quot;heap usage={}% used={}MB max={}MB&quot;,
+        used * 100 / max, used / 1024 / 1024, max / 1024 / 1024);
+}
+</code></pre>
+<h3>28.4.3 安全配置</h3>
+<pre><code class="language-text"># /etc/jmx/jmxremote.password (文件权限 600)
+monitorUser  readOnlyPassword123
+controlUser  readWritePassword456
+
+# /etc/jmx/jmxremote.access
+monitorUser  readonly
+controlUser  readwrite
+</code></pre>
+<pre><code class="language-bash">java -jar myapp.jar \
+  -Dcom.sun.management.jmxremote.port=9999 \
+  -Dcom.sun.management.jmxremote.rmi.port=9999 \
+  -Dcom.sun.management.jmxremote.authenticate=true \
+  -Dcom.sun.management.jmxremote.password.file=/etc/jmx/jmxremote.password \
+  -Dcom.sun.management.jmxremote.access.file=/etc/jmx/jmxremote.access \
+  -Dcom.sun.management.jmxremote.ssl=true \
+  -Djavax.net.ssl.keyStore=/etc/jmx/keystore.jks \
+  -Djavax.net.ssl.keyStorePassword=keystorePass
+</code></pre>
+<p>生产环境必须 <code>authenticate=true</code> + <code>ssl=true</code>。<code>authenticate=false</code> 等同于给攻击者提供 RCE 入口(可通过 <code>MLet</code> MBean 加载远程类)。</p>
+<h3>表 28-4-1:RMI vs Jolokia 对比</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>RMI Connector</th>
+<th>Jolokia HTTP</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>端口</td>
+<td>Registry + 数据(双端口)</td>
+<td>单 HTTP 端口</td>
+</tr>
+<tr>
+<td>协议</td>
+<td>Java RMI(序列化)</td>
+<td>HTTP / JSON</td>
+</tr>
+<tr>
+<td>防火墙</td>
+<td>数据端口需固定</td>
+<td>标准 HTTP,无需特殊配置</td>
+</tr>
+<tr>
+<td>容器</td>
+<td>RMI hostname / NAT 问题</td>
+<td>容器友好</td>
+</tr>
+<tr>
+<td>安全</td>
+<td>RMI 反序列化 CVE 风险</td>
+<td>标准 HTTP 安全模型</td>
+</tr>
+<tr>
+<td>客户端</td>
+<td>JConsole / VisualVM / jmxterm</td>
+<td>curl / Grafana / 自定义</td>
+</tr>
+</tbody>
+</table>
+<h2 id="28.5-通知机制">28.5 通知机制</h2>
+<h3>图 28-5-1:JMX 通知发布订阅</h3>
+<div class="diagram"><div class="mermaid">
+sequenceDiagram
+    participant Src as 源 MBean
+    participant MBS as MBeanServer
+    participant F as NotificationFilter
+    participant L1 as Listener A(告警)
+    participant L2 as Listener B(指标)
+
+    Note over MBS: 注册阶段
+    L1->>MBS: addNotificationListener(objectName, listener, filter, handback)
+    L2->>MBS: addNotificationListener(objectName, listener, null, null)
+
+    Note over Src,L2: 运行时
+    Src->>Src: 业务事件发生
+    Src->>MBS: sendNotification(Notification)
+    MBS->>F: isNotificationEnabled(notification)?
+    F-->>MBS: true
+    MBS->>L1: handleNotification(notification, handback)
+    L1->>L1: 发送告警邮件
+    MBS->>L2: handleNotification(notification, null)
+    L2->>L2: 记录指标
+
+</div></div>
+<h3>28.5.1 NotificationBroadcasterSupport</h3>
+<pre><code class="language-java">public class OrderService extends NotificationBroadcasterSupport implements OrderServiceMBean {
+
+    private long sequenceNumber = 0;
+
+    public void processOrder(Order order) {
+        Notification notification = new Notification(
+            &quot;order.processed&quot;,
+            this,
+            sequenceNumber++,
+            System.currentTimeMillis(),
+            &quot;订单处理完成: &quot; + order.getId());
+        notification.setUserData(Map.of(
+            &quot;orderId&quot;, order.getId(),
+            &quot;amount&quot;, order.getAmount()));
+        sendNotification(notification);
+    }
+
+    @Override
+    public MBeanNotificationInfo[] getNotificationInfo() {
+        return new MBeanNotificationInfo[]{
+            new MBeanNotificationInfo(
+                new String[]{&quot;order.processed&quot;, &quot;order.failed&quot;},
+                Notification.class.getName(),
+                &quot;订单处理事件通知&quot;)
+        };
+    }
+}
+</code></pre>
+<h3>28.5.2 Spring NotificationPublisher</h3>
+<pre><code class="language-java">@Component
+@ManagedResource(objectName = &quot;com.example:type=OrderService,name=main&quot;)
+@ManagedNotification(
+    name = &quot;OrderNotification&quot;,
+    notificationTypes = {&quot;order.processed&quot;, &quot;order.failed&quot;},
+    description = &quot;订单处理事件通知&quot;)
+public class OrderServiceManager implements NotificationPublisherAware {
+
+    private NotificationPublisher notificationPublisher;
+    private long sequenceNumber = 0;
+
+    @Override
+    public void setNotificationPublisher(NotificationPublisher publisher) {
+        this.notificationPublisher = publisher;
+    }
+
+    @ManagedOperation(description = &quot;处理订单&quot;)
+    public void processOrder(String orderId) {
+        try {
+            publishNotification(&quot;order.processed&quot;, &quot;订单处理成功: &quot; + orderId);
+        } catch (Exception e) {
+            publishNotification(&quot;order.failed&quot;, &quot;订单处理失败: &quot; + orderId);
+            throw e;
+        }
+    }
+
+    private void publishNotification(String type, String message) {
+        if (notificationPublisher != null) {
+            Notification notification = new Notification(type, this, sequenceNumber++, message);
+            notificationPublisher.sendNotification(notification);
+        }
+    }
+}
+</code></pre>
+<p><code>NotificationPublisherAware</code> 让普通 POJO 不必继承 <code>NotificationBroadcasterSupport</code> 即可发布 JMX 通知。Spring 在 <code>MBeanExporter</code> 内部把 <code>NotificationPublisher</code> 适配到底层 <code>RequiredModelMBean.sendNotification()</code>。</p>
+<h3>28.5.3 GC 通知监听</h3>
+<pre><code class="language-java">@Component
+public class GcMonitor {
+
+    private static final long PAUSE_THRESHOLD_MS = 200;
+
+    @PostConstruct
+    public void registerGcListener() {
+        for (GarbageCollectorMXBean gcBean : ManagementFactory.getGarbageCollectorMXBeans()) {
+            javax.management.NotificationEmitter emitter = (javax.management.NotificationEmitter) gcBean;
+            emitter.addNotificationListener((notification, handback) -&gt; {
+                if (notification.getType().equals(
+                        GarbageCollectionNotificationInfo.GARBAGE_COLLECTION_NOTIFICATION)) {
+                    CompositeData cd = (CompositeData) notification.getUserData();
+                    GarbageCollectionNotificationInfo info =
+                        GarbageCollectionNotificationInfo.from(cd);
+                    long duration = info.getGcInfo().getDuration();
+                    if (duration &gt; PAUSE_THRESHOLD_MS) {
+                        log.warn(&quot;gc pause name={} action={} duration={}ms cause={}&quot;,
+                            info.getGcName(), info.getGcAction(),
+                            duration, info.getGcCause());
+                    }
+                }
+            }, null, null);
+        }
+    }
+}
+</code></pre>
+<p>JVM <code>GarbageCollectorMXBean</code> 通过 JMX 通知发布 GC 事件,监听器可获取 GC 名称、动作、暂停时间、原因。Spring Boot Actuator 的 <code>jvm.gc.pause</code> 指标底层使用相同机制。</p>
+<h2 id="28.6-陷阱与限制">28.6 陷阱与限制</h2>
+<h3>图 28-6-1:JMX 五大陷阱</h3>
+<div class="diagram"><div class="mermaid">
+flowchart TD
+    Pit["JMX 陷阱"] --> P1["默认禁用"]
+    Pit --> P2["反序列化安全"]
+    Pit --> P3["RMI 防火墙"]
+    Pit --> P4["命名冲突"]
+    Pit --> P5["性能开销"]
+    P1 --> P11["1 Boot 2+ spring.jmx.enabled=false<br/>升级后 MBean 消失"]
+    P2 --> P21["2 RMI 反序列化 CVE<br/>RCE 风险"]
+    P3 --> P31["3 RMI 双端口<br/>容器 / NAT 不友好"]
+    P4 --> P41["4 ObjectName 全局唯一<br/>InstanceAlreadyExistsException"]
+    P5 --> P51["5 大量 MBean 影响启动<br/>轮询 CPU 消耗"]
+
+</div></div>
+<h3>表 28-6-1:陷阱明细</h3>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>陷阱</th>
+<th>症状</th>
+<th>根因</th>
+<th>修复</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Boot 2+ 默认禁用</td>
+<td>升级后 MBean 全部消失</td>
+<td><code>spring.jmx.enabled</code> 默认 false</td>
+<td>显式 <code>spring.jmx.enabled=true</code></td>
+</tr>
+<tr>
+<td>2</td>
+<td>RMI 反序列化 CVE</td>
+<td>RCE</td>
+<td>RMI 用 Java 原生序列化</td>
+<td>Java 9+ <code>serial.filter.pattern</code> 或改用 Jolokia</td>
+</tr>
+<tr>
+<td>3</td>
+<td>RMI 容器问题</td>
+<td>JConsole 连接超时</td>
+<td>双端口 + 动态分配</td>
+<td>固定 <code>rmi.port</code> + <code>java.rmi.server.hostname</code></td>
+</tr>
+<tr>
+<td>4</td>
+<td>命名冲突</td>
+<td><code>InstanceAlreadyExistsException</code></td>
+<td>两个 Bean 同 ObjectName</td>
+<td>唯一命名或 <code>RegistrationPolicy.REPLACE_EXISTING</code></td>
+</tr>
+<tr>
+<td>5</td>
+<td>性能开销</td>
+<td>启动慢 / CPU 高</td>
+<td>数百 MBean + 高频轮询</td>
+<td>减少 MBean 数 + scrape ≥ 15s</td>
+</tr>
+</tbody>
+</table>
+<h3>28.6.1 陷阱 1:Boot 2+ 默认禁用</h3>
+<p>Spring Boot 2.0 起 <code>spring.jmx.enabled</code> 默认从 <code>true</code> 改为 <code>false</code>。升级时应用不报错,但所有 <code>@ManagedResource</code> Bean 不再注册。</p>
+<pre><code class="language-yaml">spring:
+  jmx:
+    enabled: true
+</code></pre>
+<pre><code class="language-java">@Component
+public class JmxVerifier {
+
+    @Autowired
+    private MBeanServer mbs;
+
+    @PostConstruct
+    void verify() throws Exception {
+        Set&lt;ObjectName&gt; names = mbs.queryNames(
+            new ObjectName(&quot;com.example:*&quot;), null);
+        log.info(&quot;registered MBeans: {}&quot;, names);
+        if (names.isEmpty()) {
+            throw new IllegalStateException(&quot;no MBean registered&quot;);
+        }
+    }
+}
+</code></pre>
+<p>设计原因:JMX 注册过程对启动时间有可测量影响(每个 MBean 约 1-2 ms),云原生场景普遍使用 HTTP 端点替代 JMX,RMI 远程访问在容器环境中存在网络问题。</p>
+<h3>28.6.2 陷阱 2:反序列化安全</h3>
+<pre><code class="language-text">+--------------------------------------------+
+| CVE-2016-3427  Oracle JDK JMX RMI          |
+| CVE-2015-4852  WebLogic T3 + JMX           |
+| CVE-2017-3248  WebLogic JMX                |
++--------------------------------------------+
+| 共同根因:RMI 协议使用 Java 原生序列化      |
+| classpath 中存在 gadget(Commons Collections)|
+| → 攻击者构造恶意 payload → RCE             |
++--------------------------------------------+
+</code></pre>
+<p>防护措施:</p>
+<pre><code class="language-bash"># Java 9+ JMX 反序列化过滤器
+-Dcom.sun.management.jmxremote.serial.filter.pattern=java.lang.*;java.math.*;javax.management.*;!*
+
+# 改用 Jolokia(JSON 传输,无 Java 序列化)
+# 不暴露 JMX 端口到公网(防火墙限制 + Docker 不映射)
+iptables -A INPUT -p tcp --dport 9999 -s 10.0.0.0/8 -j ACCEPT
+iptables -A INPUT -p tcp --dport 9999 -j DROP
+</code></pre>
+<h3>28.6.3 陷阱 3:容器化 RMI</h3>
+<div class="diagram"><div class="mermaid">
+flowchart LR
+    Client["JConsole<br/>host"] -->|"connect localhost:9999"| HostPort["Docker 端口映射<br/>9999 → container:9999"]
+    HostPort --> Reg["RMI Registry<br/>容器内"]
+    Reg --> Stub["返回 stub<br/>hostname=container-id<br/>dataPort=49152"]
+    Stub -->|"客户端连 container-id:49152"| Fail["连接超时"]
+    Fail -.-> Fix1["固定 rmi.port=9999"]
+    Fail -.-> Fix2["固定 java.rmi.server.hostname<br/>客户端可达地址"]
+    Fix1 --> Good["stub 使用相同固定端口"]
+    Fix2 --> Good
+    Good --> Success["客户端到达 JMXConnectorServer"]
+
+</div></div>
+<pre><code class="language-bash">java -jar myapp.jar \
+  -Dcom.sun.management.jmxremote.port=9999 \
+  -Dcom.sun.management.jmxremote.rmi.port=9999 \
+  -Djava.rmi.server.hostname=192.168.1.100
+</code></pre>
+<p>Kubernetes 环境直接放弃 RMI,改用 Jolokia 或 Prometheus JMX Exporter。</p>
+<h3>28.6.4 陷阱 4:命名冲突</h3>
+<pre><code class="language-java">// 反例
+@ManagedResource(objectName = &quot;com.example:type=Service,name=main&quot;)
+public class OrderService { }
+
+@ManagedResource(objectName = &quot;com.example:type=Service,name=main&quot;)
+public class PaymentService { }
+// 启动报 InstanceAlreadyExistsException
+
+// 正例
+@ManagedResource(objectName = &quot;com.example:type=OrderService,name=main&quot;)
+public class OrderService { }
+
+@ManagedResource(objectName = &quot;com.example:type=PaymentService,name=main&quot;)
+public class PaymentService { }
+</code></pre>
+<pre><code class="language-java">@EnableMBeanExport(registration = RegistrationPolicy.REPLACE_EXISTING)
+public class JmxConfig { }
+</code></pre>
+<p><code>RegistrationPolicy</code> 三种策略:<code>FAIL_ON_EXISTING</code>(默认,抛异常)、<code>REPLACE_EXISTING</code>(静默替换)、<code>IGNORE_EXISTING</code>(静默跳过)。</p>
+<h3>28.6.5 陷阱 5:性能开销</h3>
+<pre><code class="language-text">+----------------------+---------------------+---------------------+
+| 场景                  | 启动开销             | 运行时开销           |
++----------------------+---------------------+---------------------+
+| 10 个 MBean          | &lt; 50 ms             | 可忽略               |
+| 100 个 MBean         | 100-200 ms          | 轻微                 |
+| 500 个 MBean         | 500-1000 ms         | 中等                 |
+| 5000 个 MBean        | &gt; 5 s               | 显著                 |
++----------------------+---------------------+---------------------+
+</code></pre>
+<pre><code class="language-java">@Bean
+public MBeanExporter selectiveExporter() {
+    MBeanExporter exporter = new MBeanExporter();
+    exporter.setAutodetect(false);
+    exporter.setBeans(Map.of(
+        &quot;com.example:type=CacheManager&quot;, cacheManager,
+        &quot;com.example:type=OrderService&quot;, orderService));
+    return exporter;
+}
+</code></pre>
+<p>通知监听器避免阻塞:</p>
+<pre><code class="language-java">@Component
+public class AsyncNotificationListener implements NotificationListener {
+
+    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+
+    @Override
+    public void handleNotification(Notification notification, Object handback) {
+        executor.submit(() -&gt; sendAlertEmail(notification));
+    }
+}
+</code></pre>
+<p><code>sendNotification()</code> 同步分发,所有 listener 串行执行。listener 中的 IO 操作(如发送邮件)会阻塞业务线程。生产环境建议异步分发。</p>
+<h2 id="28.7-源码深潜">28.7 源码深潜</h2>
+<h3>图 28-7-1:Spring JMX 调用链</h3>
+<div class="diagram"><div class="mermaid">
+flowchart TB
+    Config["spring.jmx.enabled=true"] --> Boot["JmxAutoConfiguration"]
+    Boot --> Exporter["AnnotationMBeanExporter"]
+    Exporter --> Scan["afterPropertiesSet<br/>autodetect managed beans"]
+    Scan --> Meta["MetadataMBeanInfoAssembler<br/>read @ManagedResource"]
+    Meta --> Name["ObjectNamingStrategy<br/>构造 ObjectName"]
+    Name --> Model["RequiredModelMBean<br/>包装目标 Bean"]
+    Model --> Reg["MBeanServer.registerMBean"]
+    Reg --> Client["JConsole / jmxterm / Jolokia"]
+    Client --> Conn["MBeanServerConnection<br/>getAttribute / setAttribute / invoke"]
+    Conn --> Model
+    Model --> Target["目标 Spring Bean<br/>getter / setter / operation"]
+
+</div></div>
+<h3>表 28-7-1:Spring JMX 关键源码入口</h3>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>入口类</th>
+<th>职责</th>
+<th>排查路径</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>JDK JMX</td>
+<td><code>ManagementFactory.getPlatformMBeanServer()</code></td>
+<td>获取 JVM 平台 MBeanServer</td>
+<td>本地注册了什么</td>
+</tr>
+<tr>
+<td>JDK Model MBean</td>
+<td><code>RequiredModelMBean</code> / <code>ModelMBeanInfo</code></td>
+<td>用元数据包装资源对象</td>
+<td>属性 / 操作如何被调用</td>
+</tr>
+<tr>
+<td>Spring 导出</td>
+<td><code>MBeanExporter#afterPropertiesSet()</code></td>
+<td>扫描、装配、注册</td>
+<td>为何 <code>@ManagedResource</code> 没注册</td>
+</tr>
+<tr>
+<td>Spring 元数据</td>
+<td><code>MetadataMBeanInfoAssembler</code></td>
+<td>读取注解</td>
+<td>getter 为何没变成属性</td>
+</tr>
+<tr>
+<td>Spring 命名</td>
+<td><code>ObjectNamingStrategy</code> / <code>MetadataNamingStrategy</code></td>
+<td>生成 ObjectName</td>
+<td>命名冲突</td>
+</tr>
+<tr>
+<td>Boot 自动配置</td>
+<td><code>JmxAutoConfiguration</code></td>
+<td>条件创建 exporter</td>
+<td><code>spring.jmx.enabled</code> 没开</td>
+</tr>
+<tr>
+<td>Actuator JMX</td>
+<td><code>JmxEndpointAutoConfiguration</code> / <code>JmxEndpointExporter</code></td>
+<td>适配 Actuator endpoint 为 MBean</td>
+<td>endpoint 在 HTTP 有但 JMX 没</td>
+</tr>
+<tr>
+<td>远程访问</td>
+<td><code>JMXConnectorServerFactory</code></td>
+<td>RMI Connector</td>
+<td>本地可见但远程连不上</td>
+</tr>
+</tbody>
+</table>
+<h3>28.7.1 JDK 调用路径</h3>
+<div class="diagram"><div class="mermaid">
+flowchart TB
+    Client["JConsole / jmxterm / Jolokia"] --> Conn["MBeanServerConnection"]
+    Conn --> Facade["JmxMBeanServer<br/>public facade"]
+    Facade --> Inter["DefaultMBeanServerInterceptor"]
+    Inter --> Repo["Repository<br/>ObjectName lookup"]
+    Repo --> Wrap["RequiredModelMBean<br/>or StandardMBean"]
+    Wrap --> Info["ModelMBeanInfo<br/>属性 / 操作元数据"]
+    Info --> Disp{"成员存在?"}
+    Disp -->|否| Err["AttributeNotFoundException<br/>or ReflectionException"]
+    Disp -->|是| Target["target Bean<br/>or platform MXBean"]
+    Target --> Result["返回值或操作结果"]
+    Result --> Conn
+
+</div></div>
+<p>排查"JConsole 读不到属性"时按层定位:<code>info</code> 没属性 → 检查 <code>MetadataMBeanInfoAssembler</code>;<code>info</code> 有属性但 <code>get</code> 失败 → 检查 getter、类型转换、目标方法异常;<code>InstanceNotFoundException</code> → 检查注册策略、命名冲突。</p>
+<h3>28.7.2 设计取舍</h3>
+<p><strong>取舍 1:管理接口与业务对象解耦</strong></p>
+<p>Spring 不要求业务 Bean 实现 <code>DynamicMBean</code>,而是用 <code>RequiredModelMBean</code> 包一层。好处是注解模型简单,业务类零侵入;代价是 MBean 元数据在启动期解析,命名冲突、大量导出会在启动期集中暴露。</p>
+<p><strong>取舍 2:Spring JMX 与 Actuator JMX 分层</strong></p>
+<p><code>JmxAutoConfiguration</code> 导出 <code>@ManagedResource</code> Bean,<code>JmxEndpointAutoConfiguration</code> 把 Actuator endpoint 适配为 MBean。两条链路独立控制:业务管理操作可开,Actuator endpoint 可只暴露 health / metrics。代价是配置项分散,升级时要同时验证两个 domain。</p>
+<p><strong>取舍 3:JMX 适用边界</strong></p>
+<p>JMX 适合"可观测状态 + 低频管理操作":连接池 active / idle、清理缓存、切换只读开关。不适合高频业务查询、批量数据导出、复杂权限系统、公网管理 API。任何修改业务状态的 <code>@ManagedOperation</code> 必须有审计日志、幂等设计、权限隔离。</p>
+<h3>表 28-7-2:验证矩阵</h3>
+<table>
+<thead>
+<tr>
+<th>验证目标</th>
+<th>工具</th>
+<th>关键断言</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>自定义 MBean 注册</td>
+<td><code>jmxterm beans -d com.example</code></td>
+<td>ObjectName 列表与预期一致</td>
+</tr>
+<tr>
+<td>Actuator JMX endpoint</td>
+<td><code>jmxterm beans -d org.springframework.boot</code></td>
+<td><code>Endpoint,name=Health</code> 等存在</td>
+</tr>
+<tr>
+<td>远程连接(RMI)</td>
+<td><code>JConsole</code> 或 <code>JMXConnector</code></td>
+<td>认证 + SSL + 双向通信</td>
+</tr>
+<tr>
+<td>远程连接(Jolokia)</td>
+<td><code>curl /actuator/jolokia/search/...</code></td>
+<td>HTTP 200 + JSON 响应</td>
+</tr>
+<tr>
+<td>通知发布</td>
+<td><code>MBeanServer.addNotificationListener</code></td>
+<td>listener 收到 Notification</td>
+</tr>
+</tbody>
+</table>
+<pre><code class="language-java">@Component
+@Profile(&quot;jmx-regression&quot;)
+public class JmxRegressionProbe implements ApplicationRunner {
+
+    private final MBeanServer mBeanServer;
+
+    public JmxRegressionProbe(MBeanServer mBeanServer) {
+        this.mBeanServer = mBeanServer;
+    }
+
+    @Override
+    public void run(ApplicationArguments args) throws Exception {
+        ObjectName cache = new ObjectName(&quot;com.example:type=CacheManager,name=userCache&quot;);
+        if (!mBeanServer.isRegistered(cache)) {
+            throw new IllegalStateException(&quot;missing JMX MBean: &quot; + cache);
+        }
+        Object maxSize = mBeanServer.getAttribute(cache, &quot;MaxSize&quot;);
+        if (!(maxSize instanceof Integer)) {
+            throw new IllegalStateException(&quot;MaxSize must be readable integer&quot;);
+        }
+        MBeanInfo info = mBeanServer.getMBeanInfo(cache);
+        boolean hasClearOperation = Arrays.stream(info.getOperations())
+            .anyMatch(op -&gt; op.getName().equals(&quot;clearCache&quot;));
+        if (!hasClearOperation) {
+            throw new IllegalStateException(&quot;missing clearCache operation&quot;);
+        }
+    }
+}
+</code></pre>
+<div class="chapter-summary">
+<h2>28.8 本章要点</h2>
+
+<table>
+<thead>
+<tr>
+<th>要点</th>
+<th>源码 / 配置依据</th>
+<th>易错点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>JMX 三层架构(Instrumentation / Agent / Remote)</td>
+<td>JSR-3 / JSR-160</td>
+<td>远程层是可选的</td>
+</tr>
+<tr>
+<td>四种 MBean 类型</td>
+<td>Standard / Dynamic / Model / Open</td>
+<td>Spring 内部用 Model MBean</td>
+</tr>
+<tr>
+<td><code>ObjectName</code> 全局唯一</td>
+<td><code>domain:key=value</code></td>
+<td>特殊字符需双引号</td>
+</tr>
+<tr>
+<td>平台 MXBean 自动注册</td>
+<td><code>ManagementFactory.*</code></td>
+<td>Memory / Threading / GC 等</td>
+</tr>
+<tr>
+<td><code>@ManagedResource</code> 三注解</td>
+<td><code>@ManagedResource</code> / <code>@ManagedAttribute</code> / <code>@ManagedOperation</code></td>
+<td>类 + getter/setter + 方法</td>
+</tr>
+<tr>
+<td><code>MBeanExporter</code> 在 <code>afterPropertiesSet()</code> 中注册</td>
+<td><code>AnnotationMBeanExporter</code></td>
+<td>启动期集中暴露问题</td>
+</tr>
+<tr>
+<td>Boot 2+ 默认禁用 JMX</td>
+<td><code>spring.jmx.enabled=false</code></td>
+<td>升级时显式启用</td>
+</tr>
+<tr>
+<td>Actuator JMX 与 Spring JMX 是两条链路</td>
+<td><code>JmxAutoConfiguration</code> + <code>JmxEndpointAutoConfiguration</code></td>
+<td>独立控制</td>
+</tr>
+<tr>
+<td>Jolokia 是 JMX-HTTP 桥接</td>
+<td><code>/actuator/jolokia/read/exec/search</code></td>
+<td>Boot 3.x 需独立 agent</td>
+</tr>
+<tr>
+<td>Prometheus JMX Exporter 是 K8s 标准方案</td>
+<td><code>-javaagent</code></td>
+<td>比 RMI 更稳定</td>
+</tr>
+<tr>
+<td>RMI 必须固定 <code>rmi.port</code> + <code>hostname</code></td>
+<td>容器化部署</td>
+<td>双端口动态分配会失败</td>
+</tr>
+<tr>
+<td>生产环境必须 <code>authenticate=true</code> + <code>ssl=true</code></td>
+<td>JMX 安全配置</td>
+<td>关闭认证 = RCE 入口</td>
+</tr>
+<tr>
+<td>通知监听器避免阻塞</td>
+<td><code>Schedulers</code> / 异步 Executor</td>
+<td><code>sendNotification()</code> 同步分发</td>
+</tr>
+<tr>
+<td>大量 MBean 影响启动</td>
+<td><code>setAutodetect(false)</code></td>
+<td>选择性导出</td>
+</tr>
+</tbody>
+</table>
+<p>最小回归验证:</p>
+<pre><code class="language-bash"># 启动 + JMX
+./mvnw spring-boot:run \
+  -Dspring-boot.run.arguments=--spring.jmx.enabled=true \
+  -Dspring-boot.run.jvmArguments=&quot;-Dcom.sun.management.jmxremote.port=9999 -Dcom.sun.management.jmxremote.rmi.port=9999 -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false&quot;
+
+# jmxterm 验证
+java -jar jmxterm-1.0.4-uber.jar -l localhost:9999 -n
+beans -d com.example
+beans -d org.springframework.boot
+
+# Jolokia 验证
+curl -s http://localhost:8080/actuator/jolokia/read/java.lang:type=Memory/HeapMemoryUsage
+
+# Prometheus JMX Exporter
+curl -s http://localhost:9404/metrics | grep -E 'jvm_memory|hikaricp'
+</code></pre>
+<hr>
+<p><strong>下一章:Resource IO 抽象</strong></p>
+<p><code>Resource</code> 是 Spring 对低级资源访问的核心抽象,统一了 classpath、文件系统、URL、Servlet 上下文等多种资源源。下一章讨论 <code>Resource</code> 接口、<code>ResourceLoader</code> 与 <code>ResourcePatternResolver</code>、Ant 风格路径匹配、<code>ApplicationContext</code> 作为 <code>ResourceLoader</code> 的角色,以及在配置加载、模板引擎、批处理任务中的应用。</p>
+</div>
+
+
+<div class="chapter-nav">
+  <a href="ch27-jca.html">&larr; ch27-jca · 第 27 章 · JCA 连接器架构</a>
+  <a href="ch29-io.html">ch29-io · 第 29 章 · Resource 资源抽象与 IO &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 Spring Boot &middot; 第 28 章 · JMX 管理与监控</p>
+
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+mermaid.initialize({startOnLoad:true,theme:'dark',themeVariables:{primaryColor:'#58a6ff',primaryTextColor:'#e6edf3',primaryBorderColor:'#30363d',lineColor:'#8b949e',secondaryColor:'#161b22',tertiaryColor:'#0d1117',background:'#161b22',mainBkg:'#161b22',nodeBorder:'#30363d',clusterBkg:'rgba(22,27,34,.5)',clusterBorder:'#30363d',titleColor:'#e6edf3',edgeLabelBackground:'#161b22',fontSize:'13px'},flowchart:{curve:'basis',padding:8,nodeSpacing:20,rankSpacing:30,useMaxWidth:true,htmlLabels:true},sequence:{useMaxWidth:true,actorMargin:30},state:{useMaxWidth:true}});
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){setTimeout(function(){document.querySelectorAll('.mermaid svg,.diagram svg').forEach(function(svg){var h=parseInt(svg.getAttribute('height')||svg.getBoundingClientRect().height);if(h>500){svg.style.maxHeight='500px';svg.style.width='auto';var p=svg.closest('.diagram');if(p)p.style.overflowX='auto';}});},1500);});</script>
+</body>
+</html>

@@ -1,0 +1,1757 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.14 Automata / Wildcard / Fuzzy — 图解 Lucene</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr"   markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    <marker id="arr-g" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#3fb950"/></marker>
+    <marker id="arr-o" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#d29922"/></marker>
+    <marker id="arr-r" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#f85149"/></marker>
+    <marker id="arr-p" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#bc8cff"/></marker>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Lucene</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="13-docvalues-packedints.html">上一章</a>
+  <a href="15-topk-wand-collector.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s14-1">14.1 模糊匹配的需求</a>
+  <a href="#s14-2">14.2 DFA / NFA 基础</a>
+  <a href="#s14-3">14.3 Automata 与 Operations</a>
+  <a href="#s14-4">14.4 WildcardQuery 编译</a>
+  <a href="#s14-5">14.5 FuzzyQuery 与 Levenshtein</a>
+  <a href="#s14-6">14.6 RegexpQuery</a>
+  <a href="#s14-7">14.7 CompiledAutomaton</a>
+  <a href="#s14-8">14.8 与 .tim 的协同</a>
+  <a href="#s14-9">14.9 1024 term 阈值</a>
+  <a href="#s14-10">14.10 leading wildcard 反模式</a>
+  <a href="#s14-11">14.11 PrefixQuery 优化</a>
+  <a href="#s14-12">14.12 业务场景与取舍</a>
+  <a href="#s14-13">14.13 性能基准</a>
+  <a href="#s14-14">14.14 源码入口</a>
+  <a href="#s14-summary">14.15 本章小结</a>
+</aside>
+
+<div class="article">
+
+<h1>第 14 章 · Automata / Wildcard / Fuzzy</h1>
+<p class="subtitle">DFA · NFA · 子集构造 · CompiledAutomaton · LevenshteinAutomata · RegExp · Terms.intersect · 1024 阈值 · 前缀剪枝</p>
+
+<div class="chapter-intro">
+  <p class="lead"><code>WildcardQuery("char*")</code>、<code>RegexpQuery("/order-[0-9]+/")</code>、<code>FuzzyQuery("iphone~2")</code> 在业务代码里看起来是三种风格迥异的"模糊匹配",在 Lucene 内部却走的是<strong>同一条管线</strong>:每种 query 先把模式编译成一个<strong>有限自动机(Finite Automaton)</strong>,再调用 <code>Terms.intersect(CompiledAutomaton)</code> 与 <code>.tim/.tip</code> 词典里的 FST 求交,只展开两条状态机都接受的 term。1000 万 term 的字典里逐一暴力匹配通配符代价是 O(N × L),用自动机求交后只看候选 term,典型 100-1000 倍加速。</p>
+  <p>这个"模式编译为状态机"的统一抽象是本章的主线。Wildcard 的 <code>*</code> 翻译为 <code>self-loop + ε 转移</code>,Regexp 通过 Thompson 构造法把 NFA 拼起来,Fuzzy 则把 <strong>"编辑距离 ≤ k"</strong> 表达为一个 (位置, 当前编辑距离) 的二维状态机——三种 query 共用 <code>Operations.determinize / minimize</code>,共用 <code>CompiledAutomaton</code> 紧凑表示,共用 <code>Terms.intersect</code> 求交算法。<em>读懂自动机,你就同时懂了三类查询。</em>本章拆解每一段:从 DFA / NFA 基础理论,到 Lucene 的 <code>org.apache.lucene.util.automaton</code> 包,到 Wildcard / Fuzzy / Regexp 的具体编译,到与 .tim 求交的物理流程,到 1024 阈值与 <code>CONSTANT_SCORE_REWRITE</code>,到 leading wildcard 反模式与生产级前缀剪枝。对应 Lucene 9.x 的 <code>util.automaton</code> + <code>search.MultiTermQuery</code> 体系。</p>
+  <ul class="will-learn">
+    <li>DFA(确定有限自动机)与 NFA(非确定有限自动机)的差别,ε 转移与子集构造,以及"DFA 状态可指数膨胀"的危险</li>
+    <li>Lucene 的 <code>Automaton</code> + <code>Operations</code> 类:concat / union / intersect / complement / determinize / minimize 这 7 个原子操作及其复杂度</li>
+    <li>WildcardQuery 的编译规则:<code>*</code> = ANY self-loop + 跨状态、<code>?</code> = 单字符转移、字面字符直接 transition、<code>\</code> 转义</li>
+    <li>FuzzyQuery 的 Levenshtein 自动机:状态 (位置 i, 编辑距离 e),k=1 时约 30 状态,k=2 时约 150 状态,代价指数级</li>
+    <li>RegexpQuery 的 Thompson 构造与 Lucene 的元字符限制(无 <code>^$</code> / <code>\b</code> / 反向引用)以避免回溯灾难</li>
+    <li>1024 term 阈值:为什么默认 <code>BooleanQuery.maxClauseCount=1024</code>,以及 <code>CONSTANT_SCORE_REWRITE</code> 如何用 DocIdSetIterator 突破</li>
+    <li><code>CompiledAutomaton</code> 的 4 种 type(NORMAL / SINGLE / ALL / NONE)与对应的退化优化</li>
+    <li>性能取舍:前缀长度 ≥ 3 的剪枝效果、leading wildcard <code>*foo</code> 的反模式、ngram 索引的替代方案</li>
+  </ul>
+  <p class="prereq">前置知识:第 4 章 BooleanQuery 与 MultiTermQuery 的 rewrite 机制(本章是 rewrite 的具体后端);第 10 章 FST 词典(本章的"求交对象"就是 .tip 里的 FST,自动机与 FST 的协同走完整 .tim 字节流);第 11 章 PostingsEnum(rewrite 后的 N 个 TermQuery 各取自己的 postings,leapfrog 求并集)。读者需要对状态机有基本认识——但不熟悉也没关系,14.2 会从零讲起。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s14-1">14.1 模糊匹配的需求:从业务到自动机</h2>
+<!-- ============================================================ -->
+
+<p>用户在搜索框打 <code>iphone</code> 想找 iPhone 商品没问题——倒排索引在 <code>.tim</code> 里二分查 <code>iphone</code> 这个 term,毫秒级返回。可如果用户:① 打 <code>iphon*</code> 想覆盖 iphone-7 / iphone-8 等所有变体(<strong>WildcardQuery</strong>);② 打 <code>iphne</code> 漏字了想容错(<strong>FuzzyQuery</strong>);③ 在日志里搜 <code>order-\d{6}</code> 这种正则(<strong>RegexpQuery</strong>)——倒排索引立刻不够用,因为词典里根本没有这三个模式,需要的是<strong>"找出所有匹配模式的 term"</strong>。</p>
+
+<h3>三类"模糊查询"的对比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 14-1-1 · WildcardQuery / FuzzyQuery / RegexpQuery 三类模式比较</div>
+  <table>
+    <thead>
+      <tr><th>查询类</th><th>典型模式</th><th>语义</th><th>编译为</th><th>常见误用</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>WildcardQuery</code></td><td><code>iphone*</code> / <code>i?hone</code></td><td><code>*</code>=任意串,<code>?</code>=单字符</td><td>Wildcard Automaton</td><td>leading <code>*foo</code> 全表扫</td></tr>
+      <tr><td><code>FuzzyQuery</code></td><td><code>iphone~2</code></td><td>编辑距离 ≤ k(默认 2)</td><td>Levenshtein Automata</td><td>k=2 + 短 target 候选爆炸</td></tr>
+      <tr><td><code>RegexpQuery</code></td><td><code>order-[0-9]+</code></td><td>Lucene 受限正则语法</td><td>RegExp → Automaton</td><td>嵌套量词 <code>(a+)+</code> 病态</td></tr>
+      <tr><td><code>PrefixQuery</code></td><td><code>order-</code></td><td>仅前缀(等价 <code>order-*</code>)</td><td>Prefix Automaton</td><td>前缀过短(< 3)候选过多</td></tr>
+      <tr><td><code>TermRangeQuery</code></td><td><code>[a TO m]</code></td><td>词典字典序区间</td><td>Range Automaton</td><td>不属于本章范围</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>为什么不能用倒排逐 term 暴力枚举?</h3>
+
+<pre><code class="language-text">假设业务字段 itemName 有 1000 万独立 term:
+  apple, apple-7, apple-watch, banana, charger, charger-30w, ...
+
+朴素方案:遍历整个 .tim,每个 term 用 java.util.regex 匹配模式
+  for (term : terms) {
+      if (Pattern.matches("char.*", term)) {
+          collect(term);
+      }
+  }
+
+代价分析:
+  N = 10^7 个 term
+  L = term 平均长度 ≈ 16 字节
+  总比较次数 = N × L = 1.6 × 10^8 次字符比较
+  耗时:~500 ms 单查询(假设 java.util.regex 优化版)
+
+灾难场景:
+  1. 高 QPS(1000 QPS)→ CPU 直接打满
+  2. 索引增长 10×(到 1 亿 term)→ 单查询 5 秒
+  3. 嵌套正则 → 回溯放大,某些模式可能数小时不返回</code></pre>
+
+<h3>自动机求交的核心思路</h3>
+
+<p>把<strong>查询模式</strong>(<code>char*</code>)和<strong>词典</strong>(.tip 内的 FST)都看作<em>有限状态机</em>——前者描述<strong>接受的字符串集合</strong>(language),后者描述<strong>已知存在的字符串集合</strong>。两个状态机的"接受语言"取交集就是命中的 term 集合。Lucene 实现这个交集的方式不是先各自展开再求交(那样退化为暴力),而是<strong>双指针同步走</strong>:在每一步,让自动机告知"下一字符可走哪些"、FST 告知"下一字符在词典里有哪些",取双方都允许的转移继续走,任一不允许就立刻剪枝整棵子树。</p>
+
+<div class="diagram">
+  <div class="diagram-title">表 14-1-2 · 暴力枚举 vs 自动机求交的代价对比</div>
+  <table>
+    <thead>
+      <tr><th>查询模式</th><th>暴力 N×L</th><th>自动机求交 候选 term</th><th>加速比</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>iphone*</code>(6 字符前缀)</td><td>1000 万 × 16 字符 = 1.6 × 10⁸</td><td>~50 个</td><td>~10000×</td></tr>
+      <tr><td><code>i*</code>(1 字符前缀)</td><td>1.6 × 10⁸</td><td>~10 万个(全 i 子树)</td><td>~10×</td></tr>
+      <tr><td><code>FuzzyQuery LD=1 (iphone)</code></td><td>1.6 × 10⁸</td><td>~50 个</td><td>~20000×</td></tr>
+      <tr><td><code>FuzzyQuery LD=2 (iphone)</code></td><td>1.6 × 10⁸</td><td>~200 个</td><td>~5000×</td></tr>
+      <tr><td><code>order-[0-9]+</code></td><td>1.6 × 10⁸</td><td>~1000 个</td><td>~500×</td></tr>
+      <tr><td><code>*phone*</code>(无前缀)</td><td>1.6 × 10⁸</td><td>~10⁴ 个(整 FST 走完)</td><td>~3×(几乎无收益)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key-insight">
+  <strong>剪枝越早越值钱</strong>。自动机与 FST 求交是<em>逐字符</em>走的——前缀越长、第一个字符的可选转移越窄,FST 子树就越早被完整剪掉。前缀 6 字符的 <code>iphone*</code> 在第一步就把 'a' 'b' 'c' 'd' 'e' 'f' 'g' 'h' 这 8 个根 arc 全砍了,剩下 'i' 子树里继续砍、再砍、再砍——剪枝越深效率越高。<em>这也是为什么 leading wildcard <code>*foo</code> 是性能毒瘤——第一字符任意,FST 整棵树都要走一遍。</em>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s14-2">14.2 DFA / NFA 基础</h2>
+<!-- ============================================================ -->
+
+<p>有限自动机(Finite Automaton)是计算理论里最简单的状态机模型。给定一个字母表 Σ(对 Lucene 来说就是 Unicode 码点),自动机由 <strong>(状态集 Q, 转移函数 δ, 起始状态 q₀, 接受状态集 F)</strong> 四元组定义。它读入一个字符串,根据当前状态 + 当前字符决定下一状态,读完字符串后落在接受状态就<em>接受</em>该字符串,否则<em>拒绝</em>。所有<em>正则语言</em>(包括 Lucene 的 Wildcard / Regexp / Levenshtein 模式)都能用有限自动机精确表达。</p>
+
+<h3>DFA 与 NFA 的关键区别</h3>
+
+<div class="compare-grid">
+  <div class="compare-card" style="background:rgba(248,81,73,.06);border:1px solid rgba(248,81,73,.2);border-radius:10px;padding:18px 20px;">
+    <div style="color:#f85149;font-weight:600;font-size:13px;margin-bottom:8px;">NFA(非确定有限自动机)</div>
+    <div style="font-size:13.5px;line-height:1.7;">
+      <strong>转移函数</strong>:δ(q, c) → 状态<em>集合</em>(可多目的地)<br>
+      <strong>ε 转移</strong>:允许不消耗字符就跳转<br>
+      <strong>同输入同状态</strong>:可有多条转移<br>
+      <strong>构造</strong>:从正则直接构建(Thompson 构造)<br>
+      <strong>判定</strong>:O(L × N²),L=输入长,N=状态数<br>
+      <strong>表达力</strong>:与 DFA 等价,可识别所有正则语言<br>
+      <strong>用途</strong>:中间表示(便于构造)
+    </div>
+  </div>
+  <div class="compare-card" style="background:rgba(63,185,80,.06);border:1px solid rgba(63,185,80,.2);border-radius:10px;padding:18px 20px;">
+    <div style="color:#3fb950;font-weight:600;font-size:13px;margin-bottom:8px;">DFA(确定有限自动机)</div>
+    <div style="font-size:13.5px;line-height:1.7;">
+      <strong>转移函数</strong>:δ(q, c) → 唯一状态<br>
+      <strong>无 ε 转移</strong>:每一步必消耗一字符<br>
+      <strong>同输入同状态</strong>:仅一条转移<br>
+      <strong>构造</strong>:从 NFA 子集构造(可能膨胀)<br>
+      <strong>判定</strong>:O(L) 线性扫一遍即可<br>
+      <strong>表达力</strong>:与 NFA 等价<br>
+      <strong>用途</strong>:Lucene 查询时<em>必须</em>是 DFA
+    </div>
+  </div>
+</div>
+
+<h3>NFA → DFA 子集构造手绘示意</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 14-2-1 · NFA → DFA 子集构造(手绘)</div>
+  <div style="background:#0d1117;border:1.5px solid #58a6ff;border-radius:10px;padding:18px;font-family:'Cascadia Code','SFMono-Regular',Consolas,monospace;font-size:12.5px;color:#a5d6ff;">
+    <div style="color:#58a6ff;font-weight:600;font-size:13px;margin-bottom:12px;">原始 NFA(含 ε 转移):正则 <code style="background:rgba(88,166,255,.12);padding:1px 6px;">a(b|c)*d</code></div>
+
+<pre style="margin:0;color:#a5d6ff;line-height:1.6;font-size:11.5px;">
+NFA 构造结果(7 个状态,含 ε):
+
+   ┌───ε────┐                ┌───ε────┐
+   │        ▼                │        ▼
+  (s0)─a─▶(s1)─ε─▶(s2)─b─▶(s3)─ε─▶(s5)─d─▶(s6) ✓
+                  │                │
+                  └─ε─▶(s4)─c─▶(s3)
+                       │
+                       └─ε─▶(s5) (回路)
+
+可走 ε 转移到任意未消耗字符的状态。
+</pre>
+
+    <div style="margin-top:14px;color:#3fb950;font-weight:600;font-size:13px;margin-bottom:8px;">第 1 步:计算每个 NFA 状态的 ε-闭包</div>
+<pre style="margin:0;color:#a5d6ff;line-height:1.6;font-size:11.5px;">
+ε-closure(s0) = {s0}
+ε-closure(s1) = {s1, s2, s4, s5}     ← 含所有 ε 可达
+ε-closure(s2) = {s2, s4, s5}
+ε-closure(s3) = {s3, s5}
+ε-closure(s4) = {s4, s5}             ← 注意 s4 也能到 s5
+ε-closure(s5) = {s5}
+ε-closure(s6) = {s6}
+</pre>
+
+    <div style="margin-top:14px;color:#d29922;font-weight:600;font-size:13px;margin-bottom:8px;">第 2 步:子集构造,起始 D0 = ε-closure(s0)</div>
+<pre style="margin:0;color:#a5d6ff;line-height:1.6;font-size:11.5px;">
+D0 = {s0}
+  on 'a' → ε-closure(δ(s0, 'a'))
+        = ε-closure(s1)
+        = {s1, s2, s4, s5}        =: D1
+
+D1 = {s1, s2, s4, s5}
+  on 'b' → ε-closure(δ(D1, 'b'))
+        = ε-closure({s3})
+        = {s3, s5}                =: D2
+  on 'c' → ε-closure(δ(D1, 'c'))
+        = ε-closure({s3})
+        = {s3, s5}                =: D2 (复用)
+  on 'd' → ε-closure(δ(D1, 'd'))
+        = ε-closure({s6})
+        = {s6}                    =: D3 ✓ accept
+
+D2 = {s3, s5}
+  on 'b' → {s3, s5} = D2 (自循环)
+  on 'c' → {s3, s5} = D2 (自循环)
+  on 'd' → {s6}     = D3 ✓
+</pre>
+
+    <div style="margin-top:14px;color:#d2a8ff;font-weight:600;font-size:13px;margin-bottom:8px;">第 3 步:得到的 DFA(4 状态)</div>
+<pre style="margin:0;color:#a5d6ff;line-height:1.6;font-size:11.5px;">
+        a            b,c
+       ──▶          ←──▶
+     ┌─────┐      ┌─────┐
+   ▶│ D0  │ ──▶ │ D1  │ ──▶ ┌─────┐
+     └─────┘  a   └─────┘  b,c│ D2  │
+                              └─────┘
+                                 │ d
+                                 ▼
+                              ┌─────┐
+                            ✓ │ D3  │
+                              └─────┘
+NFA 7 状态 → DFA 4 状态(本例缩小,但下一节会看到指数膨胀的危险)
+</pre>
+
+    <div style="margin-top:12px;padding:10px;background:rgba(88,166,255,.08);border-left:3px solid #58a6ff;border-radius:4px;color:#8b949e;font-size:11.5px;line-height:1.7;">
+      <strong style="color:#58a6ff;">为什么必须是 DFA?</strong> Lucene 在 <code>Terms.intersect</code> 里逐字符走自动机,每一步必须知道<em>唯一</em>的下一状态——多状态会导致回溯,把 O(L) 退化到 O(L × N²)。所以 <code>Operations.determinize()</code> 是 <code>CompiledAutomaton</code> 构造时必经的一步。
+    </div>
+  </div>
+</div>
+
+<h3>DFA 状态图(接受 ".*ab.*" 含 ab 子串)</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 14-2-2 · 接受"含 ab 子串"的 DFA</div>
+  <svg viewBox="0 0 1240 360" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 起点 -->
+    <circle cx="100" cy="180" r="12" fill="#39d2c0" stroke="#39d2c0" stroke-width="1.5"/>
+    <text x="100" y="155" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">start</text>
+
+    <!-- S0: 还没看到 a -->
+    <circle cx="280" cy="180" r="48" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="280" y="178" text-anchor="middle" fill="#cfe9ff" font-size="18" font-weight="700">S0</text>
+    <text x="280" y="195" text-anchor="middle" fill="#a5d6ff" font-size="10">还没看到 a</text>
+
+    <!-- S1: 看到 a, 等 b -->
+    <circle cx="620" cy="180" r="48" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="620" y="178" text-anchor="middle" fill="#ffd591" font-size="18" font-weight="700">S1</text>
+    <text x="620" y="195" text-anchor="middle" fill="#a5d6ff" font-size="10">已看到 a</text>
+
+    <!-- S2: 接受状态 (双圈) -->
+    <circle cx="960" cy="180" r="52" fill="none" stroke="#3fb950" stroke-width="1.5"/>
+    <circle cx="960" cy="180" r="44" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="960" y="178" text-anchor="middle" fill="#9be7b3" font-size="18" font-weight="700">S2</text>
+    <text x="960" y="195" text-anchor="middle" fill="#a5d6ff" font-size="10">已含 "ab" ★ accept</text>
+
+    <!-- 终点 -->
+    <circle cx="1140" cy="180" r="12" fill="#3fb950"/>
+    <circle cx="1140" cy="180" r="6" fill="#0d3a22"/>
+    <text x="1140" y="155" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="700">accept</text>
+
+    <!-- 起点 → S0 -->
+    <line x1="112" y1="180" x2="230" y2="180" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+
+    <!-- S0 self-loop: any (除 a) -->
+    <path d="M 245 145 Q 220 100 270 100 Q 320 100 295 145" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="280" y="90" text-anchor="middle" fill="#a5d6ff" font-size="11" font-weight="700">any (除 a)</text>
+
+    <!-- S0 → S1: a -->
+    <line x1="328" y1="180" x2="572" y2="180" stroke="#d29922" stroke-width="2" marker-end="url(#arr-o)"/>
+    <text x="450" y="170" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">a</text>
+
+    <!-- S1 self-loop: a -->
+    <path d="M 585 145 Q 560 100 610 100 Q 660 100 635 145" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr-o)"/>
+    <text x="620" y="90" text-anchor="middle" fill="#ffd591" font-size="11" font-weight="700">a (再多看到 a 也无所谓)</text>
+
+    <!-- S1 → S2: b -->
+    <line x1="668" y1="180" x2="908" y2="180" stroke="#3fb950" stroke-width="2" marker-end="url(#arr-g)"/>
+    <text x="790" y="170" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">b ★</text>
+
+    <!-- S1 → S0: 其他 (回退) -->
+    <path d="M 580 220 Q 450 280 320 220" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr-r)"/>
+    <text x="450" y="290" text-anchor="middle" fill="#f85149" font-size="11" font-weight="700">其他字符 (非 a / 非 b) → 回退到 S0</text>
+
+    <!-- S2 self-loop: any -->
+    <path d="M 925 145 Q 900 100 960 100 Q 1020 100 985 145" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr-g)"/>
+    <text x="960" y="90" text-anchor="middle" fill="#9be7b3" font-size="11" font-weight="700">any (后面字符无所谓)</text>
+
+    <!-- S2 → accept -->
+    <line x1="1012" y1="180" x2="1128" y2="180" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+
+    <!-- 注释 -->
+    <text x="620" y="335" text-anchor="middle" fill="#39d2c0" font-size="13" font-weight="700">3 个状态 + 7 条转移 — 双圈 = 接受状态</text>
+    <text x="620" y="353" text-anchor="middle" fill="#a5d6ff" font-size="11">关键: 一旦达到 S2 (含 ab) 永远接受 — 后面任何字符都不再 reset</text>
+  </svg>
+</div>
+
+<h3>状态膨胀的风险</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 14-2 · NFA → DFA 状态规模对比</div>
+  <table>
+    <thead>
+      <tr><th>模式</th><th>NFA 状态</th><th>DFA 状态(确定化后)</th><th>说明</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>简单 wildcard <code>a*b*c</code></td><td>5</td><td>5-7</td><td>无指数膨胀</td></tr>
+      <tr><td>简单正则 <code>(a|b)*c+</code></td><td>8</td><td>10-15</td><td>线性可控</td></tr>
+      <tr><td>Levenshtein LD=1 (target len 6)</td><td>~30</td><td>~30</td><td>已确定化构造</td></tr>
+      <tr><td>Levenshtein LD=2 (target len 6)</td><td>~150</td><td>~150</td><td>5× LD=1</td></tr>
+      <tr><td>病态正则 <code>.*(a|b){10}.*</code></td><td>30</td><td>2¹⁰ ≈ 1024</td><td>指数膨胀</td></tr>
+      <tr><td>极端病态 <code>(a|b)*(a|b){20}</code></td><td>40</td><td>~2²⁰ = 100 万</td><td>OOM 风险</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="warning">
+  <strong>子集构造最坏情况是 2^|NFA states| 指数级</strong>。Lucene 在 <code>Operations.determinize</code> 内部加了上限保护:超过 <code>maxDeterminizedStates</code>(默认 10000)直接抛 <code>TooComplexToDeterminizeException</code>,让用户必须缩简模式而不是 OOM。<em>这也是为什么 RegexpQuery 默认禁止 lookahead / 反向引用——这些不仅不属于正则语言,还会让 NFA → DFA 不可控。</em>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s14-3">14.3 Lucene Automata 与 Operations</h2>
+<!-- ============================================================ -->
+
+<p>Lucene 把自动机的所有数据结构与算法集中在 <code>org.apache.lucene.util.automaton</code> 包。<code>Automaton</code> 类是数据载体——本质是一个<em>有向带标签图</em>:每个节点是状态,每条边携带 <code>(min, max, target)</code> 三元组表示"输入字符落在 [min, max] 区间则转移到 target"。这种<strong>区间编码</strong>非常关键:一个 <code>?</code>(任意单字符)在 Wildcard 里只占一条边 <code>(0, MAX_UNICODE, target)</code>,而不是 <code>10⁵</code> 条边。</p>
+
+<h3>Operations 的 7 个原子操作</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 14-3-1 · Operations 类的 7 个核心操作</div>
+  <svg viewBox="0 0 1240 360" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 输入 -->
+    <rect x="40" y="150" width="180" height="60" rx="12" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="130" y="178" text-anchor="middle" fill="#cfe9ff" font-size="14" font-weight="700">Automaton A</text>
+    <text x="130" y="196" text-anchor="middle" fill="#a5d6ff" font-size="11">数据载体</text>
+
+    <!-- 中央 Op -->
+    <polygon points="320,180 410,140 500,180 410,220" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.6"/>
+    <text x="410" y="178" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">Operations</text>
+    <text x="410" y="196" text-anchor="middle" fill="#a5d6ff" font-size="10">7 个原子操作</text>
+
+    <line x1="220" y1="180" x2="318" y2="180" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+
+    <!-- 7 个操作 — 排成两列 -->
+    <!-- concat -->
+    <rect x="570" y="20" width="290" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="600" y="44" fill="#e6d3ff" font-size="13" font-weight="700">concat(A, B)</text>
+    <text x="600" y="64" fill="#a5d6ff" font-size="11">串联 — 接受 A·B</text>
+
+    <!-- union -->
+    <rect x="570" y="90" width="290" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="600" y="114" fill="#e6d3ff" font-size="13" font-weight="700">union(A, B)</text>
+    <text x="600" y="134" fill="#a5d6ff" font-size="11">并 — 接受 A | B</text>
+
+    <!-- intersect -->
+    <rect x="570" y="160" width="290" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="600" y="184" fill="#e6d3ff" font-size="13" font-weight="700">intersect(A, B)</text>
+    <text x="600" y="204" fill="#a5d6ff" font-size="11">交 — 同时接受</text>
+
+    <!-- complement -->
+    <rect x="570" y="230" width="290" height="60" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="1.5"/>
+    <text x="600" y="254" fill="#ffadad" font-size="13" font-weight="700">complement(A)</text>
+    <text x="600" y="274" fill="#a5d6ff" font-size="11">补 — 不接受 A 的所有串</text>
+
+    <!-- closure -->
+    <rect x="900" y="20" width="290" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="930" y="44" fill="#e6d3ff" font-size="13" font-weight="700">closure(A)</text>
+    <text x="930" y="64" fill="#a5d6ff" font-size="11">闭包 — A* (任意次重复)</text>
+
+    <!-- determinize ★ -->
+    <rect x="900" y="90" width="290" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.6"/>
+    <text x="930" y="114" fill="#ffd591" font-size="13" font-weight="700">determinize(A) ★</text>
+    <text x="930" y="134" fill="#a5d6ff" font-size="11">NFA → DFA — 子集构造 (代价高)</text>
+
+    <!-- minimize ★ -->
+    <rect x="900" y="160" width="290" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.6"/>
+    <text x="930" y="184" fill="#ffd591" font-size="13" font-weight="700">minimize(A) ★</text>
+    <text x="930" y="204" fill="#a5d6ff" font-size="11">最小化 DFA — Hopcroft 算法</text>
+
+    <!-- isFinite (额外辅助) -->
+    <rect x="900" y="230" width="290" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="930" y="254" fill="#9be7b3" font-size="13" font-weight="700">isFinite / accept-helper</text>
+    <text x="930" y="274" fill="#a5d6ff" font-size="11">辅助 — 判断接受语言是否有限</text>
+
+    <!-- 连线 from Op to 7 -->
+    <g fill="none">
+      <line x1="500" y1="160" x2="568" y2="50"  stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+      <line x1="505" y1="170" x2="568" y2="120" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+      <line x1="505" y1="180" x2="568" y2="190" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+      <line x1="505" y1="195" x2="568" y2="260" stroke="#f85149" stroke-width="1.4" marker-end="url(#arr-r)"/>
+      <line x1="500" y1="160" x2="898" y2="50"  stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+      <line x1="505" y1="180" x2="898" y2="120" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+      <line x1="505" y1="190" x2="898" y2="190" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+      <line x1="505" y1="200" x2="898" y2="260" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+    </g>
+
+    <text x="620" y="335" text-anchor="middle" fill="#39d2c0" font-size="12" font-weight="700">★ = 性能关键操作 (最坏指数级 — 必须有 maxDeterminizedStates 上限保护)</text>
+  </svg>
+</div>
+
+<h3>每个操作的复杂度</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 14-3 · Operations 复杂度</div>
+  <table>
+    <thead>
+      <tr><th>操作</th><th>复杂度</th><th>典型用法</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>concat(A, B)</code></td><td>O(|A| + |B|)</td><td>正则 <code>ab</code> = concat(A, B)</td></tr>
+      <tr><td><code>union(A, B)</code></td><td>O(|A| + |B|)</td><td>正则 <code>a|b</code></td></tr>
+      <tr><td><code>intersect(A, B)</code></td><td>O(|A| × |B|)</td><td>查询求交,本章主题</td></tr>
+      <tr><td><code>complement(A)</code></td><td>O(|A|) + 必须先 determinize</td><td>排除模式</td></tr>
+      <tr><td><code>closure(A)</code></td><td>O(|A|)</td><td>正则 <code>A*</code></td></tr>
+      <tr><td><code>determinize(A)</code></td><td>O(2^|NFA|) 最坏 / 实际多项式</td><td>查询前必经</td></tr>
+      <tr><td><code>minimize(A)</code></td><td>O(|DFA| log |DFA|) Hopcroft</td><td>缩减状态减内存</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>Java API 速览</h3>
+
+<pre><code class="language-java">import org.apache.lucene.util.automaton.Automaton;
+import org.apache.lucene.util.automaton.Automata;
+import org.apache.lucene.util.automaton.Operations;
+import org.apache.lucene.util.automaton.RegExp;
+
+Automaton aHello = Automata.makeString("hello");
+Automaton aHi    = Automata.makeString("hi");
+
+Automaton union   = Operations.union(aHello, aHi);
+Automaton det     = Operations.determinize(union, 10000);
+Automaton min     = Operations.minimize(det, 10000);
+
+Automaton aPrefix = Automata.makeAnyBinary();
+Automaton suffix  = Operations.concat(aHello, Automata.makeAnyString());
+
+Automaton fromRegex = new RegExp("order-[0-9]+").toAutomaton();
+
+System.out.println("states = " + min.getNumStates());
+System.out.println("transitions = " + min.getNumTransitions());</code></pre>
+
+<div class="paper-ref">
+  <strong>理论参考</strong>:Lucene 自动机实现的核心算法源自 dk.brics.automaton 库(Anders Møller, Aarhus University)。<em>"Automata Theory and Its Applications" (Khoussainov & Nerode, 2001)</em> 给了形式化基础,<em>"Hopcroft–Ullman, Introduction to Automata Theory"</em> 是子集构造与 DFA 最小化的标准教科书。Lucene 的具体实现在源码注释里直接引用了 brics 论文与 Hopcroft 的 N log N 最小化算法。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s14-4">14.4 WildcardQuery 编译</h2>
+<!-- ============================================================ -->
+
+<p>Wildcard 是最简单的"模糊查询",只有两个元字符:<code>*</code>(零或多任意字符)与 <code>?</code>(单任意字符)。其他字符都是字面值,直接转换为 transition。<code>\</code> 是转义符,可以让 <code>\*</code> 表示字面 <code>*</code>。</p>
+
+<h3>元字符的 NFA 翻译规则</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 14-4 · Wildcard 元字符 → NFA</div>
+  <table>
+    <thead>
+      <tr><th>字符</th><th>含义</th><th>NFA 翻译</th><th>区间编码</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>字面 'c'</td><td>必须为 c</td><td>单转移到下一状态</td><td><code>(c, c, next)</code></td></tr>
+      <tr><td><code>?</code></td><td>任意单字符</td><td>单转移,标签为 ANY</td><td><code>(0, MAX_CODE, next)</code></td></tr>
+      <tr><td><code>*</code></td><td>零或多任意</td><td>self-loop + ε 转移</td><td>self <code>(0, MAX_CODE, self)</code> + ε to next</td></tr>
+      <tr><td><code>\c</code></td><td>转义,字面 c</td><td>等同字面字符</td><td><code>(c, c, next)</code></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>WildcardQuery "char*" 的 automaton 构造</h3>
+
+<pre><code class="language-text">WildcardQuery("items", "char*") 编译过程:
+
+  字符级解析:'c''h''a''r' 字面字符,'*' = self-loop + ε
+
+  NFA 构造(逐字符 concat):
+    s0 ─c→ s1 ─h→ s2 ─a→ s3 ─r→ s4 ┄ε┄┄→ s5 (accept, ANY self-loop)
+
+  determinize 后的 DFA:
+    s0 ─c→ s1 ─h→ s2 ─a→ s3 ─r→ s4 ─ANY→ s4 (accept)
+
+  接受语言示例:
+    "char"      → s0→s1→s2→s3→s4(accept)             ✓
+    "chargers"  → s0→s1→s2→s3→s4→s4→s4→s4→s4(accept) ✓
+    "char-7"    → s0→s1→s2→s3→s4→s4→s4(accept)       ✓
+    "ch"        → s0→s1→s2 不在 accept                ✗
+    "chair"     → s0→s1→s2→s3 'i' 无转移              ✗</code></pre>
+
+<h3>WildcardQuery 的 Java 调用</h3>
+
+<pre><code class="language-java">import org.apache.lucene.search.WildcardQuery;
+import org.apache.lucene.index.Term;
+
+WildcardQuery wq = new WildcardQuery(new Term("itemName", "char*"));
+Query rewritten = wq.rewrite(searcher);
+
+Query rewritten2 = new WildcardQuery(new Term("itemName", "*phone*")).rewrite(searcher);
+Query rewritten3 = new WildcardQuery(new Term("itemName", "i?hone")).rewrite(searcher);
+
+TopDocs top = searcher.search(wq, 100);</code></pre>
+
+<h3>不同 wildcard 模式的优化路径</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 14-4-2 · WildcardQuery 优化与退化</div>
+  <table>
+    <thead>
+      <tr><th>模式</th><th>编译结果</th><th>优化建议</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>prefix*</code></td><td>普通自动机,前缀剪枝有效</td><td>用 <code>PrefixQuery</code> 更直接,语义同效率同</td></tr>
+      <tr><td><code>*suffix</code>(leading wildcard)</td><td>自动机无前缀,FST 全树遍历</td><td>反模式:改 ngram 索引或 ReverseStringFilter</td></tr>
+      <tr><td><code>m*ddle*</code></td><td>普通自动机,前缀 m 仍能剪枝</td><td>可接受,但应限前缀 ≥ 3</td></tr>
+      <tr><td><code>*</code>(空模式)</td><td>type=ALL,退化为 MatchAll</td><td>不应该在生产代码出现</td></tr>
+      <tr><td><code>iphone</code>(无元字符)</td><td>type=SINGLE,退化为 TermQuery</td><td>用 TermQuery 更明确</td></tr>
+      <tr><td><code>?</code>(单字符)</td><td>1 个 ANY transition</td><td>语义 = 任意 1 字符的 term</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key-insight">
+  <strong>WildcardQuery 在底层与 PrefixQuery 同构</strong>。<code>PrefixQuery("foo")</code> 等价于 <code>WildcardQuery("foo*")</code>——内部都构造一个"foo 后跟 ANY self-loop"的自动机。差别只在 API 表达力:PrefixQuery 拒绝接受任何元字符,代码意图更清晰、防御性更好;WildcardQuery 允许 <code>?</code> 与中缀 <code>*</code>。<em>生产代码看到 <code>"foo*"</code> 模式,应该首选 PrefixQuery 而不是 WildcardQuery。</em>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s14-5">14.5 FuzzyQuery 与 Levenshtein 自动机</h2>
+<!-- ============================================================ -->
+
+<p>FuzzyQuery 解决用户输入打错字的容错搜索:用户搜 <code>iphne</code>(漏字"o"),期望也能命中 <code>iphone</code>。这里"匹配"不再是精确串等于,而是 <strong>编辑距离 ≤ k</strong>。Levenshtein 编辑距离允许三种操作:插入字符、删除字符、替换字符;Damerau-Levenshtein 额外允许字符<em>交换</em>。Lucene 把"target 与候选的编辑距离 ≤ k"这个语义编译成一个状态机——这就是 <strong>Levenshtein 自动机</strong>。</p>
+
+<h3>编辑距离的四种操作</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 14-5-1 · 编辑距离的基本操作</div>
+  <table>
+    <thead>
+      <tr><th>操作</th><th>例子</th><th>距离 +1 后</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>insert(c)</td><td>"iphne" + insert 'o' at 3 → "iphone"</td><td>1</td></tr>
+      <tr><td>delete(c)</td><td>"iphonee" - delete one 'e' → "iphone"</td><td>1</td></tr>
+      <tr><td>substitute(c, c')</td><td>"ipgone" sub 'g'→'h' → "iphone"</td><td>1</td></tr>
+      <tr><td>transpose(c, c')</td><td>"iphoen" swap 'e''n' → "iphone"(Damerau)</td><td>1</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>Levenshtein 自动机的状态定义</h3>
+
+<p>把状态定义为 <strong>(target 中的位置 i, 当前累积编辑距离 e)</strong>。从 (0, 0) 出发,每读入一个候选字符:① 与 target[i] 相等 → 走 (i+1, e);② 替换(假定该字符与 target[i] 不同)→ 走 (i+1, e+1);③ 插入(候选有多余字符)→ 走 (i, e+1);④ 删除(候选缺字符)→ 走 (i+1, e+1)。当 i = |target| 且 e ≤ k 时接受。</p>
+
+<h3>Levenshtein 自动机(target="abc", k=1) 手绘卡片</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 14-5-1 · LevAutomata target="abc", k=1 的状态网格(手绘)</div>
+  <div style="background:#0d1117;border:1.5px solid #d29922;border-radius:10px;padding:18px;font-family:'Cascadia Code','SFMono-Regular',Consolas,monospace;font-size:12.5px;color:#a5d6ff;">
+    <div style="color:#d29922;font-weight:600;font-size:13px;margin-bottom:12px;">状态网格(行=位置 i, 列=编辑距离 e):</div>
+
+<pre style="margin:0;color:#a5d6ff;line-height:1.8;font-size:11.5px;">
+       e=0           e=1
+       ┌────┐        ┌────┐
+i=0    │ S0 │ ─ins─▶ │S0e1│      (i=0 插入扩 e)
+       └─┬──┘        └─┬──┘
+         │a            │a/?
+         ▼             ▼
+       ┌────┐        ┌────┐
+i=1    │ S1 │ ─sub─▶ │S1e1│      (i=1 替换或匹配)
+       └─┬──┘        └─┬──┘
+         │b            │b/?
+         ▼             ▼
+       ┌────┐        ┌────┐
+i=2    │ S2 │ ─sub─▶ │S2e1│
+       └─┬──┘        └─┬──┘
+         │c            │c/?
+         ▼             ▼
+       ┌────┐        ┌────┐
+i=3    │ S3 │ ─ε────▶│ ✓  │     (i=3 全消费,e ≤ 1 都接受)
+       │ ✓  │        └────┘
+       └────┘
+</pre>
+
+    <div style="margin-top:14px;color:#3fb950;font-weight:600;font-size:13px;margin-bottom:8px;">主要边(简化,实际 ~15 状态):</div>
+<pre style="margin:0;color:#a5d6ff;line-height:1.6;font-size:11.5px;">
+S0   ─'a'─→ S1            (匹配)
+S0   ─非a─→ S1e1           (替换 +1)
+S0   ─任意─→ S0e1          (插入候选额外字符,target 不动)
+S0   ─ε────→ S1e1          (删除 target 字符,target 推进 +1)
+
+S1   ─'b'─→ S2            (匹配)
+S1   ─非b─→ S2e1           (替换)
+S1   ─任意─→ S1e1          (插入)
+S1   ─ε────→ S2e1          (删除)
+
+S2   ─'c'─→ S3 ✓
+S2   ─非c─→ S3e1 ✓
+...
+</pre>
+
+    <div style="margin-top:14px;color:#d2a8ff;font-weight:600;font-size:13px;margin-bottom:8px;">几个候选字符串的接受路径:</div>
+<pre style="margin:0;color:#a5d6ff;line-height:1.6;font-size:11.5px;">
+"abc"   :  S0─a→S1─b→S2─c→S3 ✓ (e=0,精确匹配)
+"abx"   :  S0─a→S1─b→S2─x→S3e1 ✓ (sub c→x,e=1)
+"axc"   :  S0─a→S1─x→S2e1─c→S3e1 ✓ (sub b→x)
+"ac"    :  S0─a→S1─c→S2e1(del b) ✓ (删 b)
+"abbc"  :  S0─a→S1─b→S2─b→S2e1(ins b)─c→S3e1 ✓
+"axxc"  :  S0─a→S1─x→S2e1─x→? e 已经 1,再来一个 sub
+                          → e=2,超 k → 拒绝 ✗
+</pre>
+
+    <div style="margin-top:12px;padding:10px;background:rgba(210,153,34,.08);border-left:3px solid #d29922;border-radius:4px;color:#8b949e;font-size:11.5px;line-height:1.7;">
+      <strong style="color:#d29922;">关键观察</strong>:状态数 ≈ (|target|+1) × (k+1) × 常数。target 长度 6 + k=1 时约 30 状态;k=2 时(再加上 e=2 一行)状态数 ~150。再加上一些"超出 k 后必死"的隐式压缩,Lucene 实际不会构造完整网格。<em>真实状态数与 target 长度成线性,但与 k 成指数关系——这是为什么 Lucene 默认上限 maxEdits=2,k=3 时状态机已经爆炸。</em>
+    </div>
+  </div>
+</div>
+
+<h3>Levenshtein 自动机的工作流(mermaid)</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 14-5-2 · FuzzyQuery 整体工作流</div>
+  <svg viewBox="0 0 1240 720" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 1. 输入 -->
+    <rect x="420" y="20" width="400" height="64" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="620" y="46" text-anchor="middle" fill="#cfe9ff" font-size="14" font-weight="700">① 用户输入</text>
+    <text x="620" y="68" text-anchor="middle" fill="#a5d6ff" font-size="11">target = "iphne", k = 2 (maxEdits)</text>
+
+    <!-- 2. toAutomaton -->
+    <rect x="420" y="115" width="400" height="64" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="620" y="141" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">② LevenshteinAutomata.toAutomaton(target, k)</text>
+    <text x="620" y="163" text-anchor="middle" fill="#a5d6ff" font-size="11">Schulz / Mihov 网格构造法</text>
+    <line x1="620" y1="84" x2="620" y2="113" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+
+    <!-- 3 + 4 并列 -->
+    <rect x="160" y="220" width="380" height="64" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="350" y="246" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">③ NFA — (i, e) 网格状态</text>
+    <text x="350" y="268" text-anchor="middle" fill="#a5d6ff" font-size="11">i = 当前消耗的目标字符数 · e = 已用 edits</text>
+
+    <rect x="700" y="220" width="380" height="64" rx="12" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="890" y="246" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">④ Operations.determinize → DFA</text>
+    <text x="890" y="268" text-anchor="middle" fill="#a5d6ff" font-size="11">k=1 → ~30 状态; k=2 → ~150 状态</text>
+
+    <line x1="500" y1="179" x2="350" y2="218" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <line x1="740" y1="179" x2="890" y2="218" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+    <line x1="540" y1="252" x2="698" y2="252" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+
+    <!-- 5. CompiledAutomaton -->
+    <rect x="420" y="320" width="400" height="64" rx="12" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="620" y="346" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">⑤ CompiledAutomaton(DFA)</text>
+    <text x="620" y="368" text-anchor="middle" fill="#a5d6ff" font-size="11">封装 DFA + 转移表 + sinkState</text>
+    <line x1="890" y1="284" x2="700" y2="318" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+
+    <!-- 6. terms.intersect -->
+    <rect x="420" y="420" width="400" height="64" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="620" y="446" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">⑥ TermsEnum termsEnum = terms.intersect(ca, null)</text>
+    <text x="620" y="468" text-anchor="middle" fill="#a5d6ff" font-size="11">词典 × 自动机 — 同步求交</text>
+    <line x1="620" y1="384" x2="620" y2="418" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+
+    <!-- 7. 菱形 逐字符走 FST + 自动机 -->
+    <polygon points="620,510 870,560 620,610 370,560" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.6"/>
+    <text x="620" y="555" text-anchor="middle" fill="#ffd591" font-size="14" font-weight="700">⑦ 逐字符走 FST + 自动机</text>
+    <text x="620" y="575" text-anchor="middle" fill="#a5d6ff" font-size="11">FST.arc 与 DFA.transition 同步, 不一致就 prune</text>
+    <line x1="620" y1="484" x2="620" y2="508" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+
+    <!-- 8. 命中 -->
+    <rect x="40" y="630" width="380" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="230" y="654" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">⑧ 命中候选 ≈ 10-50 个</text>
+    <text x="230" y="674" text-anchor="middle" fill="#a5d6ff" font-size="11">iphone, ihone, iphnee, iphna ...</text>
+    <line x1="380" y1="600" x2="240" y2="628" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+
+    <!-- 9. 排序 -->
+    <rect x="430" y="630" width="380" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="620" y="654" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">⑨ 按 edit distance 排序</text>
+    <text x="620" y="674" text-anchor="middle" fill="#a5d6ff" font-size="11">优先选择更接近 target 的</text>
+    <line x1="425" y1="660" x2="428" y2="660" stroke="#3fb950" stroke-width="0"/>
+    <line x1="420" y1="660" x2="428" y2="660" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+
+    <!-- 10. top + 11. BooleanQuery -->
+    <rect x="820" y="630" width="380" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="1010" y="654" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">⑩ 取 top maxExpansions=50</text>
+    <text x="1010" y="674" text-anchor="middle" fill="#a5d6ff" font-size="11">→ BooleanQuery(SHOULD) / ConstantScore</text>
+    <line x1="810" y1="660" x2="818" y2="660" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<h3>FuzzyQuery 调用与参数</h3>
+
+<pre><code class="language-java">import org.apache.lucene.search.FuzzyQuery;
+import org.apache.lucene.index.Term;
+
+FuzzyQuery fq = new FuzzyQuery(
+    new Term("itemName", "iphone"),
+    2,        // maxEdits: 0..2
+    1,        // prefixLength: 必须精确匹配的前缀长度
+    50,       // maxExpansions: 候选 term 上限
+    true);    // transpositions: 允许字符交换(Damerau)
+
+FuzzyQuery defaults = new FuzzyQuery(new Term("itemName", "iphone"));
+
+TopDocs top = searcher.search(fq, 100);</code></pre>
+
+<h3>LD=1 vs LD=2 的代价对比</h3>
+
+<div class="compare-grid">
+  <div class="compare-card" style="background:rgba(63,185,80,.06);border:1px solid rgba(63,185,80,.2);border-radius:10px;padding:18px 20px;">
+    <div style="color:#3fb950;font-weight:600;font-size:13px;margin-bottom:8px;">FuzzyQuery LD=1(默认推荐)</div>
+    <div style="font-size:13.5px;line-height:1.7;">
+      <strong>状态数</strong>:~30(target 长 6)<br>
+      <strong>构造时间</strong>:&lt; 1 ms<br>
+      <strong>候选 term</strong>:~10-50 个<br>
+      <strong>求交时间</strong>:1-3 ms(1000 万 term 索引)<br>
+      <strong>覆盖错误</strong>:单字符插入/删除/替换<br>
+      <strong>典型用例</strong>:用户拼写微小错误<br>
+      <strong>误命中率</strong>:低
+    </div>
+  </div>
+  <div class="compare-card" style="background:rgba(248,81,73,.06);border:1px solid rgba(248,81,73,.2);border-radius:10px;padding:18px 20px;">
+    <div style="color:#f85149;font-weight:600;font-size:13px;margin-bottom:8px;">FuzzyQuery LD=2(慎用)</div>
+    <div style="font-size:13.5px;line-height:1.7;">
+      <strong>状态数</strong>:~150(target 长 6)<br>
+      <strong>构造时间</strong>:1-2 ms<br>
+      <strong>候选 term</strong>:~50-500 个<br>
+      <strong>求交时间</strong>:5-30 ms<br>
+      <strong>覆盖错误</strong>:连续两次错误,如 "phon" → "iphone"<br>
+      <strong>典型用例</strong>:特殊容错场景<br>
+      <strong>误命中率</strong>:显著上升,语义歧义
+    </div>
+  </div>
+</div>
+
+<h3>LevAutomata 状态规模(实测量级)</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 14-5-2 · LevAutomata 状态数与构造时间</div>
+  <table>
+    <thead>
+      <tr><th>target 长度</th><th>k</th><th>状态数(参考)</th><th>构造时间</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>5</td><td>1</td><td>~30</td><td>&lt; 1 ms</td></tr>
+      <tr><td>5</td><td>2</td><td>~150</td><td>1-2 ms</td></tr>
+      <tr><td>10</td><td>1</td><td>~50</td><td>1 ms</td></tr>
+      <tr><td>10</td><td>2</td><td>~300</td><td>2-5 ms</td></tr>
+      <tr><td>20</td><td>1</td><td>~100</td><td>1-3 ms</td></tr>
+      <tr><td>20</td><td>2</td><td>~1200</td><td>5-10 ms</td></tr>
+      <tr><td>50</td><td>2</td><td>~3000</td><td>10-20 ms</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key-insight">
+  <strong>k=2 比 k=1 慢约 50 倍</strong>。状态数增长 ~5×、候选 term 增长 ~10×,两者叠加的求交工作量是 ~50×。生产推荐:① 默认 maxEdits=1,只在 UX 明确需要时用 2;② 始终设 prefixLength ≥ 1,让前缀字符必须精确匹配,从根本剪枝 FST 子树;③ maxExpansions 默认 50,极少需要超过 100。<em>不要用 FuzzyQuery 处理"短 target"(< 4 字符)——k=2 会接受几乎所有同长度 term,候选爆炸到几万,延迟秒级。</em>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s14-6">14.6 RegexpQuery</h2>
+<!-- ============================================================ -->
+
+<p>RegexpQuery 比 Wildcard 更强大,支持完整(但有限)的正则语法:字符类 <code>[a-z]</code>、量词 <code>*</code> <code>+</code> <code>?</code>、选择 <code>|</code>、分组 <code>(...)</code> 等。Lucene 用 Thompson 构造法把正则编译为 NFA,再 determinize 为 DFA。<strong>但有意限制了不少 PCRE 元素</strong>——是不<em>能</em>支持,而是它们要么会让 NFA → DFA 不可控膨胀,要么超出"正则语言"范畴(必须用反向引用、回溯)。</p>
+
+<h3>支持的正则元素</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 14-6-1 · Lucene 支持的正则元素与 NFA 大小</div>
+  <table>
+    <thead>
+      <tr><th>正则</th><th>含义</th><th>NFA 状态数</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>字面 <code>a</code></td><td>字符 a</td><td>2</td></tr>
+      <tr><td>字符类 <code>[a-z]</code></td><td>区间</td><td>2(用区间编码)</td></tr>
+      <tr><td>否定字符类 <code>[^abc]</code></td><td>排除</td><td>2(多区间)</td></tr>
+      <tr><td><code>.</code></td><td>任意单字符</td><td>2</td></tr>
+      <tr><td><code>?</code> 量词(0/1)</td><td>可选</td><td>2 + ε</td></tr>
+      <tr><td><code>*</code> 量词(0+)</td><td>零或多</td><td>2 + ε self-loop</td></tr>
+      <tr><td><code>+</code> 量词(1+)</td><td>一或多</td><td>2 + 进入后 ε self-loop</td></tr>
+      <tr><td><code>{n}</code></td><td>恰好 n 次</td><td>n × |sub|</td></tr>
+      <tr><td><code>{n,m}</code></td><td>n 到 m 次</td><td>m × |sub| + ε(危险)</td></tr>
+      <tr><td>选择 <code>a|b</code></td><td>或</td><td>4 + ε</td></tr>
+      <tr><td>分组 <code>(...)</code></td><td>子表达式</td><td>同子</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>不支持的元素与替代方案</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 14-6-2 · Lucene 主动禁用的正则元素</div>
+  <table>
+    <thead>
+      <tr><th>不支持</th><th>禁用原因</th><th>替代</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>^</code> <code>$</code> 锚点</td><td>RegexpQuery 默认整 term 匹配</td><td>不需要</td></tr>
+      <tr><td><code>\b</code> 词边界</td><td>analyzer 已切分</td><td>用 PhraseQuery / SpanNearQuery</td></tr>
+      <tr><td>反向引用 <code>\1</code></td><td>非正则语言,需回溯</td><td>BooleanQuery 多 term 组合</td></tr>
+      <tr><td>Lookahead <code>(?=...)</code></td><td>非正则语言</td><td>业务层后置过滤</td></tr>
+      <tr><td>Lookbehind <code>(?&lt;=...)</code></td><td>同上</td><td>同上</td></tr>
+      <tr><td>Unicode property <code>\p{L}</code></td><td>部分支持</td><td>显式字符类 <code>[a-zA-Z]</code></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>RegexpQuery 调用</h3>
+
+<pre><code class="language-java">import org.apache.lucene.search.RegexpQuery;
+import org.apache.lucene.index.Term;
+
+RegexpQuery rq = new RegexpQuery(new Term("logEntry", "order-[0-9]+"));
+TopDocs top = searcher.search(rq, 100);
+
+RegexpQuery rq2 = new RegexpQuery(new Term("logEntry", "/(error|warn).*timeout/"));
+
+import org.apache.lucene.util.automaton.RegExp;
+import org.apache.lucene.util.automaton.Automaton;
+
+RegExp re = new RegExp("order-[0-9]+");
+Automaton a = re.toAutomaton();
+System.out.println("DFA states = " + a.getNumStates());</code></pre>
+
+<h3>"order-[0-9]+" 的编译过程</h3>
+
+<pre><code class="language-text">RegexpQuery 内部步骤:
+
+  1. 词法解析 "order-[0-9]+":
+     ['o', 'r', 'd', 'e', 'r', '-', char_class([0-9]), '+']
+
+  2. Thompson 构造,逐元素拼 NFA:
+     'o' 'r' 'd' 'e' 'r' '-' 都是字面字符
+     [0-9] 是字符区间 transition
+     + 是 1+ 量词,翻译为 (子NFA 至少走一次,再 self-loop)
+
+  3. 拼接结果(NFA, 含 ε):
+     s0 ─o→ s1 ─r→ s2 ─d→ s3 ─e→ s4 ─r→ s5 ─-→ s6
+                                                  ┊
+                                                  ε
+                                                  ▼
+                                             s7 ─[0-9]→ s7 (accept)
+
+  4. determinize:
+     ε 转移消除,s6 与 s7 合并(可空 ε 链)
+     最终 DFA(7 状态):
+       s0 ─o→ s1 ─r→ s2 ─d→ s3 ─e→ s4 ─r→ s5 ─-→ s7 ─[0-9]→ s7(accept)
+
+  5. minimize:
+     无可合并状态(每个状态语义不同)→ 7 状态保持
+
+  6. CompiledAutomaton 包装,准备求交</code></pre>
+
+<div class="warning">
+  <strong>嵌套量词 <code>(a+)+</code> 是 RegexpQuery 头号陷阱</strong>。这种模式让 NFA 内部出现"多重 ε 入口指向同一状态",determinize 时子集大小指数膨胀。Lucene 加了 <code>maxDeterminizedStates</code> 上限(默认 10000)防止 OOM,超过即抛 <code>TooComplexToDeterminizeException</code>。生产代码必须在业务层校验:① 禁用 <code>(...)+</code> 形式;② 模式长度不超过 100;③ 最好做正则白名单。<em>"用户输入直接拼 RegexpQuery"是常见的安全漏洞,可被 ReDoS 攻击。</em>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s14-7">14.7 CompiledAutomaton:统一的求交载体</h2>
+<!-- ============================================================ -->
+
+<p>三类查询编译出来的 <code>Automaton</code> 还不能直接拿去和 .tim 求交——<code>Automaton</code> 是逻辑数据结构,内部用 <code>int[]</code> 存状态、用 <code>Transition[]</code> 存转移,访问需要多次跳转。<code>CompiledAutomaton</code> 把它紧凑化:把整个 DFA 序列化成连续 byte 数组,把转移用区间排序后二分查找,同时<strong>识别四种特殊形态</strong>做退化优化。</p>
+
+<h3>四种 type 的退化优化</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 14-7-1 · CompiledAutomaton.AUTOMATON_TYPE</div>
+  <table>
+    <thead>
+      <tr><th>type</th><th>byte 值</th><th>条件</th><th>退化为</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>NORMAL</code></td><td>0</td><td>普通自动机</td><td>走标准 Terms.intersect</td></tr>
+      <tr><td><code>SINGLE</code></td><td>1</td><td>仅接受唯一字符串</td><td>退化为 <code>TermQuery</code></td></tr>
+      <tr><td><code>ALL</code></td><td>2</td><td>接受所有字符串</td><td>退化为 <code>MatchAllDocsQuery</code></td></tr>
+      <tr><td><code>NONE</code></td><td>3</td><td>不接受任何字符串</td><td>退化为空 BooleanQuery</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>CompiledAutomaton 的工作流</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 14-7-1 · CompiledAutomaton 构造与使用流程</div>
+  <svg viewBox="0 0 1240 800" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 1. Query -->
+    <rect x="380" y="20" width="480" height="64" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="620" y="46" text-anchor="middle" fill="#cfe9ff" font-size="14" font-weight="700">Query: WildcardQuery / FuzzyQuery / RegexpQuery</text>
+    <text x="620" y="68" text-anchor="middle" fill="#a5d6ff" font-size="11">每种 query 内部各自构造原始 Automaton</text>
+
+    <!-- 2. 原始 Automaton -->
+    <rect x="380" y="115" width="480" height="64" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="620" y="141" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">原始 Automaton</text>
+    <text x="620" y="163" text-anchor="middle" fill="#a5d6ff" font-size="11">可能是 NFA · 可能未最小化</text>
+    <line x1="620" y1="84" x2="620" y2="113" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+
+    <!-- 3. determinize -->
+    <rect x="380" y="210" width="480" height="64" rx="12" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="620" y="236" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">Operations.determinize ★</text>
+    <text x="620" y="258" text-anchor="middle" fill="#a5d6ff" font-size="11">子集构造 — 受 maxDeterminizedStates 上限保护</text>
+    <line x1="620" y1="179" x2="620" y2="208" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+
+    <!-- 4. minimize -->
+    <rect x="380" y="305" width="480" height="64" rx="12" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="620" y="331" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">Operations.minimize</text>
+    <text x="620" y="353" text-anchor="middle" fill="#a5d6ff" font-size="11">Hopcroft 算法 — 合并等价状态</text>
+    <line x1="620" y1="274" x2="620" y2="303" stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+
+    <!-- 5. CA -->
+    <rect x="380" y="400" width="480" height="64" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.6"/>
+    <text x="620" y="426" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">new CompiledAutomaton(automaton)</text>
+    <text x="620" y="448" text-anchor="middle" fill="#a5d6ff" font-size="11">封装结果 — 检测特殊 type</text>
+    <line x1="620" y1="369" x2="620" y2="398" stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+
+    <!-- 6. type 菱形 -->
+    <polygon points="620,490 870,560 620,630 370,560" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.6"/>
+    <text x="620" y="555" text-anchor="middle" fill="#ffd591" font-size="14" font-weight="700">判断 type</text>
+    <text x="620" y="575" text-anchor="middle" fill="#a5d6ff" font-size="11">检查接受语言形态</text>
+    <line x1="620" y1="464" x2="620" y2="488" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+
+    <!-- 4 个出口 -->
+    <rect x="20" y="660" width="270" height="64" rx="10" fill="rgba(57,210,192,0.10)" stroke="#39d2c0" stroke-width="1.4"/>
+    <text x="155" y="685" text-anchor="middle" fill="#39d2c0" font-size="12" font-weight="700">ALL — 接受全部</text>
+    <text x="155" y="704" text-anchor="middle" fill="#a5d6ff" font-size="11">→ 退化 MatchAllDocs</text>
+    <line x1="395" y1="540" x2="220" y2="658" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+
+    <rect x="305" y="660" width="270" height="64" rx="10" fill="rgba(248,81,73,0.10)" stroke="#f85149" stroke-width="1.4"/>
+    <text x="440" y="685" text-anchor="middle" fill="#ffadad" font-size="12" font-weight="700">NONE — 不接受任何</text>
+    <text x="440" y="704" text-anchor="middle" fill="#a5d6ff" font-size="11">→ 退化 空 BooleanQuery</text>
+    <line x1="490" y1="595" x2="440" y2="658" stroke="#f85149" stroke-width="1.4" marker-end="url(#arr-r)"/>
+
+    <rect x="590" y="660" width="270" height="64" rx="10" fill="rgba(88,166,255,0.10)" stroke="#58a6ff" stroke-width="1.4"/>
+    <text x="725" y="685" text-anchor="middle" fill="#cfe9ff" font-size="12" font-weight="700">SINGLE — 唯一 term</text>
+    <text x="725" y="704" text-anchor="middle" fill="#a5d6ff" font-size="11">→ 退化 TermQuery</text>
+    <line x1="750" y1="595" x2="730" y2="658" stroke="#58a6ff" stroke-width="1.4" marker-end="url(#arr)"/>
+
+    <rect x="875" y="660" width="345" height="64" rx="10" fill="rgba(63,185,80,0.12)" stroke="#3fb950" stroke-width="1.6"/>
+    <text x="1047" y="685" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">NORMAL — 一般 DFA</text>
+    <text x="1047" y="704" text-anchor="middle" fill="#a5d6ff" font-size="11">→ 紧凑 byte + commonSuffixRef + runAutomaton</text>
+    <line x1="850" y1="540" x2="1010" y2="658" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+
+    <!-- NORMAL → Use → TE — 在 NORMAL 框右下方延展 -->
+    <rect x="875" y="745" width="345" height="40" rx="10" fill="rgba(63,185,80,0.05)" stroke="#3fb950" stroke-width="1.2" stroke-dasharray="4 3"/>
+    <text x="1047" y="770" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">→ Terms.intersect(ca, null) → TermsEnum</text>
+
+    <!-- 注释 -->
+    <text x="240" y="772" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">特殊 type — 跳过自动机执行 → 极快</text>
+    <text x="240" y="788" text-anchor="middle" fill="#a5d6ff" font-size="10">3 种退化都不需要走 Terms.intersect</text>
+  </svg>
+</div>
+
+<h3>CompiledAutomaton 的关键字段</h3>
+
+<pre><code class="language-text">CompiledAutomaton 内部数据(简化):
+
+  AUTOMATON_TYPE type;                  // NORMAL / SINGLE / ALL / NONE
+  Automaton automaton;                  // 原始 DFA(用于运行时 step)
+  ByteRunAutomaton runAutomaton;        // byte 级别快速 run(用 byte 数组打包状态机)
+  BytesRef term;                        // SINGLE 时存储的唯一字符串
+  BytesRef commonSuffixRef;             // 所有接受字符串的共同后缀(用于额外剪枝)
+  IntsRef finite;                       // 接受语言是否有限
+  Transition transition;                // 复用对象,避免分配
+
+  byte[] sinkState bitset;              // 死状态(进去就出不来)
+  int[] startStates;                    // 起始状态
+  ...
+
+ByteRunAutomaton 的关键方法:
+  int step(int state, int label)        // 输入字符 label,从 state 走一步
+  boolean isAccept(int state)           // state 是否为接受
+  boolean isSinkState(int state)        // state 是否死(无任何 transition)</code></pre>
+
+<h3>commonSuffixRef:额外剪枝</h3>
+
+<p>除了起点(prefix),CompiledAutomaton 还预计算所有接受字符串的<strong>共同后缀</strong>。对 Wildcard <code>*phone</code> 来说所有接受的 term 都以 "phone" 结尾,FST 求交时如果发现某 term 已读完前缀但 ".tim 中剩余 byte 不可能形成 'phone' 后缀",可以提前 skip 整棵子树。这个优化对"中缀 + 后缀"模式(如 <code>m*phone</code>)特别有效。</p>
+
+<pre><code class="language-java">import org.apache.lucene.util.automaton.RegExp;
+import org.apache.lucene.util.automaton.Automaton;
+import org.apache.lucene.util.automaton.CompiledAutomaton;
+
+RegExp re = new RegExp("order-[0-9]+");
+Automaton a = re.toAutomaton();
+
+CompiledAutomaton ca = new CompiledAutomaton(a);
+
+System.out.println("type = " + ca.type);
+System.out.println("commonSuffix = "
+    + (ca.commonSuffixRef == null ? "null" : ca.commonSuffixRef.utf8ToString()));
+
+if (ca.type == CompiledAutomaton.AUTOMATON_TYPE.SINGLE) {
+    System.out.println("退化为 TermQuery, term = " + ca.term.utf8ToString());
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s14-8">14.8 与 .tim 的协同:Terms.intersect 算法</h2>
+<!-- ============================================================ -->
+
+<p>所有前面的章节铺垫都在等这一节:<code>CompiledAutomaton</code> 与 <code>.tip + .tim</code> 词典的 FST<strong>双指针同步走</strong>。这是 Wildcard / Fuzzy / Regexp 性能的真正决定环节——前面所有编译都很便宜(毫秒级),求交才是<em>主成本</em>(几毫秒到几百毫秒,取决于剪枝率)。</p>
+
+<h3>求交的核心思路:双指针走</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 14-8-1 · automaton + .tim 求交逐步过程(手绘)</div>
+  <div style="background:#0d1117;border:1.5px solid #d2a8ff;border-radius:10px;padding:18px;font-family:'Cascadia Code','SFMono-Regular',Consolas,monospace;font-size:12.5px;color:#a5d6ff;">
+    <div style="color:#d2a8ff;font-weight:600;font-size:13px;margin-bottom:12px;">假设:WildcardQuery("iphone*"),词典前 5 个根 arc:</div>
+<pre style="margin:0;color:#a5d6ff;line-height:1.6;font-size:11.5px;">
+.tip FST 根节点的 arcs(按 byte 排序):
+  arc 'a' (apple, apricot, ant ...)
+  arc 'b' (banana, basket, ...)
+  arc 'c' (charger, candle, ...)
+  arc 'i' (ice, idea, iphone, iphone-7, ...)
+  arc 'p' (phone, paper, ...)
+
+Automaton(WildcardQuery "iphone*"):
+  s0 ─i→ s1
+  s1 ─p→ s2
+  s2 ─h→ s3
+  s3 ─o→ s4
+  s4 ─n→ s5
+  s5 ─e→ s6
+  s6 ─ANY→ s6 (accept)
+</pre>
+
+    <div style="margin-top:14px;color:#3fb950;font-weight:600;font-size:13px;margin-bottom:8px;">逐步求交过程:</div>
+<pre style="margin:0;color:#a5d6ff;line-height:1.6;font-size:11.5px;">
+Step 1:  指针 (sA=s0, sFST=root)
+  FST root arc 'a' → automaton s0 上 'a' 转移?
+    automaton s0 只有 'i' 转移,'a' 不在 → ❌
+    → 整 'a' 子树<span style="color:#f85149;">剪枝</span>(apple, apricot, ant 全跳过)
+
+Step 2:  arc 'b'
+  s0 上 'b' 转移?  ❌
+  → 'b' 子树<span style="color:#f85149;">剪枝</span>(banana, basket 全跳过)
+
+Step 3:  arc 'c'
+  s0 上 'c' 转移?  ❌
+  → 'c' 子树<span style="color:#f85149;">剪枝</span>(charger, candle 全跳过)
+
+Step 4:  arc 'i'
+  s0 上 'i' 转移?  ✅ 走到 sA=s1
+  → 进入 .tip 'i' 子树,sFST=ice 节点
+  
+  在 i 子树继续:
+    arc 'c' (ice 路径) → s1 上 'c' 转移? ❌ 跳过
+    arc 'd' (idea)     → s1 上 'd' 转移? ❌ 跳过
+    arc 'p' (iphone)   → s1 上 'p' 转移? ✅ 走 s2
+      在 ip 子树:
+        arc 'h' (iphone) → s2 上 'h' ? ✅ s3
+          arc 'o' → s3 上 'o' ? ✅ s4
+            arc 'n' → s4 上 'n' ? ✅ s5
+              arc 'e' → s5 上 'e' ? ✅ s6
+                automaton 当前 s6 是 accept!
+                → emit term "iphone" ✓
+                继续走 s6 ─ANY→ s6
+                  arc '-' → s6 ANY ✅ s6
+                    arc '7' → s6 ANY ✅ s6 → emit "iphone-7" ✓
+                    arc '8' → s6 ANY ✅ s6 → emit "iphone-8" ✓
+                    arc 'p' → s6 ANY ✅ s6 → emit "iphone-pro" ✓
+
+Step 5:  arc 'p' (phone, paper)
+  s0 上 'p' 转移?  ❌
+  → 'p' 子树<span style="color:#f85149;">剪枝</span>(phone, paper 全跳过)
+</pre>
+
+    <div style="margin-top:14px;color:#d29922;font-weight:600;font-size:13px;margin-bottom:8px;">收益统计:</div>
+<pre style="margin:0;color:#a5d6ff;line-height:1.6;font-size:11.5px;">
+访问的 .tim 子树:
+  - 跳过: a/b/c/p 子树(假设各 100K-500K term)
+  - 走入: i 子树 → ip 子树 → iphone 子树
+  - 触发:仅 iphone 子树的 term 被列出
+
+实际访问 term 数: ~5-50(iphone* 命中)
+遍历的 .tim 字节: ~1 KB(主要在 iphone 子树)
+而非全词典遍历: 不需要 mmap 整个 .tim(可能 100-200 MB)
+
+理论复杂度: O(命中 term 数 × 平均 term 长度)
+而非 O(总 term 数 × 模式长度)
+</pre>
+
+    <div style="margin-top:12px;padding:10px;background:rgba(210,168,255,.08);border-left:3px solid #d2a8ff;border-radius:4px;color:#8b949e;font-size:11.5px;line-height:1.7;">
+      <strong style="color:#d2a8ff;">关键观察</strong>:Step 1-3 用 3 次 byte 比较剪掉 ~50% 词典(a/b/c 子树),Step 5 又剪掉 ~10%(p 子树)。整个查询的<em>有效工作量</em>就在 Step 4 的 <code>iphone</code> 子树内,几乎所有"无关 term"在根节点就被砍掉。<em>这就是为什么"前缀越长,delay 越低"——前缀字符在 Step 1 阶段就消除了越多根 arc。</em>
+    </div>
+  </div>
+</div>
+
+<h3>求交的协作时序</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 14-8-2 · Terms.intersect 协作时序</div>
+  <svg viewBox="0 0 1240 700" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 4 个泳道 -->
+    <rect x="40"  y="20" width="240" height="50" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="1.4"/>
+    <text x="160" y="48" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">Query (Q)</text>
+
+    <rect x="320" y="20" width="240" height="50" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.4"/>
+    <text x="440" y="48" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">CompiledAutomaton (CA)</text>
+
+    <rect x="600" y="20" width="280" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.4"/>
+    <text x="740" y="40" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">TermsEnum</text>
+    <text x="740" y="58" text-anchor="middle" fill="#a5d6ff" font-size="10">(IntersectTermsEnum)</text>
+
+    <rect x="920" y="20" width="280" height="50" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="1.4"/>
+    <text x="1060" y="48" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">FST (.tip + .tim)</text>
+
+    <line x1="160"  y1="70" x2="160"  y2="680" stroke="#58a6ff" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="440"  y1="70" x2="440"  y2="680" stroke="#d29922" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="740"  y1="70" x2="740"  y2="680" stroke="#bc8cff" stroke-width="1" stroke-dasharray="4 4"/>
+    <line x1="1060" y1="70" x2="1060" y2="680" stroke="#3fb950" stroke-width="1" stroke-dasharray="4 4"/>
+
+    <!-- 1 Q→CA new -->
+    <line x1="160" y1="105" x2="438" y2="105" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+    <text x="299" y="98" text-anchor="middle" fill="#cfe9ff" font-size="11">① new CompiledAutomaton(automaton)</text>
+
+    <!-- 2 Q→TE terms.intersect(ca, null) -->
+    <line x1="160" y1="140" x2="738" y2="140" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+    <text x="450" y="133" text-anchor="middle" fill="#cfe9ff" font-size="11">② terms.intersect(ca, null) — 求交入口</text>
+
+    <!-- loop 每个 .tim arc 框 -->
+    <rect x="120" y="170" width="1080" height="430" rx="10" fill="rgba(63,185,80,0.04)" stroke="#3fb950" stroke-width="1.2" stroke-dasharray="6 4"/>
+    <text x="160" y="190" fill="#3fb950" font-size="12" font-weight="700">loop · 每个 .tim arc 同步推进</text>
+
+    <!-- 3 TE→FST 当前 arc 列表 -->
+    <line x1="740" y1="220" x2="1058" y2="220" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+    <text x="900" y="213" text-anchor="middle" fill="#9be7b3" font-size="11">③ 当前 FST 状态 sF 上的 arc 列表</text>
+
+    <!-- 4 TE→CA runAutomaton.step -->
+    <line x1="740" y1="255" x2="442" y2="255" stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+    <text x="591" y="248" text-anchor="middle" fill="#ffd591" font-size="11">④ runAutomaton.step(sA, label)</text>
+
+    <!-- alt 自动机有 transition 框 -->
+    <rect x="160" y="285" width="1020" height="180" rx="10" fill="rgba(212,153,34,0.06)" stroke="#d29922" stroke-width="1.1" stroke-dasharray="5 3"/>
+    <text x="200" y="305" fill="#d29922" font-size="11" font-weight="700">alt · 自动机有该 transition</text>
+
+    <!-- 5 TE self 同步推进 -->
+    <path d="M 740 330 Q 810 330 810 350 Q 810 370 742 370" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr-p)"/>
+    <text x="830" y="353" fill="#e6d3ff" font-size="11">⑤ 同步推进 (sA', sF') — 进入子树</text>
+
+    <!-- alt sA' 是 accept 框 (嵌套) -->
+    <rect x="180" y="380" width="980" height="80" rx="10" fill="rgba(63,185,80,0.06)" stroke="#3fb950" stroke-width="1.1" stroke-dasharray="4 3"/>
+    <text x="220" y="400" fill="#3fb950" font-size="11" font-weight="700">alt · sA' 是 accept 状态</text>
+
+    <line x1="740" y1="430" x2="162" y2="430" stroke="#3fb950" stroke-width="1.6" stroke-dasharray="6 3" marker-end="url(#arr-g)"/>
+    <text x="450" y="423" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">⑥ emit term — 命中候选</text>
+
+    <!-- else 无 transition 框 -->
+    <rect x="160" y="485" width="1020" height="100" rx="10" fill="rgba(248,81,73,0.06)" stroke="#f85149" stroke-width="1.1" stroke-dasharray="5 3"/>
+    <text x="200" y="505" fill="#f85149" font-size="11" font-weight="700">else · 自动机无该 transition</text>
+
+    <!-- 7 TE self 跳过 -->
+    <path d="M 740 530 Q 810 530 810 550 Q 810 570 742 570" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr-r)"/>
+    <text x="830" y="553" fill="#f85149" font-size="11" font-weight="700">⑦ 跳过整个 arc 子树 — prune (核心优化)</text>
+
+    <!-- 8 TE→Q 求交完毕 -->
+    <line x1="740" y1="630" x2="162" y2="630" stroke="#bc8cff" stroke-width="1.6" stroke-dasharray="6 3" marker-end="url(#arr-p)"/>
+    <text x="450" y="623" text-anchor="middle" fill="#e6d3ff" font-size="11" font-weight="700">⑧ 求交完毕 — 返回所有命中 term</text>
+
+    <text x="620" y="675" text-anchor="middle" fill="#39d2c0" font-size="12" font-weight="700">关键: prune 子树是双自动机求交的核心 — 把 O(N词典) 降到 O(命中 + 边界)</text>
+  </svg>
+</div>
+
+<h3>Java 调用入口</h3>
+
+<pre><code class="language-java">import org.apache.lucene.index.LeafReader;
+import org.apache.lucene.index.Terms;
+import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.util.automaton.CompiledAutomaton;
+import org.apache.lucene.util.BytesRef;
+
+WildcardQuery wq = new WildcardQuery(new Term("itemName", "iphone*"));
+CompiledAutomaton ca = new CompiledAutomaton(
+    wq.getTerm().bytes() != null
+        ? wq.toAutomaton(wq.getTerm())
+        : null
+);
+
+LeafReader leafReader = ...;
+Terms terms = leafReader.terms("itemName");
+TermsEnum termsEnum = terms.intersect(ca, null);
+
+BytesRef term;
+int count = 0;
+while ((term = termsEnum.next()) != null) {
+    System.out.println("matched: " + term.utf8ToString()
+        + " docFreq=" + termsEnum.docFreq());
+    count++;
+}
+System.out.println("total matched terms = " + count);</code></pre>
+
+<h3>求交性能收益(实测量级)</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 14-8 · 求交在 1000 万 term 索引上的实测</div>
+  <table>
+    <thead>
+      <tr><th>查询</th><th>暴力枚举</th><th>自动机求交</th><th>加速</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>WildcardQuery <code>iphone*</code></td><td>~500 ms</td><td>~2-5 ms(~50 candidate)</td><td>100-250×</td></tr>
+      <tr><td>WildcardQuery <code>i*</code></td><td>~500 ms</td><td>~50-100 ms(~100K candidate)</td><td>5-10×</td></tr>
+      <tr><td>FuzzyQuery LD=1(target=iphone)</td><td>~500 ms</td><td>~3-5 ms(~50 candidate)</td><td>100-150×</td></tr>
+      <tr><td>FuzzyQuery LD=2(target=iphone)</td><td>~500 ms</td><td>~10-30 ms(~200 candidate)</td><td>15-50×</td></tr>
+      <tr><td>RegexpQuery 复杂</td><td>~500 ms</td><td>不定,取决正则</td><td>1-1000×</td></tr>
+      <tr><td>WildcardQuery <code>*phone*</code></td><td>~500 ms</td><td>~200-500 ms</td><td>1-2×(几无收益)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s14-9">14.9 1024 term 阈值与 CONSTANT_SCORE_REWRITE</h2>
+<!-- ============================================================ -->
+
+<p>求交完毕只是第一步——<code>Terms.intersect</code> 返回的是<strong>命中 term 的迭代器</strong>(IntersectTermsEnum),还要决定怎么把这些 term 转成最终查询。<code>MultiTermQuery</code>(Wildcard / Fuzzy / Regexp 的共同父类)默认行为是把每个命中 term 包装成 <code>TermQuery</code>,再用 <code>BooleanQuery(SHOULD)</code> 取并集。但 <code>BooleanQuery</code> 有 <strong>maxClauseCount = 1024</strong> 的硬性上限——超过就抛 <code>TooManyClauses</code>。</p>
+
+<h3>5 种 RewriteMethod 对比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 14-9-1 · MultiTermQuery 的 5 种 rewrite 策略</div>
+  <table>
+    <thead>
+      <tr><th>RewriteMethod</th><th>结果</th><th>评分</th><th>1024 限制</th><th>适用</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>SCORING_BOOLEAN_REWRITE</code></td><td>BooleanQuery(SHOULD)</td><td>BM25 精确</td><td>是</td><td>命中少 + 需要相关性</td></tr>
+      <tr><td><code>CONSTANT_SCORE_BOOLEAN_REWRITE</code></td><td>BooleanQuery 但常分</td><td>所有命中 score=1</td><td>是</td><td>不需评分 + 命中较少</td></tr>
+      <tr><td><code>CONSTANT_SCORE_REWRITE</code>(默认)</td><td>DocIdSetIterator 直接遍历</td><td>常分 1.0</td><td>否</td><td>命中可能很多</td></tr>
+      <tr><td><code>CONSTANT_SCORE_BLENDED_REWRITE</code></td><td>常分 + IDF 混合</td><td>稍微评分</td><td>否</td><td>大量命中但需要弱相关性</td></tr>
+      <tr><td><code>TopTermsScoringBooleanQueryRewrite(N)</code></td><td>只取 top N term</td><td>BM25</td><td>否(N 自定)</td><td>FuzzyQuery 默认</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>Java 配置示例</h3>
+
+<pre><code class="language-java">import org.apache.lucene.search.WildcardQuery;
+import org.apache.lucene.search.MultiTermQuery;
+import org.apache.lucene.search.BooleanQuery;
+import org.apache.lucene.index.Term;
+
+WildcardQuery wq = new WildcardQuery(new Term("itemName", "i*"));
+
+wq.setRewriteMethod(MultiTermQuery.CONSTANT_SCORE_BOOLEAN_REWRITE);
+wq.setRewriteMethod(MultiTermQuery.CONSTANT_SCORE_REWRITE);
+wq.setRewriteMethod(new MultiTermQuery.TopTermsScoringBooleanQueryRewrite(50));
+
+BooleanQuery.setMaxClauseCount(8192);
+
+TopDocs top = searcher.search(wq, 100);</code></pre>
+
+<h3>1024 阈值的来源</h3>
+
+<pre><code class="language-text">为什么 BooleanQuery 默认 maxClauseCount=1024?
+
+  1. 内存:每个 BooleanClause 包装一个 Query + 一个 Occur enum
+     1024 clause ≈ 1024 × ~200 bytes = ~200 KB 单查询
+     若 1 万,延迟到 100 万次构造,GC 压力显著
+
+  2. 评分代价:BM25 + Disjunction 求并集是 leapfrog 多路归并
+     每多一个 clause 就多一个 PostingsEnum 与堆操作
+     1024 clause 已是 BooleanQuery 性能拐点
+
+  3. 实际经验:99% 用户合理查询都 < 100 clause
+     超过 1024 通常意味着 wildcard 或 fuzzy 失控
+     抛异常比悄悄变慢更"诚实"
+
+  4. 上下文限制:Lucene 历史上 maxClauseCount=1024 是全局 static
+     8.0+ 改为可配置但默认仍 1024,以发现错误用法
+
+  突破方案:CONSTANT_SCORE_REWRITE
+  原理:
+    - 不构造 BooleanQuery
+    - 用 DocIdSetBuilder 直接收集所有命中 doc 的 docID
+    - 包装为 ConstantScoreScorer,所有 doc 评分=1.0(或 boost)
+    - 可处理百万级 term 命中,延迟与命中数线性相关</code></pre>
+
+<div class="warning">
+  <strong>TooManyClauses 是 wildcard/fuzzy 最常见的生产异常</strong>。<code>WildcardQuery("i*")</code> 在 1000 万 term 索引上展开 ~10 万 term,默认 SCORING_BOOLEAN_REWRITE 立刻抛 <code>TooManyClauses</code>。<em>修复</em>:① 业务限制前缀长度 ≥ 3,把命中量降到 < 1000;② 或显式 <code>setRewriteMethod(CONSTANT_SCORE_REWRITE)</code>,牺牲精确评分换大命中可行性;③ 不要简单地 <code>setMaxClauseCount(1000000)</code>——这只是把异常推迟到 OOM。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s14-10">14.10 leading wildcard 反模式</h2>
+<!-- ============================================================ -->
+
+<p>"leading wildcard" 指的是模式以 <code>*</code> 或 <code>?</code> 开头,如 <code>*phone</code>、<code>?phone</code>、<code>*phone*</code>。这类模式让自动机的起始状态接受任意首字符,导致 .tim 求交时根 arc 一个都剪不掉,FST 整棵树都要走一遍——这是 Lucene 性能<em>头号毒瘤</em>。</p>
+
+<h3>性能对比:有前缀 vs 无前缀</h3>
+
+<div class="compare-grid">
+  <div class="compare-card" style="background:rgba(248,81,73,.06);border:1px solid rgba(248,81,73,.2);border-radius:10px;padding:18px 20px;">
+    <div style="color:#f85149;font-weight:600;font-size:13px;margin-bottom:8px;">❌ leading wildcard <code style="background:rgba(248,81,73,.15);padding:1px 6px;">*phone</code></div>
+    <div style="font-size:13.5px;line-height:1.7;">
+      <strong>自动机起点</strong>:s0 ─ANY→ s0 self-loop<br>
+      <strong>.tim 求交</strong>:无任何 arc 可剪枝<br>
+      <strong>访问 term 数</strong>:全部 1000 万<br>
+      <strong>访问 .tim 字节</strong>:全部 ~100 MB<br>
+      <strong>典型延迟</strong>:500-2000 ms<br>
+      <strong>QPS 限制</strong>:1-2 QPS 已打满 CPU<br>
+      <strong>问题</strong>:用户输入,无业务保护
+    </div>
+  </div>
+  <div class="compare-card" style="background:rgba(63,185,80,.06);border:1px solid rgba(63,185,80,.2);border-radius:10px;padding:18px 20px;">
+    <div style="color:#3fb950;font-weight:600;font-size:13px;margin-bottom:8px;">✅ 前缀 ≥ 3 字符 <code style="background:rgba(63,185,80,.15);padding:1px 6px;">iph*</code></div>
+    <div style="font-size:13.5px;line-height:1.7;">
+      <strong>自动机起点</strong>:s0 ─i→ s1 ─p→ s2 ─h→ s3<br>
+      <strong>.tim 求交</strong>:剪掉 ~25 个根 arc(96% 词典)<br>
+      <strong>访问 term 数</strong>:~10 万(i 子树相关)<br>
+      <strong>访问 .tim 字节</strong>:~5-10 MB<br>
+      <strong>典型延迟</strong>:5-20 ms<br>
+      <strong>QPS 上限</strong>:1000+ QPS 可承受<br>
+      <strong>建议</strong>:业务层强制前缀 ≥ 3
+    </div>
+  </div>
+</div>
+
+<h3>反例代码</h3>
+
+<pre><code class="language-java">String userInput = request.getParameter("q");
+Query bad = new WildcardQuery(new Term("itemName", "*" + userInput + "*"));
+TopDocs top = searcher.search(bad, 100);
+
+if (userInput.length() < 3) {
+    throw new IllegalArgumentException("搜索关键词至少 3 字符");
+}
+Query good = new PrefixQuery(new Term("itemName", userInput));
+
+import org.apache.lucene.analysis.TokenStream;
+import org.apache.lucene.analysis.tokenattributes.CharTermAttribute;
+import org.apache.lucene.search.BooleanQuery;
+import org.apache.lucene.search.BooleanClause;
+
+TokenStream ts = analyzer.tokenStream("itemName", userInput);
+BooleanQuery.Builder bq = new BooleanQuery.Builder();
+ts.reset();
+while (ts.incrementToken()) {
+    String tok = ts.getAttribute(CharTermAttribute.class).toString();
+    bq.add(new TermQuery(new Term("itemName", tok)), BooleanClause.Occur.SHOULD);
+}
+ts.close();
+Query best = bq.build();</code></pre>
+
+<h3>ngram 索引方案</h3>
+
+<p>业务真需要"中缀匹配"(搜索栏所见即所得)时,改用 NGramTokenFilter:索引侧用 <code>NGramTokenFilter(min=3, max=5)</code> 生成所有 3-5 字符子串,查询侧用普通 TermQuery,完全绕开 wildcard。例:<code>iphone-12-pro</code> 切成 <code>["iph", "pho", "hon", "one", "ne-", ...]</code>。</p>
+
+<pre><code class="language-text">存储成本: ngram 数 ≈ |term| × (max - min + 1) ≈ 12 × 3 = 36 ngram/原 term
+          1000 万 term → 3.6 亿 ngram, .tim 大 5-10×
+
+查询代价: TermQuery("phone") → 直接 .tim 二分 → < 1 ms
+          无自动机求交,无 1024 阈值问题
+
+权衡:    + 查询极快  + 用户体验好(无字符限制)
+          - 索引大 5-10×  - 适合数据 < 1 亿 doc  - 重建索引慢
+
+适用:    商品名搜索栏 / 日志关键词高亮</code></pre>
+
+<div class="real-world">
+  <strong>某电商站内搜索的 leading wildcard 雪崩</strong>。某团队上线"通配符搜索"功能,允许用户输入任意 wildcard 模式直接走 WildcardQuery。上线 2 周后,周末高峰一个用户输入 <code>*</code> 触发 MatchAll,接着另一个输入 <code>*phone*</code> 全表扫,5 分钟内 P99 从 50ms 飙到 8s,集群 12 个节点 CPU 全部 100%,搜索整个不可用。事后修复:① 业务层校验最少 3 字符前缀;② <code>*</code> 单独提示"请输入更多字符";③ 监控 TooManyClauses 异常率,> 0.1% 立刻报警;④ 后续切换到 ngram 索引,wildcard query 完全弃用。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s14-11">14.11 PrefixQuery 优化</h2>
+<!-- ============================================================ -->
+
+<p>PrefixQuery 是 WildcardQuery 的"语义清晰版":只接受字面前缀,拒绝任何元字符。其内部仍走 CompiledAutomaton + Terms.intersect 路径,但 API 上更安全——不会因为用户输入中夹杂 <code>*</code> <code>?</code> 触发意外行为。</p>
+
+<h3>WildcardQuery vs PrefixQuery</h3>
+
+<div class="compare-grid">
+  <div class="compare-card" style="background:rgba(214,153,34,.06);border:1px solid rgba(214,153,34,.2);border-radius:10px;padding:18px 20px;">
+    <div style="color:#d29922;font-weight:600;font-size:13px;margin-bottom:8px;">WildcardQuery("foo*")</div>
+    <div style="font-size:13.5px;line-height:1.7;">
+      <strong>API</strong>:<code>new WildcardQuery(Term)</code><br>
+      <strong>支持元字符</strong>:<code>*</code> <code>?</code> <code>\</code><br>
+      <strong>解析</strong>:扫描模式找元字符位置<br>
+      <strong>自动机</strong>:与 PrefixQuery 物理同构<br>
+      <strong>陷阱</strong>:<code>*foo*</code> 被允许,leading wildcard 慢<br>
+      <strong>用户输入安全</strong>:不安全(用户可输入元字符)<br>
+      <strong>推荐</strong>:仅在业务真需要 <code>?</code> 或中缀时
+    </div>
+  </div>
+  <div class="compare-card" style="background:rgba(63,185,80,.06);border:1px solid rgba(63,185,80,.2);border-radius:10px;padding:18px 20px;">
+    <div style="color:#3fb950;font-weight:600;font-size:13px;margin-bottom:8px;">PrefixQuery("foo")</div>
+    <div style="font-size:13.5px;line-height:1.7;">
+      <strong>API</strong>:<code>new PrefixQuery(Term)</code><br>
+      <strong>支持元字符</strong>:无,字面前缀<br>
+      <strong>解析</strong>:整个字符串作为前缀<br>
+      <strong>自动机</strong>:foo + ANY self-loop<br>
+      <strong>陷阱</strong>:前缀过短(< 3)候选过多<br>
+      <strong>用户输入安全</strong>:安全(任何字符当字面)<br>
+      <strong>推荐</strong>:绝大多数"以...开头"场景的首选
+    </div>
+  </div>
+</div>
+
+<h3>PrefixQuery 的字节级流程</h3>
+
+<pre><code class="language-text">PrefixQuery("itemName", "order-") 的执行:
+
+  1. 构造 PrefixQuery
+       prefix = "order-"
+
+  2. 编译为 CompiledAutomaton(隐式)
+       PrefixQuery 内部不显式调用 Automata.makePrefix,
+       而是 buildAutomaton(prefix) 直接走最优路径
+     自动机:
+       s0 ─o→ s1 ─r→ s2 ─d→ s3 ─e→ s4 ─r→ s5 ─-→ s6 ─ANY→ s6 (accept)
+
+  3. terms.intersect(ca, null) 求交
+       根 arcs:'a' 'b' 'c' 'd' 'e' 'f' 'g' 'h' 'i' 'j' 'k' 'l' 'm' 'n' 'o' 'p'...
+       走到 'o' arc,其余全剪
+       'o' 子树继续:'r' 'p' 'l' ... → 走 'r' 子树
+       逐字符走完 "order-",剩下 ANY self-loop
+       展开 "order-" 子树下所有 term
+
+  4. rewrite 决策
+       命中数 ≤ 1024 → BooleanQuery(SHOULD)
+       命中数 > 1024 → ConstantScoreQuery(默认)
+
+  5. 与 PostingsEnum 配合,获取每 term 的 doc 列表
+       leapfrog 求并集
+       BM25 评分(若 SCORING_BOOLEAN_REWRITE)</code></pre>
+
+<h3>前缀长度对延迟的影响</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 14-11 · 前缀长度 vs 候选 term(1000 万 term 索引)</div>
+  <table>
+    <thead>
+      <tr><th>前缀长度</th><th>候选 term 量级</th><th>典型延迟</th><th>建议</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>0(空)</td><td>全部 1000 万</td><td>500-2000 ms</td><td>禁用,退化为 MatchAll</td></tr>
+      <tr><td>1(<code>i</code>)</td><td>~100 万</td><td>50-200 ms</td><td>禁用,业务不可接受</td></tr>
+      <tr><td>2(<code>ip</code>)</td><td>~50 万</td><td>20-80 ms</td><td>警告,边缘可用</td></tr>
+      <tr><td>3(<code>iph</code>)</td><td>~10 万</td><td>5-20 ms</td><td>默认推荐</td></tr>
+      <tr><td>4(<code>ipho</code>)</td><td>~10 万</td><td>3-10 ms</td><td>更安全</td></tr>
+      <tr><td>6(<code>iphone</code>)</td><td>~50</td><td>1-3 ms</td><td>极安全</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<pre><code class="language-java">import org.apache.lucene.search.PrefixQuery;
+import org.apache.lucene.search.MultiTermQuery;
+import org.apache.lucene.index.Term;
+
+PrefixQuery pq = new PrefixQuery(new Term("itemName", "iphone"));
+
+pq.setRewriteMethod(MultiTermQuery.CONSTANT_SCORE_REWRITE);
+
+if (request.getParameter("q").length() < 3) {
+    throw new IllegalArgumentException("最少 3 字符前缀");
+}
+Query safe = new PrefixQuery(new Term("itemName", request.getParameter("q")));
+
+TopDocs top = searcher.search(safe, 100);</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s14-12">14.12 业务场景与取舍</h2>
+<!-- ============================================================ -->
+
+<p>三个真实场景的"该用哪个查询、怎么调参"建议。每个场景都给出技术选型 + 代码 + 性能预算。</p>
+
+<h3>场景 A:商品名拼写容错(电商搜索)</h3>
+
+<p>用户输入商品名,允许 1 个字符的拼写错误,例:输入 <code>iphne</code> → 期望命中 <code>iphone</code>。数据规模 itemName 字段 1000 万独立 term。<strong>选型:FuzzyQuery(maxEdits=1, prefixLength=1)</strong>;不用 LD=2 是因为误命中过多——<code>iphne</code> 在 LD=2 下会误中 <code>phone</code> / <code>iPhone-7</code> 等无关 term。</p>
+
+<pre><code class="language-java">String userInput = "iphne";
+if (userInput.length() < 3) {
+    return new TermQuery(new Term("itemName", userInput));
+}
+Query q = new FuzzyQuery(
+    new Term("itemName", userInput),
+    1,        // maxEdits:单字符容错足够
+    1,        // prefixLength:首字符必须精确
+    50,       // maxExpansions
+    true);    // transpositions:允许字符交换</code></pre>
+
+<p><strong>性能预算</strong>:自动机构造 &lt; 1 ms + Terms.intersect 2-5 ms + TopK 评分 1-2 ms = <strong>5-10 ms P95</strong>。</p>
+
+<h3>场景 B:订单号 / SKU 前缀搜索</h3>
+
+<p>运营搜索某客户的订单 / 某品类的 SKU,订单号格式 <code>ORD-20260510-XXXXX</code>,运营输入 <code>ORD-2026</code> 看本年订单。<strong>选型:PrefixQuery</strong>(语义清晰、安全);WildcardQuery 等价但允许元字符,有用户输入风险;FuzzyQuery 不适用——订单号必须精确。</p>
+
+<pre><code class="language-java">String prefix = request.getParameter("orderPrefix");
+if (prefix == null || prefix.length() < 4) {
+    throw new IllegalArgumentException("至少 4 字符前缀");
+}
+PrefixQuery q = new PrefixQuery(new Term("orderId", prefix));
+q.setRewriteMethod(MultiTermQuery.CONSTANT_SCORE_REWRITE);</code></pre>
+
+<p><strong>性能预算</strong>:前缀 4 字符候选 ~万级,Terms.intersect 5-10 ms,CONSTANT_SCORE 无 1024 限制 = <strong>10-30 ms P95</strong>。</p>
+
+<h3>场景 C:日志正则搜索</h3>
+
+<p>运维搜日志匹配错误码 <code>error-[0-9]{4}-(timeout|conn)</code>,数据规模 logEntry 字段 5 亿 term。<strong>选型:RegexpQuery</strong>,但<em>必须做模式校验</em>防 ReDoS。</p>
+
+<pre><code class="language-java">public Query buildLogRegex(String pattern) {
+    if (pattern.length() > 100) {
+        throw new IllegalArgumentException("正则过长");
+    }
+    if (pattern.matches(".*\\([^)]*[+*?][^)]*\\)[+*?].*")) {
+        throw new IllegalArgumentException("禁用嵌套量词");
+    }
+    if (!pattern.matches("^[a-zA-Z0-9\\-_/\\[\\]\\(\\)\\|\\+\\*\\?\\.,]+$")) {
+        throw new IllegalArgumentException("非白名单字符");
+    }
+    RegexpQuery rq = new RegexpQuery(new Term("logEntry", pattern));
+    rq.setRewriteMethod(MultiTermQuery.CONSTANT_SCORE_REWRITE);
+    return rq;
+}</code></pre>
+
+<p><strong>性能预算</strong>:自动机构造 1-3 ms + Terms.intersect 10-50 ms = <strong>20-100 ms P95</strong>。</p>
+
+<h3>三场景总览</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 14-12 · 三场景对比</div>
+  <table>
+    <thead>
+      <tr><th>场景</th><th>查询类</th><th>关键参数</th><th>P95 预算</th><th>风险</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>A 商品名容错</td><td>FuzzyQuery</td><td>maxEdits=1, prefixLength=1</td><td>5-10 ms</td><td>k=2 候选爆炸</td></tr>
+      <tr><td>B 订单号前缀</td><td>PrefixQuery</td><td>prefix ≥ 4, CONSTANT_SCORE_REWRITE</td><td>10-30 ms</td><td>前缀过短</td></tr>
+      <tr><td>C 日志正则</td><td>RegexpQuery</td><td>白名单 + 长度限制</td><td>20-100 ms</td><td>嵌套量词 ReDoS</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="os-note">
+  <strong>不要让用户直接拼模式</strong>。三类查询都对"输入"敏感:Wildcard 怕 leading <code>*</code>,Fuzzy 怕短 target,Regexp 怕嵌套量词。生产代码必须有<em>解析层</em>:把用户搜索框的字符串经过严格的合法性校验(长度、字符白名单、模式黑名单)再传到 Lucene API,而不是直接 <code>new WildcardQuery(userInput)</code>。这一层校验通常在 Service 入口或 QueryParser 自定义子类里实现。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s14-13">14.13 性能基准:不同前缀长度的延迟</h2>
+<!-- ============================================================ -->
+
+<p>具体数字。基于 1000 万订单 itemName 字段(平均 term 长度 14,JVM heap 4G,SSD 存储,Lucene 9.x)实测。</p>
+
+<h3>WildcardQuery 不同前缀长度</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 14-13-1 · WildcardQuery P50 / P95 延迟</div>
+  <table>
+    <thead>
+      <tr><th>模式</th><th>候选 term</th><th>P50</th><th>P95</th><th>P99</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>iphone-7-pro*</code>(12 字符)</td><td>~5</td><td>1 ms</td><td>2 ms</td><td>4 ms</td></tr>
+      <tr><td><code>iphone*</code>(6 字符)</td><td>~50</td><td>2 ms</td><td>5 ms</td><td>10 ms</td></tr>
+      <tr><td><code>iph*</code>(3 字符)</td><td>~5K</td><td>8 ms</td><td>20 ms</td><td>40 ms</td></tr>
+      <tr><td><code>i*</code>(1 字符)</td><td>~100K</td><td>50 ms</td><td>120 ms</td><td>250 ms</td></tr>
+      <tr><td><code>*</code>(空)</td><td>全部 10M</td><td>退化 MatchAll</td><td>—</td><td>—</td></tr>
+      <tr><td><code>*phone</code>(leading)</td><td>~10K</td><td>200 ms</td><td>500 ms</td><td>1500 ms</td></tr>
+      <tr><td><code>*phone*</code>(中缀)</td><td>~30K</td><td>300 ms</td><td>800 ms</td><td>2000 ms</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>FuzzyQuery 不同 (target len, k) 组合</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 14-13-2 · FuzzyQuery 性能</div>
+  <table>
+    <thead>
+      <tr><th>target 长度</th><th>maxEdits</th><th>prefixLength</th><th>候选</th><th>P95</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>6</td><td>1</td><td>0</td><td>~100</td><td>5 ms</td></tr>
+      <tr><td>6</td><td>1</td><td>1</td><td>~50</td><td>3 ms</td></tr>
+      <tr><td>6</td><td>1</td><td>3</td><td>~10</td><td>1 ms</td></tr>
+      <tr><td>6</td><td>2</td><td>0</td><td>~5K</td><td>80 ms</td></tr>
+      <tr><td>6</td><td>2</td><td>1</td><td>~500</td><td>30 ms</td></tr>
+      <tr><td>6</td><td>2</td><td>3</td><td>~50</td><td>5 ms</td></tr>
+      <tr><td>3</td><td>2</td><td>0</td><td>~50K</td><td>500 ms(灾难)</td></tr>
+      <tr><td>3</td><td>1</td><td>1</td><td>~200</td><td>10 ms</td></tr>
+      <tr><td>15</td><td>2</td><td>0</td><td>~200</td><td>10 ms</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>RegexpQuery 复杂度等级</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 14-13-3 · RegexpQuery P95 延迟</div>
+  <table>
+    <thead>
+      <tr><th>正则</th><th>NFA 状态</th><th>DFA 状态</th><th>候选</th><th>P95</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>order-[0-9]+</code></td><td>~10</td><td>~10</td><td>~1K</td><td>15 ms</td></tr>
+      <tr><td><code>iphone-?[0-9]?</code></td><td>~12</td><td>~12</td><td>~10</td><td>2 ms</td></tr>
+      <tr><td><code>(error|warn).*timeout</code></td><td>~20</td><td>~30</td><td>~5K</td><td>100 ms</td></tr>
+      <tr><td><code>[a-z]{5,10}</code></td><td>~12</td><td>~12</td><td>~500K</td><td>800 ms</td></tr>
+      <tr><td><code>(a|b){15}</code></td><td>~30</td><td>~32K(指数)</td><td>—</td><td>OOM 或 TooComplex</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p>三类查询延迟的主导成本各不相同:WildcardQuery 卡在 FST 求交遍历(候选 term 数);FuzzyQuery 卡在 Levenshtein 状态机规模(target 长 × k);RegexpQuery 卡在 determinize 复杂度(正则结构)。对应调优杠杆:Wildcard 前缀长度 ≥ 3、Fuzzy k=1 + prefixLength ≥ 1、Regexp 禁嵌套量词且模式 ≤ 100 字。</p>
+
+<div class="real-world">
+  <strong>某搜索引擎的"商品名 wildcard 失控事件"</strong>。某团队上线"商品搜索栏支持 *",未限前缀长度。线上某用户用 <code>*</code> 测试,触发 MatchAll 全表 1 亿 doc 评分,P99 从 30ms 飙到 12s,集群 cache miss 雪崩。事后修复:① 前端限制最少 3 字符;② 后端二次校验长度;③ Wildcard query 默认 <code>setRewriteMethod(CONSTANT_SCORE_REWRITE)</code>;④ Prometheus 监控 query latency P99 > 200ms 报警;⑤ 长期切换到 EdgeNGramTokenFilter 索引,wildcard 完全弃用。事故后 3 个月 P99 稳定在 50ms 以内。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s14-14">14.14 源码入口</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">表 14-14 · 自动机相关核心源码</div>
+  <table>
+    <thead>
+      <tr><th>类</th><th>路径</th><th>职责</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>Automaton</code></td><td><code>core/.../util/automaton/Automaton.java</code></td><td>自动机数据结构(状态 + 转移)</td></tr>
+      <tr><td><code>Automata</code></td><td><code>core/.../util/automaton/Automata.java</code></td><td>常用工厂(makeString / makeAnyString)</td></tr>
+      <tr><td><code>Operations</code></td><td><code>core/.../util/automaton/Operations.java</code></td><td>concat / union / intersect / determinize / minimize</td></tr>
+      <tr><td><code>RegExp</code></td><td><code>core/.../util/automaton/RegExp.java</code></td><td>正则解析与编译</td></tr>
+      <tr><td><code>LevenshteinAutomata</code></td><td><code>core/.../util/automaton/LevenshteinAutomata.java</code></td><td>Levenshtein 自动机构造</td></tr>
+      <tr><td><code>CompiledAutomaton</code></td><td><code>core/.../util/automaton/CompiledAutomaton.java</code></td><td>紧凑表示 + type 退化</td></tr>
+      <tr><td><code>ByteRunAutomaton</code></td><td><code>core/.../util/automaton/ByteRunAutomaton.java</code></td><td>byte 级 step 加速</td></tr>
+      <tr><td><code>WildcardQuery</code></td><td><code>core/.../search/WildcardQuery.java</code></td><td>通配符查询 entry</td></tr>
+      <tr><td><code>RegexpQuery</code></td><td><code>core/.../search/RegexpQuery.java</code></td><td>正则查询 entry</td></tr>
+      <tr><td><code>FuzzyQuery</code></td><td><code>core/.../search/FuzzyQuery.java</code></td><td>模糊查询 entry</td></tr>
+      <tr><td><code>PrefixQuery</code></td><td><code>core/.../search/PrefixQuery.java</code></td><td>前缀查询 entry</td></tr>
+      <tr><td><code>MultiTermQuery</code></td><td><code>core/.../search/MultiTermQuery.java</code></td><td>父类 + RewriteMethod 定义</td></tr>
+      <tr><td><code>Terms.intersect</code></td><td><code>core/.../index/Terms.java</code></td><td>FST × Automaton 求交入口</td></tr>
+      <tr><td><code>IntersectTermsEnum</code></td><td><code>core/.../codecs/lucene90/blocktree/</code></td><td>BlockTree 上的求交实现</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>调试工具速查</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 14-14-2 · 自动机相关调试 API</div>
+  <table>
+    <thead>
+      <tr><th>API / 工具</th><th>用途</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>query.toString()</code></td><td>查看 rewrite 后的 query 形态</td></tr>
+      <tr><td><code>Operations.run(automaton, BytesRef)</code></td><td>测试一个具体 term 是否被自动机接受</td></tr>
+      <tr><td><code>RegExp.toAutomaton()</code></td><td>把正则编译为 Automaton(独立调试)</td></tr>
+      <tr><td><code>Automaton.getNumStates()</code></td><td>看 DFA 状态数,检测膨胀</td></tr>
+      <tr><td><code>CompiledAutomaton.type</code></td><td>检查是否退化(SINGLE / ALL / NONE)</td></tr>
+      <tr><td><code>CompiledAutomaton.commonSuffixRef</code></td><td>查看公共后缀剪枝</td></tr>
+      <tr><td>Luke "Search" 视图</td><td>可视化通配符 / 正则查询命中</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>典型调试代码</h3>
+
+<pre><code class="language-java">import org.apache.lucene.util.automaton.RegExp;
+import org.apache.lucene.util.automaton.Automaton;
+import org.apache.lucene.util.automaton.Operations;
+import org.apache.lucene.util.automaton.CompiledAutomaton;
+import org.apache.lucene.util.BytesRef;
+
+RegExp re = new RegExp("order-[0-9]+");
+Automaton a = re.toAutomaton();
+System.out.println("Raw NFA states = " + a.getNumStates());
+
+Automaton det = Operations.determinize(a, 10000);
+System.out.println("DFA states = " + det.getNumStates());
+
+Automaton min = Operations.minimize(det, 10000);
+System.out.println("Minimized DFA states = " + min.getNumStates());
+
+CompiledAutomaton ca = new CompiledAutomaton(min);
+System.out.println("type = " + ca.type);
+System.out.println("commonSuffix = "
+    + (ca.commonSuffixRef == null ? "<none>" : ca.commonSuffixRef.utf8ToString()));
+
+System.out.println("accept order-12345? "
+    + Operations.run(min, new BytesRef("order-12345").utf8ToString()));
+System.out.println("accept order-? "
+    + Operations.run(min, "order-"));
+System.out.println("accept abc-12345? "
+    + Operations.run(min, "abc-12345"));</code></pre>
+
+<!-- ============================================================ -->
+<!-- Chapter Summary -->
+<!-- ============================================================ -->
+
+<div class="chapter-summary" id="s14-summary">
+  <h2>14.15 本章小结</h2>
+  <table>
+    <thead>
+      <tr><th>关注点</th><th>核心 API / 概念</th><th>关键建议</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>统一抽象</td><td>WildcardQuery / FuzzyQuery / RegexpQuery → Automaton</td><td>三类查询底层都是状态机,理解一个就懂三个</td></tr>
+      <tr><td>NFA / DFA</td><td>子集构造 + ε-closure</td><td>NFA 易构造,DFA 才能快速 run;最坏指数膨胀</td></tr>
+      <tr><td>Operations 类</td><td>concat / union / intersect / determinize / minimize</td><td>determinize 必须设 maxDeterminizedStates 上限</td></tr>
+      <tr><td>WildcardQuery</td><td><code>*</code> = ANY self-loop, <code>?</code> = 单 ANY</td><td>语义清晰时用 PrefixQuery 替代</td></tr>
+      <tr><td>FuzzyQuery</td><td>LevenshteinAutomata, 状态 (i, e)</td><td>maxEdits=1 默认;k=2 慢 ~50×</td></tr>
+      <tr><td>RegexpQuery</td><td>RegExp.toAutomaton</td><td>白名单 + 禁嵌套量词,防 ReDoS</td></tr>
+      <tr><td>CompiledAutomaton</td><td>4 种 type:NORMAL / SINGLE / ALL / NONE</td><td>type 退化优化是 Lucene 性能关键</td></tr>
+      <tr><td>commonSuffixRef</td><td>公共后缀提前剪枝</td><td>对 <code>*phone</code> / <code>m*phone</code> 有效</td></tr>
+      <tr><td>Terms.intersect</td><td>FST + Automaton 双指针走</td><td>按 byte 排序的 arc 让剪枝在第一字符就生效</td></tr>
+      <tr><td>1024 阈值</td><td>BooleanQuery.maxClauseCount</td><td>突破用 CONSTANT_SCORE_REWRITE,不要简单调高</td></tr>
+      <tr><td>leading wildcard 反模式</td><td><code>*foo</code> / <code>*foo*</code> 全 FST 扫</td><td>业务限前缀 ≥ 3,或改 NGram 索引</td></tr>
+      <tr><td>PrefixQuery 优化</td><td>前缀长度 ≥ 3 是生产基线</td><td>前缀越长,FST 子树剪枝越深</td></tr>
+      <tr><td>性能基准</td><td>P95:前缀 6 字符 ~5 ms,1 字符 ~120 ms</td><td>QPS / latency 都和前缀长度强相关</td></tr>
+      <tr><td>调试工具</td><td><code>Operations.run</code> / <code>Automaton.getNumStates</code></td><td>线上 query 慢先看 rewrite 后形态与状态数</td></tr>
+      <tr><td>核心源码</td><td>util.automaton.* + search.MultiTermQuery</td><td>Terms.intersect 是协同入口</td></tr>
+    </tbody>
+  </table>
+  <p class="next-hint">下一章 <a href="15-topk-wand-collector.html">第 15 章 · TopK 与 WAND Collector</a> 把"返回 Top K 命中"展开。BooleanQuery / WildcardQuery / FuzzyQuery 都给出大量候选 doc,但用户只关心前 K 个 BM25 最高的。Lucene 8.x 引入 BlockMax WAND 算法,通过 block 级 maxScore 上界提前跳过低分块——这是把"评分链路"从 O(命中数) 降到 O(K × log) 的关键。下一章拆解 ScoreMode.TOP_SCORES 状态机、impacts 写入与读取、BlockMaxConjunctionScorer 的实现细节,以及与本章 Wildcard / Fuzzy 大量命中场景的协同。</p>
+</div>
+
+<!-- ============================================================ -->
+<!-- Chapter navigation -->
+<!-- ============================================================ -->
+<div class="chapter-nav">
+  <a href="13-docvalues-packedints.html">&larr; 第 13 章 &middot; DocValues 与 PackedInts</a>
+  <a href="15-topk-wand-collector.html">第 15 章 &middot; TopK 与 WAND Collector &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 Lucene &middot; 第 14 章 &middot; Automata / Wildcard / Fuzzy</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){setTimeout(function(){document.querySelectorAll('.mermaid svg,.diagram svg').forEach(function(svg){var h=parseInt(svg.getAttribute('height')||svg.getBoundingClientRect().height);if(h>500){svg.style.maxHeight='500px';svg.style.width='auto';var p=svg.closest('.diagram');if(p)p.style.overflowX='auto';}});},1500);});</script>
+</body>
+</html>

@@ -1,0 +1,1534 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.9 Lucene 源码阅读路径 — 图解 Lucene</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr"   markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    <marker id="arr-g" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#3fb950"/></marker>
+    <marker id="arr-o" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#d29922"/></marker>
+    <marker id="arr-r" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#f85149"/></marker>
+    <marker id="arr-p" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#bc8cff"/></marker>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Lucene</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="08-relevance-debugging.html">上一章</a>
+  <a href="10-fst-term-dictionary.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s9-1">9.1 工程克隆与构建</a>
+  <a href="#s9-2">9.2 最小 Lab 工程</a>
+  <a href="#s9-3">9.3 实验:写入与文件落盘</a>
+  <a href="#s9-4">9.4 实验:Postings Dump</a>
+  <a href="#s9-5">9.5 实验:更新与删除</a>
+  <a href="#s9-6">9.6 实验:Query 与 Rewrite</a>
+  <a href="#s9-7">9.7 实验:Weight 与 Scorer</a>
+  <a href="#s9-8">9.8 实验:Explain</a>
+  <a href="#s9-9">9.9 实验:NRT 刷新</a>
+  <a href="#s9-10">9.10 实验:Snapshot</a>
+  <a href="#s9-11">9.11 实验:CheckIndex</a>
+  <a href="#s9-12">9.12 实验:Merge</a>
+  <a href="#s9-13">9.13 实验:Codec 与压缩</a>
+  <a href="#s9-14">9.14 删除的三种状态</a>
+  <a href="#s9-15">9.15 Snapshot/Rebuild Lab</a>
+  <a href="#s9-16">9.16 源码阅读地图</a>
+  <a href="#s9-17">9.17 阅读规划与版本演进</a>
+  <a href="#s9-18">9.18 工具链</a>
+  <a href="#s9-summary">9.19 本章小结</a>
+</aside>
+
+<div class="article">
+
+<h1>第 9 章 · Lucene 源码阅读路径</h1>
+<p class="subtitle">最小 Lab · 12 个实验 · 问题驱动阅读 · 删除三种状态 · Snapshot · Rebuild · 阅读地图</p>
+
+<div class="chapter-intro">
+  <p class="lead">前 8 章把 Lucene 当"黑盒框架"用,你已经知道倒排怎么建、BM25 怎么算、searchAfter 怎么翻页、segment 怎么合并。但当生产出现一个具体问题——比如"为什么 commit 卡 30 秒"或"forceMerge 后查询变慢了"——光靠 API 文档读不出根因,必须沿着调用栈钻进 Lucene 源码。这一章的任务就是把"读源码"这件事变成可重复的工程动作,而不是漫无目的的代码漫游。</p>
+  <p>方法论很简单:<strong>每一个源码路径都配一个可运行的最小 Lab</strong>。Lab 跑出来一个看得见的产物(文件、日志、计数),你回头去对照源码,源码再回到 Lab 验证假设——这是把"抽象代码"变成"可触摸现象"的唯一办法。本章给出 <strong>12 个 Lab + 1 个 Lucene 工程克隆向导 + 1 个"问题→源码入口"映射表</strong>。每个 Lab 200 行以内,跑一遍 5 分钟,产物清晰可观察。Lab 结束你会知道:写入慢去看 <code>DocumentsWriter.flushControl</code>;查询慢去看 <code>BlockMaxConjunctionScorer</code>;评分错去看 <code>BM25Similarity.scorer</code>。</p>
+  <ul class="will-learn">
+    <li>Lucene 工程的 10 个核心模块结构,以及如何用 Gradle 构建并 Run 单个测试</li>
+    <li>10 文档订单 Lab 的标准 pom.xml + 目录结构,作为后续所有实验的脚手架</li>
+    <li>12 个 Lab 串联起 IndexWriter / IndexReader / IndexSearcher 三大入口的关键源码路径</li>
+    <li>Postings Dump 实验:用 TermsEnum + PostingsEnum 直接打印 .tim/.doc 解码结果</li>
+    <li>删除的三种状态:<code>Indexed</code> → <code>DeletedMarker (.liv)</code> → <code>Reclaimed (merge)</code>,以及 maxDoc/numDocs/磁盘的差异</li>
+    <li>SnapshotDeletionPolicy 的内部机制:为什么"快照"不复制文件而是阻止合并清理</li>
+    <li>forceMerge(1) 的真实代价(临时磁盘 IO 1-2 倍索引大小),以及 forceMergeDeletes() 的低代价替代</li>
+    <li>"问题 → 源码入口"映射表:12 类生产问题各自对应的 3-4 个关键类</li>
+    <li>Lucene 4.x → 9.x 的版本演进时间线(BKD-tree / BlockMax / HNSW 等大特性引入点)</li>
+  </ul>
+  <p class="prereq">前置知识:第 1-8 章的全部内容(本章是源码导览,不再展开理论)。读者要熟悉 IndexWriter / IndexSearcher 的 API,知道 segment 的物理形态。建议在 IDEA 里克隆 Lucene 9.10.0 工程并完成 Gradle Sync,边读源码边在 Lab 里设断点。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s9-1">9.1 工程克隆与本地构建</h2>
+<!-- ============================================================ -->
+
+<p>Lucene 的源码在 GitHub 上是一个很大的 monorepo,包含 70+ 个 Gradle 模块。想读懂它,先把 4-5 个核心模块挑出来,其它先不管。</p>
+
+<h3>核心模块速览</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 9-1 · Lucene 9.x 的 10 个核心模块</div>
+  <table>
+    <thead>
+      <tr><th>模块</th><th>作用</th><th>典型文件数</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>lucene/core</code></td><td>核心引擎(IndexWriter/Searcher/Codec/Query)</td><td>~1500</td></tr>
+      <tr><td><code>lucene/analysis/common</code></td><td>StandardAnalyzer / 同义词 / Stemmer</td><td>~400</td></tr>
+      <tr><td><code>lucene/analysis/smartcn</code></td><td>中文分词</td><td>~30</td></tr>
+      <tr><td><code>lucene/queryparser</code></td><td>Query DSL 解析</td><td>~150</td></tr>
+      <tr><td><code>lucene/codecs</code></td><td>非默认 Codec 实现</td><td>~100</td></tr>
+      <tr><td><code>lucene/highlighter</code></td><td>UnifiedHighlighter</td><td>~80</td></tr>
+      <tr><td><code>lucene/join</code></td><td>父子文档</td><td>~40</td></tr>
+      <tr><td><code>lucene/spatial3d</code></td><td>空间索引</td><td>~150</td></tr>
+      <tr><td><code>lucene/suggest</code></td><td>自动补全 / FST 应用</td><td>~80</td></tr>
+      <tr><td><code>lucene/test-framework</code></td><td>RandomIndexWriter 等测试基础设施</td><td>~80</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>克隆与 Gradle 构建</h3>
+
+<pre><code class="language-bash">git clone https://github.com/apache/lucene.git
+cd lucene
+git checkout releases/lucene/9.10.0
+
+./gradlew :lucene:core:assemble                          # 只编译 core 模块
+./gradlew :lucene:core:test --tests TestIndexWriter      # 跑单个测试
+./gradlew :lucene:analysis:common:test                   # 跑 analysis 模块全部测试
+
+./gradlew idea                                            # 生成 IDEA 项目文件</code></pre>
+
+<h3>IDE 导入流程</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 9-1-1 · IDEA 导入与调试流程</div>
+  <svg viewBox="0 0 1200 200" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <g>
+      <rect x="20"   y="50" width="170" height="100" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+      <text x="105"  y="82" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">git clone</text>
+      <text x="105"  y="104" text-anchor="middle" fill="#a5d6ff" font-size="11">releases/lucene/</text>
+      <text x="105"  y="120" text-anchor="middle" fill="#a5d6ff" font-size="11">9.10.0</text>
+
+      <rect x="220"  y="50" width="170" height="100" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+      <text x="305"  y="82" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">IDEA</text>
+      <text x="305"  y="104" text-anchor="middle" fill="#a5d6ff" font-size="11">Import Gradle</text>
+      <text x="305"  y="120" text-anchor="middle" fill="#a5d6ff" font-size="11">project</text>
+
+      <rect x="420"  y="50" width="170" height="100" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="505"  y="82" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">Gradle Sync</text>
+      <text x="505"  y="104" text-anchor="middle" fill="#a5d6ff" font-size="11">下依赖 / 解析</text>
+      <text x="505"  y="120" text-anchor="middle" fill="#a5d6ff" font-size="11">3-5 分钟</text>
+
+      <rect x="620"  y="50" width="170" height="100" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="705"  y="82" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">Build Project</text>
+      <text x="705"  y="104" text-anchor="middle" fill="#a5d6ff" font-size="11">编译 70+ 模块</text>
+      <text x="705"  y="120" text-anchor="middle" fill="#a5d6ff" font-size="11">JDK 17+</text>
+
+      <rect x="820"  y="50" width="170" height="100" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+      <text x="905"  y="82" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">Run Test</text>
+      <text x="905"  y="104" text-anchor="middle" fill="#a5d6ff" font-size="11">TestIndexWriter</text>
+      <text x="905"  y="120" text-anchor="middle" fill="#a5d6ff" font-size="11">→ 设 breakpoint</text>
+
+      <rect x="1020" y="50" width="170" height="100" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+      <text x="1105" y="82" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">Step Debug</text>
+      <text x="1105" y="104" text-anchor="middle" fill="#a5d6ff" font-size="11">看变量 / 调用栈</text>
+      <text x="1105" y="120" text-anchor="middle" fill="#a5d6ff" font-size="11">读源码</text>
+    </g>
+
+    <g fill="none">
+      <line x1="190" y1="100" x2="218" y2="100" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <line x1="390" y1="100" x2="418" y2="100" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <line x1="590" y1="100" x2="618" y2="100" stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+      <line x1="790" y1="100" x2="818" y2="100" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <line x1="990" y1="100" x2="1018" y2="100" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+    </g>
+
+    <text x="600" y="35" text-anchor="middle" fill="#39d2c0" font-size="12" font-weight="700">从测试用例进入源码 — Lucene 没有 main, TestXxx 是阅读路径的入口</text>
+    <text x="600" y="180" text-anchor="middle" fill="#8b949e" font-size="11">TestIndexWriter (写入)  ·  TestBooleanQuery (求交求并)  ·  TestBM25Similarity (评分)</text>
+  </svg>
+</div>
+
+<div class="key-insight">
+  <strong>不要从 main() 开始读源码</strong>。Lucene 没有 main——它是一个库。"读 Lucene 源码"的正确入口是<em>跑测试用例</em>:<code>TestIndexWriter</code> 涵盖了写入路径的几乎所有关键场景,<code>TestBooleanQuery</code> 覆盖布尔求交求并,<code>TestBM25Similarity</code> 覆盖评分。在这些测试用例里设 breakpoint,就能跟着 Lucene 团队精心设计的最小用例进入源码深处。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s9-2">9.2 最小订单 Lab 工程</h2>
+<!-- ============================================================ -->
+
+<p>除了在 Lucene 自己的工程里调试,还要建一个独立的 Lab 工程。这样既能验证某个版本的具体行为,又能把每个实验保存成可回归的小工具。下面是约定的目录结构。</p>
+
+<h3>Lab 工程结构</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 9-2-1 · order-search-lab 工程标准结构</div>
+  <div style="background:#0d1117;border:1.5px solid #58a6ff;border-radius:10px;padding:18px;font-family:'Cascadia Code','SFMono-Regular',Consolas,monospace;font-size:12.5px;color:#a5d6ff;">
+    <div style="color:#58a6ff;font-weight:600;font-size:13px;margin-bottom:10px;">order-search-lab/</div>
+    <div style="line-height:1.85;">
+    ├── <span style="color:#d2a8ff;">pom.xml</span>                         <span style="color:#6e7681;"># lucene-core + analysis-common + analysis-smartcn + junit</span><br>
+    ├── src/main/java/io/lab/<br>
+    │   ├── <span style="color:#3fb950;">OrderLab.java</span>              <span style="color:#6e7681;"># 主入口(每个实验一个 main)</span><br>
+    │   ├── <span style="color:#3fb950;">OrderToDocConverter.java</span>   <span style="color:#6e7681;"># OrderEvent → Document</span><br>
+    │   ├── <span style="color:#d29922;">PostingsDumper.java</span>        <span style="color:#6e7681;"># 实验 2: TermsEnum 解码</span><br>
+    │   ├── <span style="color:#d29922;">QueryExperiment.java</span>       <span style="color:#6e7681;"># 实验 4-7: Query/Weight/Scorer</span><br>
+    │   ├── <span style="color:#d29922;">MergeExperiment.java</span>       <span style="color:#6e7681;"># 实验 10: forceMerge</span><br>
+    │   ├── <span style="color:#d29922;">DeleteLifecycleLab.java</span>    <span style="color:#6e7681;"># 实验: 删除三状态</span><br>
+    │   └── <span style="color:#d29922;">RebuildLab.java</span>            <span style="color:#6e7681;"># 全量重建 + alias 切流</span><br>
+    ├── src/test/java/io/lab/<br>
+    │   ├── <span style="color:#f0883e;">AddDocumentTest.java</span>       <span style="color:#6e7681;"># 写入断言</span><br>
+    │   ├── <span style="color:#f0883e;">SearchTest.java</span>            <span style="color:#6e7681;"># 查询断言</span><br>
+    │   ├── <span style="color:#f0883e;">NrtTest.java</span>               <span style="color:#6e7681;"># NRT 断言</span><br>
+    │   └── <span style="color:#f0883e;">MergeTest.java</span>             <span style="color:#6e7681;"># 合并断言</span><br>
+    ├── data/<br>
+    │   └── <span style="color:#39d2c0;">orders.csv</span>                 <span style="color:#6e7681;"># 10 条样本订单</span><br>
+    └── index/                          <span style="color:#6e7681;"># 实验产出 (gitignore)</span>
+    </div>
+  </div>
+</div>
+
+<h3>Maven pom.xml 模板</h3>
+
+<pre><code class="language-xml">&lt;dependencies&gt;
+    &lt;dependency&gt;
+        &lt;groupId&gt;org.apache.lucene&lt;/groupId&gt;
+        &lt;artifactId&gt;lucene-core&lt;/artifactId&gt;
+        &lt;version&gt;9.10.0&lt;/version&gt;
+    &lt;/dependency&gt;
+    &lt;dependency&gt;
+        &lt;groupId&gt;org.apache.lucene&lt;/groupId&gt;
+        &lt;artifactId&gt;lucene-analysis-common&lt;/artifactId&gt;
+        &lt;version&gt;9.10.0&lt;/version&gt;
+    &lt;/dependency&gt;
+    &lt;dependency&gt;
+        &lt;groupId&gt;org.apache.lucene&lt;/groupId&gt;
+        &lt;artifactId&gt;lucene-analysis-smartcn&lt;/artifactId&gt;
+        &lt;version&gt;9.10.0&lt;/version&gt;
+    &lt;/dependency&gt;
+    &lt;dependency&gt;
+        &lt;groupId&gt;junit&lt;/groupId&gt;
+        &lt;artifactId&gt;junit&lt;/artifactId&gt;
+        &lt;version&gt;4.13.2&lt;/version&gt;
+        &lt;scope&gt;test&lt;/scope&gt;
+    &lt;/dependency&gt;
+&lt;/dependencies&gt;</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s9-3">9.3 实验 1:写入与文件落盘</h2>
+<!-- ============================================================ -->
+
+<p>第一个 Lab 把 10 条订单写入,关闭 compound file 选项让所有文件直接落盘成单个 segment。这样能在 <code>index/</code> 目录下看到第 1 章里画的那 13 种文件。</p>
+
+<h3>实验代码</h3>
+
+<pre><code class="language-java">public class OrderLab {
+    public static void main(String[] args) throws Exception {
+        Path indexPath = Paths.get("index/orders");
+        try (Directory dir = FSDirectory.open(indexPath)) {
+            IndexWriterConfig cfg = new IndexWriterConfig(new StandardAnalyzer());
+            cfg.setOpenMode(OpenMode.CREATE);
+            cfg.setUseCompoundFile(false);  // 关键: 关闭 .cfs 打包,让文件直接可见
+            try (IndexWriter w = new IndexWriter(dir, cfg)) {
+                List&lt;OrderEvent&gt; events = loadFromCsv("data/orders.csv");
+                for (OrderEvent ev : events) {
+                    w.addDocument(OrderToDocConverter.convert(ev));
+                }
+                w.commit();
+            }
+        }
+    }
+}</code></pre>
+
+<h3>产出文件清单</h3>
+
+<pre><code class="language-text">执行后 index/orders/ 内容:
+
+  segments_1                 ← 当前 commit point (引用 _0 这个 segment)
+  _0.si                      ← segment 元数据
+  _0.fnm                     ← 字段 schema
+  _0.tim _0.tip              ← term dict (block) + 索引 (FST)
+  _0.doc                     ← postings docID + freq
+  _0.pos                     ← positions(若开 IndexOptions.DOCS_AND_FREQS_AND_POSITIONS)
+  _0.fdt _0.fdx _0.fdm       ← stored fields (data + index + meta)
+  _0.dvd _0.dvm              ← doc values (data + meta)
+  _0.dim _0.dii              ← points BKD (data + index)
+  _0.nvd _0.nvm              ← norms (data + meta)
+  write.lock                 ← 写入互斥锁</code></pre>
+
+<h3>文件大小观察(10 doc → 1M doc 外推)</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 9-3 · 各文件类型的典型大小估算</div>
+  <table>
+    <thead>
+      <tr><th>文件</th><th>10 doc</th><th>1M doc 估算</th><th>主要驱动因子</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>.tim + .tip</td><td>&lt; 1 KiB</td><td>50-200 MiB</td><td>unique term 数</td></tr>
+      <tr><td>.doc</td><td>&lt; 1 KiB</td><td>200-800 MiB</td><td>postings 总长(每命中 docID delta)</td></tr>
+      <tr><td>.fdt + .fdx</td><td>&lt; 5 KiB</td><td>1-5 GiB</td><td>stored field 累计文本长</td></tr>
+      <tr><td>.dvd + .dvm</td><td>&lt; 1 KiB</td><td>50-300 MiB</td><td>DocValues 字段数 × maxDoc</td></tr>
+      <tr><td>.dim + .dii</td><td>&lt; 1 KiB</td><td>100-500 MiB</td><td>Point 字段数 × maxDoc</td></tr>
+      <tr><td>.nvd + .nvm</td><td>&lt; 1 KiB</td><td>5-50 MiB</td><td>评分字段数 × maxDoc(每 doc 1 字节)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>源码追踪入口</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 9-3-1 · addDocument 到文件落盘的源码层次</div>
+  <svg viewBox="0 0 1200 660" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 入口 -->
+    <rect x="430" y="20" width="340" height="60" rx="12" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="600" y="46" text-anchor="middle" fill="#cfe9ff" font-size="14" font-weight="700">IndexWriter.addDocument(doc)</text>
+    <text x="600" y="66" text-anchor="middle" fill="#a5d6ff" font-size="11">org.apache.lucene.index.IndexWriter</text>
+
+    <!-- 两条路径标签 -->
+    <text x="200" y="120" text-anchor="middle" fill="#39d2c0" font-size="12" font-weight="700">↓  写入路径 (写到内存 RAM buffer)</text>
+    <text x="990" y="120" text-anchor="middle" fill="#d29922" font-size="12" font-weight="700">↓  commit 路径 (落盘到 Directory)</text>
+
+    <!-- 左路: addDocument call chain -->
+    <g>
+      <rect x="40"  y="140" width="320" height="56" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+      <text x="200" y="166" text-anchor="middle" fill="#cfe9ff" font-size="12" font-weight="700">startTransaction()</text>
+      <text x="200" y="184" text-anchor="middle" fill="#a5d6ff" font-size="11">IndexWriter — 抢锁, 标 dirty</text>
+
+      <rect x="40"  y="210" width="320" height="56" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="200" y="236" text-anchor="middle" fill="#e6d3ff" font-size="12" font-weight="700">DocumentsWriter.updateDocuments()</text>
+      <text x="200" y="254" text-anchor="middle" fill="#a5d6ff" font-size="11">分配 DWPT (per-thread)</text>
+
+      <rect x="40"  y="280" width="320" height="56" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="200" y="306" text-anchor="middle" fill="#e6d3ff" font-size="12" font-weight="700">DWPT.updateDocuments()</text>
+      <text x="200" y="324" text-anchor="middle" fill="#a5d6ff" font-size="11">DocumentsWriterPerThread</text>
+
+      <rect x="40"  y="350" width="320" height="56" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="200" y="376" text-anchor="middle" fill="#e6d3ff" font-size="12" font-weight="700">DefaultIndexingChain.processDocument()</text>
+      <text x="200" y="394" text-anchor="middle" fill="#a5d6ff" font-size="11">遍历 fields → 调 invert</text>
+
+      <rect x="40"  y="420" width="320" height="56" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="200" y="446" text-anchor="middle" fill="#ffd591" font-size="12" font-weight="700">IndexingChain.PerField.invert()</text>
+      <text x="200" y="464" text-anchor="middle" fill="#a5d6ff" font-size="11">tokenStream → analyzer 切词</text>
+
+      <rect x="40"  y="490" width="320" height="56" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="200" y="516" text-anchor="middle" fill="#ffd591" font-size="12" font-weight="700">TermsHashPerField.add()</text>
+      <text x="200" y="534" text-anchor="middle" fill="#a5d6ff" font-size="11">写到 RAM 倒排 (term → postings)</text>
+
+      <rect x="40"  y="560" width="320" height="60" rx="12" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.6"/>
+      <text x="200" y="586" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">→ RAM buffer 累积</text>
+      <text x="200" y="606" text-anchor="middle" fill="#a5d6ff" font-size="11">未刷盘 — 此时不可被搜</text>
+    </g>
+
+    <!-- 右路: commit call chain -->
+    <g>
+      <rect x="780" y="140" width="380" height="56" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+      <text x="970" y="166" text-anchor="middle" fill="#cfe9ff" font-size="12" font-weight="700">IndexWriter.commit()</text>
+      <text x="970" y="184" text-anchor="middle" fill="#a5d6ff" font-size="11">两阶段: prepareCommit → finishCommit</text>
+
+      <rect x="780" y="240" width="380" height="56" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="970" y="266" text-anchor="middle" fill="#e6d3ff" font-size="12" font-weight="700">doFlush(applyAllDeletes=true)</text>
+      <text x="970" y="284" text-anchor="middle" fill="#a5d6ff" font-size="11">FlushControl 调度所有 DWPT 刷盘</text>
+
+      <rect x="780" y="340" width="380" height="56" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="970" y="366" text-anchor="middle" fill="#e6d3ff" font-size="12" font-weight="700">DWPT.flush() → SegmentInfo</text>
+      <text x="970" y="384" text-anchor="middle" fill="#a5d6ff" font-size="11">写 .tim / .tip / .doc / .pos / .fdt ...</text>
+
+      <rect x="780" y="440" width="380" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="970" y="466" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">writeSegmentInfos()</text>
+      <text x="970" y="486" text-anchor="middle" fill="#a5d6ff" font-size="11">原子写 segments_N + Directory.sync()</text>
+
+      <rect x="780" y="540" width="380" height="80" rx="14" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.6"/>
+      <text x="970" y="568" text-anchor="middle" fill="#9be7b3" font-size="14" font-weight="700">→ 文件落盘可见</text>
+      <text x="970" y="588" text-anchor="middle" fill="#a5d6ff" font-size="11">DirectoryReader.openIfChanged() 可看到新 segment</text>
+      <text x="970" y="606" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">crash-safe — 看到新 segments_N 才算 commit</text>
+    </g>
+
+    <!-- arrows -->
+    <g fill="none">
+      <line x1="500" y1="80" x2="280" y2="138" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <line x1="700" y1="80" x2="900" y2="138" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+
+      <line x1="200" y1="196" x2="200" y2="208" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+      <line x1="200" y1="266" x2="200" y2="278" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <line x1="200" y1="336" x2="200" y2="348" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <line x1="200" y1="406" x2="200" y2="418" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <line x1="200" y1="476" x2="200" y2="488" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+      <line x1="200" y1="546" x2="200" y2="558" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+
+      <line x1="970" y1="196" x2="970" y2="238" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+      <line x1="970" y1="296" x2="970" y2="338" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <line x1="970" y1="396" x2="970" y2="438" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <line x1="970" y1="500" x2="970" y2="538" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+
+      <!-- 关联: RAM buffer → doFlush -->
+      <line x1="360" y1="590" x2="780" y2="270" stroke="#39d2c0" stroke-width="1.4" stroke-dasharray="6 4" marker-end="url(#arr-g)"/>
+      <text x="540" y="425" fill="#39d2c0" font-size="11" font-weight="700">RAM buffer 满 / commit 触发 →</text>
+    </g>
+  </svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s9-4">9.4 实验 2:Postings Dump</h2>
+<!-- ============================================================ -->
+
+<p>这个 Lab 直接打开 reader,用 TermsEnum 遍历某字段的所有 term,再用 PostingsEnum 解码每个 term 的倒排列表。看得见的产物是一份"term → docFreq + (docID, tf) 列表"的纯文本 dump。这相当于把 .tim/.tip/.doc 三个文件的内容反编码成人能读的形式。</p>
+
+<h3>实验代码</h3>
+
+<pre><code class="language-java">public class PostingsDumper {
+    public static void main(String[] args) throws Exception {
+        try (DirectoryReader reader = DirectoryReader.open(
+                FSDirectory.open(Paths.get("index/orders")))) {
+            for (LeafReaderContext leaf : reader.leaves()) {
+                Terms terms = leaf.reader().terms("items");
+                if (terms == null) continue;
+
+                TermsEnum te = terms.iterator();
+                BytesRef term;
+                while ((term = te.next()) != null) {
+                    System.out.println("term=" + term.utf8ToString()
+                        + " df=" + te.docFreq()
+                        + " ttf=" + te.totalTermFreq());
+                    PostingsEnum pe = te.postings(null, PostingsEnum.FREQS);
+                    int doc;
+                    while ((doc = pe.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+                        System.out.println("  doc=" + doc + " freq=" + pe.freq());
+                    }
+                }
+            }
+        }
+    }
+}</code></pre>
+
+<h3>关注的源码类</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 9-4 · Postings Dump 路径上的关键类</div>
+  <table>
+    <thead>
+      <tr><th>类</th><th>作用</th><th>关注点</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>BlockTreeTermsReader</code></td><td>.tim/.tip 读取</td><td>FST.findTargetArc + block seek</td></tr>
+      <tr><td><code>Lucene90PostingsReader</code></td><td>.doc/.pos/.pay 读取</td><td>PackedInts decode + skip</td></tr>
+      <tr><td><code>TermsEnum</code></td><td>term 迭代器</td><td>seekExact / seekCeil / next</td></tr>
+      <tr><td><code>PostingsEnum</code></td><td>postings 解码</td><td>nextDoc / advance / freq</td></tr>
+      <tr><td><code>ImpactsEnum</code></td><td>BlockMax impacts(maxScore 上界)</td><td>BlockMax 启用前提</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s9-5">9.5 实验 3:更新与删除</h2>
+<!-- ============================================================ -->
+
+<p>这一节验证"先删后加"的语义,以及 LiveDocs 的物理形态。</p>
+
+<pre><code class="language-java">// 更新:Lucene 内部其实是 delete + add 两步
+w.updateDocument(new Term("orderId", "ORDER-001"),
+    OrderToDocConverter.convert(updatedEvent));
+
+// 纯删除
+w.deleteDocuments(new Term("orderId", "ORDER-002"));
+
+w.commit();</code></pre>
+
+<h3>产出变化</h3>
+
+<pre><code class="language-text">执行前:  segments_1 → _0.* (10 doc)
+
+执行后:
+  segments_2                 ← 新 commit point
+  _0.* 仍然存在              ← 原 segment 没动
+  + _0_1.liv                 ← LiveDocs (FixedBitSet, 标记 doc 1 已删除)
+  + _1.* 新 segment          ← 包含更新后的 doc
+
+  segments_2 引用:
+    _0 (含 _0_1.liv)         ← 9 个可见 doc
+    _1                        ← 1 个新 doc</code></pre>
+
+<h3>更新源码追踪</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 9-5 · 删除 / 更新涉及的核心类</div>
+  <table>
+    <thead>
+      <tr><th>类</th><th>作用</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>BufferedUpdates</code></td><td>per-DWPT 删除缓冲</td></tr>
+      <tr><td><code>BufferedUpdatesStream</code></td><td>全局删除流(广播到所有 DWPT)</td></tr>
+      <tr><td><code>ReadersAndUpdates</code></td><td>per-segment 删除应用</td></tr>
+      <tr><td><code>Lucene90LiveDocsFormat</code></td><td>LiveDocs 编解码(.liv)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s9-6">9.6 实验 4:Query 与 rewrite</h2>
+<!-- ============================================================ -->
+
+<pre><code class="language-java">Query q = new BooleanQuery.Builder()
+    .add(new TermQuery(new Term("status", "PAID")), BooleanClause.Occur.FILTER)
+    .add(new WildcardQuery(new Term("items", "iphone*")), BooleanClause.Occur.SHOULD)
+    .build();
+
+System.out.println("Original:  " + q);
+Query rewritten = searcher.rewrite(q);
+System.out.println("Rewritten: " + rewritten);
+// Wildcard 在该索引上展开为 (items:iphone, items:iphone12, items:iphone13...)</code></pre>
+
+<div class="diagram">
+  <div class="diagram-title">表 9-6 · Query rewrite 涉及的源码</div>
+  <table>
+    <thead>
+      <tr><th>类</th><th>作用</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>BooleanQuery</code></td><td>布尔组合 + rewrite(把无效子句剔除)</td></tr>
+      <tr><td><code>WildcardQuery</code> / <code>FuzzyQuery</code></td><td>MultiTermQuery 子类,在词典上展开</td></tr>
+      <tr><td><code>MultiTermQuery.RewriteMethod</code></td><td>4 种 rewrite 模式(SCORING_BOOLEAN / CONSTANT_SCORE_BOOLEAN / CONSTANT_SCORE / BLENDED)</td></tr>
+      <tr><td><code>ConstantScoreQuery</code></td><td>常量分包装(rewrite 输出之一)</td></tr>
+      <tr><td><code>BoostQuery</code></td><td>boost 包装(乘子)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s9-7">9.7 实验 5:Weight 与 Scorer</h2>
+<!-- ============================================================ -->
+
+<pre><code class="language-java">Query q = new TermQuery(new Term("items", "iphone"));
+Weight w = searcher.createWeight(q, ScoreMode.COMPLETE, 1.0f);
+
+for (LeafReaderContext leaf : reader.leaves()) {
+    Scorer s = w.scorer(leaf);
+    if (s == null) continue;
+    DocIdSetIterator it = s.iterator();
+    int doc;
+    while ((doc = it.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+        System.out.printf("leaf=%d doc=%d score=%.4f%n",
+            leaf.ord, doc, s.score());
+    }
+}</code></pre>
+
+<div class="diagram">
+  <div class="diagram-title">图 9-7 · Weight / Scorer 的类层次</div>
+  <svg viewBox="0 0 1240 540" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 顶层: Query -->
+    <rect x="510" y="20" width="220" height="56" rx="12" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="620" y="46" text-anchor="middle" fill="#cfe9ff" font-size="14" font-weight="700">Query</text>
+    <text x="620" y="64" text-anchor="middle" fill="#a5d6ff" font-size="11">用户的语义表达</text>
+
+    <!-- createWeight -->
+    <rect x="510" y="120" width="220" height="56" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="620" y="146" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">createWeight()</text>
+    <text x="620" y="164" text-anchor="middle" fill="#a5d6ff" font-size="11">指定 ScoreMode (BM25 / TOP_SCORES)</text>
+
+    <!-- 第三层: Weights (2 类) -->
+    <rect x="120" y="220" width="220" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="230" y="246" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">TermWeight</text>
+    <text x="230" y="264" text-anchor="middle" fill="#a5d6ff" font-size="11">单 term 求 idf · tf · norm</text>
+
+    <rect x="900" y="220" width="220" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="1010" y="246" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">BooleanWeight</text>
+    <text x="1010" y="264" text-anchor="middle" fill="#a5d6ff" font-size="11">求交 / 求并 / 过滤组合</text>
+
+    <!-- 第四层: Scorers (5 类) -->
+    <g>
+      <rect x="40"  y="340" width="220" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+      <text x="150" y="366" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">TermScorer</text>
+      <text x="150" y="384" text-anchor="middle" fill="#a5d6ff" font-size="11">读 PostingsEnum 算 BM25</text>
+
+      <rect x="280" y="340" width="220" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+      <text x="390" y="366" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">ConjunctionScorer</text>
+      <text x="390" y="384" text-anchor="middle" fill="#a5d6ff" font-size="11">求交 (MUST / FILTER)</text>
+
+      <rect x="520" y="340" width="220" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+      <text x="630" y="366" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">DisjunctionScorer</text>
+      <text x="630" y="384" text-anchor="middle" fill="#a5d6ff" font-size="11">求并 (SHOULD)</text>
+
+      <rect x="760" y="340" width="220" height="60" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="1.5"/>
+      <text x="870" y="366" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">BlockMaxConjunction</text>
+      <text x="870" y="384" text-anchor="middle" fill="#a5d6ff" font-size="11">scoreMode=TOP_SCORES 时</text>
+
+      <rect x="1000" y="340" width="220" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="1110" y="366" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">CachingScorer</text>
+      <text x="1110" y="384" text-anchor="middle" fill="#a5d6ff" font-size="11">filter cache 缓存 BitSet</text>
+    </g>
+
+    <!-- 第五层: 底层迭代器 -->
+    <g>
+      <rect x="40"  y="450" width="240" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+      <text x="160" y="476" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">PostingsEnum</text>
+      <text x="160" y="494" text-anchor="middle" fill="#a5d6ff" font-size="11">读 .doc / .pos 倒排</text>
+
+      <rect x="320" y="450" width="240" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+      <text x="440" y="476" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">ConjunctionDISI</text>
+      <text x="440" y="494" text-anchor="middle" fill="#a5d6ff" font-size="11">多 DISI 求交 (skipTo)</text>
+
+      <rect x="600" y="450" width="280" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+      <text x="740" y="476" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">DisjunctionDISIPriorityQueue</text>
+      <text x="740" y="494" text-anchor="middle" fill="#a5d6ff" font-size="11">堆顶轮转</text>
+    </g>
+
+    <g fill="none">
+      <line x1="620" y1="76"  x2="620" y2="118" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <line x1="540" y1="176" x2="290" y2="218" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <line x1="700" y1="176" x2="950" y2="218" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+
+      <line x1="230" y1="280" x2="160" y2="338" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+      <line x1="1010" y1="280" x2="395" y2="338" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+      <line x1="1010" y1="280" x2="635" y2="338" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+      <line x1="1010" y1="280" x2="870" y2="338" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+      <line x1="1010" y1="280" x2="1110" y2="338" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+
+      <line x1="150" y1="400" x2="160" y2="448" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+      <line x1="390" y1="400" x2="440" y2="448" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+      <line x1="630" y1="400" x2="740" y2="448" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+      <line x1="870" y1="400" x2="500" y2="448" stroke="#f85149" stroke-width="1.3" stroke-dasharray="6 3" marker-end="url(#arr-r)"/>
+    </g>
+  </svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s9-8">9.8 实验 6:Explain</h2>
+<!-- ============================================================ -->
+
+<pre><code class="language-java">TopDocs top = searcher.search(q, 10);
+for (ScoreDoc sd : top.scoreDocs) {
+    Explanation expl = searcher.explain(q, sd.doc);
+    System.out.println(expl);
+    System.out.println("---");
+}</code></pre>
+
+<p>explain 把每个 doc 的最终分数拆解为一棵 Explanation 树。它和 search 走的是相似但不同的代码路径——search 时为了性能,中间因子(idf、tfNorm、norm)不会保留;explain 时重新走一遍并把每个中间值都装进树。所以 explain 比 search 慢,但能看到 BM25 三因子的具体值。</p>
+
+<div class="diagram">
+  <div class="diagram-title">表 9-8 · Explain 路径的源码</div>
+  <table>
+    <thead>
+      <tr><th>类</th><th>作用</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>Weight.explain</code></td><td>评分树根节点构造</td></tr>
+      <tr><td><code>BM25Similarity</code></td><td>tfNorm + idf 公式实现</td></tr>
+      <tr><td><code>Explanation</code></td><td>树节点(value + description + details[])</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s9-9">9.9 实验 7:NRT 刷新</h2>
+<!-- ============================================================ -->
+
+<pre><code class="language-java">SearcherManager mgr = new SearcherManager(writer, true, true, new SearcherFactory());
+
+// 写新 doc 但不 commit (NRT 不需要 commit 就可见)
+w.addDocument(newDoc);
+
+// 主动刷新(把内存 RAM 索引 flush 出来,产生一个新的临时 segment)
+mgr.maybeRefresh();
+
+// 取一个一致的 IndexSearcher 视图
+IndexSearcher s = mgr.acquire();
+try {
+    TopDocs top = s.search(query, 10);
+    // 此时 newDoc 已经能搜到
+} finally {
+    mgr.release(s);  // 引用计数 -1
+}</code></pre>
+
+<div class="diagram">
+  <div class="diagram-title">表 9-9 · NRT 路径的源码</div>
+  <table>
+    <thead>
+      <tr><th>类</th><th>作用</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>SearcherManager</code></td><td>NRT 的标准入口</td></tr>
+      <tr><td><code>ReferenceManager</code></td><td>RefCount 管理(maybeRefresh / acquire / release)</td></tr>
+      <tr><td><code>StandardDirectoryReader</code></td><td>reader 实现</td></tr>
+      <tr><td><code>IndexWriter.getReader</code></td><td>实时视图(被 SearcherManager 包装)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key-insight">
+  <strong>NRT 不需要 commit</strong>。<code>SearcherManager.maybeRefresh()</code> 内部调用 <code>writer.getReader()</code>,把 RAM 中的 DWPT 数据 flush 成一个临时段(uncommitted),reader 直接打开包含这个临时段的 view。重启进程会丢这部分数据(因为没 commit),所以 NRT 适用"短延时可见"的搜索,持久化必须靠 commit。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s9-10">9.10 实验 8:Snapshot</h2>
+<!-- ============================================================ -->
+
+<pre><code class="language-java">SnapshotDeletionPolicy policy = new SnapshotDeletionPolicy(
+    new KeepOnlyLastCommitDeletionPolicy());
+IndexWriterConfig cfg = new IndexWriterConfig(analyzer)
+    .setIndexDeletionPolicy(policy);
+
+// 创建快照
+IndexCommit snapshot = policy.snapshot();
+for (String fileName : snapshot.getFileNames()) {
+    Files.copy(indexPath.resolve(fileName),
+               backupPath.resolve(fileName));
+}
+
+// 释放
+policy.release(snapshot);</code></pre>
+
+<div class="diagram">
+  <div class="diagram-title">表 9-10 · Snapshot 路径源码</div>
+  <table>
+    <thead>
+      <tr><th>类</th><th>作用</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>SnapshotDeletionPolicy</code></td><td>保留 commit 不被合并清理</td></tr>
+      <tr><td><code>KeepOnlyLastCommitDeletionPolicy</code></td><td>默认仅保留最近 commit</td></tr>
+      <tr><td><code>IndexCommit</code></td><td>commit 句柄(含 segments_N 文件名列表)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s9-11">9.11 实验 9:CheckIndex</h2>
+<!-- ============================================================ -->
+
+<pre><code class="language-java">try (Directory dir = FSDirectory.open(indexPath)) {
+    CheckIndex checker = new CheckIndex(dir);
+    checker.setInfoStream(new PrintStreamInfoStream(System.out));
+    CheckIndex.Status status = checker.checkIndex();
+    System.out.println("clean=" + status.clean);
+    System.out.println("totLoseDocCount=" + status.totLoseDocCount);
+    System.out.println("numBadSegments=" + status.numBadSegments);
+}</code></pre>
+
+<p>CheckIndex 是 Lucene 自带的索引完整性诊断工具。生产里出现过 Bug、JVM 崩溃、或磁盘损坏后,先跑 CheckIndex 才能判断"是 Lucene 索引坏了"还是"是查询逻辑错了"。它会重新解码每个 segment 的所有结构(term、postings、stored、dv、point、norms),非常彻底但耗时——1 GB 索引大约 1-3 分钟。</p>
+
+<!-- ============================================================ -->
+<h2 id="s9-12">9.12 实验 10:Merge</h2>
+<!-- ============================================================ -->
+
+<pre><code class="language-java">// 触发 forceMerge(1):合并所有段为一个
+w.forceMerge(1);
+w.commit();
+// 执行后:_0/_1/.../_n 全部消失,只剩 _N+1 这个唯一 segment</code></pre>
+
+<div class="diagram">
+  <div class="diagram-title">图 9-12 · SegmentMerger 的内部分发</div>
+  <svg viewBox="0 0 1240 540" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 顶层 -->
+    <rect x="40"  y="20" width="280" height="60" rx="12" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="180" y="46" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">MergePolicy.findMerges()</text>
+    <text x="180" y="64" text-anchor="middle" fill="#a5d6ff" font-size="11">TieredMergePolicy 默认</text>
+
+    <rect x="380" y="20" width="240" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="500" y="46" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">MergeSpecification</text>
+    <text x="500" y="64" text-anchor="middle" fill="#a5d6ff" font-size="11">每个 OneMerge 含 N 个 segment</text>
+
+    <rect x="680" y="20" width="260" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="810" y="46" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">IndexWriter.merge()</text>
+    <text x="810" y="64" text-anchor="middle" fill="#a5d6ff" font-size="11">ConcurrentMergeScheduler</text>
+
+    <rect x="1000" y="20" width="220" height="60" rx="12" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.6"/>
+    <text x="1110" y="46" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">SegmentMerger</text>
+    <text x="1110" y="64" text-anchor="middle" fill="#a5d6ff" font-size="11">合并执行器</text>
+
+    <!-- 7 子任务 (流水线) -->
+    <g>
+      <rect x="40"   y="170" width="160" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+      <text x="120"  y="194" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">mergeFieldInfos</text>
+      <text x="120"  y="212" text-anchor="middle" fill="#a5d6ff" font-size="10">.fnm</text>
+
+      <rect x="220"  y="170" width="160" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+      <text x="300"  y="194" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">mergePostings</text>
+      <text x="300"  y="212" text-anchor="middle" fill="#a5d6ff" font-size="10">.tim/.tip/.doc/.pos</text>
+
+      <rect x="400"  y="170" width="160" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+      <text x="480"  y="194" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">mergeDocValues</text>
+      <text x="480"  y="212" text-anchor="middle" fill="#a5d6ff" font-size="10">.dvd / .dvm</text>
+
+      <rect x="580"  y="170" width="160" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+      <text x="660"  y="194" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">mergeStoredFields</text>
+      <text x="660"  y="212" text-anchor="middle" fill="#a5d6ff" font-size="10">.fdt / .fdx / .fdm</text>
+
+      <rect x="760"  y="170" width="160" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+      <text x="840"  y="194" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">mergePoints</text>
+      <text x="840"  y="212" text-anchor="middle" fill="#a5d6ff" font-size="10">BKD .dim / .dii</text>
+
+      <rect x="940"  y="170" width="160" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+      <text x="1020" y="194" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">mergeNorms</text>
+      <text x="1020" y="212" text-anchor="middle" fill="#a5d6ff" font-size="10">.nvd / .nvm</text>
+
+      <rect x="1120" y="170" width="100" height="60" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="1.5"/>
+      <text x="1170" y="194" text-anchor="middle" fill="#ffadad" font-size="12" font-weight="700">liveDocs</text>
+      <text x="1170" y="212" text-anchor="middle" fill="#a5d6ff" font-size="10">跳过 .liv</text>
+    </g>
+
+    <!-- 输入: N segments -->
+    <g>
+      <rect x="40" y="290" width="180" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5" opacity="0.7"/>
+      <text x="130" y="316" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">_0  (1.2 GB)</text>
+      <text x="130" y="332" text-anchor="middle" fill="#a5d6ff" font-size="11">+200K liveDocs</text>
+
+      <rect x="240" y="290" width="180" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5" opacity="0.7"/>
+      <text x="330" y="316" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">_1  (800 MB)</text>
+      <text x="330" y="332" text-anchor="middle" fill="#a5d6ff" font-size="11">+150K liveDocs</text>
+
+      <rect x="440" y="290" width="180" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5" opacity="0.7"/>
+      <text x="530" y="316" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">_2  (500 MB)</text>
+      <text x="530" y="332" text-anchor="middle" fill="#a5d6ff" font-size="11">+100K liveDocs</text>
+
+      <text x="690" y="324" fill="#39d2c0" font-size="14" font-weight="700">⟶ 合并到</text>
+
+      <rect x="800" y="280" width="380" height="80" rx="14" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.8"/>
+      <text x="990" y="312" text-anchor="middle" fill="#ffd591" font-size="14" font-weight="700">_3 (新 segment, ~2.5 GB)</text>
+      <text x="990" y="332" text-anchor="middle" fill="#a5d6ff" font-size="11">所有 liveDocs 合并 + 已删 doc 物理消失</text>
+      <text x="990" y="350" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">writeSegmentInfos → segments_N+1</text>
+    </g>
+
+    <!-- 完成 -->
+    <rect x="40" y="420" width="1180" height="80" rx="14" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.6"/>
+    <text x="630" y="450" text-anchor="middle" fill="#9be7b3" font-size="14" font-weight="700">最后一步: writeSegmentInfos(segments_N+1) — 旧 segment 进 IndexFileDeleter 等清理</text>
+    <text x="630" y="476" text-anchor="middle" fill="#a5d6ff" font-size="11">SnapshotDeletionPolicy 持有时, 旧 segment 文件不会被立即删 — 这是 backup / online rebuild 的基础</text>
+
+    <g fill="none">
+      <line x1="320" y1="50" x2="378" y2="50" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <line x1="620" y1="50" x2="678" y2="50" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <line x1="940" y1="50" x2="998" y2="50" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+
+      <line x1="1110" y1="80" x2="120" y2="168" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+      <line x1="1110" y1="80" x2="300" y2="168" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+      <line x1="1110" y1="80" x2="480" y2="168" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+      <line x1="1110" y1="80" x2="660" y2="168" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+      <line x1="1110" y1="80" x2="840" y2="168" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+      <line x1="1110" y1="80" x2="1020" y2="168" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+      <line x1="1110" y1="80" x2="1170" y2="168" stroke="#f85149" stroke-width="1.4" marker-end="url(#arr-r)"/>
+
+      <line x1="990" y1="360" x2="630" y2="418" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+    </g>
+  </svg>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">表 9-12 · Merge 路径的核心类</div>
+  <table>
+    <thead>
+      <tr><th>类</th><th>作用</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>TieredMergePolicy</code></td><td>默认合并策略,按大小分层</td></tr>
+      <tr><td><code>ConcurrentMergeScheduler</code></td><td>并发合并调度器(默认 4 线程)</td></tr>
+      <tr><td><code>SegmentMerger</code></td><td>合并执行器</td></tr>
+      <tr><td><code>MergeState</code></td><td>合并上下文(doc 重映射、被删 doc 跳过)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s9-13">9.13 实验 11/12:Codec 与压缩</h2>
+<!-- ============================================================ -->
+
+<pre><code class="language-java">// 强制选择 9.x 默认 Codec
+IndexWriterConfig cfg = new IndexWriterConfig(analyzer);
+cfg.setCodec(new Lucene99Codec());
+
+// 选择高压缩 stored field 模式(DEFLATE 替代 LZ4)
+StoredFieldsFormat fmt = new Lucene90CompressingStoredFieldsFormat(
+    "Lucene90CompressingStoredFields",
+    new Lucene90CompressingStoredFieldsHighCompressionMode(),
+    16 * 1024,    // chunkSize
+    16 * 1024,    // maxDocsPerChunk
+    1024          // blockSize
+);</code></pre>
+
+<div class="diagram">
+  <div class="diagram-title">表 9-13 · Codec 与压缩相关源码</div>
+  <table>
+    <thead>
+      <tr><th>类</th><th>作用</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>Codec</code></td><td>抽象顶层(描述 6 种文件格式)</td></tr>
+      <tr><td><code>Lucene99Codec</code></td><td>9.x 默认实现</td></tr>
+      <tr><td><code>PostingsFormat</code></td><td>倒排格式</td></tr>
+      <tr><td><code>DocValuesFormat</code></td><td>列式格式</td></tr>
+      <tr><td><code>StoredFieldsFormat</code></td><td>行存格式(LZ4 / DEFLATE 二选一)</td></tr>
+      <tr><td><code>PointsFormat</code></td><td>BKD 数值索引</td></tr>
+      <tr><td><code>Compressor</code> / <code>LZ4Compressor</code> / <code>DeflateCompressor</code></td><td>压缩抽象与实现</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s9-14">9.14 删除的三种状态</h2>
+<!-- ============================================================ -->
+
+<p>9.5 节看过 <code>updateDocument</code> / <code>deleteDocuments</code> 会产生 .liv 文件,但很多人停在"删除完成"这个抽象。删除其实有<strong>三种独立的状态</strong>,每种对应不同的查询行为、磁盘占用和合并触发条件。这一节用一个 Lab 把三种状态都跑出来。</p>
+
+<h3>三种状态的转换</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 9-14-1 · 删除生命周期(状态机)</div>
+  <svg viewBox="0 0 1240 380" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 起始 -->
+    <circle cx="60" cy="180" r="18" fill="#21262d" stroke="#8b949e" stroke-width="2"/>
+    <text x="60" y="185" text-anchor="middle" fill="#8b949e" font-size="13" font-weight="700">●</text>
+    <text x="60" y="220" text-anchor="middle" fill="#8b949e" font-size="11">start</text>
+
+    <!-- 状态 1: Indexed (live in postings) -->
+    <rect x="120" y="120" width="240" height="120" rx="14" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="240" y="152" text-anchor="middle" fill="#9be7b3" font-size="15" font-weight="700">① Indexed</text>
+    <text x="240" y="176" text-anchor="middle" fill="#a5d6ff" font-size="11">活在 postings 里</text>
+    <text x="240" y="194" text-anchor="middle" fill="#a5d6ff" font-size="11">liveDocs.get(id) = true</text>
+    <text x="240" y="216" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">查询命中, 占磁盘</text>
+
+    <!-- 状态 2: DeletedMarker (.liv) -->
+    <rect x="500" y="120" width="240" height="120" rx="14" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="620" y="152" text-anchor="middle" fill="#ffd591" font-size="15" font-weight="700">② DeletedMarker</text>
+    <text x="620" y="176" text-anchor="middle" fill="#a5d6ff" font-size="11">写入 .liv 文件</text>
+    <text x="620" y="194" text-anchor="middle" fill="#a5d6ff" font-size="11">liveDocs.get(id) = false</text>
+    <text x="620" y="216" text-anchor="middle" fill="#d29922" font-size="11" font-weight="700">查询不命中, 仍占磁盘</text>
+
+    <!-- 状态 3: Reclaimed (merge) -->
+    <rect x="880" y="120" width="240" height="120" rx="14" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="1000" y="152" text-anchor="middle" fill="#ffadad" font-size="15" font-weight="700">③ Reclaimed</text>
+    <text x="1000" y="176" text-anchor="middle" fill="#a5d6ff" font-size="11">merge 物理移除</text>
+    <text x="1000" y="194" text-anchor="middle" fill="#a5d6ff" font-size="11">postings + storedFields 全消失</text>
+    <text x="1000" y="216" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">磁盘真正释放</text>
+
+    <!-- 终止 -->
+    <circle cx="1200" cy="180" r="18" fill="#21262d" stroke="#8b949e" stroke-width="2"/>
+    <circle cx="1200" cy="180" r="10" fill="#8b949e"/>
+    <text x="1200" y="220" text-anchor="middle" fill="#8b949e" font-size="11">end</text>
+
+    <!-- 转换 -->
+    <g fill="none">
+      <line x1="78"  y1="180" x2="118" y2="180" stroke="#3fb950" stroke-width="1.8" marker-end="url(#arr-g)"/>
+      <text x="100" y="170" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="700">addDocument</text>
+
+      <line x1="360" y1="180" x2="498" y2="180" stroke="#d29922" stroke-width="1.8" marker-end="url(#arr-o)"/>
+      <text x="430" y="160" text-anchor="middle" fill="#d29922" font-size="11" font-weight="700">deleteDocuments(term)</text>
+      <text x="430" y="174" text-anchor="middle" fill="#d29922" font-size="11" font-weight="700">/ updateDocument</text>
+
+      <line x1="740" y1="180" x2="878" y2="180" stroke="#f85149" stroke-width="1.8" marker-end="url(#arr-r)"/>
+      <text x="810" y="160" text-anchor="middle" fill="#f85149" font-size="11" font-weight="700">merge / forceMergeDeletes</text>
+      <text x="810" y="174" text-anchor="middle" fill="#f85149" font-size="11" font-weight="700">物理移除</text>
+
+      <line x1="1120" y1="180" x2="1180" y2="180" stroke="#8b949e" stroke-width="1.6" marker-end="url(#arr)"/>
+    </g>
+
+    <!-- 注 -->
+    <text x="630" y="40" text-anchor="middle" fill="#39d2c0" font-size="13" font-weight="700">删除 ≠ 立即释放磁盘 — 必须等到 merge 才会真正回收</text>
+    <text x="630" y="58" text-anchor="middle" fill="#8b949e" font-size="11">.liv 是位图标记, postings 仍在 .doc 文件里 — 查询 skip 时遇到 deletedDoc 跳过</text>
+
+    <text x="430" y="290" text-anchor="middle" fill="#d29922" font-size="11" font-weight="700">⚠ 高频 update 索引: numDocs &lt; maxDoc, 大量 .liv 占空间</text>
+    <text x="810" y="290" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">→ 用 forceMergeDeletes() 只清理大量删的段, 比 forceMerge(1) 便宜</text>
+    <text x="630" y="320" text-anchor="middle" fill="#a5d6ff" font-size="12">查看指标: maxDoc (含已删) · numDocs (不含已删) · 物理大小</text>
+  </svg>
+</div>
+
+<h3>三种状态的指标对比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 9-14-2 · 三种删除状态的指标差异(手绘)</div>
+  <div style="background:#0d1117;border:1.5px solid #f85149;border-radius:10px;padding:18px;font-family:'Cascadia Code','SFMono-Regular',Consolas,monospace;font-size:12.5px;color:#a5d6ff;">
+    <div style="color:#f85149;font-weight:600;font-size:13px;margin-bottom:12px;">删除状态对比 — 一张表说清</div>
+
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;">
+      <div style="background:#161b22;border:1.5px solid #3fb950;border-radius:6px;padding:12px;">
+        <div style="color:#3fb950;font-weight:600;font-size:13px;margin-bottom:8px;">① Indexed (live)</div>
+        <div style="line-height:1.7;font-size:11.5px;color:#8b949e;">
+          maxDoc:    +1<br>
+          numDocs:   +1<br>
+          磁盘:      全量<br>
+          .liv:      不存在<br>
+          可见:      <span style="color:#3fb950;">是</span>
+        </div>
+      </div>
+
+      <div style="background:#161b22;border:1.5px solid #d29922;border-radius:6px;padding:12px;">
+        <div style="color:#d29922;font-weight:600;font-size:13px;margin-bottom:8px;">② DeletedMarker</div>
+        <div style="line-height:1.7;font-size:11.5px;color:#8b949e;">
+          maxDoc:    <span style="color:#d29922;">不变</span><br>
+          numDocs:   <span style="color:#f85149;">-1</span><br>
+          磁盘:      <span style="color:#d29922;">全量 + .liv</span><br>
+          .liv:      存在(BitSet)<br>
+          可见:      <span style="color:#f85149;">否(liveDocs 跳过)</span>
+        </div>
+      </div>
+
+      <div style="background:#161b22;border:1.5px solid #d2a8ff;border-radius:6px;padding:12px;">
+        <div style="color:#d2a8ff;font-weight:600;font-size:13px;margin-bottom:8px;">③ Reclaimed (after merge)</div>
+        <div style="line-height:1.7;font-size:11.5px;color:#8b949e;">
+          maxDoc:    <span style="color:#3fb950;">-1</span><br>
+          numDocs:   不变<br>
+          磁盘:      <span style="color:#3fb950;">物理回收</span><br>
+          .liv:      不存在<br>
+          可见:      否(已没了)
+        </div>
+      </div>
+    </div>
+
+    <div style="margin-top:14px;padding:10px;background:rgba(248,81,73,0.08);border-left:3px solid #f85149;border-radius:4px;color:#8b949e;font-size:11.5px;line-height:1.7;">
+      <strong style="color:#f85149;">关键观察:</strong>
+      ① 删除阶段(②)maxDoc 不变 — 磁盘上 .doc/.pos/.fdt 还存着 doc 全量数据,只是 .liv 标记不可见;② 物理回收(③)只发生在合并时,maxDoc 才会减少;③ <strong>numDocs &lt; maxDoc</strong> 是 Lucene 的常态,不是异常。
+    </div>
+  </div>
+</div>
+
+<h3>Lab:观察三种状态的实验</h3>
+
+<pre><code class="language-java">public class DeleteLifecycleLab {
+    static void stats(String label, Directory dir) throws Exception {
+        try (DirectoryReader r = DirectoryReader.open(dir)) {
+            System.out.printf("%-20s maxDoc=%d numDocs=%d deleted=%d leaves=%d%n",
+                label, r.maxDoc(), r.numDocs(),
+                r.maxDoc() - r.numDocs(), r.leaves().size());
+        }
+    }
+
+    public static void main(String[] args) throws Exception {
+        Directory dir = FSDirectory.open(Path.of("target", "order-index"));
+
+        // 阶段 1: 写 10 条订单
+        try (IndexWriter w = new IndexWriter(dir,
+                new IndexWriterConfig(new StandardAnalyzer()))) {
+            for (int i = 0; i &lt; 10; i++) {
+                Document d = new Document();
+                d.add(new StringField("orderId", "O-" + i, Field.Store.YES));
+                w.addDocument(d);
+            }
+            w.commit();
+        }
+        stats("after 10 adds", dir);
+
+        // 阶段 2: 删 2 条 (进 DeletedMarker 状态)
+        try (IndexWriter w = new IndexWriter(dir,
+                new IndexWriterConfig(new StandardAnalyzer()))) {
+            w.deleteDocuments(new Term("orderId", "O-3"));
+            w.deleteDocuments(new Term("orderId", "O-7"));
+            w.commit();
+        }
+        stats("after delete 2", dir);
+
+        // 阶段 3: forceMerge(1) (物理回收)
+        try (IndexWriter w = new IndexWriter(dir,
+                new IndexWriterConfig(new StandardAnalyzer()))) {
+            w.forceMerge(1);
+            w.commit();
+        }
+        stats("after forceMerge", dir);
+    }
+}</code></pre>
+
+<pre><code class="language-text">预期输出:
+
+after 10 adds        maxDoc=10  numDocs=10  deleted=0  leaves=1
+after delete 2       maxDoc=10  numDocs=8   deleted=2  leaves=1   ← maxDoc 不变!
+after forceMerge     maxDoc=8   numDocs=8   deleted=0  leaves=1   ← 物理回收</code></pre>
+
+<h3>liveDocs 的优化:何时为 null</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 9-14 · LiveDocs 在不同段状态的形态</div>
+  <table>
+    <thead>
+      <tr><th>段状态</th><th>leaf.getLiveDocs()</th><th>查询性能</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>从未删除</td><td><code>null</code></td><td>fast path,跳过 BitSet 检查</td></tr>
+      <tr><td>有部分删除</td><td>FixedBitSet</td><td>每 docID 都 <code>BitSet.get()</code> 检查</td></tr>
+      <tr><td>全删了</td><td>(理论 null,实际此段被 merge drop)</td><td>—</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="warning">
+  <strong>forceMerge(1) 的真实代价</strong>:它要把全索引重写成一个 segment,期间产生 segment 数 × avg-segment-size 的临时磁盘 IO。10 GB 索引可能产生 10-20 GB 临时占用,合并完成才释放。生产里高峰期跑 forceMerge = 灾难。<em>用 <code>forceMergeDeletes()</code> 仅清理删除而不全量合并,代价小 5-10 倍,</em>触发条件 <code>deleted / maxDoc &gt; 30%</code>,凌晨低峰跑。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s9-15">9.15 Snapshot/Rebuild Lab:可回滚 vs 全量重建</h2>
+<!-- ============================================================ -->
+
+<p>线上索引<strong>不是数据库本体</strong>——OLTP DB 或事件日志才是源头,Lucene 索引可以丢了重建。基于这个原则,生产部署有两个守护机制:Snapshot(打快照,可回滚)、Rebuild(从源数据全量重建)。两者用途完全不同,选错会出大问题。</p>
+
+<h3>Snapshot vs Rebuild 的决策</h3>
+
+<div class="compare-grid">
+  <div class="compare-card">
+    <div class="compare-title" style="color:#3fb950;">Snapshot(时间点回滚)</div>
+    <div class="compare-body">
+      <strong>原理</strong>:阻止合并清理某个 commit 引用的文件,文件仍在磁盘,reader 可打开<br>
+      <strong>代价</strong>:磁盘暂时多占用旧 segment 大小<br>
+      <strong>适用</strong>:试 boost 调优、改 Analyzer 参数、临时性试验回滚<br>
+      <strong>不适用</strong>:跨 Lucene 大版本、改字段类型、Schema 迁移<br>
+      <strong>恢复时间</strong>:几秒(直接打开旧 commit)
+    </div>
+  </div>
+  <div class="compare-card">
+    <div class="compare-title" style="color:#58a6ff;">Rebuild(全量重建)</div>
+    <div class="compare-body">
+      <strong>原理</strong>:从源数据(OLTP / 事件日志)新建到新目录,验证后 alias 切流<br>
+      <strong>代价</strong>:重建时间 + 双倍磁盘临时占用<br>
+      <strong>适用</strong>:升级 Lucene、改 Analyzer、改字段类型、Schema 迁移<br>
+      <strong>不适用</strong>:无法回滚到旧数据(源数据已消失场景)<br>
+      <strong>恢复时间</strong>:全量重建时间(分钟到小时)
+    </div>
+  </div>
+</div>
+
+<h3>Snapshot 的工作原理</h3>
+
+<p>Snapshot <strong>不是文件复制</strong>。它告诉 IndexWriter:这个 commit 引用的文件不要删,即使后续合并产生新 commit。这样磁盘上同时存在两组段文件,reader 可以打开任一 commit 对应的视图。直到调用 <code>release(snapshot)</code> 之后,旧 commit 的文件才被允许在下一次合并时清理。</p>
+
+<pre><code class="language-java">SnapshotDeletionPolicy snapshotPolicy = new SnapshotDeletionPolicy(
+    new KeepOnlyLastCommitDeletionPolicy());
+
+IndexWriterConfig conf = new IndexWriterConfig(new StandardAnalyzer())
+    .setIndexDeletionPolicy(snapshotPolicy);
+
+try (IndexWriter w = new IndexWriter(dir, conf)) {
+    // ... 写入 ...
+    w.commit();
+
+    // 打快照
+    IndexCommit snapshot = snapshotPolicy.snapshot();
+    System.out.println("snapshot files: " + snapshot.getFileNames());
+
+    // ... 继续写入,合并产生新 commit ...
+
+    // 出问题: 用快照打开旧版本 reader
+    try (DirectoryReader oldReader = DirectoryReader.open(snapshot)) {
+        // 这个 reader 看到的是快照那一刻的索引状态
+    }
+
+    // 释放快照,旧 segment 允许被合并清理
+    snapshotPolicy.release(snapshot);
+}</code></pre>
+
+<h3>Rebuild Lab:从事件源全量重建</h3>
+
+<pre><code class="language-java">public class RebuildLab {
+    public static void main(String[] args) throws Exception {
+        Path oldIndex = Path.of("target", "order-index-v1");
+        Path newIndex = Path.of("target", "order-index-v2");
+
+        // 全量重建到新目录
+        try (IndexWriter w = new IndexWriter(FSDirectory.open(newIndex),
+                new IndexWriterConfig(new StandardAnalyzer()))) {
+            for (OrderEvent e : eventStore.scanAll()) {
+                w.addDocument(toDoc(e));
+            }
+            w.forceMerge(1);
+            w.commit();
+        }
+
+        // 抽样验证: 新旧 index 命中数应一致
+        long oldCount = countDocs(oldIndex);
+        long newCount = countDocs(newIndex);
+        if (Math.abs(oldCount - newCount) &gt; oldCount * 0.0001) {
+            throw new IllegalStateException("count diff &gt; 0.01%, abort switch");
+        }
+
+        // 通过验证后, 应用层 atomic 切 alias 指向 newIndex
+        // (alias 是应用层概念, Lucene 本身没有 alias)
+    }
+}</code></pre>
+
+<div class="real-world">
+  <strong>alias 切换让索引重建从"30 分钟停服"降到"0 停服"</strong>。某次升级 Lucene 7→9,如果 in-place 升级要停服 35 分钟(rebuild 过程不能查询)。改 alias 切流方案:旧索引继续服务读流量,新索引在另一个目录后台重建,验证 OK 后 atomic 替换 alias 指向。<em>用户感知到的停机时间 = 0;只有"alias 替换的几毫秒"内有竞态,可重试。</em>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s9-16">9.16 源码阅读地图:问题 → 入口</h2>
+<!-- ============================================================ -->
+
+<p>读源码不是要"通读全部",而是"出现问题时知道从哪开始"。这张表是按"业务问题"反查"源码入口"的索引,生产里出现一个具体症状,直接来这查。</p>
+
+<div class="diagram">
+  <div class="diagram-title">表 9-16 · 12 类生产问题的源码入口</div>
+  <table>
+    <thead>
+      <tr><th>业务问题</th><th>源码入口</th><th>关键类</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>写入慢</td><td><code>IndexWriter.addDocument</code></td><td>DWPT, DefaultIndexingChain, TermsHash</td></tr>
+      <tr><td>写入卡死</td><td><code>DocumentsWriter.flushControl</code></td><td>StallControl, FlushPolicy</td></tr>
+      <tr><td>查询慢</td><td><code>IndexSearcher.search</code></td><td>Weight.scorer, ConjunctionDISI, BlockMaxConjunctionScorer</td></tr>
+      <tr><td>查询不命中</td><td><code>TermsEnum.seekExact</code></td><td>BlockTreeTermsReader, FST</td></tr>
+      <tr><td>翻页错</td><td><code>TopFieldCollector</code></td><td>FieldComparator, ScoreDoc, FieldDoc</td></tr>
+      <tr><td>评分异常</td><td><code>BM25Similarity.scorer</code></td><td>tfNorm, idf, SmallFloat</td></tr>
+      <tr><td>范围查询慢</td><td><code>PointRangeQuery</code></td><td>BKDReader, BKDWriter</td></tr>
+      <tr><td>通配符慢</td><td><code>MultiTermQuery.rewrite</code></td><td>AutomatonQuery, CompiledAutomaton</td></tr>
+      <tr><td>同义词漏召回</td><td><code>SynonymGraphFilter</code></td><td>TokenStream graph, PositionLengthAttribute</td></tr>
+      <tr><td>合并慢</td><td><code>TieredMergePolicy</code></td><td>SegmentMerger, MergeState</td></tr>
+      <tr><td>删除不生效</td><td><code>BufferedUpdatesStream</code></td><td>ReadersAndUpdates, LiveDocs</td></tr>
+      <tr><td>commit 慢</td><td><code>IndexWriter.commit</code></td><td>SegmentInfos.write, IndexFileDeleter</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>三大入口的阅读顺序</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 9-16 · Lucene 核心源码的三条阅读路径</div>
+  <svg viewBox="0 0 1240 620" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 入口 -->
+    <rect x="510" y="20" width="220" height="60" rx="14" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.6"/>
+    <text x="620" y="46" text-anchor="middle" fill="#cfe9ff" font-size="14" font-weight="700">从这里开始</text>
+    <text x="620" y="64" text-anchor="middle" fill="#a5d6ff" font-size="11">问题驱动 — 选一条路径</text>
+
+    <!-- 列标题 -->
+    <text x="180" y="115" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="700">写入路径 (写慢 / commit 慢)</text>
+    <text x="620" y="115" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="700">查询路径 (查慢 / 排序怪)</text>
+    <text x="1060" y="115" text-anchor="middle" fill="#d29922" font-size="13" font-weight="700">合并路径 (磁盘大 / 抖动)</text>
+
+    <!-- 写入路径 7 步 -->
+    <g>
+      <rect x="40"  y="135" width="280" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.4"/>
+      <text x="180" y="166" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">IndexWriter.java</text>
+
+      <rect x="40"  y="195" width="280" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.4"/>
+      <text x="180" y="226" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">DocumentsWriter.java</text>
+
+      <rect x="40"  y="255" width="280" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.4"/>
+      <text x="180" y="286" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">DocumentsWriterPerThread.java</text>
+
+      <rect x="40"  y="315" width="280" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.4"/>
+      <text x="180" y="346" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">DefaultIndexingChain.java</text>
+
+      <rect x="40"  y="375" width="280" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.4"/>
+      <text x="180" y="406" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">TermsHashPerField.java</text>
+
+      <rect x="40"  y="435" width="280" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.4"/>
+      <text x="180" y="466" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">BlockTreeTermsWriter.java</text>
+
+      <rect x="40"  y="495" width="280" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.6"/>
+      <text x="180" y="522" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">Lucene90PostingsWriter.java</text>
+      <text x="180" y="540" text-anchor="middle" fill="#a5d6ff" font-size="11">→ 终点: 写 .doc / .pos 文件</text>
+    </g>
+
+    <!-- 查询路径 5 步 -->
+    <g>
+      <rect x="480" y="135" width="280" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.4"/>
+      <text x="620" y="166" text-anchor="middle" fill="#e6d3ff" font-size="12" font-weight="700">IndexSearcher.java</text>
+
+      <rect x="480" y="195" width="280" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.4"/>
+      <text x="620" y="226" text-anchor="middle" fill="#e6d3ff" font-size="12" font-weight="700">Weight.java</text>
+
+      <rect x="480" y="255" width="280" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.4"/>
+      <text x="620" y="286" text-anchor="middle" fill="#e6d3ff" font-size="12" font-weight="700">Scorer.java</text>
+
+      <rect x="480" y="315" width="280" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.4"/>
+      <text x="620" y="346" text-anchor="middle" fill="#e6d3ff" font-size="12" font-weight="700">DocIdSetIterator.java</text>
+
+      <rect x="480" y="375" width="280" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.6"/>
+      <text x="620" y="402" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">PostingsEnum.java</text>
+      <text x="620" y="420" text-anchor="middle" fill="#a5d6ff" font-size="11">→ 终点: 读 postings 解码</text>
+
+      <rect x="480" y="475" width="280" height="50" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="1.4"/>
+      <text x="620" y="500" text-anchor="middle" fill="#ffadad" font-size="12" font-weight="700">BlockMaxConjunctionScorer</text>
+      <text x="620" y="518" text-anchor="middle" fill="#a5d6ff" font-size="11">TOP_SCORES 模式跳过低分块</text>
+    </g>
+
+    <!-- 合并路径 3 步 -->
+    <g>
+      <rect x="920" y="135" width="280" height="50" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.4"/>
+      <text x="1060" y="166" text-anchor="middle" fill="#ffd591" font-size="12" font-weight="700">TieredMergePolicy.java</text>
+
+      <rect x="920" y="195" width="280" height="50" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.4"/>
+      <text x="1060" y="226" text-anchor="middle" fill="#ffd591" font-size="12" font-weight="700">SegmentMerger.java</text>
+
+      <rect x="920" y="255" width="280" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.6"/>
+      <text x="1060" y="282" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">mergePostings / mergeStored</text>
+      <text x="1060" y="300" text-anchor="middle" fill="#a5d6ff" font-size="11">→ 终点: 写新 segment</text>
+
+      <rect x="920" y="345" width="280" height="50" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.4"/>
+      <text x="1060" y="370" text-anchor="middle" fill="#cfe9ff" font-size="12" font-weight="700">ConcurrentMergeScheduler</text>
+      <text x="1060" y="388" text-anchor="middle" fill="#a5d6ff" font-size="11">默认 4 线程后台 merge</text>
+
+      <rect x="920" y="415" width="280" height="50" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="1.4"/>
+      <text x="1060" y="440" text-anchor="middle" fill="#ffadad" font-size="12" font-weight="700">IndexFileDeleter</text>
+      <text x="1060" y="458" text-anchor="middle" fill="#a5d6ff" font-size="11">引用计数释放旧 segment</text>
+    </g>
+
+    <!-- 入口分发箭头 -->
+    <g fill="none">
+      <line x1="540" y1="80" x2="220" y2="130" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <line x1="620" y1="80" x2="620" y2="130" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <line x1="700" y1="80" x2="1020" y2="130" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+
+      <!-- 写入路径垂直串联 -->
+      <line x1="180" y1="185" x2="180" y2="193" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+      <line x1="180" y1="245" x2="180" y2="253" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+      <line x1="180" y1="305" x2="180" y2="313" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+      <line x1="180" y1="365" x2="180" y2="373" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+      <line x1="180" y1="425" x2="180" y2="433" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+      <line x1="180" y1="485" x2="180" y2="493" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+
+      <line x1="620" y1="185" x2="620" y2="193" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+      <line x1="620" y1="245" x2="620" y2="253" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+      <line x1="620" y1="305" x2="620" y2="313" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+      <line x1="620" y1="365" x2="620" y2="373" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+      <line x1="620" y1="435" x2="620" y2="473" stroke="#f85149" stroke-width="1.3" stroke-dasharray="6 3" marker-end="url(#arr-r)"/>
+
+      <line x1="1060" y1="185" x2="1060" y2="193" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+      <line x1="1060" y1="245" x2="1060" y2="253" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+      <line x1="1060" y1="315" x2="1060" y2="343" stroke="#58a6ff" stroke-width="1.4" marker-end="url(#arr)"/>
+      <line x1="1060" y1="395" x2="1060" y2="413" stroke="#f85149" stroke-width="1.4" marker-end="url(#arr-r)"/>
+    </g>
+
+    <text x="620" y="585" text-anchor="middle" fill="#39d2c0" font-size="12" font-weight="700">问题驱动 &gt; 自顶向下 — 1500+ 文件不要从头读, 选一个生产问题沿一条路径走到底</text>
+    <text x="620" y="605" text-anchor="middle" fill="#8b949e" font-size="11">写入慢→绿路径; 查询慢→紫路径; 磁盘大→橙路径</text>
+  </svg>
+</div>
+
+<div class="key-insight">
+  <strong>问题驱动 &gt; 自顶向下</strong>。Lucene 9.x core 模块就有 1500+ 文件,从 IndexWriter.java 开头通读会花上百小时,而且容易迷失在抽象层级里。问题驱动法把"读源码"转化为"诊断生产问题"——这个动作有明确的开始和结束(找到根因),也有可验证的成果(写出修复 PR 或运维 runbook)。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s9-17">9.17 阅读规划与版本演进</h2>
+<!-- ============================================================ -->
+
+<h3>不同模块的阅读时长估算</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 9-17 · 7 个核心模块的阅读时长(平均水平工程师)</div>
+  <table>
+    <thead>
+      <tr><th>模块</th><th>代码行数</th><th>建议时长</th><th>难度</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>IndexWriter + 写入链</td><td>~8,000</td><td>5-8 小时</td><td>★★★★</td></tr>
+      <tr><td>Query / Weight / Scorer</td><td>~6,000</td><td>4-6 小时</td><td>★★★</td></tr>
+      <tr><td>Codec(默认 Lucene99)</td><td>~10,000</td><td>6-10 小时</td><td>★★★★★</td></tr>
+      <tr><td>BKD-tree(数值 / 空间)</td><td>~3,000</td><td>2-3 小时</td><td>★★★★</td></tr>
+      <tr><td>Merge(MergePolicy + Merger)</td><td>~3,000</td><td>2-3 小时</td><td>★★★</td></tr>
+      <tr><td>Analyzer + TokenStream</td><td>~5,000</td><td>3-5 小时</td><td>★★</td></tr>
+      <tr><td>NRT + ReferenceManager</td><td>~1,500</td><td>1-2 小时</td><td>★★★</td></tr>
+      <tr><td><strong>合计</strong></td><td><strong>~36,500</strong></td><td><strong>23-37 小时</strong></td><td>—</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>版本演进时间线</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 9-17 · Lucene 4.x 到 9.x 的关键特性引入</div>
+  <svg viewBox="0 0 1240 360" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 时间轴 -->
+    <line x1="60" y1="180" x2="1180" y2="180" stroke="#30363d" stroke-width="2"/>
+
+    <!-- 6 版本节点 -->
+    <g>
+      <circle cx="80"   cy="180" r="38" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="1.8"/>
+      <text x="80"   y="178" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">4.x</text>
+      <text x="80"   y="194" text-anchor="middle" fill="#a5d6ff" font-size="10">2012</text>
+
+      <circle cx="280"  cy="180" r="38" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="1.8"/>
+      <text x="280"  y="178" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">5.x</text>
+      <text x="280"  y="194" text-anchor="middle" fill="#a5d6ff" font-size="10">2015</text>
+
+      <circle cx="480"  cy="180" r="38" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.8"/>
+      <text x="480"  y="178" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">6.x</text>
+      <text x="480"  y="194" text-anchor="middle" fill="#a5d6ff" font-size="10">2016</text>
+
+      <circle cx="680"  cy="180" r="38" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.8"/>
+      <text x="680"  y="178" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">7.x</text>
+      <text x="680"  y="194" text-anchor="middle" fill="#a5d6ff" font-size="10">2017</text>
+
+      <circle cx="880"  cy="180" r="38" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.8"/>
+      <text x="880"  y="178" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">8.x</text>
+      <text x="880"  y="194" text-anchor="middle" fill="#a5d6ff" font-size="10">2019</text>
+
+      <circle cx="1100" cy="180" r="46" fill="url(#g-green)"  stroke="#3fb950" stroke-width="2.2"/>
+      <text x="1100" y="174" text-anchor="middle" fill="#9be7b3" font-size="14" font-weight="700">9.x</text>
+      <text x="1100" y="192" text-anchor="middle" fill="#a5d6ff" font-size="10">2021</text>
+      <text x="1100" y="208" text-anchor="middle" fill="#39d2c0" font-size="10" font-weight="700">本书基线</text>
+    </g>
+
+    <!-- 上方关键特性气泡 -->
+    <g>
+      <rect x="20"  y="40" width="160" height="50" rx="8" fill="#0f2438" stroke="#58a6ff" stroke-width="1.2"/>
+      <text x="100" y="60" text-anchor="middle" fill="#cfe9ff" font-size="11" font-weight="700">DocValues</text>
+      <text x="100" y="76" text-anchor="middle" fill="#a5d6ff" font-size="10">+ Codec 框架</text>
+
+      <rect x="220" y="40" width="160" height="50" rx="8" fill="#0f2438" stroke="#58a6ff" stroke-width="1.2"/>
+      <text x="300" y="60" text-anchor="middle" fill="#cfe9ff" font-size="11" font-weight="700">BKD-tree</text>
+      <text x="300" y="76" text-anchor="middle" fill="#a5d6ff" font-size="10">数值范围 Points</text>
+
+      <rect x="420" y="40" width="160" height="50" rx="8" fill="#260f38" stroke="#bc8cff" stroke-width="1.2"/>
+      <text x="500" y="60" text-anchor="middle" fill="#e6d3ff" font-size="11" font-weight="700">Dimensional</text>
+      <text x="500" y="76" text-anchor="middle" fill="#a5d6ff" font-size="10">多维 Point Field</text>
+
+      <rect x="620" y="40" width="160" height="50" rx="8" fill="#260f38" stroke="#bc8cff" stroke-width="1.2"/>
+      <text x="700" y="60" text-anchor="middle" fill="#e6d3ff" font-size="11" font-weight="700">BlockMax WAND</text>
+      <text x="700" y="76" text-anchor="middle" fill="#a5d6ff" font-size="10">Top-K 跳块加速</text>
+
+      <rect x="820" y="40" width="160" height="50" rx="8" fill="#3a280a" stroke="#d29922" stroke-width="1.2"/>
+      <text x="900" y="60" text-anchor="middle" fill="#ffd591" font-size="11" font-weight="700">性能 + JFR</text>
+      <text x="900" y="76" text-anchor="middle" fill="#a5d6ff" font-size="10">大规模优化</text>
+
+      <rect x="1020" y="40" width="180" height="50" rx="8" fill="#0d3a22" stroke="#3fb950" stroke-width="1.4"/>
+      <text x="1110" y="60" text-anchor="middle" fill="#9be7b3" font-size="11" font-weight="700">HNSW 向量检索</text>
+      <text x="1110" y="76" text-anchor="middle" fill="#a5d6ff" font-size="10">+ Lucene99Codec</text>
+    </g>
+
+    <!-- 下方说明 -->
+    <g>
+      <text x="80"  y="260" text-anchor="middle" fill="#a5d6ff" font-size="11">字段从 .fdt 转</text>
+      <text x="80"  y="276" text-anchor="middle" fill="#a5d6ff" font-size="11">入 DocValues</text>
+
+      <text x="280" y="260" text-anchor="middle" fill="#a5d6ff" font-size="11">替代 NumericField</text>
+      <text x="280" y="276" text-anchor="middle" fill="#a5d6ff" font-size="11">Trie 索引</text>
+
+      <text x="480" y="260" text-anchor="middle" fill="#a5d6ff" font-size="11">geo / IP / 时间</text>
+      <text x="480" y="276" text-anchor="middle" fill="#a5d6ff" font-size="11">用同一个结构</text>
+
+      <text x="680" y="260" text-anchor="middle" fill="#a5d6ff" font-size="11">Top-K 查询</text>
+      <text x="680" y="276" text-anchor="middle" fill="#a5d6ff" font-size="11">10x+ 提速</text>
+
+      <text x="880" y="260" text-anchor="middle" fill="#a5d6ff" font-size="11">大量 fix &amp;</text>
+      <text x="880" y="276" text-anchor="middle" fill="#a5d6ff" font-size="11">JFR profiling</text>
+
+      <text x="1100" y="260" text-anchor="middle" fill="#a5d6ff" font-size="11">支持 dense vector</text>
+      <text x="1100" y="276" text-anchor="middle" fill="#a5d6ff" font-size="11">Embedding 检索</text>
+    </g>
+
+    <!-- 时间轴箭头 -->
+    <g fill="none">
+      <line x1="120" y1="180" x2="240" y2="180" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <line x1="320" y1="180" x2="440" y2="180" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <line x1="520" y1="180" x2="640" y2="180" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <line x1="720" y1="180" x2="840" y2="180" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <line x1="920" y1="180" x2="1052" y2="180" stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+
+      <line x1="100" y1="90"  x2="80"   y2="142" stroke="#58a6ff" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#arr)"/>
+      <line x1="300" y1="90"  x2="280"  y2="142" stroke="#58a6ff" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#arr)"/>
+      <line x1="500" y1="90"  x2="480"  y2="142" stroke="#bc8cff" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#arr-p)"/>
+      <line x1="700" y1="90"  x2="680"  y2="142" stroke="#bc8cff" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#arr-p)"/>
+      <line x1="900" y1="90"  x2="880"  y2="142" stroke="#d29922" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#arr-o)"/>
+      <line x1="1110" y1="90" x2="1100" y2="135" stroke="#3fb950" stroke-width="1.4" stroke-dasharray="4 3" marker-end="url(#arr-g)"/>
+    </g>
+
+    <text x="620" y="335" text-anchor="middle" fill="#39d2c0" font-size="12" font-weight="700">9.x 引入 HNSW 让 Lucene 同时支持倒排 + 向量 — 全文 + 语义混合检索成为可能</text>
+  </svg>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">表 9-17-2 · 各版本的关键特性</div>
+  <table>
+    <thead>
+      <tr><th>版本</th><th>年份</th><th>关键特性</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>4.x</td><td>2012</td><td>DocValues + Codec 抽象层(架构里程碑)</td></tr>
+      <tr><td>5.x</td><td>2015</td><td>Points / BKD-tree(替代 NumericRangeQuery)</td></tr>
+      <tr><td>6.x</td><td>2016</td><td>Dimensional Points 多维数值索引</td></tr>
+      <tr><td>7.x</td><td>2017</td><td>BlockMax WAND(TopK 大数据加速)</td></tr>
+      <tr><td>8.x</td><td>2019</td><td>性能优化(JIT + Vectorization)</td></tr>
+      <tr><td>9.x</td><td>2021</td><td>HNSW 向量检索 + Lucene99Codec</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s9-18">9.18 工具链</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">表 9-18 · 配套工具与适用场景</div>
+  <table>
+    <thead>
+      <tr><th>工具</th><th>类型</th><th>用途</th><th>常用命令</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Luke</td><td>GUI</td><td>索引浏览(term / postings / stored)</td><td><code>java -jar luke.jar</code></td></tr>
+      <tr><td>CheckIndex</td><td>CLI</td><td>索引完整性校验</td><td><code>java org.apache.lucene.index.CheckIndex /path</code></td></tr>
+      <tr><td>IndexUpgrader</td><td>CLI</td><td>旧版本索引升级到当前版本</td><td><code>IndexUpgrader.main</code></td></tr>
+      <tr><td>InfoStream</td><td>API</td><td>写入日志(每个 flush/merge 详细)</td><td><code>cfg.setInfoStream(System.out)</code></td></tr>
+      <tr><td>MMapDirectory</td><td>API</td><td>默认 Linux/macOS 实现</td><td><code>FSDirectory.open()</code> 自动选</td></tr>
+      <tr><td>ByteBuffersDirectory</td><td>API</td><td>测试用内存目录</td><td><code>new ByteBuffersDirectory()</code></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="real-world">
+  <strong>Luke 是 90% 索引诊断的最快路径</strong>。生产里第一次接触一个不熟悉的索引,先用 Luke 打开看 schema(字段类型是不是符合预期)、term count(词典是不是合理)、postings(某个 term 命中是不是漂浮)。这比直接读源码或写 Lab 快 10×。<em>Luke 本身就是基于 Lucene API 写的,可以读源码当作"高级 Lab 实例"学习。</em>
+</div>
+
+<!-- ============================================================ -->
+<!-- Chapter Summary -->
+<!-- ============================================================ -->
+
+<div class="chapter-summary" id="s9-summary">
+  <h2>本章小结</h2>
+  <table>
+    <thead>
+      <tr><th>关注点</th><th>核心 API / 工具</th><th>关键建议</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>读源码方法论</td><td>Lab + 源码 + 验证</td><td>每个 Lab 必须看到产物;源码不通读,问题驱动</td></tr>
+      <tr><td>工程克隆</td><td>git + ./gradlew idea</td><td>9.10.0 是稳定基线;Sync 3-5 分钟</td></tr>
+      <tr><td>Lab 工程</td><td>10 doc + pom.xml + 4 个 main</td><td>实验 5 分钟跑完,产物可观察</td></tr>
+      <tr><td>写入路径</td><td>IndexWriter → DWPT → IndexingChain</td><td>关闭 useCompoundFile 看见所有底层文件</td></tr>
+      <tr><td>Postings Dump</td><td>TermsEnum + PostingsEnum</td><td>反编码 .tim/.doc,看每个 term 的命中</td></tr>
+      <tr><td>Query rewrite</td><td>WildcardQuery / FuzzyQuery 展开</td><td>1024 term 阈值切换 SCORING ↔ CONSTANT_SCORE</td></tr>
+      <tr><td>Weight / Scorer</td><td>per-leaf scorer + DocIdSetIterator</td><td>BlockMax 仅 TOP_SCORES 模式启用</td></tr>
+      <tr><td>NRT</td><td>SearcherManager.maybeRefresh</td><td>不需要 commit 即可见;RefCount 必须 release</td></tr>
+      <tr><td>Snapshot</td><td>SnapshotDeletionPolicy</td><td>不复制文件,阻止合并清理;release 前不能丢</td></tr>
+      <tr><td>CheckIndex</td><td>org.apache.lucene.index.CheckIndex</td><td>JVM 崩溃 / 磁盘异常后必跑;1 GB 索引 1-3 分钟</td></tr>
+      <tr><td>删除三状态</td><td>Indexed / DeletedMarker / Reclaimed</td><td>maxDoc &gt; numDocs 是常态,不是异常</td></tr>
+      <tr><td>forceMerge 代价</td><td>临时 IO 1-2× 索引大小</td><td>用 forceMergeDeletes() 替代;低峰期跑</td></tr>
+      <tr><td>Snapshot vs Rebuild</td><td>时间点回滚 vs 全量重建</td><td>跨大版本必须 Rebuild;调优试错用 Snapshot</td></tr>
+      <tr><td>问题→源码入口</td><td>12 类问题映射表</td><td>生产症状 → 直接定位 3-4 个关键类</td></tr>
+      <tr><td>工具链</td><td>Luke + CheckIndex + InfoStream</td><td>第一次诊断先用 Luke,90% 问题能秒定位</td></tr>
+    </tbody>
+  </table>
+  <p class="next-hint">下一章 <a href="10-fst-term-dictionary.html">第 10 章 · FST 与词典索引</a> 把"term dictionary"这一抽象概念展开到字节级。FST(Finite State Transducer)是 .tip 文件的物理结构,它如何用一个有限状态机紧凑表示几百万 term 的前缀共享、如何支持 O(log N + B) 的 term seek、如何让 1 千万 unique term 的 .tip 文件压缩到几十 MiB——这些是后续 9 个文件格式章节的基础。</p>
+</div>
+
+<!-- ============================================================ -->
+<!-- Chapter navigation -->
+<!-- ============================================================ -->
+<div class="chapter-nav">
+  <a href="08-relevance-debugging.html">&larr; 第 8 章 &middot; 相关性调试</a>
+  <a href="10-fst-term-dictionary.html">第 10 章 &middot; FST 与词典索引 &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 Lucene &middot; 第 9 章 &middot; Lucene 源码阅读路径</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){setTimeout(function(){document.querySelectorAll('.mermaid svg,.diagram svg').forEach(function(svg){var h=parseInt(svg.getAttribute('height')||svg.getBoundingClientRect().height);if(h>500){svg.style.maxHeight='500px';svg.style.width='auto';var p=svg.closest('.diagram');if(p)p.style.overflowX='auto';}});},1500);});</script>
+</body>
+</html>

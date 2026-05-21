@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.25 跨集群复制 — 图解 Kafka</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Kafka</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="24-elr.html">上一章</a>
+  <a href="26-multi-tenancy.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s25-0">25.0 章首速览</a>
+  <a href="#s25-1">25.1 为什么不单集群跨 DC</a>
+  <a href="#s25-2">25.2 MM2 三件套</a>
+  <a href="#s25-3">25.3 MirrorSourceConnector</a>
+  <a href="#s25-4">25.4 Offset Sync</a>
+  <a href="#s25-5">25.5 Heartbeat</a>
+  <a href="#s25-6">25.6 Active-Passive Failover</a>
+  <a href="#s25-7">25.7 Active-Active</a>
+  <a href="#s25-8">25.8 Cluster Linking</a>
+  <a href="#s25-9">25.9 监控 RPO/RTO</a>
+  <a href="#s25-10">25.10 取舍与陷阱</a>
+  <a href="#s25-summary">25.11 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 25 章 · 跨集群复制 (Geo-replication)</h1>
+<p class="subtitle">MirrorMaker 2 · MirrorSource/Checkpoint/Heartbeat · Cluster Linking · Active-Passive · Active-Active · RPO/RTO</p>
+
+<div class="chapter-intro">
+  <p class="lead">"<em>把 Kafka 部署到两个数据中心,一边挂了切到另一边</em>" — 这事说起来简单,做起来九成团队会踩坑。最常见的错误是"<em>把一个集群横跨 DC</em>" — 让 broker 同时落在 us-east + eu-west,认为这样就是"<em>跨地域高可用</em>"。错。Kafka 副本协议假设 broker 间稳定低延迟(单数字 ms RTT),50-200ms 跨 DC RTT 会让 ISR / Controller / acks=all 全部承担跨地域开销,P99 飙升到秒级,故障恢复非常痛苦。</p>
+  <p>正确做法是<strong>多集群异步复制</strong>:每个 DC 一个独立 Kafka 集群,跨 DC 用 MirrorMaker 2(KIP-382)或 Cluster Linking(Confluent)做异步复制。这种架构下,本地写入仍是低延迟,跨 DC 复制延迟以"<em>RPO</em>"形式被显式管理 — 业务知道"<em>切流时最多丢 X 秒数据</em>"。</p>
+  <p>本章按"为什么不跨 DC → MM2 三件套 → MirrorSource → Offset Sync → Heartbeat → Failover → Active-Active → Cluster Linking → 性能 → 取舍"组织,对应 Kafka 4.x 的 MirrorMaker 2.0。</p>
+  <ul class="will-learn">
+    <li>"<em>不要单集群跨 DC</em>" 的根因(ISR / KRaft / acks=all 的网络假设)</li>
+    <li>MM2 三件套分工:Source / Checkpoint / Heartbeat</li>
+    <li>远程 topic 命名约定(<code>us-east.orders</code>)</li>
+    <li>Offset Sync 怎样让 consumer failover 时找到正确 offset</li>
+    <li>Heartbeat 监控复制延迟</li>
+    <li>Active-Passive failover 的标准 runbook</li>
+    <li>Active-Active 的循环防护与冲突解决</li>
+    <li>Cluster Linking vs MM2 取舍</li>
+  </ul>
+  <p class="prereq">第 21 章 Kafka Connect(MM2 跑在 Connect 上);第 9 章 ISR 与 acks=all;基本网络拓扑;RPO/RTO 概念。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s25-0">25.0 章首速览</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">图 25-0 · 跨集群复制全景</div>
+<svg viewBox="0 0 900 460" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="460" fill="#0f172a" rx="8"/>
+
+  <!-- USE Cluster -->
+  <rect x="20" y="30" width="280" height="400" rx="12" fill="#1e293b" stroke="#a78bfa" stroke-width="2"/>
+  <text x="160" y="60" text-anchor="middle" fill="#a78bfa" font-size="14" font-weight="700">Cluster us-east (Active)</text>
+
+  <rect x="40" y="80" width="240" height="50" rx="6" fill="url(#g-purple)"/>
+  <text x="160" y="100" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">Producers</text>
+  <text x="160" y="118" text-anchor="middle" fill="#e9d5ff" font-size="10">写入业务数据</text>
+
+  <rect x="40" y="150" width="240" height="50" rx="6" fill="url(#g-blue)"/>
+  <text x="160" y="170" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">orders / inventory</text>
+  <text x="160" y="188" text-anchor="middle" fill="#dbeafe" font-size="10">主 topic</text>
+
+  <rect x="40" y="220" width="240" height="50" rx="6" fill="url(#g-green)"/>
+  <text x="160" y="240" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">Consumer Groups</text>
+  <text x="160" y="258" text-anchor="middle" fill="#dcfce7" font-size="10">本地消费 (低延迟)</text>
+
+  <rect x="40" y="290" width="240" height="50" rx="6" fill="url(#g-orange)"/>
+  <text x="160" y="310" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">eu-west.orders</text>
+  <text x="160" y="328" text-anchor="middle" fill="#fef3c7" font-size="10">(若 Active-Active)</text>
+
+  <!-- MM2 layer -->
+  <rect x="320" y="80" width="260" height="380" rx="12" fill="#0d1117" stroke="#94a3b8" stroke-width="2"/>
+  <text x="450" y="105" text-anchor="middle" fill="#fff" font-size="14" font-weight="700">Replication Layer</text>
+
+  <rect x="340" y="125" width="220" height="60" rx="8" fill="url(#g-blue)" stroke="#60a5fa"/>
+  <text x="450" y="148" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">MirrorSourceConnector</text>
+  <text x="450" y="168" text-anchor="middle" fill="#dbeafe" font-size="10">records + config + ACL</text>
+
+  <rect x="340" y="200" width="220" height="60" rx="8" fill="url(#g-green)" stroke="#22c55e"/>
+  <text x="450" y="223" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">MirrorCheckpointConnector</text>
+  <text x="450" y="243" text-anchor="middle" fill="#dcfce7" font-size="10">group offset translation</text>
+
+  <rect x="340" y="275" width="220" height="60" rx="8" fill="url(#g-orange)" stroke="#f59e0b"/>
+  <text x="450" y="298" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">MirrorHeartbeatConnector</text>
+  <text x="450" y="318" text-anchor="middle" fill="#fef3c7" font-size="10">latency / health probe</text>
+
+  <rect x="340" y="350" width="220" height="60" rx="8" fill="url(#g-red)" stroke="#ef4444"/>
+  <text x="450" y="373" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">Cluster Linking</text>
+  <text x="450" y="393" text-anchor="middle" fill="#fecaca" font-size="10">替代方案: broker-native</text>
+
+  <!-- EUW Cluster -->
+  <rect x="600" y="30" width="280" height="400" rx="12" fill="#1e293b" stroke="#60a5fa" stroke-width="2"/>
+  <text x="740" y="60" text-anchor="middle" fill="#60a5fa" font-size="14" font-weight="700">Cluster eu-west (Standby)</text>
+
+  <rect x="620" y="80" width="240" height="50" rx="6" fill="url(#g-orange)"/>
+  <text x="740" y="100" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">us-east.orders</text>
+  <text x="740" y="118" text-anchor="middle" fill="#fef3c7" font-size="10">远程 topic(复制结果)</text>
+
+  <rect x="620" y="150" width="240" height="50" rx="6" fill="url(#g-orange)"/>
+  <text x="740" y="170" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">us-east.checkpoints.internal</text>
+  <text x="740" y="188" text-anchor="middle" fill="#fef3c7" font-size="10">offset sync 表</text>
+
+  <rect x="620" y="220" width="240" height="50" rx="6" fill="url(#g-orange)"/>
+  <text x="740" y="240" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">us-east.heartbeats</text>
+  <text x="740" y="258" text-anchor="middle" fill="#fef3c7" font-size="10">心跳 topic</text>
+
+  <rect x="620" y="290" width="240" height="50" rx="6" fill="url(#g-green)"/>
+  <text x="740" y="310" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">Standby Consumers</text>
+  <text x="740" y="328" text-anchor="middle" fill="#dcfce7" font-size="10">就近读 / failover 接管</text>
+
+  <!-- Arrows -->
+  <path d="M280 175 L340 155" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M560 155 L620 105" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M280 245 L340 230" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M560 230 L620 175" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M450 335 L450 350" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+</svg>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">图 25-0-1 · 三句话</div>
+<pre><code>1 跨地域不要单集群跨 DC
+  用多集群异步复制 + 显式管理 RPO/RTO
+
+2 MM2 三件套 (Source/Checkpoint/Heartbeat) 分工明确
+  只装一个不能 failover
+
+3 远程 Topic 是复制结果不是事实源
+  Active-Active 必须在业务层设计冲突解决</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s25-1">25.1 为什么不单集群跨 DC</h2>
+<!-- ============================================================ -->
+
+<p>把一个 Kafka 集群横跨 50-200ms RTT 的 DC,会触发以下连锁反应:</p>
+
+<table>
+  <thead><tr><th>机制</th><th>跨 DC 的代价</th></tr></thead>
+  <tbody>
+    <tr><td>ISR 同步</td><td>follower 在远端,fetch RTT 飙,replica.lag.time.max.ms 设大会让 ISR 失去意义</td></tr>
+    <tr><td>acks=all</td><td>等远端 follower ACK,Producer P99 飙到 100ms+</td></tr>
+    <tr><td>KRaft Controller</td><td>quorum vote 跨 DC RTT,选举时间变长</td></tr>
+    <tr><td>Consumer fetch</td><td>消费者只能从 leader fetch(除 follower fetch),远端消费高延迟</td></tr>
+    <tr><td>网络分区</td><td>DC 间网络抖动直接表现为 ISR 收缩 / leader 变更风暴</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s25-2">25.2 MM2 三件套</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>Connector</th><th>职责</th><th>核心 topic</th></tr></thead>
+  <tbody>
+    <tr><td><code>MirrorSourceConnector</code></td><td>复制 records + topic 配置 + ACL</td><td>远端目标 topic + <code>mm2-offset-syncs.&lt;cluster&gt;.internal</code></td></tr>
+    <tr><td><code>MirrorCheckpointConnector</code></td><td>复制 consumer group offset(翻译后)</td><td><code>&lt;source&gt;.checkpoints.internal</code></td></tr>
+    <tr><td><code>MirrorHeartbeatConnector</code></td><td>定期写 heartbeat,测延迟</td><td><code>heartbeats</code>(在源)+ <code>&lt;source&gt;.heartbeats</code>(在目标)</td></tr>
+  </tbody>
+</table>
+
+<h3>远程 topic 命名</h3>
+
+<pre><code class="language-text">源集群 us-east 的 topic:
+  orders
+
+复制到 eu-west 后, 默认 IdentityReplicationPolicy:
+  us-east.orders
+
+(可换成 IdentityReplicationPolicy 保持相同名, 但 Active-Active 会循环)</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s25-3">25.3 MirrorSourceConnector</h2>
+<!-- ============================================================ -->
+
+<pre><code class="language-properties">name=us-east-to-eu-west-source
+connector.class=org.apache.kafka.connect.mirror.MirrorSourceConnector
+topics=orders,inventory,payments
+source.cluster.alias=us-east
+target.cluster.alias=eu-west
+source.cluster.bootstrap.servers=kafka.use1.com:9092
+target.cluster.bootstrap.servers=kafka.euw1.com:9092
+replication.factor=3
+refresh.topics.enabled=true               # 自动镜像新 topic
+refresh.topics.interval.seconds=60
+sync.topic.configs.enabled=true
+sync.topic.acls.enabled=true
+emit.checkpoints.enabled=true
+tasks.max=8</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s25-4">25.4 Offset Sync</h2>
+<!-- ============================================================ -->
+
+<p>跨集群复制最难的不是搬数据,而是<strong>搬 consumer group offset</strong>。同一条消息在源集群 offset=12345,复制到目标集群可能 offset=98765(因为目标 topic 是新建的,offset 序列不一样)。MirrorCheckpointConnector 维护一张映射表帮助 consumer 在 failover 时找到等价位置。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 25-4 · Offset Sync 工作流</div>
+<svg viewBox="0 0 900 320" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="320" fill="#0f172a" rx="8"/>
+
+  <rect x="20" y="40" width="200" height="80" rx="8" fill="url(#g-purple)"/>
+  <text x="120" y="65" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">us-east</text>
+  <text x="120" y="85" text-anchor="middle" fill="#e9d5ff" font-size="10">orders[0] offset=12345</text>
+  <text x="120" y="103" text-anchor="middle" fill="#e9d5ff" font-size="10">group=order-svc</text>
+
+  <rect x="350" y="40" width="200" height="80" rx="8" fill="url(#g-blue)"/>
+  <text x="450" y="65" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">MirrorCheckpoint</text>
+  <text x="450" y="85" text-anchor="middle" fill="#dbeafe" font-size="10">读 consumer offset</text>
+  <text x="450" y="103" text-anchor="middle" fill="#dbeafe" font-size="10">查 offset-syncs 映射</text>
+
+  <rect x="680" y="40" width="200" height="80" rx="8" fill="url(#g-orange)"/>
+  <text x="780" y="65" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">eu-west</text>
+  <text x="780" y="85" text-anchor="middle" fill="#fef3c7" font-size="10">us-east.orders[0] off=98765</text>
+  <text x="780" y="103" text-anchor="middle" fill="#fef3c7" font-size="10">checkpoints.internal:</text>
+
+  <path d="M220 80 L350 80" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M550 80 L680 80" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+  <rect x="40" y="180" width="820" height="120" rx="10" fill="#1e293b" stroke="#475569"/>
+  <text x="450" y="205" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">eu-west.us-east.checkpoints.internal record</text>
+  <text x="60" y="232" fill="#cbd5e1" font-size="11">consumerGroupId: "order-svc"</text>
+  <text x="60" y="252" fill="#cbd5e1" font-size="11">topicPartition:   "orders-0"</text>
+  <text x="60" y="272" fill="#cbd5e1" font-size="11">upstreamOffset:   12345         ← us-east 的 offset</text>
+  <text x="60" y="292" fill="#fbbf24" font-size="11">downstreamOffset: 98765         ← eu-west 的等价 offset</text>
+</svg>
+</div>
+
+<h3>failover 时用 RemoteClusterUtils</h3>
+
+<pre><code class="language-java">// failover 时, 把 consumer 切到 eu-west
+Map&lt;TopicPartition, OffsetAndMetadata&gt; offsets =
+    RemoteClusterUtils.translateOffsets(
+        props,                  // eu-west 连接配置
+        "us-east",              // source alias
+        "order-svc",            // consumer group
+        Duration.ofSeconds(10)
+    );
+
+KafkaConsumer&lt;String, String&gt; consumer = new KafkaConsumer&lt;&gt;(props);
+consumer.subscribe(List.of("us-east.orders"));
+consumer.poll(0);  // 触发 assignment
+offsets.forEach((tp, oam) -&gt; consumer.seek(tp, oam.offset()));
+// 继续消费, 从正确位置开始</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s25-5">25.5 Heartbeat</h2>
+<!-- ============================================================ -->
+
+<p>Heartbeat 是一个特殊的小 topic — MirrorHeartbeatConnector 每秒往源集群 <code>heartbeats</code> 写一条带时间戳的消息,MM2 把它复制到目标 <code>us-east.heartbeats</code>。运维通过对比"<em>消息时间戳 vs 当前时间</em>"算<strong>复制延迟</strong>(replication lag),即 RPO 指标。</p>
+
+<pre><code>监控复制延迟:
+
+  现在时间:      2026-05-12 10:00:30 UTC
+  最新 heartbeat: 2026-05-12 10:00:25 UTC (从 us-east.heartbeats 读)
+  → 复制延迟 = 5 秒
+  → failover RPO ≤ 5 秒 (近似)</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s25-6">25.6 Active-Passive Failover</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">图 25-6 · Active-Passive failover 步骤</div>
+<svg viewBox="0 0 900 360" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="360" fill="#0f172a" rx="8"/>
+
+  <g font-size="11">
+    <rect x="40" y="40" width="180" height="60" rx="8" fill="url(#g-red)"/>
+    <text x="130" y="65" text-anchor="middle" fill="#fff" font-weight="700">① us-east 不可用</text>
+    <text x="130" y="85" text-anchor="middle" fill="#fecaca">事故 / 网络 / 维护</text>
+
+    <rect x="240" y="40" width="200" height="60" rx="8" fill="url(#g-orange)"/>
+    <text x="340" y="65" text-anchor="middle" fill="#fff" font-weight="700">② 检查最新 heartbeat</text>
+    <text x="340" y="85" text-anchor="middle" fill="#fef3c7">确认 RPO 可接受</text>
+
+    <rect x="460" y="40" width="200" height="60" rx="8" fill="url(#g-blue)"/>
+    <text x="560" y="65" text-anchor="middle" fill="#fff" font-weight="700">③ Producer 切流到 eu-west</text>
+    <text x="560" y="85" text-anchor="middle" fill="#dbeafe">DNS / LB 切流</text>
+
+    <rect x="680" y="40" width="180" height="60" rx="8" fill="url(#g-purple)"/>
+    <text x="770" y="65" text-anchor="middle" fill="#fff" font-weight="700">④ Translate offsets</text>
+    <text x="770" y="85" text-anchor="middle" fill="#e9d5ff">RemoteClusterUtils</text>
+
+    <rect x="40" y="180" width="200" height="60" rx="8" fill="url(#g-green)"/>
+    <text x="140" y="205" text-anchor="middle" fill="#fff" font-weight="700">⑤ Consumer 启动</text>
+    <text x="140" y="225" text-anchor="middle" fill="#dcfce7">订阅 us-east.orders</text>
+
+    <rect x="260" y="180" width="200" height="60" rx="8" fill="url(#g-green)"/>
+    <text x="360" y="205" text-anchor="middle" fill="#fff" font-weight="700">⑥ seek to translated offset</text>
+    <text x="360" y="225" text-anchor="middle" fill="#dcfce7">从正确位置继续</text>
+
+    <rect x="480" y="180" width="200" height="60" rx="8" fill="url(#g-blue)"/>
+    <text x="580" y="205" text-anchor="middle" fill="#fff" font-weight="700">⑦ 业务恢复</text>
+    <text x="580" y="225" text-anchor="middle" fill="#dbeafe">eu-west 成新 Active</text>
+
+    <rect x="700" y="180" width="180" height="60" rx="8" fill="url(#g-orange)"/>
+    <text x="790" y="205" text-anchor="middle" fill="#fff" font-weight="700">⑧ us-east 恢复后</text>
+    <text x="790" y="225" text-anchor="middle" fill="#fef3c7">反向 MM2 回填</text>
+  </g>
+
+  <path d="M220 70 L240 70" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M440 70 L460 70" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M660 70 L680 70" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M770 100 Q500 130 140 180" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M240 210 L260 210" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M460 210 L480 210" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M680 210 L700 210" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+  <text x="450" y="290" text-anchor="middle" fill="#fbbf24" font-size="12" font-weight="700">RTO 目标:从 ① 到 ⑦ ≤ 5 分钟(取决于自动化程度)</text>
+  <text x="450" y="315" text-anchor="middle" fill="#cbd5e1" font-size="11">关键自动化:DNS 切流 + Consumer 容器重启 + offset translation 提前演练</text>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s25-7">25.7 Active-Active</h2>
+<!-- ============================================================ -->
+
+<p>两个集群都接 producer。MM2 配双向:</p>
+
+<pre><code class="language-properties"># us-east → eu-west
+us-east-&gt;eu-west.enabled=true
+us-east-&gt;eu-west.topics=orders,inventory
+
+# eu-west → us-east
+eu-west-&gt;us-east.enabled=true
+eu-west-&gt;us-east.topics=orders,inventory</code></pre>
+
+<div class="warning">
+<strong>循环防护</strong>:MM2 用 DefaultReplicationPolicy 给远程 topic 加 source alias 前缀(<code>us-east.orders</code>),防止循环复制。但如果你用 IdentityReplicationPolicy(保持同名),必须用 <code>topics.exclude</code> 显式列出"<em>不要再复制回来</em>"的 topic。漏配 = 循环复制 = 数据指数膨胀。
+</div>
+
+<h3>冲突解决</h3>
+
+<p>两端同时写同一 key 的数据,业务侧必须设计冲突解决策略:</p>
+<ul>
+  <li><strong>用户 ID 分区</strong>:user 1-1000 写 us-east,1001-2000 写 eu-west。无冲突。</li>
+  <li><strong>Last Write Wins</strong>:用消息时间戳,后写覆盖。需要时钟同步。</li>
+  <li><strong>CRDT</strong>:用合并友好的数据结构(计数、集合)。</li>
+</ul>
+
+<!-- ============================================================ -->
+<h2 id="s25-8">25.8 Cluster Linking</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>维度</th><th>MM2</th><th>Cluster Linking(Confluent)</th></tr></thead>
+  <tbody>
+    <tr><td>实现</td><td>跑在 Connect 上,独立进程</td><td>broker 原生 fetch,无独立进程</td></tr>
+    <tr><td>开销</td><td>额外 Connect cluster,需运维</td><td>broker 内部线程,无额外组件</td></tr>
+    <tr><td>offset 保留</td><td>需 translation 表</td><td>原生保留 offset</td></tr>
+    <tr><td>topic 重命名</td><td>支持(default policy)</td><td>不重命名(同名)</td></tr>
+    <tr><td>开源</td><td>是(Apache)</td><td>否(Confluent 企业版)</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s25-9">25.9 监控 RPO/RTO</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>指标</th><th>含义</th><th>异常</th></tr></thead>
+  <tbody>
+    <tr><td>MirrorMaker2.MirrorSourceConnector.record-age-ms</td><td>复制延迟</td><td>P99 &gt; 60s = 复制跟不上</td></tr>
+    <tr><td>Heartbeat 时差</td><td>RPO 实测</td><td>持续 &gt; 业务 SLO</td></tr>
+    <tr><td>MirrorSource.byte-rate</td><td>复制吞吐</td><td>突降 = 网络问题</td></tr>
+    <tr><td>Checkpoint 滞后</td><td>offset 翻译表新鲜度</td><td>&gt; 30s = consumer failover 可能 stale</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s25-10">25.10 取舍与陷阱</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>#</th><th>陷阱</th><th>现象</th><th>修复</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>单集群跨 DC</td><td>P99 飙、ISR 抖</td><td>改多集群异步</td></tr>
+    <tr><td>2</td><td>只装 MirrorSource,不装 Checkpoint</td><td>failover 时 consumer 找不到 offset</td><td>三件套全装</td></tr>
+    <tr><td>3</td><td>Active-Active 用 IdentityPolicy 没排除</td><td>循环复制</td><td>topics.exclude 显式列</td></tr>
+    <tr><td>4</td><td>不监控 heartbeat 时差</td><td>不知道 RPO</td><td>设告警阈值</td></tr>
+    <tr><td>5</td><td>没演练 failover</td><td>真故障时手忙脚乱</td><td>季度演练</td></tr>
+    <tr><td>6</td><td>Producer 切流忘了切 Consumer</td><td>消费者还在连旧 cluster</td><td>切流脚本一并处理</td></tr>
+    <tr><td>7</td><td>MM2 跑在生产 broker 上</td><td>占用业务资源</td><td>独立 Connect 集群</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s25-summary">25.11 本章要点</h2>
+<!-- ============================================================ -->
+
+<div class="chapter-summary">
+  <h3>本章小结</h3>
+  <p>跨集群复制是 Kafka 生产部署的<strong>必备能力</strong>,但也是踩坑最多的领域。三个核心原则:① <strong>不要单集群跨 DC</strong> — Kafka 副本协议假设低 RTT,跨 DC 用异步复制;② <strong>MM2 三件套都要装</strong> — Source / Checkpoint / Heartbeat,缺任何一个 failover 都不完整;③ <strong>Active-Active 必须设计冲突解决</strong> — 业务侧策略,不靠 Kafka 魔法。监控 heartbeat 时差就是监控 RPO,定期演练 failover 就是验证 RTO。</p>
+  <p>下一章我们看 Kafka 生产运维的最后一块拼图:<strong>多租户与监控</strong>。</p>
+</div>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script>hljs.highlightAll();</script>
+
+</body>
+</html>

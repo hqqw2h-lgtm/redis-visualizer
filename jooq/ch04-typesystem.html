@@ -1,0 +1,1775 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 4 章 · 类型系统:Field&lt;T&gt; 与 DataType — 图解 jOOQ</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 jOOQ</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="ch03-dslcontext.html">上一章 ch03-dslcontext</a>
+  <a href="ch05-select.html">下一章 ch05-select</a>
+</nav>
+
+<aside class="toc">
+<a href="#4.0-章首速览">4.0 章首速览</a>
+<a href="#4.1-sql-类型到-java-类型的映射">4.1 SQL 类型到 Java 类型的映射</a>
+<a href="#4.2-field-泛型体系">4.2 Field 泛型体系</a>
+<a href="#4.3-编译期与运行期类型安全对比">4.3 编译期与运行期类型安全对比</a>
+<a href="#4.4-datatype-spi">4.4 DataType SPI</a>
+<a href="#4.5-nullability-与约束传递">4.5 Nullability 与约束传递</a>
+<a href="#4.6-cast、coerce-与-convert">4.6 cast、coerce 与 convert</a>
+<a href="#4.7-陷阱与限制">4.7 陷阱与限制</a>
+<a href="#4.8-sql-snapshot-守护">4.8 SQL Snapshot 守护</a>
+<a href="#4.9-源码深潜">4.9 源码深潜</a>
+<a href="#4.10-本章要点">4.10 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 4 章 · 类型系统:Field&lt;T&gt; 与 DataType</h1>
+<p class="subtitle">v7 图解版 · 自动从 v6 markdown 生成 · Mermaid 图原样保留</p>
+<div class="chapter-intro"><p>jOOQ 的类型安全不是注解约定,而是 Java 泛型与代码生成的物理产物。每张表的每个列在 codegen 阶段被生成为 <code>TableField&lt;R, T&gt;</code> 静态字段,泛型参数 <code>R</code> 锁定 <code>Record</code> 类型,<code>T</code> 锁定列的 Java 类型。所有 DSL 表达式 <code>eq / gt / lt / in / between</code> 等方法,在 <code>Field&lt;T&gt;</code> 接口上以 <code>T</code> 为约束重载,使类型不匹配的比较在 <code>javac</code> 阶段就被拒绝。</p>
+<p>本章拆解类型系统的四层结构:SQL 类型与 Java 类型的映射规则、<code>Field&lt;T&gt;</code> 泛型传播机制、<code>DataType&lt;T&gt;</code> SPI 与自定义类型扩展、<code>cast / coerce / convert</code> 三种类型转换的语义边界。最后回到陷阱(泛型擦除、MULTISET 推断、方言差异)与源码深潜(<code>Field</code> / <code>DataType</code> / <code>Converter</code> / <code>Binding</code> 协作)。</p>
+</div>
+<h2 id="4.0-章首速览">4.0 章首速览</h2>
+<h3>图 4-0:类型系统全景</h3>
+<div class="diagram">
+  <div class="diagram-title">图 4-0 · 类型系统全景 — 7 大主题 + 子要点</div>
+  <svg viewBox="0 0 920 420" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="320" y="14" width="280" height="56" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="38" text-anchor="middle" fill="#bc8cff" font-size="14" font-weight="bold">jOOQ 类型系统</text>
+    <text x="460" y="58" text-anchor="middle" fill="#c9d1d9" font-size="11">Field&lt;T&gt; + DataType + Converter / Binding</text>
+
+    <path d="M 340 70 L 70  130" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 380 70 L 200 130" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 420 70 L 340 130" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 70 L 460 130" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 500 70 L 580 130" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 540 70 L 720 130" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 580 70 L 850 130" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="10"  y="135" width="120" height="44" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="2"/>
+    <text x="70"  y="155" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">§4.1</text>
+    <text x="70"  y="172" text-anchor="middle" fill="#c9d1d9" font-size="10">SQL ↔ Java 映射</text>
+
+    <rect x="140" y="135" width="120" height="44" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="2"/>
+    <text x="200" y="155" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">§4.2</text>
+    <text x="200" y="172" text-anchor="middle" fill="#c9d1d9" font-size="10">Field&lt;T&gt; 泛型</text>
+
+    <rect x="280" y="135" width="120" height="44" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="340" y="155" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">§4.3</text>
+    <text x="340" y="172" text-anchor="middle" fill="#c9d1d9" font-size="10">编译期 vs 运行期</text>
+
+    <rect x="400" y="135" width="120" height="44" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="155" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">§4.4</text>
+    <text x="460" y="172" text-anchor="middle" fill="#c9d1d9" font-size="10">DataType SPI</text>
+
+    <rect x="520" y="135" width="120" height="44" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="580" y="155" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">§4.5</text>
+    <text x="580" y="172" text-anchor="middle" fill="#c9d1d9" font-size="10">Nullability</text>
+
+    <rect x="660" y="135" width="120" height="44" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="2"/>
+    <text x="720" y="155" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">§4.6</text>
+    <text x="720" y="172" text-anchor="middle" fill="#c9d1d9" font-size="10">cast / coerce / convert</text>
+
+    <rect x="790" y="135" width="120" height="44" rx="8" fill="url(#g-red)"    stroke="#f85149" stroke-width="2"/>
+    <text x="850" y="155" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">§4.7-4.10</text>
+    <text x="850" y="172" text-anchor="middle" fill="#c9d1d9" font-size="10">陷阱 + 源码</text>
+
+    <path d="M 70  179 L 70  220" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 200 179 L 200 220" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 340 179 L 340 220" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 179 L 460 220" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 580 179 L 580 220" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 720 179 L 720 220" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 850 179 L 850 220" stroke="#58a6ff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="10"  y="225" width="120" height="46" rx="6" fill="#161b22" stroke="#58a6ff"/>
+    <text x="70"  y="245" text-anchor="middle" fill="#c9d1d9" font-size="10">SQLDataType</text>
+    <text x="70"  y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">常量</text>
+
+    <rect x="140" y="225" width="120" height="46" rx="6" fill="#161b22" stroke="#3fb950"/>
+    <text x="200" y="245" text-anchor="middle" fill="#c9d1d9" font-size="10">TableField</text>
+    <text x="200" y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">&lt;R, T&gt;</text>
+
+    <rect x="280" y="225" width="120" height="46" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="340" y="245" text-anchor="middle" fill="#c9d1d9" font-size="10">MyBatis</text>
+    <text x="340" y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">Criteria / jOOQ</text>
+
+    <rect x="400" y="225" width="120" height="46" rx="6" fill="#161b22" stroke="#bc8cff"/>
+    <text x="460" y="245" text-anchor="middle" fill="#c9d1d9" font-size="10">DataType&lt;T&gt;</text>
+    <text x="460" y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">+ Converter</text>
+
+    <rect x="520" y="225" width="120" height="46" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="580" y="245" text-anchor="middle" fill="#c9d1d9" font-size="10">nullable</text>
+    <text x="580" y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">元信息</text>
+
+    <rect x="660" y="225" width="120" height="46" rx="6" fill="#161b22" stroke="#3fb950"/>
+    <text x="720" y="245" text-anchor="middle" fill="#c9d1d9" font-size="10">三种转换</text>
+    <text x="720" y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">语义对比</text>
+
+    <rect x="790" y="225" width="120" height="46" rx="6" fill="#161b22" stroke="#f85149"/>
+    <text x="850" y="245" text-anchor="middle" fill="#c9d1d9" font-size="10">泛型擦除</text>
+    <text x="850" y="262" text-anchor="middle" fill="#c9d1d9" font-size="10">MULTISET</text>
+
+    <rect x="60" y="300" width="800" height="100" rx="8" fill="#0d1117" stroke="#30363d"/>
+    <text x="460" y="325" text-anchor="middle" fill="#8b949e" font-size="11">阅读路径:§4.1 映射 → §4.2 泛型 → §4.3 三方案对比 → §4.4 DataType SPI → §4.5 Nullability → §4.6 cast/coerce/convert</text>
+    <text x="460" y="345" text-anchor="middle" fill="#8b949e" font-size="11">jOOQ 类型安全是 Java 泛型 + codegen 的物理产物 · 在 javac 阶段拒绝错误,而非运行期</text>
+    <text x="460" y="365" text-anchor="middle" fill="#8b949e" font-size="11">DataType&lt;T&gt; 不可变 · 所有修饰方法返回新实例 · 与 Field&lt;T&gt; 配合实现类型元信息共享</text>
+    <text x="460" y="385" text-anchor="middle" fill="#8b949e" font-size="11">本章不讨论 SQL 语法,专注于类型机制与扩展点(Converter / Binding / cast / coerce)</text>
+  </svg>
+</div>
+<p>本章按"映射 → 泛型 → 对比 → SPI → 转换 → 陷阱"六层组织。前两节建立基础概念,中间三节展开机制,最后三节涵盖工程实践。</p>
+<h2 id="4.1-sql-类型到-java-类型的映射">4.1 SQL 类型到 Java 类型的映射</h2>
+<h3>4.1.1 映射管线</h3>
+<div class="diagram">
+  <div class="diagram-title">图 4-1-1 · SQL → DataType → Java 映射管线 — 7 种代表类型</div>
+  <svg viewBox="0 0 920 500" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20"  y="20" width="260" height="450" rx="10" fill="rgba(26,61,92,.08)" stroke="#58a6ff" stroke-dasharray="4 3"/>
+    <text x="150" y="44" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">SQL 列类型</text>
+
+    <rect x="330" y="20" width="260" height="450" rx="10" fill="rgba(60,30,90,.08)" stroke="#bc8cff" stroke-dasharray="4 3"/>
+    <text x="460" y="44" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">jOOQ DataType</text>
+
+    <rect x="640" y="20" width="260" height="450" rx="10" fill="rgba(30,95,58,.08)" stroke="#3fb950" stroke-dasharray="4 3"/>
+    <text x="770" y="44" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">Java 类型</text>
+
+    <g>
+      <rect x="40"  y="60" width="220" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+      <text x="150" y="84" text-anchor="middle" fill="#c9d1d9" font-size="12">VARCHAR(255)</text>
+      <rect x="350" y="60" width="220" height="40" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+      <text x="460" y="84" text-anchor="middle" fill="#c9d1d9" font-size="12">SQLDataType.VARCHAR</text>
+      <rect x="660" y="60" width="220" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+      <text x="770" y="84" text-anchor="middle" fill="#c9d1d9" font-size="12">String</text>
+      <path d="M 260 80 L 350 80" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+      <path d="M 570 80 L 660 80" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    </g>
+
+    <g>
+      <rect x="40"  y="115" width="220" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+      <text x="150" y="139" text-anchor="middle" fill="#c9d1d9" font-size="12">INTEGER</text>
+      <rect x="350" y="115" width="220" height="40" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+      <text x="460" y="139" text-anchor="middle" fill="#c9d1d9" font-size="12">SQLDataType.INTEGER</text>
+      <rect x="660" y="115" width="220" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+      <text x="770" y="139" text-anchor="middle" fill="#c9d1d9" font-size="12">Integer</text>
+      <path d="M 260 135 L 350 135" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+      <path d="M 570 135 L 660 135" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    </g>
+
+    <g>
+      <rect x="40"  y="170" width="220" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+      <text x="150" y="194" text-anchor="middle" fill="#c9d1d9" font-size="12">TIMESTAMP</text>
+      <rect x="350" y="170" width="220" height="40" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+      <text x="460" y="194" text-anchor="middle" fill="#c9d1d9" font-size="12">SQLDataType.LOCALDATETIME</text>
+      <rect x="660" y="170" width="220" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+      <text x="770" y="194" text-anchor="middle" fill="#c9d1d9" font-size="12">LocalDateTime</text>
+      <path d="M 260 190 L 350 190" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+      <path d="M 570 190 L 660 190" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    </g>
+
+    <g>
+      <rect x="40"  y="225" width="220" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+      <text x="150" y="249" text-anchor="middle" fill="#c9d1d9" font-size="12">BOOLEAN</text>
+      <rect x="350" y="225" width="220" height="40" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+      <text x="460" y="249" text-anchor="middle" fill="#c9d1d9" font-size="12">SQLDataType.BOOLEAN</text>
+      <rect x="660" y="225" width="220" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+      <text x="770" y="249" text-anchor="middle" fill="#c9d1d9" font-size="12">Boolean</text>
+      <path d="M 260 245 L 350 245" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+      <path d="M 570 245 L 660 245" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    </g>
+
+    <g>
+      <rect x="40"  y="280" width="220" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+      <text x="150" y="304" text-anchor="middle" fill="#c9d1d9" font-size="12">JSONB</text>
+      <rect x="350" y="280" width="220" height="40" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+      <text x="460" y="304" text-anchor="middle" fill="#c9d1d9" font-size="12">SQLDataType.JSONB</text>
+      <rect x="660" y="280" width="220" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+      <text x="770" y="304" text-anchor="middle" fill="#c9d1d9" font-size="12">JSONB (jOOQ 类)</text>
+      <path d="M 260 300 L 350 300" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+      <path d="M 570 300 L 660 300" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    </g>
+
+    <g>
+      <rect x="40"  y="335" width="220" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+      <text x="150" y="359" text-anchor="middle" fill="#c9d1d9" font-size="12">NUMERIC(10,2)</text>
+      <rect x="350" y="335" width="220" height="40" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+      <text x="460" y="359" text-anchor="middle" fill="#c9d1d9" font-size="12">SQLDataType.NUMERIC</text>
+      <rect x="660" y="335" width="220" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+      <text x="770" y="359" text-anchor="middle" fill="#c9d1d9" font-size="12">BigDecimal</text>
+      <path d="M 260 355 L 350 355" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+      <path d="M 570 355 L 660 355" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    </g>
+
+    <g>
+      <rect x="40"  y="390" width="220" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+      <text x="150" y="414" text-anchor="middle" fill="#c9d1d9" font-size="12">BLOB</text>
+      <rect x="350" y="390" width="220" height="40" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+      <text x="460" y="414" text-anchor="middle" fill="#c9d1d9" font-size="12">SQLDataType.BLOB</text>
+      <rect x="660" y="390" width="220" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+      <text x="770" y="414" text-anchor="middle" fill="#c9d1d9" font-size="12">byte[]</text>
+      <path d="M 260 410 L 350 410" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+      <path d="M 570 410 L 660 410" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    </g>
+
+    <text x="460" y="455" text-anchor="middle" fill="#8b949e" font-size="11">jOOQ DataType 是方言无关常量 · 渲染时由 RenderContext 转换为目标方言的具体语法</text>
+  </svg>
+</div>
+<h3>4.1.2 完整映射表</h3>
+<table>
+<thead>
+<tr>
+<th>SQL 类型</th>
+<th>jOOQ SQLDataType</th>
+<th>Java 类型</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>VARCHAR / TEXT</td>
+<td><code>VARCHAR</code></td>
+<td><code>String</code></td>
+<td>字符类型统一</td>
+</tr>
+<tr>
+<td>INTEGER</td>
+<td><code>INTEGER</code></td>
+<td><code>Integer</code></td>
+<td>32 位有符号</td>
+</tr>
+<tr>
+<td>BIGINT</td>
+<td><code>BIGINT</code></td>
+<td><code>Long</code></td>
+<td>主键常用</td>
+</tr>
+<tr>
+<td>SMALLINT</td>
+<td><code>SMALLINT</code></td>
+<td><code>Short</code></td>
+<td>16 位</td>
+</tr>
+<tr>
+<td>NUMERIC / DECIMAL</td>
+<td><code>NUMERIC</code></td>
+<td><code>BigDecimal</code></td>
+<td>金融场景</td>
+</tr>
+<tr>
+<td>REAL / FLOAT</td>
+<td><code>REAL</code></td>
+<td><code>Float</code></td>
+<td>单精度</td>
+</tr>
+<tr>
+<td>DOUBLE</td>
+<td><code>DOUBLE</code></td>
+<td><code>Double</code></td>
+<td>双精度</td>
+</tr>
+<tr>
+<td>BOOLEAN</td>
+<td><code>BOOLEAN</code></td>
+<td><code>Boolean</code></td>
+<td>MySQL 模拟为 TINYINT(1)</td>
+</tr>
+<tr>
+<td>DATE</td>
+<td><code>LOCALDATE</code></td>
+<td><code>LocalDate</code></td>
+<td>无时区</td>
+</tr>
+<tr>
+<td>TIME</td>
+<td><code>LOCALTIME</code></td>
+<td><code>LocalTime</code></td>
+<td>无时区</td>
+</tr>
+<tr>
+<td>TIMESTAMP</td>
+<td><code>LOCALDATETIME</code></td>
+<td><code>LocalDateTime</code></td>
+<td>无时区</td>
+</tr>
+<tr>
+<td>TIMESTAMPTZ</td>
+<td><code>OFFSETDATETIME</code></td>
+<td><code>OffsetDateTime</code></td>
+<td>带偏移</td>
+</tr>
+<tr>
+<td>BLOB / BYTEA</td>
+<td><code>BLOB</code></td>
+<td><code>byte[]</code></td>
+<td>二进制</td>
+</tr>
+<tr>
+<td>JSONB</td>
+<td><code>JSONB</code></td>
+<td><code>JSONB</code></td>
+<td>jOOQ 包装类</td>
+</tr>
+<tr>
+<td>UUID</td>
+<td><code>UUID</code></td>
+<td><code>UUID</code></td>
+<td>PG 原生 / 其他模拟</td>
+</tr>
+<tr>
+<td>ARRAY</td>
+<td><code>VARCHAR.array()</code></td>
+<td><code>String[]</code></td>
+<td>元素类型可变</td>
+</tr>
+</tbody>
+</table>
+<h3>4.1.3 codegen 推导时序</h3>
+<div class="diagram">
+  <div class="diagram-title">图 4-1-3 · codegen 类型推导时序 — DB Schema → DataType → TableField</div>
+  <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20"  y="20" width="140" height="36" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="90"  y="44" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">数据库 Schema</text>
+    <rect x="200" y="20" width="140" height="36" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="270" y="44" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">jOOQ Codegen</text>
+    <rect x="380" y="20" width="160" height="36" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="460" y="44" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">DatabaseMetaData</text>
+    <rect x="580" y="20" width="160" height="36" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="660" y="44" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">SQLDataType 映射</text>
+    <rect x="780" y="20" width="120" height="36" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="840" y="44" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">生成 Java 类</text>
+
+    <line x1="90"  y1="56" x2="90"  y2="450" stroke="#30363d" stroke-dasharray="3 3"/>
+    <line x1="270" y1="56" x2="270" y2="450" stroke="#30363d" stroke-dasharray="3 3"/>
+    <line x1="460" y1="56" x2="460" y2="450" stroke="#30363d" stroke-dasharray="3 3"/>
+    <line x1="660" y1="56" x2="660" y2="450" stroke="#30363d" stroke-dasharray="3 3"/>
+    <line x1="840" y1="56" x2="840" y2="450" stroke="#30363d" stroke-dasharray="3 3"/>
+
+    <path d="M 90 80 L 270 80" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="180" y="74" text-anchor="middle" fill="#c9d1d9" font-size="11">① 触发生成</text>
+
+    <path d="M 270 110 L 460 110" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="365" y="104" text-anchor="middle" fill="#c9d1d9" font-size="11">② 读 INFORMATION_SCHEMA</text>
+
+    <path d="M 460 140 L 270 140" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" fill="none" marker-end="url(#arr)"/>
+    <text x="365" y="134" text-anchor="middle" fill="#c9d1d9" font-size="11">③ 列名 + 类型 + 精度 + 可空</text>
+
+    <path d="M 270 170 L 660 170" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="465" y="164" text-anchor="middle" fill="#c9d1d9" font-size="11">④ 查 SQL → Java 映射</text>
+
+    <path d="M 660 200 L 270 200" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 3" fill="none" marker-end="url(#arr)"/>
+    <text x="465" y="194" text-anchor="middle" fill="#c9d1d9" font-size="11">⑤ DataType&lt;T&gt;</text>
+
+    <path d="M 270 250 L 840 250" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="555" y="244" text-anchor="middle" fill="#c9d1d9" font-size="11">⑥ TableField&lt;OrdersRecord, String&gt; TITLE</text>
+
+    <path d="M 270 290 L 840 290" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="555" y="284" text-anchor="middle" fill="#c9d1d9" font-size="11">⑦ TableField&lt;OrdersRecord, Integer&gt; ID</text>
+
+    <path d="M 270 330 L 840 330" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="555" y="324" text-anchor="middle" fill="#c9d1d9" font-size="11">⑧ TableField&lt;OrdersRecord, LocalDateTime&gt; CREATED_AT</text>
+
+    <rect x="100" y="370" width="720" height="60" rx="8" fill="#0d1117" stroke="#30363d"/>
+    <text x="460" y="392" text-anchor="middle" fill="#8b949e" font-size="11">codegen 产物示例:每个列变为静态 TableField · R 锁定 Record 类型,T 锁定 Java 类型</text>
+    <text x="460" y="412" text-anchor="middle" fill="#8b949e" font-size="11">业务代码 ORDERS.ID 直接是 Field&lt;Long&gt;,IDE 与 javac 立即拒绝类型错误</text>
+  </svg>
+</div>
+<h3>4.1.4 字段类型自检</h3>
+<pre><code class="language-java">Stream.of(ORDERS.ID, ORDERS.STATUS, ORDERS.AMOUNT, ORDERS.CREATED_AT)
+      .forEach(f -&gt; System.out.printf(
+          &quot;%-12s | java=%-22s | sql=%-18s | nullable=%s%n&quot;,
+          f.getName(),
+          f.getDataType().getType().getSimpleName(),
+          f.getDataType().getTypeName(),
+          f.getDataType().nullable()));
+</code></pre>
+<pre><code class="language-text">id           | java=Long                   | sql=bigint           | nullable=false
+status       | java=String                 | sql=varchar          | nullable=false
+amount       | java=BigDecimal             | sql=numeric          | nullable=false
+created_at   | java=LocalDateTime          | sql=timestamp        | nullable=false
+</code></pre>
+<h2 id="4.2-field-泛型体系">4.2 Field<T> 泛型体系</h2>
+<h3>4.2.1 类层次</h3>
+<div class="diagram">
+  <div class="diagram-title">图 4-2-1 · Field 类层次 — 多接口继承使 Field 能用于 select/groupBy/orderBy</div>
+  <svg viewBox="0 0 920 500" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr-tri" markerWidth="14" markerHeight="14" refX="13" refY="7" orient="auto"><path d="M0,0 L13,7 L0,14 z" fill="none" stroke="#8b949e" stroke-width="1.5"/></marker>
+      <marker id="arr-dash" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#bc8cff"/></marker>
+    </defs>
+
+    <rect x="50"  y="20" width="180" height="60" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="140" y="40" text-anchor="middle" fill="#58a6ff" font-size="11" font-style="italic">«interface»</text>
+    <text x="140" y="58" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">SelectFieldOrAsterisk</text>
+    <text x="140" y="74" text-anchor="middle" fill="#8b949e" font-size="10">SELECT 子句基类型</text>
+
+    <rect x="260" y="20" width="180" height="60" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="350" y="40" text-anchor="middle" fill="#58a6ff" font-size="11" font-style="italic">«interface»</text>
+    <text x="350" y="58" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">SelectField&lt;T&gt;</text>
+    <text x="350" y="74" text-anchor="middle" fill="#8b949e" font-size="10">带类型的 SELECT 元素</text>
+
+    <rect x="470" y="20" width="180" height="60" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="560" y="40" text-anchor="middle" fill="#d29922" font-size="11" font-style="italic">«interface»</text>
+    <text x="560" y="58" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">GroupField</text>
+    <text x="560" y="74" text-anchor="middle" fill="#8b949e" font-size="10">GROUP BY 元素</text>
+
+    <rect x="680" y="20" width="180" height="60" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="770" y="40" text-anchor="middle" fill="#3fb950" font-size="11" font-style="italic">«interface»</text>
+    <text x="770" y="58" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">OrderField&lt;T&gt;</text>
+    <text x="770" y="74" text-anchor="middle" fill="#8b949e" font-size="10">ORDER BY 元素</text>
+
+    <path d="M 350 130 L 140 90"  stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr-tri)"/>
+    <path d="M 350 130 L 350 90"  stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr-tri)"/>
+    <path d="M 380 130 L 560 90"  stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr-tri)"/>
+    <path d="M 410 130 L 770 90"  stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr-tri)"/>
+
+    <rect x="220" y="135" width="350" height="180" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="395" y="158" text-anchor="middle" fill="#bc8cff" font-size="11" font-style="italic">«interface»</text>
+    <text x="395" y="178" text-anchor="middle" fill="#bc8cff" font-size="14" font-weight="bold">Field&lt;T&gt;</text>
+    <line x1="230" y1="188" x2="560" y2="188" stroke="#bc8cff" stroke-dasharray="3 3"/>
+    <text x="230" y="208" fill="#c9d1d9" font-size="11">+ DataType&lt;T&gt; getDataType()</text>
+    <text x="230" y="226" fill="#c9d1d9" font-size="11">+ Condition eq(Field&lt;T&gt; other)</text>
+    <text x="230" y="244" fill="#c9d1d9" font-size="11">+ Condition gt(Field&lt;T&gt; other)</text>
+    <text x="230" y="262" fill="#c9d1d9" font-size="11">+ Field&lt;T&gt; as(String alias)</text>
+    <text x="230" y="280" fill="#c9d1d9" font-size="11">+ Field&lt;U&gt; cast(DataType&lt;U&gt; type)</text>
+    <text x="230" y="302" fill="#8b949e" font-size="10" font-style="italic">类型 T 决定可用方法的签名(eq/gt/in 等)</text>
+
+    <path d="M 395 315 L 395 360" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr-tri)"/>
+    <text x="415" y="345" fill="#8b949e" font-size="10" font-style="italic">extends</text>
+
+    <rect x="220" y="365" width="350" height="100" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="395" y="388" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">TableField&lt;R, T&gt;</text>
+    <line x1="230" y1="398" x2="560" y2="398" stroke="#3fb950" stroke-dasharray="3 3"/>
+    <text x="230" y="418" fill="#c9d1d9" font-size="11">+ Table&lt;R&gt; getTable()</text>
+    <text x="230" y="436" fill="#c9d1d9" font-size="11">+ String getName()</text>
+    <text x="230" y="455" fill="#8b949e" font-size="10" font-style="italic">codegen 实际产物 · R 锁记录类型</text>
+
+    <path d="M 570 220 L 660 220" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="4 3" fill="none" marker-end="url(#arr-dash)"/>
+    <text x="615" y="212" text-anchor="middle" fill="#8b949e" font-size="10" font-style="italic">creates</text>
+
+    <rect x="670" y="180" width="220" height="120" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="780" y="203" text-anchor="middle" fill="#d29922" font-size="11" font-style="italic">«interface»</text>
+    <text x="780" y="222" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">Condition</text>
+    <line x1="680" y1="232" x2="880" y2="232" stroke="#d29922" stroke-dasharray="3 3"/>
+    <text x="680" y="252" fill="#c9d1d9" font-size="11">+ and(Condition other)</text>
+    <text x="680" y="270" fill="#c9d1d9" font-size="11">+ or(Condition other)</text>
+    <text x="680" y="290" fill="#8b949e" font-size="10" font-style="italic">eq/gt 等返回 Condition</text>
+
+    <text x="460" y="485" text-anchor="middle" fill="#8b949e" font-size="11">Field&lt;T&gt; 同时实现 4 个接口 → 同一对象可出现在 select/groupBy/orderBy/where 多个上下文</text>
+  </svg>
+</div>
+<p><code>Field&lt;T&gt;</code> 同时实现多个接口,使其能出现在 <code>select</code>、<code>group by</code>、<code>order by</code> 等不同上下文。<code>TableField&lt;R, T&gt;</code> 增加 <code>Table&lt;R&gt;</code> 与列名信息,是 codegen 产物的实际类型。</p>
+<h3>4.2.2 类型约束实例</h3>
+<pre><code class="language-java">Condition c1 = ORDERS.STATUS.eq(&quot;PAID&quot;);
+Condition c2 = ORDERS.ID.gt(100L);
+Condition c3 = ORDERS.AMOUNT.le(new BigDecimal(&quot;128.00&quot;));
+</code></pre>
+<pre><code class="language-java">Condition wrong1 = ORDERS.ID.eq(&quot;PAID&quot;);
+Condition wrong2 = ORDERS.STATUS.eq(42);
+</code></pre>
+<pre><code class="language-text">[ERROR] no suitable method found for eq(String)
+[ERROR]   method Field.eq(Long) is not applicable
+[ERROR]     argument mismatch; String cannot be converted to Long
+
+[ERROR] no suitable method found for eq(int)
+[ERROR]   method Field.eq(String) is not applicable
+[ERROR]     argument mismatch; int cannot be converted to String
+</code></pre>
+<h3>4.2.3 重载方法签名</h3>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>签名</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>eq(T)</code></td>
+<td><code>Condition eq(T value)</code></td>
+<td>字段与字面量</td>
+</tr>
+<tr>
+<td><code>eq(Field&lt;T&gt;)</code></td>
+<td><code>Condition eq(Field&lt;T&gt; other)</code></td>
+<td>字段与字段</td>
+</tr>
+<tr>
+<td><code>eq(Select&lt;? extends Record1&lt;T&gt;&gt;)</code></td>
+<td>子查询</td>
+<td>单值子查询</td>
+</tr>
+<tr>
+<td><code>eq(QuantifiedSelect&lt;? extends Record1&lt;T&gt;&gt;)</code></td>
+<td><code>eq ANY</code> 等</td>
+<td>量化子查询</td>
+</tr>
+</tbody>
+</table>
+<p>每条 <code>eq</code> 重载共享同一 <code>T</code>,使字段、字面量、子查询在编译期保持类型一致。该重载策略适用于所有比较与运算方法。</p>
+<h3>4.2.4 类型传播路径</h3>
+<div class="diagram">
+  <div class="diagram-title">图 4-2-4 · 类型传播路径 — T 在派生方法中保持,直到 cast/coerce/convert 显式改变</div>
+  <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="370" y="20" width="180" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="44" text-anchor="middle" fill="#bc8cff" font-size="14" font-weight="bold">TableField&lt;R, T&gt;</text>
+    <text x="460" y="64" text-anchor="middle" fill="#c9d1d9" font-size="11">codegen 产物</text>
+
+    <path d="M 390 80 L 110 140"  stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 410 80 L 280 140"  stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 430 80 L 460 140"  stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 470 80 L 640 140"  stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 510 80 L 810 140"  stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="20"  y="145" width="180" height="56" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="110" y="167" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">Condition</text>
+    <text x="110" y="185" text-anchor="middle" fill="#c9d1d9" font-size="11">eq/gt/in 返回</text>
+
+    <rect x="210" y="145" width="160" height="56" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="290" y="167" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">OrderField&lt;T&gt;</text>
+    <text x="290" y="185" text-anchor="middle" fill="#c9d1d9" font-size="11">T 保留</text>
+
+    <rect x="380" y="145" width="160" height="56" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="460" y="167" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">GroupField</text>
+    <text x="460" y="185" text-anchor="middle" fill="#c9d1d9" font-size="11">无 T 约束</text>
+
+    <rect x="550" y="145" width="180" height="56" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="640" y="167" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">WindowSpecification</text>
+    <text x="640" y="185" text-anchor="middle" fill="#c9d1d9" font-size="11">over(...) 入参</text>
+
+    <rect x="740" y="145" width="160" height="56" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="820" y="167" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">Field&lt;T&gt; as(...)</text>
+    <text x="820" y="185" text-anchor="middle" fill="#c9d1d9" font-size="11">T 保留</text>
+
+    <path d="M 110 201 L 110 240" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 290 201 L 290 240" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 201 L 460 240" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 640 201 L 640 240" stroke="#8b949e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="20"  y="245" width="180" height="40" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="110" y="269" text-anchor="middle" fill="#c9d1d9" font-size="11">where / having / on</text>
+
+    <rect x="210" y="245" width="160" height="40" rx="6" fill="#161b22" stroke="#3fb950"/>
+    <text x="290" y="269" text-anchor="middle" fill="#c9d1d9" font-size="11">orderBy</text>
+
+    <rect x="380" y="245" width="160" height="40" rx="6" fill="#161b22" stroke="#3fb950"/>
+    <text x="460" y="269" text-anchor="middle" fill="#c9d1d9" font-size="11">groupBy</text>
+
+    <rect x="550" y="245" width="180" height="40" rx="6" fill="#161b22" stroke="#3fb950"/>
+    <text x="640" y="269" text-anchor="middle" fill="#c9d1d9" font-size="11">over(...)</text>
+
+    <rect x="60" y="320" width="800" height="120" rx="10" fill="rgba(92,31,31,.10)" stroke="#f85149" stroke-dasharray="4 3"/>
+    <text x="460" y="345" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">类型 T 改变的三种显式入口</text>
+
+    <rect x="100" y="360" width="220" height="60" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="210" y="383" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">cast(DataType&lt;U&gt;)</text>
+    <text x="210" y="401" text-anchor="middle" fill="#c9d1d9" font-size="11">SQL 加 CAST · 数据库执行</text>
+    <text x="210" y="415" text-anchor="middle" fill="#8b949e" font-size="10">返回 Field&lt;U&gt;</text>
+
+    <rect x="350" y="360" width="220" height="60" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="460" y="383" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">coerce(DataType&lt;U&gt;)</text>
+    <text x="460" y="401" text-anchor="middle" fill="#c9d1d9" font-size="11">仅改 Java 泛型 · jOOQ 端</text>
+    <text x="460" y="415" text-anchor="middle" fill="#8b949e" font-size="10">返回 Field&lt;U&gt;</text>
+
+    <rect x="600" y="360" width="220" height="60" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="710" y="383" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">convert(Converter&lt;T, U&gt;)</text>
+    <text x="710" y="401" text-anchor="middle" fill="#c9d1d9" font-size="11">Converter 值对象转换</text>
+    <text x="710" y="415" text-anchor="middle" fill="#8b949e" font-size="10">返回 Field&lt;U&gt;</text>
+  </svg>
+</div>
+<p><code>Field&lt;T&gt;</code> 的 <code>T</code> 在所有派生方法中保持,直到 <code>cast / coerce / convert</code> 显式改变类型参数。该传播链使 SQL 表达式整体保持类型一致。</p>
+<h2 id="4.3-编译期与运行期类型安全对比">4.3 编译期与运行期类型安全对比</h2>
+<h3>4.3.1 三方案谱系</h3>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>列引用</th>
+<th>类型校验</th>
+<th>错误时机</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MyBatis</td>
+<td>XML / 字符串</td>
+<td>多数运行时</td>
+<td>SQL 执行</td>
+</tr>
+<tr>
+<td>JPA Criteria</td>
+<td>Metamodel(<code>Order_.title</code>)</td>
+<td>部分编译期</td>
+<td>编译 + 运行</td>
+</tr>
+<tr>
+<td>jOOQ DSL</td>
+<td>codegen <code>ORDERS.ID</code></td>
+<td><code>Field&lt;T&gt;</code> 全链路</td>
+<td>IDE / <code>javac</code></td>
+</tr>
+</tbody>
+</table>
+<h3>4.3.2 同查询三种实现</h3>
+<p>MyBatis XML:</p>
+<pre><code class="language-xml">&lt;select id=&quot;findOrders&quot; resultType=&quot;Orders&quot;&gt;
+  SELECT * FROM orders
+  WHERE status = #{status}
+    AND amount &gt; #{amount}
+&lt;/select&gt;
+</code></pre>
+<pre><code class="language-log">### Error querying database. Cause: org.postgresql.util.PSQLException:
+ERROR: operator does not exist: character varying = integer
+  Hint: No operator matches the given name and argument types.
+  Position: 34
+</code></pre>
+<p>JPA Criteria:</p>
+<pre><code class="language-java">CriteriaBuilder cb = em.getCriteriaBuilder();
+CriteriaQuery&lt;Orders&gt; cq = cb.createQuery(Orders.class);
+Root&lt;Orders&gt; root = cq.from(Orders.class);
+
+cq.where(cb.and(
+    cb.equal(root.get(Orders_.status), status),
+    cb.gt(root.get(Orders_.amount), amount)));
+
+List&lt;Orders&gt; orders = em.createQuery(cq).getResultList();
+</code></pre>
+<p>jOOQ DSL:</p>
+<pre><code class="language-java">List&lt;OrdersRecord&gt; orders = dsl.selectFrom(ORDERS)
+    .where(ORDERS.STATUS.eq(status),
+           ORDERS.AMOUNT.gt(amount))
+    .fetch();
+</code></pre>
+<h3>4.3.3 错误发现时机对比</h3>
+<div class="diagram">
+  <div class="diagram-title">图 4-3-3 · 错误发现时机对比 — jOOQ / JPA Criteria / MyBatis 三方案</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="40"  y="40" width="180" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="130" y="62" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">① 编码</text>
+    <text x="130" y="80" text-anchor="middle" fill="#c9d1d9" font-size="11">IDE 红线 / lint</text>
+    <text x="130" y="94" text-anchor="middle" fill="#8b949e" font-size="10">秒级反馈</text>
+
+    <rect x="270" y="40" width="180" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="360" y="62" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">② 编译</text>
+    <text x="360" y="80" text-anchor="middle" fill="#c9d1d9" font-size="11">javac</text>
+    <text x="360" y="94" text-anchor="middle" fill="#8b949e" font-size="10">分钟级</text>
+
+    <rect x="500" y="40" width="180" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="590" y="62" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">③ 集成测试</text>
+    <text x="590" y="80" text-anchor="middle" fill="#c9d1d9" font-size="11">CI Pipeline</text>
+    <text x="590" y="94" text-anchor="middle" fill="#8b949e" font-size="10">10+ 分钟</text>
+
+    <rect x="730" y="40" width="180" height="60" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="820" y="62" text-anchor="middle" fill="#f85149" font-size="13" font-weight="bold">④ 运行</text>
+    <text x="820" y="80" text-anchor="middle" fill="#c9d1d9" font-size="11">SQL 执行</text>
+    <text x="820" y="94" text-anchor="middle" fill="#8b949e" font-size="10">线上故障</text>
+
+    <path d="M 220 70 L 270 70" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 450 70 L 500 70" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 680 70 L 730 70" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="40"  y="135" width="160" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="120" y="158" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">jOOQ DSL</text>
+    <text x="120" y="174" text-anchor="middle" fill="#c9d1d9" font-size="10">Field&lt;T&gt; 全链路</text>
+
+    <path d="M 130 135 L 130 110" stroke="#bc8cff" stroke-width="2" stroke-dasharray="6 3" fill="none" marker-end="url(#arr)"/>
+    <path d="M 175 135 L 320 110" stroke="#bc8cff" stroke-width="2" stroke-dasharray="6 3" fill="none" marker-end="url(#arr)"/>
+    <text x="130" y="130" text-anchor="middle" fill="#3fb950" font-size="10" font-weight="bold">✓ ① ②</text>
+
+    <rect x="380" y="135" width="160" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="158" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">JPA Criteria</text>
+    <text x="460" y="174" text-anchor="middle" fill="#c9d1d9" font-size="10">Metamodel 部分</text>
+
+    <path d="M 420 135 L 360 110" stroke="#bc8cff" stroke-width="2" stroke-dasharray="6 3" fill="none" marker-end="url(#arr)"/>
+    <path d="M 510 135 L 800 110" stroke="#f85149" stroke-width="2" stroke-dasharray="6 3" fill="none" marker-end="url(#arr)"/>
+    <text x="465" y="130" text-anchor="middle" fill="#d29922" font-size="10" font-weight="bold">⚠ ② ④</text>
+
+    <rect x="720" y="135" width="160" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="800" y="158" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">MyBatis</text>
+    <text x="800" y="174" text-anchor="middle" fill="#c9d1d9" font-size="10">XML 字符串</text>
+
+    <path d="M 750 135 L 590 110" stroke="#f85149" stroke-width="2" stroke-dasharray="6 3" fill="none" marker-end="url(#arr)"/>
+    <path d="M 820 135 L 820 110" stroke="#f85149" stroke-width="2" stroke-dasharray="6 3" fill="none" marker-end="url(#arr)"/>
+    <text x="800" y="130" text-anchor="middle" fill="#f85149" font-size="10" font-weight="bold">✗ ③ ④</text>
+
+    <rect x="60" y="230" width="800" height="130" rx="10" fill="#0d1117" stroke="#30363d"/>
+    <text x="80" y="252" fill="#c9d1d9" font-size="11" font-weight="bold">关键差异</text>
+    <text x="80" y="276" fill="#3fb950" font-size="11">jOOQ:</text>
+    <text x="160" y="276" fill="#c9d1d9" font-size="11">列名拼写错误 + 参数类型不匹配,在 IDE 红线立刻发现,javac 必然失败</text>
+    <text x="80" y="298" fill="#d29922" font-size="11">Criteria:</text>
+    <text x="160" y="298" fill="#c9d1d9" font-size="11">字段名通过 Metamodel(Orders_.status) 编译期校验,但 JOIN 类型推断常运行期报错</text>
+    <text x="80" y="320" fill="#f85149" font-size="11">MyBatis:</text>
+    <text x="160" y="320" fill="#c9d1d9" font-size="11">列拼写 / 类型不匹配 / 参数缺失全部到运行时 — 强依赖集成测试覆盖率</text>
+    <text x="80" y="346" fill="#8b949e" font-size="10">越靠左发现 = 越便宜的修复 · 越靠右 = 线上事故</text>
+  </svg>
+</div>
+<h3>4.3.4 渲染产物与绑定值</h3>
+<pre><code class="language-sql">select orders.id, orders.status, orders.amount
+from orders
+where orders.status = ?
+  and orders.amount &gt; ?
+</code></pre>
+<pre><code class="language-text">bind[1] = &quot;PAID&quot;           (String)
+bind[2] = 20.00            (BigDecimal)
+rows    = 1
+</code></pre>
+<p>迁移评审中常见的收益:列名拼写错误、参数类型不匹配,在 codegen 重新生成后于 <code>mvn compile</code> 立即暴露,无需依赖运行时单元测试覆盖率。</p>
+<h2 id="4.4-datatype-spi">4.4 DataType SPI</h2>
+<h3>4.4.1 DataType 接口结构</h3>
+<div class="diagram">
+  <div class="diagram-title">图 4-4-1 · DataType 类层次 — 接口 / 实现 / 常量库 / Converter 装饰器</div>
+  <svg viewBox="0 0 920 560" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr-tri" markerWidth="14" markerHeight="14" refX="13" refY="7" orient="auto"><path d="M0,0 L13,7 L0,14 z" fill="none" stroke="#bc8cff" stroke-width="1.5"/></marker>
+      <marker id="arr-dash" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="320" y="20" width="280" height="280" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="42" text-anchor="middle" fill="#bc8cff" font-size="11" font-style="italic">«interface»</text>
+    <text x="460" y="60" text-anchor="middle" fill="#bc8cff" font-size="14" font-weight="bold">DataType&lt;T&gt;</text>
+    <line x1="330" y1="70" x2="590" y2="70" stroke="#bc8cff" stroke-dasharray="3 3"/>
+    <text x="335" y="89"  fill="#c9d1d9" font-size="11">+ Class&lt;T&gt; getType()</text>
+    <text x="335" y="106" fill="#c9d1d9" font-size="11">+ SQLDialect getDialect()</text>
+    <text x="335" y="123" fill="#c9d1d9" font-size="11">+ String getTypeName()</text>
+    <text x="335" y="140" fill="#c9d1d9" font-size="11">+ int precision() / scale() / length()</text>
+    <text x="335" y="157" fill="#c9d1d9" font-size="11">+ boolean nullable() / identity()</text>
+    <text x="335" y="174" fill="#c9d1d9" font-size="11">+ Field&lt;T&gt; defaultValue()</text>
+    <line x1="330" y1="184" x2="590" y2="184" stroke="#bc8cff" stroke-dasharray="3 3"/>
+    <text x="335" y="203" fill="#c9d1d9" font-size="11">+ DataType&lt;T&gt; nullable(boolean)</text>
+    <text x="335" y="220" fill="#c9d1d9" font-size="11">+ DataType&lt;T&gt; precision(int)</text>
+    <text x="335" y="237" fill="#c9d1d9" font-size="11">+ DataType&lt;T&gt; length(int)</text>
+    <text x="335" y="254" fill="#c9d1d9" font-size="11">+ DataType&lt;U&gt; asConvertedDataType(Converter)</text>
+    <text x="335" y="282" fill="#8b949e" font-size="10" font-style="italic">不可变 · 所有修饰方法返回新实例</text>
+
+    <rect x="40"  y="350" width="280" height="180" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="180" y="374" text-anchor="middle" fill="#d29922" font-size="11" font-style="italic">«final»</text>
+    <text x="180" y="392" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">SQLDataType</text>
+    <line x1="50" y1="402" x2="310" y2="402" stroke="#d29922" stroke-dasharray="3 3"/>
+    <text x="55" y="422" fill="#c9d1d9" font-size="11">+ DataType&lt;String&gt; VARCHAR$</text>
+    <text x="55" y="440" fill="#c9d1d9" font-size="11">+ DataType&lt;Integer&gt; INTEGER$</text>
+    <text x="55" y="458" fill="#c9d1d9" font-size="11">+ DataType&lt;LocalDateTime&gt; LOCALDATETIME$</text>
+    <text x="55" y="476" fill="#c9d1d9" font-size="11">+ DataType&lt;Boolean&gt; BOOLEAN$</text>
+    <text x="55" y="494" fill="#c9d1d9" font-size="11">+ DataType&lt;BigDecimal&gt; NUMERIC$</text>
+    <text x="55" y="512" fill="#c9d1d9" font-size="11">+ DataType&lt;JSONB&gt; JSONB$</text>
+
+    <rect x="340" y="350" width="240" height="180" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="460" y="374" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">DefaultDataType&lt;T&gt;</text>
+    <line x1="350" y1="384" x2="570" y2="384" stroke="#58a6ff" stroke-dasharray="3 3"/>
+    <text x="355" y="404" fill="#c9d1d9" font-size="11">- SQLDialect dialect</text>
+    <text x="355" y="422" fill="#c9d1d9" font-size="11">- Class&lt;T&gt; type</text>
+    <text x="355" y="440" fill="#c9d1d9" font-size="11">- String typeName</text>
+    <text x="355" y="458" fill="#c9d1d9" font-size="11">- int precision</text>
+    <text x="355" y="476" fill="#c9d1d9" font-size="11">- int scale</text>
+    <text x="355" y="494" fill="#c9d1d9" font-size="11">- int length</text>
+    <text x="460" y="518" text-anchor="middle" fill="#8b949e" font-size="10" font-style="italic">主要实现 · 缓存所有元信息</text>
+
+    <rect x="600" y="350" width="280" height="180" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="740" y="374" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">ConvertedDataType&lt;T, U&gt;</text>
+    <line x1="610" y1="384" x2="870" y2="384" stroke="#3fb950" stroke-dasharray="3 3"/>
+    <text x="615" y="404" fill="#c9d1d9" font-size="11">- DataType&lt;T&gt; delegate</text>
+    <text x="615" y="422" fill="#c9d1d9" font-size="11">- Converter&lt;T, U&gt; converter</text>
+    <text x="615" y="448" fill="#8b949e" font-size="10" font-style="italic">装饰器模式</text>
+    <text x="615" y="466" fill="#c9d1d9" font-size="11">getType() → U.class</text>
+    <text x="615" y="484" fill="#c9d1d9" font-size="11">读取:delegate.read → converter.from</text>
+    <text x="615" y="502" fill="#c9d1d9" font-size="11">写入:converter.to → delegate.write</text>
+    <text x="615" y="520" fill="#8b949e" font-size="10" font-style="italic">asConvertedDataType(...) 创建</text>
+
+    <path d="M 460 530 L 460 300" stroke="#bc8cff" stroke-width="2" fill="none" marker-end="url(#arr-tri)"/>
+    <text x="480" y="320" fill="#8b949e" font-size="10" font-style="italic">implements</text>
+
+    <path d="M 740 530 L 740 415 Q 600 415 600 300" stroke="#bc8cff" stroke-width="2" fill="none" marker-end="url(#arr-tri)"/>
+    <text x="680" y="332" fill="#8b949e" font-size="10" font-style="italic">implements</text>
+
+    <path d="M 180 350 L 180 320 L 380 320 L 460 350" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="4 3" fill="none" marker-end="url(#arr-dash)"/>
+    <text x="270" y="312" text-anchor="middle" fill="#8b949e" font-size="10" font-style="italic">creates DefaultDataType 单例</text>
+
+    <path d="M 600 410 L 580 410" stroke="#bc8cff" stroke-width="2" fill="none" marker-end="url(#arr-tri)"/>
+    <text x="590" y="402" text-anchor="end" fill="#8b949e" font-size="10" font-style="italic">extends</text>
+  </svg>
+</div>
+<h3>4.4.2 SQLDataType 标准常量</h3>
+<pre><code class="language-java">Field&lt;String&gt;  name = DSL.field(&quot;name&quot;, SQLDataType.VARCHAR.length(100));
+Field&lt;Boolean&gt; active = DSL.field(&quot;active&quot;, SQLDataType.BOOLEAN);
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>方言</th>
+<th>VARCHAR(100) DDL</th>
+<th>BOOLEAN DDL</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PostgreSQL</td>
+<td><code>VARCHAR(100)</code></td>
+<td><code>BOOLEAN</code></td>
+</tr>
+<tr>
+<td>MySQL</td>
+<td><code>VARCHAR(100)</code></td>
+<td><code>TINYINT(1)</code></td>
+</tr>
+<tr>
+<td>Oracle</td>
+<td><code>VARCHAR2(100)</code></td>
+<td><code>NUMBER(1)</code></td>
+</tr>
+<tr>
+<td>SQL Server</td>
+<td><code>VARCHAR(100)</code></td>
+<td><code>BIT</code></td>
+</tr>
+<tr>
+<td>H2</td>
+<td><code>VARCHAR(100)</code></td>
+<td><code>BOOLEAN</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>SQLDataType</code> 是方言无关的标准常量,渲染时由 <code>RenderContext</code> 转换为目标方言语法。</p>
+<h3>4.4.3 DataType 不可变构建链</h3>
+<div class="diagram">
+  <div class="diagram-title">图 4-4-3 · DataType 不可变构建链 — 每次调用返回新实例</div>
+  <svg viewBox="0 0 920 280" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20"  y="60" width="200" height="80" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="120" y="86" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">SQLDataType</text>
+    <text x="120" y="104" text-anchor="middle" fill="#c9d1d9" font-size="12">.VARCHAR</text>
+    <text x="120" y="124" text-anchor="middle" fill="#8b949e" font-size="10">VARCHAR · nullable=true · length=∞</text>
+
+    <path d="M 220 100 L 270 100" stroke="#58a6ff" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+    <text x="245" y="92" text-anchor="middle" fill="#3fb950" font-size="10" font-weight="bold">.length(100)</text>
+
+    <rect x="270" y="60" width="200" height="80" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="370" y="86" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">新实例 ②</text>
+    <text x="370" y="104" text-anchor="middle" fill="#c9d1d9" font-size="12">VARCHAR(100)</text>
+    <text x="370" y="124" text-anchor="middle" fill="#8b949e" font-size="10">nullable=true · 字符串最大 100</text>
+
+    <path d="M 470 100 L 520 100" stroke="#58a6ff" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+    <text x="495" y="92" text-anchor="middle" fill="#d29922" font-size="10" font-weight="bold">.nullable(false)</text>
+
+    <rect x="520" y="60" width="200" height="80" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="620" y="86" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">新实例 ③</text>
+    <text x="620" y="104" text-anchor="middle" fill="#c9d1d9" font-size="12">VARCHAR(100) NOT NULL</text>
+    <text x="620" y="124" text-anchor="middle" fill="#8b949e" font-size="10">不可为空</text>
+
+    <path d="M 720 100 L 750 100" stroke="#58a6ff" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 720 145 L 460 200" stroke="#58a6ff" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+    <text x="640" y="170" fill="#bc8cff" font-size="10" font-weight="bold">.defaultValue('N/A')</text>
+
+    <rect x="750" y="60" width="150" height="80" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="825" y="86" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">最终 ④</text>
+    <text x="825" y="108" text-anchor="middle" fill="#c9d1d9" font-size="11">VARCHAR(100)</text>
+    <text x="825" y="122" text-anchor="middle" fill="#c9d1d9" font-size="11">NOT NULL DEFAULT 'N/A'</text>
+
+    <rect x="220" y="195" width="480" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="218" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">最终 DataType 实例</text>
+    <text x="460" y="238" text-anchor="middle" fill="#c9d1d9" font-size="11">VARCHAR(100) NOT NULL DEFAULT 'N/A'</text>
+
+    <text x="460" y="30" text-anchor="middle" fill="#8b949e" font-size="11">原 SQLDataType.VARCHAR 始终不变 · ②③④ 都是独立的新对象</text>
+  </svg>
+</div>
+<p><code>DataType&lt;T&gt;</code> 是不可变对象,所有修饰方法返回新实例。该设计与 <code>Field&lt;T&gt;</code> 配合,使类型元信息可在多个 <code>Field</code> 间共享而不被修改。</p>
+<h3>4.4.4 自定义 Converter</h3>
+<pre><code class="language-java">Converter&lt;String, OrderStatus&gt; converter = Converter.ofNullable(
+    String.class, OrderStatus.class,
+    OrderStatus::valueOf,
+    OrderStatus::name);
+
+DataType&lt;OrderStatus&gt; statusType =
+    SQLDataType.VARCHAR.asConvertedDataType(converter);
+
+Field&lt;OrderStatus&gt; status = DSL.field(&quot;status&quot;, statusType);
+
+Condition c = status.eq(OrderStatus.PAID);
+</code></pre>
+<pre><code class="language-sql">select status
+from orders
+where status = ?
+</code></pre>
+<pre><code class="language-text">bind[1] = &quot;PAID&quot;           (String, from OrderStatus.PAID)
+record.get(status)         = PAID  (OrderStatus)
+status.getDataType().getType() = OrderStatus.class
+</code></pre>
+<h3>4.4.5 Converter 失败模式</h3>
+<pre><code class="language-log">org.jooq.exception.DataTypeException: Error while reading field: status
+Caused by: java.lang.IllegalArgumentException: No enum constant OrderStatus.ARCHIVED_OLD
+  at java.lang.Enum.valueOf(Enum.java:273)
+  at OrderStatus.valueOf(OrderStatus.java:1)
+</code></pre>
+<p>数据库出现 Java 枚举不识别的字面量时,Converter 在读取阶段抛出 <code>DataTypeException</code>。生产防护:在 Converter 内捕获并降级为默认值,或在数据库层加 CHECK 约束。</p>
+<h2 id="4.5-nullability-与约束传递">4.5 Nullability 与约束传递</h2>
+<h3>4.5.1 Nullability 元信息流</h3>
+<div class="diagram">
+  <div class="diagram-title">图 4-5-1 · Nullability 元信息流 — DDL → MetaData → DataType → 生成代码</div>
+  <svg viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20"  y="80" width="200" height="80" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="120" y="105" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">① CREATE TABLE</text>
+    <text x="120" y="125" text-anchor="middle" fill="#c9d1d9" font-size="11">id BIGINT NOT NULL</text>
+    <text x="120" y="143" text-anchor="middle" fill="#8b949e" font-size="10">数据库 DDL · 真实约束</text>
+
+    <path d="M 220 120 L 260 120" stroke="#58a6ff" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="260" y="80" width="200" height="80" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="360" y="105" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">② DatabaseMetaData</text>
+    <text x="360" y="125" text-anchor="middle" fill="#c9d1d9" font-size="11">IS_NULLABLE = NO</text>
+    <text x="360" y="143" text-anchor="middle" fill="#8b949e" font-size="10">JDBC 反射 schema</text>
+
+    <path d="M 460 120 L 500 120" stroke="#58a6ff" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="500" y="80" width="200" height="80" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="600" y="105" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">③ JavaGenerator</text>
+    <text x="600" y="125" text-anchor="middle" fill="#c9d1d9" font-size="11">codegen 阶段</text>
+    <text x="600" y="143" text-anchor="middle" fill="#8b949e" font-size="10">设置 nullable=false</text>
+
+    <path d="M 700 120 L 740 120" stroke="#58a6ff" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="740" y="80" width="160" height="80" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="820" y="105" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">④ TableField</text>
+    <text x="820" y="123" text-anchor="middle" fill="#c9d1d9" font-size="11">&lt;R, T&gt;</text>
+    <text x="820" y="143" text-anchor="middle" fill="#8b949e" font-size="10">nullable=false</text>
+
+    <path d="M 800 160 L 600 220" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 840 160 L 840 220" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="450" y="225" width="220" height="60" rx="8" fill="#161b22" stroke="#bc8cff"/>
+    <text x="560" y="248" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">Javadoc 注解</text>
+    <text x="560" y="266" text-anchor="middle" fill="#c9d1d9" font-size="10">@nullable=false (仅文档)</text>
+    <text x="560" y="280" text-anchor="middle" fill="#8b949e" font-size="10">Java Generator</text>
+
+    <rect x="740" y="225" width="160" height="60" rx="8" fill="#161b22" stroke="#3fb950"/>
+    <text x="820" y="248" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">Kotlin: T (非 T?)</text>
+    <text x="820" y="266" text-anchor="middle" fill="#c9d1d9" font-size="10">编译器强制</text>
+    <text x="820" y="280" text-anchor="middle" fill="#8b949e" font-size="10">KotlinGenerator 3.17+</text>
+
+    <text x="460" y="320" text-anchor="middle" fill="#8b949e" font-size="11">Java Generator 仅在 Javadoc 注明 · Kotlin Generator 映射为非空类型 → 编译期强制检查</text>
+    <text x="460" y="340" text-anchor="middle" fill="#8b949e" font-size="11">运行期允许写入 null,由数据库 NOT NULL 约束兜底 — "防御深度"原则</text>
+  </svg>
+</div>
+<h3>4.5.2 nullable 元信息对照</h3>
+<table>
+<thead>
+<tr>
+<th>DDL 列定义</th>
+<th>生成 DataType</th>
+<th><code>Record.get</code> 语义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>id BIGINT NOT NULL</code></td>
+<td><code>BIGINT.nullable(false)</code></td>
+<td>持久化数据非空</td>
+</tr>
+<tr>
+<td><code>status VARCHAR(20) NOT NULL</code></td>
+<td><code>VARCHAR.nullable(false)</code></td>
+<td>持久化数据非空</td>
+</tr>
+<tr>
+<td><code>note VARCHAR(200)</code></td>
+<td><code>VARCHAR.nullable(true)</code></td>
+<td>可能返回 <code>null</code></td>
+</tr>
+</tbody>
+</table>
+<h3>4.5.3 NOT NULL 与 NULLABLE 列读取</h3>
+<pre><code class="language-java">String status   = record.get(ORDERS.STATUS);
+String note     = record.get(ORDERS.NOTE);
+
+System.out.println(&quot;status nullable=&quot; + ORDERS.STATUS.getDataType().nullable());
+System.out.println(&quot;note   nullable=&quot; + ORDERS.NOTE.getDataType().nullable());
+System.out.println(&quot;status = &quot; + status);
+System.out.println(&quot;note   = &quot; + note);
+</code></pre>
+<pre><code class="language-text">status nullable=false
+note   nullable=true
+status = PAID
+note   = null
+</code></pre>
+<h3>4.5.4 Kotlin Generator 的 null 安全</h3>
+<table>
+<thead>
+<tr>
+<th>元信息</th>
+<th>Kotlin 生成类型</th>
+<th>编译器约束</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>nullable=false</code></td>
+<td><code>String</code></td>
+<td>直接使用</td>
+</tr>
+<tr>
+<td><code>nullable=true</code></td>
+<td><code>String?</code></td>
+<td>必须 <code>?.</code> 或 <code>!!</code></td>
+</tr>
+</tbody>
+</table>
+<p>jOOQ 3.17+ 的 <code>KotlinGenerator</code> 把 nullable 元信息映射为 Kotlin 可空类型,使空值检查由 Kotlin 编译器强制。Java Generator 仅在 Javadoc 中注明,不引入 <code>@Nullable</code> 注解。</p>
+<h3>4.5.5 INSERT NOT NULL 拒绝</h3>
+<pre><code class="language-java">dsl.insertInto(ORDERS)
+   .set(ORDERS.ID, (Long) null)
+   .set(ORDERS.STATUS, &quot;PAID&quot;)
+   .execute();
+</code></pre>
+<pre><code class="language-log">org.jooq.exception.DataAccessException:
+SQL [insert into orders (id, status) values (?, ?)];
+ERROR: null value in column &quot;id&quot; of relation &quot;orders&quot; violates not-null constraint
+</code></pre>
+<p>类型系统不阻止 <code>null</code> 写入(Java 类型仍是 <code>Long</code>),最终由数据库 NOT NULL 约束拒绝。该层防护对应"防御深度"原则:类型系统是第一层,数据库约束是最后兜底。</p>
+<h2 id="4.6-cast、coerce-与-convert">4.6 cast、coerce 与 convert</h2>
+<h3>4.6.1 三种转换的决策树</h3>
+<div class="diagram">
+  <div class="diagram-title">图 4-6-1 · cast / coerce / convert 决策树 — 三种转换语义边界</div>
+  <svg viewBox="0 0 920 480" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <polygon points="460,14 600,54 460,94 320,54" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="50" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">Q1 · 需要改变 Field 类型?</text>
+    <text x="460" y="68" text-anchor="middle" fill="#c9d1d9" font-size="10">从 T → U</text>
+
+    <path d="M 320 54 Q 200 54 200 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="240" y="100" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">否</text>
+
+    <path d="M 460 94 L 460 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="495" y="120" fill="#3fb950" font-size="11" font-weight="bold">是</text>
+
+    <rect x="60"  y="135" width="280" height="70" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="200" y="160" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">CONV: field.convert(converter)</text>
+    <text x="200" y="180" text-anchor="middle" fill="#c9d1d9" font-size="11">仅 Java 端转换</text>
+    <text x="200" y="196" text-anchor="middle" fill="#8b949e" font-size="10">Converter&lt;T, U&gt; · 不改 SQL</text>
+
+    <polygon points="460,135 600,175 460,215 320,175" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="170" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">Q2 · 数据库执行转换?</text>
+    <text x="460" y="188" text-anchor="middle" fill="#c9d1d9" font-size="10">需 SQL 真正 CAST</text>
+
+    <path d="M 320 175 Q 200 175 200 270" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="240" y="225" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">是</text>
+
+    <path d="M 600 175 Q 720 175 720 270" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="680" y="225" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">否</text>
+
+    <rect x="60"  y="275" width="280" height="70" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="200" y="300" text-anchor="middle" fill="#f85149" font-size="13" font-weight="bold">CAST: DSL.cast(field, type)</text>
+    <text x="200" y="320" text-anchor="middle" fill="#c9d1d9" font-size="11">SQL 加 CAST(...)</text>
+    <text x="200" y="336" text-anchor="middle" fill="#8b949e" font-size="10">数据库执行 · 方言敏感</text>
+
+    <rect x="580" y="275" width="280" height="70" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="720" y="300" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">COERCE: field.coerce(type)</text>
+    <text x="720" y="320" text-anchor="middle" fill="#c9d1d9" font-size="11">仅改 Java 泛型</text>
+    <text x="720" y="336" text-anchor="middle" fill="#8b949e" font-size="10">jOOQ Java 端 · 开发者承诺</text>
+
+    <path d="M 200 345 L 200 380" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 720 345 L 720 380" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 200 205 L 200 380" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="4 3" fill="none" marker-end="url(#arr)"/>
+    <text x="170" y="290" fill="#8b949e" font-size="9" font-style="italic">(否分支)</text>
+
+    <rect x="60"  y="385" width="280" height="60" rx="8" fill="#161b22" stroke="#f85149"/>
+    <text x="200" y="408" text-anchor="middle" fill="#c9d1d9" font-size="11">SQL: CAST(amount AS VARCHAR)</text>
+    <text x="200" y="428" text-anchor="middle" fill="#8b949e" font-size="10">数据库内做类型转换</text>
+
+    <rect x="580" y="385" width="280" height="60" rx="8" fill="#161b22" stroke="#d29922"/>
+    <text x="720" y="408" text-anchor="middle" fill="#c9d1d9" font-size="11">SQL: amount (无 CAST)</text>
+    <text x="720" y="428" text-anchor="middle" fill="#8b949e" font-size="10">JDBC 取值后 Java 端处理</text>
+
+    <text x="460" y="465" text-anchor="middle" fill="#8b949e" font-size="11">cast 用于跨类型字段操作 · coerce 用于纯 SQL 模板返回值类型 · convert 用于值对象转换</text>
+  </svg>
+</div>
+<h3>4.6.2 cast 数据库级转换</h3>
+<pre><code class="language-java">Field&lt;String&gt; amountText = ORDERS.AMOUNT.cast(SQLDataType.VARCHAR);
+dsl.select(ORDERS.ID, amountText).from(ORDERS).fetch();
+</code></pre>
+<pre><code class="language-sql">select orders.id, cast(orders.amount as varchar)
+from orders
+</code></pre>
+<pre><code class="language-text">record.get(ORDERS.ID)   = 100        (Long)
+record.get(amountText)  = &quot;129.90&quot;   (String)
+amountText.getDataType().getType() = String.class
+</code></pre>
+<h3>4.6.3 coerce 仅改 Java 泛型</h3>
+<pre><code class="language-java">Field&lt;Object&gt; raw = DSL.field(&quot;metadata-&gt;&gt;'count'&quot;);
+Field&lt;Integer&gt; count = raw.coerce(SQLDataType.INTEGER);
+
+dsl.select(count).from(ORDERS).fetch();
+</code></pre>
+<pre><code class="language-sql">select metadata-&gt;&gt;'count'
+from orders
+</code></pre>
+<p><code>coerce</code> 不在 SQL 中加 <code>CAST</code>,仅把 Java 泛型从 <code>Object</code> 改为 <code>Integer</code>。该机制适用于纯 SQL 模板返回值类型 jOOQ 无法推断的场景。</p>
+<h3>4.6.4 coerce 失败模式</h3>
+<pre><code class="language-log">database value = &quot;many&quot;
+
+org.jooq.exception.DataTypeException: Cannot convert from many (class java.lang.String) to class java.lang.Integer
+Caused by: java.lang.NumberFormatException: For input string: &quot;many&quot;
+</code></pre>
+<p><code>coerce</code> 是开发者承诺类型兼容的机制。若实际值不能转换,jOOQ 在读取阶段抛出 <code>DataTypeException</code>。生产代码应配合 SQL snapshot 测试与运行时断言。</p>
+<h3>4.6.5 三方法对比表</h3>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>Java 类型</th>
+<th>SQL 输出</th>
+<th>转换执行方</th>
+<th>风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>cast(T)</code></td>
+<td>改为 <code>Field&lt;T&gt;</code></td>
+<td><code>CAST(... AS T)</code></td>
+<td>数据库</td>
+<td>SQL 报错</td>
+</tr>
+<tr>
+<td><code>coerce(T)</code></td>
+<td>改为 <code>Field&lt;T&gt;</code></td>
+<td>原样</td>
+<td>jOOQ Java 端</td>
+<td>读取异常</td>
+</tr>
+<tr>
+<td><code>convert(Converter)</code></td>
+<td>改为 <code>Field&lt;U&gt;</code></td>
+<td>原样</td>
+<td>Converter</td>
+<td>Converter 自定义</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>推荐方法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>INT → TEXT 用于拼接</td>
+<td><code>cast</code></td>
+</tr>
+<tr>
+<td>纯 SQL 模板返回值已知</td>
+<td><code>coerce</code></td>
+</tr>
+<tr>
+<td>枚举 / JSON / POJO 转换</td>
+<td><code>convert</code></td>
+</tr>
+<tr>
+<td>字面量类型不匹配</td>
+<td><code>DSL.val(x).cast(...)</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="4.7-陷阱与限制">4.7 陷阱与限制</h2>
+<h3>图 4-7:类型系统陷阱分类</h3>
+<div class="diagram">
+  <div class="diagram-title">图 4-7 · 类型系统陷阱分类 — 4 大类 8 个高频问题</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="350" y="14" width="220" height="48" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="460" y="38" text-anchor="middle" fill="#f85149" font-size="14" font-weight="bold">类型系统陷阱</text>
+    <text x="460" y="55" text-anchor="middle" fill="#c9d1d9" font-size="11">8 个高频问题 · 4 个类别</text>
+
+    <path d="M 380 62 L 130 110" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 430 62 L 360 110" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 490 62 L 580 110" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 540 62 L 800 110" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="40"  y="115" width="200" height="40" rx="8" fill="url(#g-red)"    stroke="#f85149" stroke-width="2"/>
+    <text x="140" y="139" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">类别 1 · 语言机制</text>
+    <rect x="260" y="115" width="200" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="360" y="139" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">类别 2 · 推断失败</text>
+    <rect x="480" y="115" width="200" height="40" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="2"/>
+    <text x="580" y="139" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">类别 3 · 方言差异</text>
+    <rect x="700" y="115" width="200" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="800" y="139" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">类别 4 · 转换类</text>
+
+    <path d="M 100 155 L 80 175"  stroke="#8b949e" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 180 155 L 200 175" stroke="#8b949e" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 320 155 L 300 175" stroke="#8b949e" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 400 155 L 420 175" stroke="#8b949e" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 540 155 L 520 175" stroke="#8b949e" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 620 155 L 640 175" stroke="#8b949e" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 760 155 L 740 175" stroke="#8b949e" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 840 155 L 860 175" stroke="#8b949e" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="20"  y="180" width="120" height="60" rx="6" fill="#161b22" stroke="#f85149"/>
+    <text x="80"  y="200" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">1</text>
+    <text x="80"  y="218" text-anchor="middle" fill="#c9d1d9" font-size="10">泛型擦除</text>
+    <text x="80"  y="232" text-anchor="middle" fill="#c9d1d9" font-size="10">运行期丢失</text>
+
+    <rect x="140" y="180" width="120" height="60" rx="6" fill="#161b22" stroke="#f85149"/>
+    <text x="200" y="200" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">2</text>
+    <text x="200" y="218" text-anchor="middle" fill="#c9d1d9" font-size="10">instanceof</text>
+    <text x="200" y="232" text-anchor="middle" fill="#c9d1d9" font-size="10">不可用</text>
+
+    <rect x="240" y="180" width="120" height="60" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="300" y="200" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">3</text>
+    <text x="300" y="218" text-anchor="middle" fill="#c9d1d9" font-size="10">MULTISET</text>
+    <text x="300" y="232" text-anchor="middle" fill="#c9d1d9" font-size="10">嵌套推断</text>
+
+    <rect x="360" y="180" width="120" height="60" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="420" y="200" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">4</text>
+    <text x="420" y="218" text-anchor="middle" fill="#c9d1d9" font-size="10">var 与显式</text>
+    <text x="420" y="232" text-anchor="middle" fill="#c9d1d9" font-size="10">泛型冲突</text>
+
+    <rect x="460" y="180" width="120" height="60" rx="6" fill="#161b22" stroke="#58a6ff"/>
+    <text x="520" y="200" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">5</text>
+    <text x="520" y="218" text-anchor="middle" fill="#c9d1d9" font-size="10">JSONB 跨方言</text>
+    <text x="520" y="232" text-anchor="middle" fill="#c9d1d9" font-size="10">行为差异</text>
+
+    <rect x="580" y="180" width="120" height="60" rx="6" fill="#161b22" stroke="#58a6ff"/>
+    <text x="640" y="200" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">6</text>
+    <text x="640" y="218" text-anchor="middle" fill="#c9d1d9" font-size="10">UUID 模拟</text>
+    <text x="640" y="232" text-anchor="middle" fill="#c9d1d9" font-size="10">与原生差异</text>
+
+    <rect x="680" y="180" width="120" height="60" rx="6" fill="#161b22" stroke="#bc8cff"/>
+    <text x="740" y="200" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">7</text>
+    <text x="740" y="218" text-anchor="middle" fill="#c9d1d9" font-size="10">coerce 类型</text>
+    <text x="740" y="232" text-anchor="middle" fill="#c9d1d9" font-size="10">不匹配</text>
+
+    <rect x="800" y="180" width="120" height="60" rx="6" fill="#161b22" stroke="#bc8cff"/>
+    <text x="860" y="200" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">8</text>
+    <text x="860" y="218" text-anchor="middle" fill="#c9d1d9" font-size="10">数组类型</text>
+    <text x="860" y="232" text-anchor="middle" fill="#c9d1d9" font-size="10">仅 PG 原生</text>
+
+    <rect x="40" y="265" width="840" height="100" rx="8" fill="#0d1117" stroke="#30363d"/>
+    <text x="60" y="285" fill="#8b949e" font-size="11">严重度:</text>
+    <text x="60" y="305" fill="#f85149" font-size="11" font-weight="bold">高:1 / 2</text>
+    <text x="160" y="305" fill="#c9d1d9" font-size="11">— 运行期类型判断 / instanceof 必须改写为 getDataType() 路径</text>
+    <text x="60" y="325" fill="#d29922" font-size="11" font-weight="bold">中:3 / 4</text>
+    <text x="160" y="325" fill="#c9d1d9" font-size="11">— 编译期类型推断失败,需显式类型注解或 convertFrom</text>
+    <text x="60" y="345" fill="#58a6ff" font-size="11" font-weight="bold">低:5 / 6 / 7 / 8</text>
+    <text x="195" y="345" fill="#c9d1d9" font-size="11">— 方言相关,需 Testcontainers 覆盖目标数据库</text>
+  </svg>
+</div>
+<h3>表 4-7:陷阱明细</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">#</th>
+<th>陷阱</th>
+<th>症状</th>
+<th>根因</th>
+<th>修复</th>
+<th>监控指标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">1</td>
+<td>泛型擦除</td>
+<td>运行时类型丢失</td>
+<td>Java 语言机制</td>
+<td><code>field.getDataType().getType()</code></td>
+<td>单元测试</td>
+</tr>
+<tr>
+<td style="text-align: right;">2</td>
+<td><code>instanceof</code> 不可用</td>
+<td>编译失败</td>
+<td>同上</td>
+<td>间接判断</td>
+<td>编译日志</td>
+</tr>
+<tr>
+<td style="text-align: right;">3</td>
+<td>MULTISET 嵌套推断</td>
+<td>编译报"无法推断"</td>
+<td>深层嵌套</td>
+<td><code>.convertFrom(...)</code> 显式</td>
+<td>编译日志</td>
+</tr>
+<tr>
+<td style="text-align: right;">4</td>
+<td>var 与显式泛型</td>
+<td>编译错乱</td>
+<td>Java 类型推断</td>
+<td>显式声明</td>
+<td>编译日志</td>
+</tr>
+<tr>
+<td style="text-align: right;">5</td>
+<td>JSONB 跨方言</td>
+<td>H2 通过 PG 失败</td>
+<td>操作符差异</td>
+<td>Testcontainers</td>
+<td>跨方言测试</td>
+</tr>
+<tr>
+<td style="text-align: right;">6</td>
+<td>UUID 模拟</td>
+<td>性能差</td>
+<td>非原生支持</td>
+<td>原生 BLOB / 枚举</td>
+<td>性能指标</td>
+</tr>
+<tr>
+<td style="text-align: right;">7</td>
+<td>coerce 不匹配</td>
+<td>读取异常</td>
+<td>开发者承诺错</td>
+<td>SQL snapshot</td>
+<td>单元测试</td>
+</tr>
+<tr>
+<td style="text-align: right;">8</td>
+<td>数组类型</td>
+<td>异常</td>
+<td>仅 PG 原生</td>
+<td>JSON / 逗号字符串</td>
+<td>跨方言测试</td>
+</tr>
+</tbody>
+</table>
+<h3>泛型擦除的工程对策</h3>
+<pre><code class="language-java">// 不可编译
+// if (field instanceof Field&lt;String&gt;) { ... }
+
+// 正确做法
+if (field.getDataType().getType() == String.class) {
+    Field&lt;String&gt; stringField = (Field&lt;String&gt;) field;
+    // 此处 cast 安全
+}
+</code></pre>
+<pre><code class="language-text">field.getDataType().getType() = java.lang.String
+field.getDataType().getTypeName() = varchar
+safe branch = cast to Field&lt;String&gt;
+</code></pre>
+<h3>MULTISET 推断辅助</h3>
+<pre><code class="language-java">Field&lt;Result&lt;Record2&lt;String, Integer&gt;&gt;&gt; orders = multiset(
+    select(ORDERS.STATUS, ORDERS.ID)
+    .from(ORDERS)
+    .where(ORDERS.CUSTOMER_ID.eq(CUSTOMERS.ID)));
+
+var authorsWithOrders = dsl.select(
+    CUSTOMERS.NAME,
+    multiset(
+        select(ORDERS.ID, ORDERS.AMOUNT)
+        .from(ORDERS)
+        .where(ORDERS.CUSTOMER_ID.eq(CUSTOMERS.ID)))
+        .convertFrom(r -&gt; r.map(mapping(OrderDto::new))))
+    .from(CUSTOMERS)
+    .fetch();
+</code></pre>
+<h3>方言差异速查</h3>
+<table>
+<thead>
+<tr>
+<th>方言</th>
+<th>JSON 操作</th>
+<th>数组</th>
+<th>UUID</th>
+<th>Converter 影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PostgreSQL</td>
+<td>完整 JSONB</td>
+<td>原生</td>
+<td>原生</td>
+<td>透明</td>
+</tr>
+<tr>
+<td>MySQL</td>
+<td><code>JSON_EXTRACT</code></td>
+<td>不支持</td>
+<td>CHAR(36)</td>
+<td>函数不同</td>
+</tr>
+<tr>
+<td>Oracle</td>
+<td>JSON_TABLE</td>
+<td>不支持</td>
+<td>RAW(16)</td>
+<td>转换需 Binding</td>
+</tr>
+<tr>
+<td>SQL Server</td>
+<td>JSON_VALUE</td>
+<td>不支持</td>
+<td>UNIQUEIDENTIFIER</td>
+<td>字面量格式不同</td>
+</tr>
+<tr>
+<td>H2</td>
+<td>字符串退化</td>
+<td>不支持</td>
+<td>UUID 类型</td>
+<td>测试受限</td>
+</tr>
+</tbody>
+</table>
+<h2 id="4.8-sql-snapshot-守护">4.8 SQL Snapshot 守护</h2>
+<h3>4.8.1 类型 + SQL 联合断言</h3>
+<pre><code class="language-java">@Test
+void status_filter_keeps_typed_bind() {
+    var query = dsl.select(ORDERS.ID, ORDERS.STATUS, ORDERS.AMOUNT)
+        .from(ORDERS)
+        .where(ORDERS.STATUS.eq(&quot;PAID&quot;)
+            .and(ORDERS.AMOUNT.gt(new BigDecimal(&quot;100.00&quot;))));
+
+    assertThat(query.getSQL())
+        .isEqualToNormalizingWhitespace(&quot;&quot;&quot;
+            select orders.id, orders.status, orders.amount
+            from orders
+            where (orders.status = ? and orders.amount &gt; ?)
+            &quot;&quot;&quot;);
+
+    assertThat(query.getBindValues())
+        .containsExactly(&quot;PAID&quot;, new BigDecimal(&quot;100.00&quot;));
+}
+</code></pre>
+<h3>4.8.2 Converter 路径断言</h3>
+<pre><code class="language-java">@Test
+void status_converter_round_trips() {
+    Field&lt;OrderStatus&gt; typed = ORDERS.STATUS.convert(
+        Converter.ofNullable(
+            String.class, OrderStatus.class,
+            OrderStatus::valueOf,
+            OrderStatus::name));
+
+    var query = dsl.select(ORDERS.ID, typed)
+        .from(ORDERS)
+        .where(typed.eq(OrderStatus.PAID));
+
+    assertThat(query.getBindValues())
+        .containsExactly(OrderStatus.PAID);
+
+    assertThat(query.getSQL())
+        .contains(&quot;orders.status = ?&quot;);
+}
+</code></pre>
+<h3>4.8.3 cast 与 coerce 边界测试</h3>
+<table>
+<thead>
+<tr>
+<th>测试目标</th>
+<th>断言</th>
+<th>频率</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>cast</code> 输出含 CAST</td>
+<td><code>query.getSQL().contains("cast")</code></td>
+<td>升级方言时</td>
+</tr>
+<tr>
+<td><code>coerce</code> 不引入 CAST</td>
+<td><code>query.getSQL()</code> 无 CAST</td>
+<td>同上</td>
+</tr>
+<tr>
+<td>Converter 不改 SQL</td>
+<td><code>query.getSQL()</code> 与基线一致</td>
+<td>同上</td>
+</tr>
+<tr>
+<td>类型回退默认值</td>
+<td><code>Converter</code> catch 路径</td>
+<td>数据迁移期</td>
+</tr>
+</tbody>
+</table>
+<h2 id="4.9-源码深潜">4.9 源码深潜</h2>
+<h3>图 4-9:类型系统组件协作</h3>
+<div class="diagram">
+  <div class="diagram-title">图 4-9 · 类型系统组件协作 — 从 codegen 到 PreparedStatement 的完整链路</div>
+  <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20"  y="40" width="180" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="110" y="64" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">① 生成 Orders.java</text>
+    <text x="110" y="82" text-anchor="middle" fill="#c9d1d9" font-size="11">codegen 阶段</text>
+    <text x="110" y="96" text-anchor="middle" fill="#8b949e" font-size="10">javac 编译</text>
+
+    <path d="M 200 70 L 240 70" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="240" y="40" width="220" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="350" y="64" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">② TableField&lt;R, BigDecimal&gt;</text>
+    <text x="350" y="82" text-anchor="middle" fill="#c9d1d9" font-size="11">ORDERS.AMOUNT</text>
+    <text x="350" y="96" text-anchor="middle" fill="#8b949e" font-size="10">静态字段</text>
+
+    <path d="M 460 70 L 500 70" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="500" y="40" width="220" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="610" y="64" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">③ Field&lt;T&gt;</text>
+    <text x="610" y="82" text-anchor="middle" fill="#c9d1d9" font-size="11">eq / gt / cast / coerce / convert</text>
+    <text x="610" y="96" text-anchor="middle" fill="#8b949e" font-size="10">类型安全 API 入口</text>
+
+    <path d="M 610 100 L 610 140" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 580 100 L 250 140" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="500" y="145" width="220" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="610" y="169" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">④ DataType&lt;T&gt;</text>
+    <text x="610" y="187" text-anchor="middle" fill="#c9d1d9" font-size="11">SQLDataType / DefaultDataType</text>
+    <text x="610" y="201" text-anchor="middle" fill="#8b949e" font-size="10">类型元信息</text>
+
+    <rect x="130" y="145" width="220" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="240" y="169" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">⑤ RenderContext</text>
+    <text x="240" y="187" text-anchor="middle" fill="#c9d1d9" font-size="11">方言 SQL + 类型表达式</text>
+    <text x="240" y="201" text-anchor="middle" fill="#8b949e" font-size="10">遍历 AST</text>
+
+    <path d="M 610 205 L 610 240" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="500" y="245" width="220" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="610" y="269" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">⑥ Converter / Binding</text>
+    <text x="610" y="287" text-anchor="middle" fill="#c9d1d9" font-size="11">Java 视图 ↔ JDBC</text>
+    <text x="610" y="301" text-anchor="middle" fill="#8b949e" font-size="10">值对象 / 协议级</text>
+
+    <path d="M 610 305 L 610 345" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="500" y="350" width="220" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="610" y="374" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">⑦ BindContext</text>
+    <text x="610" y="392" text-anchor="middle" fill="#c9d1d9" font-size="11">PreparedStatement.setXxx</text>
+    <text x="610" y="406" text-anchor="middle" fill="#8b949e" font-size="10">协议级写入</text>
+
+    <path d="M 240 205 L 240 350" stroke="#58a6ff" stroke-width="1.5" fill="none"/>
+    <path d="M 240 350 L 800 350" stroke="#58a6ff" stroke-width="1.5" fill="none"/>
+    <path d="M 720 380 L 760 380" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="770" y="350" width="130" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="835" y="374" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">⑧ 运行时</text>
+    <text x="835" y="392" text-anchor="middle" fill="#c9d1d9" font-size="11">SQL + bind</text>
+    <text x="835" y="406" text-anchor="middle" fill="#8b949e" font-size="10">→ 数据库</text>
+
+    <text x="460" y="440" text-anchor="middle" fill="#8b949e" font-size="11">三层视图:① TableField=codegen 产物 · ② Field&lt;T&gt;=类型安全 API · ③ DataType+Converter+Binding=底层执行</text>
+  </svg>
+</div>
+<h3>表 4-9:核心源码入口</h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>org.jooq.Field</code></td>
+<td>列接口</td>
+</tr>
+<tr>
+<td><code>org.jooq.DataType</code></td>
+<td>类型元信息</td>
+</tr>
+<tr>
+<td><code>org.jooq.Converter</code></td>
+<td>Java 端转换</td>
+</tr>
+<tr>
+<td><code>org.jooq.Binding</code></td>
+<td>JDBC 协议级</td>
+</tr>
+<tr>
+<td><code>org.jooq.impl.AbstractField</code></td>
+<td>Field 抽象实现</td>
+</tr>
+<tr>
+<td><code>org.jooq.impl.DefaultDataType</code></td>
+<td>DataType 实现</td>
+</tr>
+<tr>
+<td><code>org.jooq.impl.ConvertedDataType</code></td>
+<td>Converter 装饰器</td>
+</tr>
+<tr>
+<td><code>org.jooq.impl.Val</code></td>
+<td>字面量实现</td>
+</tr>
+</tbody>
+</table>
+<h3>设计取舍</h3>
+<p><strong>取舍 1:Field<T> 泛型与运行期擦除</strong></p>
+<p>Java 泛型在 <code>javac</code> 后被擦除,运行期无法保留 <code>T</code>。jOOQ 的类型安全完全发生在编译期,运行期通过 <code>DataType&lt;T&gt;</code> 间接保留类型元信息。代价是运行期类型判断必须经 <code>getDataType().getType()</code>。</p>
+<p><strong>取舍 2:Converter 与 Binding 分层</strong></p>
+<p>Converter 适用于值对象转换(枚举、UUID 字符串),不感知 JDBC。Binding 适用于 JDBC 协议级控制(JSON、自定义二进制),需实现 <code>set / get / register</code> 等方法。日常场景 Converter 足够,Binding 仅用于复杂类型映射。</p>
+<p><strong>取舍 3:cast 与 coerce 二选一</strong></p>
+<p><code>cast</code> 把转换责任交给数据库,代价是 SQL 文本变化与方言差异。<code>coerce</code> 把转换责任交给 jOOQ Java 端,代价是开发者承诺类型兼容。两者互补:数据库能直接转的用 <code>cast</code>,jOOQ 已知类型用 <code>coerce</code>,两者都不便用 <code>convert + Converter</code>。</p>
+<div class="chapter-summary">
+<h2>4.10 本章要点</h2>
+
+<table>
+<thead>
+<tr>
+<th>要点</th>
+<th>验证依据</th>
+<th>易错点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Field<T> 的 T 决定可调用方法</td>
+<td><code>eq / gt / lt</code> 重载</td>
+<td>错传字面量</td>
+</tr>
+<tr>
+<td>codegen 锁定 Java 类型</td>
+<td><code>TableField&lt;R, T&gt;</code></td>
+<td>类型不一致</td>
+</tr>
+<tr>
+<td>DataType 不可变</td>
+<td><code>nullable / length / precision</code></td>
+<td>直接修改</td>
+</tr>
+<tr>
+<td>Converter 不改 SQL</td>
+<td><code>getDataType().getType()</code></td>
+<td>期望影响 SQL</td>
+</tr>
+<tr>
+<td>cast 影响 SQL 文本</td>
+<td><code>getSQL().contains("cast")</code></td>
+<td>误用 coerce</td>
+</tr>
+<tr>
+<td>coerce 是承诺机制</td>
+<td>读取阶段异常</td>
+<td>类型不兼容</td>
+</tr>
+<tr>
+<td>Nullability 进入 DataType</td>
+<td><code>nullable()</code></td>
+<td>忽略空值</td>
+</tr>
+<tr>
+<td>方言差异需测试覆盖</td>
+<td>Testcontainers</td>
+<td>仅本地 H2 测试</td>
+</tr>
+</tbody>
+</table>
+<p>最小回归命令:</p>
+<pre><code class="language-text">mvn -q test -Dtest=TypeSystem*Test
+</code></pre>
+<pre><code class="language-log">[INFO] Tests run: 12, Failures: 0
+[INFO] BUILD SUCCESS
+</code></pre>
+<hr>
+<p>下一章把类型系统应用于 SELECT 查询全场景:<code>Field&lt;T&gt;</code> 在 WHERE / JOIN / GROUP BY / ORDER BY / 子查询 / 窗口函数中如何全链路保持类型一致,以及 jOOQ 在多表关联与聚合下的渲染策略。</p>
+</div>
+
+
+<div class="chapter-nav">
+  <a href="ch03-dslcontext.html">&larr; ch03-dslcontext · 第 3 章 · DSLContext 与 Configuration</a>
+  <a href="ch05-select.html">ch05-select · 第 5 章 · SELECT 查询构建 &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 jOOQ &middot; 第 4 章 · 类型系统:Field&lt;T&gt; 与 DataType</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+</body>
+</html>

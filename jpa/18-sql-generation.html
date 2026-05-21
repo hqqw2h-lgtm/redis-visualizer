@@ -1,0 +1,753 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.18 SQL 生成与执行计划 — 图解 JPA &amp; Hibernate</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📘 图解 JPA &amp; Hibernate</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="17-hibernate-architecture.html">上一章</a>
+  <a href="19-connection-pool.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s18-0">18.0 SQL 管线</a>
+  <a href="#s18-1">18.1 公共示例 DDL</a>
+  <a href="#s18-2">18.2 SQM 阶段</a>
+  <a href="#s18-3">18.3 SQL AST</a>
+  <a href="#s18-4">18.4 Dialect 渲染</a>
+  <a href="#s18-5">18.5 JDBC bind 日志</a>
+  <a href="#s18-6">18.6 IN padding</a>
+  <a href="#s18-7">18.7 性能场景</a>
+  <a href="#s18-8">18.8 监控回归</a>
+  <a href="#s18-9">18.9 设计取舍</a>
+  <a href="#s18-10">18.10 陷阱</a>
+  <a href="#s18-summary">18.11 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 18 章 · SQL 生成与执行计划</h1>
+<p class="subtitle">JPQL → SQM → SQL AST → Dialect → JDBC · IN padding · EXPLAIN · 5 个性能场景</p>
+
+<div class="chapter-intro">
+  <p class="lead">应用代码描述的是 JPQL、Criteria 或 Repository 方法。数据库收到的是带 <code>?</code> 占位符的方言 SQL。两者之间存在一条<strong>多阶段翻译管线</strong>:HQL 解析、SQM 构建、SQM-to-SQL-AST 转换、Dialect 渲染、JDBC 绑定与执行。</p>
+  <p>本章按管线顺序拆解 Hibernate 6 的实现,给出每一阶段的可观察输入输出、源码入口、典型陷阱与修复对照。重点放在三个层面:① SQM 与 SQL AST 的语义边界 ② Dialect 对分页、锁、函数、布尔、引号的渲染分叉 ③ JDBC 绑定与执行计划的性能权衡。</p>
+  <ul class="will-learn">
+    <li>SQL 生成 5 阶段管线:HQL Parser → SQM → SQL AST → Dialect → JDBC bind,每阶段的输入输出</li>
+    <li>SQM(Semantic Query Model)的实体级语义树 + QueryInterpretationCache 缓存机制</li>
+    <li>SQL AST 的关系级表现:TableGroup / ColumnReference / Predicate</li>
+    <li>4 大数据库方言差异:分页 / 锁 / 字符串拼接 / 自增 / 布尔 / 引号</li>
+    <li>JDBC bind 日志配置(<code>jdbc.bind=TRACE</code>)+ datasource-proxy 显示真实参数</li>
+    <li>IN padding 让 SQL 形状从 N 收敛到 log2(N),稳定 plan cache</li>
+    <li>5 个生产性能场景反例 + 修复 + 量化:N+1 / fetch+分页退化 / 外键无索引 / cascade ALL / OSIV</li>
+    <li>SQL 快照测试 + SQL 计数测试 + bind 数量测试 + 方言差异测试</li>
+    <li>10 大陷阱(IN 撑爆 / fetch+分页 / show_sql / dialect 错检 / 枚举映射 / N+1 / 计划缓存 / 隐式 join / Inspector 改写 SQL)</li>
+    <li>核心源码 9 大入口:StandardHqlTranslator / SqmToSqlAstConverter / SqlAstTranslator / JdbcSelectExecutor</li>
+  </ul>
+  <p class="prereq">前置知识:JPQL / Criteria API 基础;EXPLAIN ANALYZE 读图;PostgreSQL 索引扫描类型;PreparedStatement 与 JDBC bind 机制;第 11/12 章的 fetch 策略。</p>
+</div>
+
+<h2 id="s18-0">18.0 SQL 生成端到端管线</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-0-1 · 5 阶段翻译管线 — 从 JPQL 字符串到数据库</div>
+  <svg viewBox="0 0 920 330" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="20"  y="40"  width="180" height="48" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="110" y="60"  text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">JPQL 字符串</text>
+    <text x="110" y="78"  text-anchor="middle" fill="#c9d1d9" font-size="10">select o from Order o</text>
+
+    <rect x="20"  y="100" width="180" height="48" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="110" y="120" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">Criteria API</text>
+    <text x="110" y="138" text-anchor="middle" fill="#c9d1d9" font-size="10">cb.createQuery</text>
+
+    <rect x="20"  y="160" width="180" height="48" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="110" y="180" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">Repository 方法</text>
+    <text x="110" y="198" text-anchor="middle" fill="#c9d1d9" font-size="10">findByStatus</text>
+
+    <rect x="240" y="100" width="160" height="68" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="320" y="128" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">SQM</text>
+    <text x="320" y="150" text-anchor="middle" fill="#c9d1d9" font-size="11">语义查询模型</text>
+
+    <rect x="430" y="100" width="160" height="68" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="510" y="128" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">SQL AST</text>
+    <text x="510" y="150" text-anchor="middle" fill="#c9d1d9" font-size="11">表/列/Join</text>
+
+    <rect x="620" y="100" width="160" height="68" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="700" y="128" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">Dialect</text>
+    <text x="700" y="150" text-anchor="middle" fill="#c9d1d9" font-size="11">PG/MySQL/Oracle</text>
+
+    <rect x="810" y="100" width="100" height="68" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="860" y="128" text-anchor="middle" fill="#f85149" font-size="13" font-weight="bold">JDBC</text>
+    <text x="860" y="150" text-anchor="middle" fill="#c9d1d9" font-size="11">PS+绑定</text>
+
+    <rect x="240" y="208" width="160" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="320" y="232" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">QueryInterpretation</text>
+
+    <rect x="430" y="208" width="160" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="510" y="232" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">SelectQueryPlan</text>
+
+    <rect x="360" y="278" width="180" height="46" rx="6" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="450" y="304" text-anchor="middle" fill="#f85149" font-size="13" font-weight="bold">数据库</text>
+
+    <path d="M200,64  L240,120" stroke="#bc8cff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M200,124 L240,134" stroke="#bc8cff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M200,184 L240,150" stroke="#bc8cff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M400,134 L430,134" stroke="#58a6ff" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <path d="M590,134 L620,134" stroke="#d29922" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <path d="M780,134 L810,134" stroke="#d29922" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <path d="M320,168 L320,208" stroke="#3fb950" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M510,168 L510,208" stroke="#3fb950" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M860,168 L460,278" stroke="#f85149" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<table>
+<thead><tr><th>阶段</th><th>输入</th><th>输出</th><th>排查的典型问题</th></tr></thead>
+<tbody>
+<tr><td>HQL 解析</td><td>JPQL 字符串</td><td>SQM 树</td><td>属性名拼写、参数名错、语法错误</td></tr>
+<tr><td>Criteria 构建</td><td>CriteriaBuilder API</td><td>SQM 树</td><td>类型不匹配、隐式 join、动态条件遗漏</td></tr>
+<tr><td>SQM</td><td>实体语义树</td><td>SQL AST</td><td>多态、继承、fetch join、子查询</td></tr>
+<tr><td>SQL AST</td><td>表 / 列 / 谓词</td><td>方言 SQL</td><td>分页、锁模式、函数选型</td></tr>
+<tr><td>Dialect</td><td>SQL AST + 数据库版本</td><td>SQL 字符串</td><td>同一 AST 在不同数据库语法分叉</td></tr>
+<tr><td>JDBC bind</td><td>SQL + 实参</td><td>PreparedStatement</td><td>bind 数量、类型、顺序、绑定失败</td></tr>
+</tbody>
+</table>
+
+<h2 id="s18-1">18.1 公共示例 DDL</h2>
+
+<pre><code class="language-sql">CREATE TABLE customers (
+    id          BIGSERIAL    NOT NULL,
+    email       VARCHAR(180) NOT NULL,
+    name        VARCHAR(120) NOT NULL,
+    region      VARCHAR(40)  NOT NULL,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    CONSTRAINT pk_customers PRIMARY KEY (id),
+    CONSTRAINT uk_customers_email UNIQUE (email)
+);
+CREATE INDEX idx_customers_region ON customers (region);
+
+CREATE TABLE orders (
+    id            BIGSERIAL      NOT NULL,
+    customer_id   BIGINT         NOT NULL,
+    status        VARCHAR(20)    NOT NULL,
+    total_amount  NUMERIC(14,2)  NOT NULL,
+    created_at    TIMESTAMPTZ    NOT NULL DEFAULT now(),
+    version       BIGINT         NOT NULL DEFAULT 0,
+    CONSTRAINT pk_orders PRIMARY KEY (id),
+    CONSTRAINT fk_orders_customer FOREIGN KEY (customer_id)
+        REFERENCES customers (id) ON DELETE RESTRICT,
+    CONSTRAINT ck_orders_status CHECK (status IN ('NEW','PAID','SHIPPED','CANCELLED'))
+);
+CREATE INDEX idx_orders_status_created ON orders (status, created_at DESC);
+CREATE INDEX idx_orders_customer ON orders (customer_id);
+
+CREATE TABLE order_items (
+    id          BIGSERIAL      NOT NULL,
+    order_id    BIGINT         NOT NULL,
+    product_id  BIGINT         NOT NULL,
+    quantity    INTEGER        NOT NULL,
+    unit_price  NUMERIC(14,2)  NOT NULL,
+    CONSTRAINT pk_order_items PRIMARY KEY (id),
+    CONSTRAINT fk_items_order FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE CASCADE,
+    CONSTRAINT fk_items_product FOREIGN KEY (product_id) REFERENCES products (id) ON DELETE RESTRICT,
+    CONSTRAINT ck_items_qty CHECK (quantity &gt; 0)
+);
+CREATE INDEX idx_items_order ON order_items (order_id);
+CREATE INDEX idx_items_product ON order_items (product_id);</code></pre>
+
+<p><code>idx_orders_status_created</code> 同时覆盖 status 等值与 created_at 排序,是后续性能场景中"分页 + 状态过滤"的核心。</p>
+
+<h2 id="s18-2">18.2 SQM:JPQL 与 Criteria 的共同语义层</h2>
+
+<table>
+<thead><tr><th>节点</th><th>职责</th><th>对应 JPQL 片段</th></tr></thead>
+<tbody>
+<tr><td>SqmSelectStatement</td><td>顶层 select</td><td>整条 select</td></tr>
+<tr><td>SqmQuerySpec</td><td>单 select 块</td><td>select / from / where / order</td></tr>
+<tr><td>SqmRoot</td><td>主体实体</td><td>from Order o</td></tr>
+<tr><td>SqmAttributeJoin</td><td>属性 join</td><td>join o.customer c</td></tr>
+<tr><td>SqmComparisonPredicate</td><td>比较</td><td>o.status = :status</td></tr>
+<tr><td>SqmInListPredicate</td><td>IN</td><td>p.id in :ids</td></tr>
+<tr><td>SqmParameter</td><td>占位</td><td>:status</td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-java">TypedQuery&lt;Order&gt; query = em.createQuery("""
+        select o
+        from Order o
+        join fetch o.customer c
+        where o.status = :status
+          and c.region = :region
+        order by o.createdAt desc
+        """, Order.class);
+query.setParameter("status", OrderStatus.PAID);
+query.setParameter("region", "CN-EAST");
+query.setMaxResults(20);
+List&lt;Order&gt; result = query.getResultList();</code></pre>
+
+<pre><code>SqmSelectStatement
+├── SqmQuerySpec
+│   ├── SqmFromClause
+│   │   └── SqmRoot(Order as o)
+│   │       └── SqmAttributeJoin(o.customer as c, fetch=true)
+│   ├── SqmWhereClause
+│   │   ├── SqmComparisonPredicate(o.status = ?status)
+│   │   └── SqmComparisonPredicate(c.region = ?region)
+│   └── SqmOrderByClause
+│       └── SqmSortSpecification(o.createdAt DESC)
+└── limit = 20</code></pre>
+
+<div class="key-insight"><p>SQM 仍是<strong>实体世界</strong>。它知道 <code>Order.customer.email</code>,但不知道物理列名是 <code>customer_id</code> 还是 <code>email_address</code>。物理表/列映射要等到 SQM 转 SQL AST 时才会发生。</p></div>
+
+<h2 id="s18-3">18.3 SQL AST:从实体路径到表、列、Join</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-3-1 · SQM → SQL AST 翻译 — 实体路径替换为表列引用</div>
+  <svg viewBox="0 0 920 170" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="20"  y="50" width="230" height="68" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="135" y="78" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">SQM 节点</text>
+    <text x="135" y="100" text-anchor="middle" fill="#c9d1d9" font-size="11">o.customer.email = :email</text>
+
+    <rect x="290" y="50" width="220" height="68" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="400" y="78" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">SqmToSqlAstConverter</text>
+    <text x="400" y="100" text-anchor="middle" fill="#c9d1d9" font-size="11">读 mapping metamodel</text>
+
+    <rect x="540" y="50" width="180" height="68" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="630" y="78" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">SQL AST</text>
+    <text x="630" y="100" text-anchor="middle" fill="#c9d1d9" font-size="11">TableGroup + Column</text>
+
+    <rect x="750" y="50" width="150" height="68" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="825" y="78" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">SQL 字符串</text>
+    <text x="825" y="100" text-anchor="middle" fill="#c9d1d9" font-size="11">join customers c1_0</text>
+
+    <path d="M250,84 L290,84" stroke="#58a6ff" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <path d="M510,84 L540,84" stroke="#bc8cff" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <path d="M720,84 L750,84" stroke="#d29922" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<pre><code>SelectStatement
+├── QuerySpec
+│   ├── SelectClause
+│   │   ├── ColumnReference(orders.id)
+│   │   ├── ColumnReference(orders.status)
+│   │   ├── ColumnReference(orders.total_amount)
+│   │   ├── ColumnReference(customers.id)
+│   │   ├── ColumnReference(customers.email)
+│   │   └── ColumnReference(customers.region)
+│   ├── FromClause
+│   │   └── TableGroup(orders o1_0)
+│   │       └── TableGroupJoin(customers c1_0,
+│   │              ON c1_0.id = o1_0.customer_id)
+│   ├── WhereClause
+│   │   ├── Predicate(o1_0.status = ?)
+│   │   └── Predicate(c1_0.region = ?)
+│   └── OrderByClause
+│       └── SortSpecification(o1_0.created_at DESC)
+└── Limit(rowCount=?, offset=null)</code></pre>
+
+<table>
+<thead><tr><th>JPQL 改动</th><th>AST 变化</th><th>最终 SQL 体现</th></tr></thead>
+<tbody>
+<tr><td>增加 <code>join o.customer</code></td><td>多一个 TableGroupJoin</td><td><code>join customers ...</code></td></tr>
+<tr><td>增加 <code>left join fetch o.items</code></td><td>多一个 collection fetch</td><td>行膨胀,分页可能内存执行</td></tr>
+<tr><td>隐式 <code>where o.customer.email = :e</code></td><td>AST 自动补 join</td><td>多余 join 出现</td></tr>
+<tr><td><code>select new dto(...)</code></td><td>SelectClause 列变少</td><td>不再 select entity 全列</td></tr>
+<tr><td>子查询 <code>where exists (...)</code></td><td>嵌套 QuerySpec</td><td><code>exists (select 1 ...)</code></td></tr>
+</tbody>
+</table>
+
+<h2 id="s18-4">18.4 Dialect:同一 SQL AST 渲染不同 SQL</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-4-1 · 方言分叉 — 同一 AST 在 4 个数据库的渲染</div>
+  <svg viewBox="0 0 920 290" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="280" y="20" width="360" height="60" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="460" y="44" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">SQL AST</text>
+    <text x="460" y="64" text-anchor="middle" fill="#c9d1d9" font-size="11">select * from product order by id offset 20 limit 10</text>
+
+    <rect x="20"  y="120" width="200" height="44" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="120" y="146" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">PostgreSQLDialect</text>
+
+    <rect x="240" y="120" width="200" height="44" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="340" y="146" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">MySQLDialect</text>
+
+    <rect x="460" y="120" width="200" height="44" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="560" y="146" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">OracleDialect</text>
+
+    <rect x="680" y="120" width="220" height="44" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="790" y="146" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">SQLServerDialect</text>
+
+    <rect x="10"  y="208" width="220" height="68" rx="6" fill="#0d3a22" stroke="#3fb950"/>
+    <text x="120" y="232" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">offset ? rows</text>
+    <text x="120" y="252" text-anchor="middle" fill="#c9d1d9" font-size="11">fetch first ? rows only</text>
+
+    <rect x="240" y="208" width="200" height="68" rx="6" fill="#0d3a22" stroke="#3fb950"/>
+    <text x="340" y="244" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">limit ? offset ?</text>
+
+    <rect x="460" y="208" width="200" height="68" rx="6" fill="#0d3a22" stroke="#3fb950"/>
+    <text x="560" y="232" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">offset ? rows</text>
+    <text x="560" y="252" text-anchor="middle" fill="#c9d1d9" font-size="11">fetch next ? rows only</text>
+
+    <rect x="680" y="208" width="220" height="68" rx="6" fill="#0d3a22" stroke="#3fb950"/>
+    <text x="790" y="232" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">offset ? rows</text>
+    <text x="790" y="252" text-anchor="middle" fill="#c9d1d9" font-size="11">fetch next ? rows only</text>
+
+    <path d="M460,80 L120,120" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,80 L340,120" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,80 L560,120" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,80 L790,120" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M120,164 L120,208" stroke="#3fb950" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M340,164 L340,208" stroke="#3fb950" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M560,164 L560,208" stroke="#3fb950" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M790,164 L790,208" stroke="#3fb950" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<table>
+<thead><tr><th>特性</th><th>PostgreSQL</th><th>MySQL</th><th>Oracle</th><th>SQL Server</th></tr></thead>
+<tbody>
+<tr><td>分页</td><td>OFFSET ROWS FETCH FIRST</td><td>LIMIT n OFFSET m</td><td>OFFSET FETCH NEXT</td><td>OFFSET FETCH NEXT</td></tr>
+<tr><td>锁 NOWAIT</td><td>FOR UPDATE NOWAIT</td><td>FOR UPDATE NOWAIT</td><td>FOR UPDATE NOWAIT</td><td>WITH (UPDLOCK, NOWAIT)</td></tr>
+<tr><td>锁 SKIP LOCKED</td><td>FOR UPDATE SKIP LOCKED</td><td>FOR UPDATE SKIP LOCKED</td><td>FOR UPDATE SKIP LOCKED</td><td>READPAST</td></tr>
+<tr><td>布尔字面量</td><td>TRUE / FALSE</td><td>1 / 0</td><td>1 / 0</td><td>1 / 0</td></tr>
+<tr><td>字符串拼接</td><td><code>||</code></td><td>CONCAT()</td><td><code>||</code></td><td><code>+</code></td></tr>
+<tr><td>自增 ID</td><td>SEQUENCE / IDENTITY</td><td>AUTO_INCREMENT</td><td>SEQUENCE</td><td>IDENTITY</td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-sql">-- PostgreSQL
+select p1_0.id, p1_0.sku, p1_0.name, p1_0.list_price
+from products p1_0
+order by p1_0.id
+offset ? rows fetch first ? rows only;
+-- bind[1] INTEGER &lt;- 20, bind[2] INTEGER &lt;- 10
+
+-- MySQL
+select p1_0.id, p1_0.sku, p1_0.name, p1_0.list_price
+from products p1_0
+order by p1_0.id
+limit ?, ?;
+-- bind[1] INTEGER &lt;- 20, bind[2] INTEGER &lt;- 10</code></pre>
+
+<div class="warning"><p><strong>bind 顺序在不同方言不同</strong>。直接断言绑定数组等价的回归用例,迁库时会失败。</p></div>
+
+<h2 id="s18-5">18.5 JDBC bind 与 SQL 日志</h2>
+
+<pre><code class="language-properties">logging.level.org.hibernate.SQL=DEBUG
+logging.level.org.hibernate.orm.jdbc.bind=TRACE
+logging.level.org.hibernate.orm.query=DEBUG
+logging.level.org.hibernate.orm.sql.ast=DEBUG
+spring.jpa.properties.hibernate.format_sql=true
+spring.jpa.properties.hibernate.use_sql_comments=true
+spring.jpa.properties.hibernate.generate_statistics=true</code></pre>
+
+<pre><code>DEBUG org.hibernate.SQL -
+    /* select o from Order o where o.status = :status */
+    select o1_0.id, o1_0.customer_id, o1_0.status,
+           o1_0.total_amount, o1_0.created_at, o1_0.version
+    from orders o1_0
+    where o1_0.status = ?
+    order by o1_0.created_at desc
+    fetch first ? rows only
+
+TRACE org.hibernate.orm.jdbc.bind - binding parameter (1:VARCHAR) &lt;- [PAID]
+TRACE org.hibernate.orm.jdbc.bind - binding parameter (2:INTEGER) &lt;- [20]
+
+DEBUG org.hibernate.stat - 1 SQL statement, 12 ms</code></pre>
+
+<table>
+<thead><tr><th>异常</th><th>根因</th><th>修复</th></tr></thead>
+<tbody>
+<tr><td>Parameter index out of range</td><td>setParameter 数量不匹配</td><td>核对 JPQL 占位符与 setParameter</td></tr>
+<tr><td>Cannot infer type for parameter</td><td>null 无类型</td><td>TypedParameterValue + sqlType</td></tr>
+<tr><td>Cannot bind java.time.Instant</td><td>driver 不支持</td><td>使用 LocalDateTime + ZoneOffset</td></tr>
+<tr><td>Could not extract column</td><td>ResultSet 列不存在</td><td>与 SQL AST select 列对齐</td></tr>
+<tr><td>Invalid LOB descriptor</td><td>Blob 流式失败</td><td>改用分批 / @Lob + LAZY</td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-java">@Bean
+DataSource proxyDataSource(@Qualifier("realDataSource") DataSource target) {
+    return ProxyDataSourceBuilder.create(target)
+        .name("SQL")
+        .countQuery()
+        .multiline()
+        .logQueryBySlf4j(SLF4JLogLevel.INFO)
+        .build();
+}</code></pre>
+
+<div class="key-insight"><p><strong>show_sql 不够</strong>。<code>hibernate.show_sql=true</code> 仅打印 SQL 文本,不含 bind、耗时、线程上下文,生产环境不应启用。生产排障需要可采集、可过滤、可关联 traceId 的 SQL 事件。</p></div>
+
+<h2 id="s18-6">18.6 IN padding:SQL 形状稳定化</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-6-1 · SQL 形状爆炸 vs padding 收敛</div>
+  <svg viewBox="0 0 920 230" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="20"  y="80" width="160" height="60" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="100" y="106" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">where id in :ids</text>
+    <text x="100" y="124" text-anchor="middle" fill="#c9d1d9" font-size="11">SQM 节点</text>
+
+    <rect x="220" y="20"  width="200" height="44" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="320" y="46"  text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">size=3 → in (?, ?, ?)</text>
+
+    <rect x="220" y="80"  width="200" height="44" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="320" y="106" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">size=4 → in (?, ?, ?, ?)</text>
+
+    <rect x="220" y="140" width="200" height="44" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="320" y="166" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">size=57 → in (? × 57)</text>
+
+    <rect x="460" y="80" width="200" height="68" rx="8" fill="#3a0e0e" stroke="#f85149" stroke-width="2"/>
+    <text x="560" y="106" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">DB plan cache 爆炸</text>
+    <text x="560" y="126" text-anchor="middle" fill="#c9d1d9" font-size="11">N 种 SQL shape</text>
+
+    <rect x="700" y="80" width="200" height="68" rx="8" fill="#0d3a22" stroke="#3fb950" stroke-width="2"/>
+    <text x="800" y="106" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">padding=true</text>
+    <text x="800" y="126" text-anchor="middle" fill="#c9d1d9" font-size="11">收敛到 log2(N) 形状</text>
+
+    <path d="M180,100 L220,42"  stroke="#bc8cff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M180,108 L220,102" stroke="#bc8cff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M180,116 L220,162" stroke="#bc8cff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M420,42  L460,100" stroke="#f85149" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M420,102 L460,114" stroke="#f85149" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M420,162 L460,128" stroke="#f85149" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M660,114 L700,114" stroke="#3fb950" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<pre><code class="language-properties">spring.jpa.properties.hibernate.query.in_clause_parameter_padding=true</code></pre>
+
+<table>
+<thead><tr><th>原始 IN 数量</th><th>padding 后</th><th>SQL 形状</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>1</td><td><code>in (?)</code></td></tr>
+<tr><td>2</td><td>2</td><td><code>in (?, ?)</code></td></tr>
+<tr><td>3</td><td>4</td><td><code>in (?, ?, ?, ?)</code></td></tr>
+<tr><td>5..8</td><td>8</td><td><code>in (?, ... × 8)</code></td></tr>
+<tr><td>9..16</td><td>16</td><td><code>in (?, ... × 16)</code></td></tr>
+<tr><td>17..32</td><td>32</td><td><code>in (?, ... × 32)</code></td></tr>
+<tr><td>33..64</td><td>64</td><td><code>in (?, ... × 64)</code></td></tr>
+</tbody>
+</table>
+
+<div class="key-insight"><p>padding 不让单条 SQL 更快,而让全应用 SQL 形状从数百种<strong>收敛到十几种</strong>。多绑几个重复参数,换更稳的 plan cache。</p></div>
+
+<h2 id="s18-7">18.7 性能场景与量化</h2>
+
+<h3>18.7.1 场景 A:列表查询 N+1</h3>
+
+<pre><code class="language-java">// 反例: 1 + 100 = 101 条 SQL
+List&lt;Order&gt; orders = em.createQuery("""
+        select o from Order o where o.status = :status
+        order by o.createdAt desc
+        """, Order.class)
+    .setParameter("status", OrderStatus.PAID)
+    .setMaxResults(100)
+    .getResultList();
+
+for (Order o : orders) {
+    String customerName = o.getCustomer().getName();  // 触发懒加载
+}
+
+// 修复: 1 条 SQL
+List&lt;Order&gt; orders2 = em.createQuery("""
+        select o from Order o
+        join fetch o.customer c
+        where o.status = :status
+        order by o.createdAt desc
+        """, Order.class)
+    .setParameter("status", OrderStatus.PAID)
+    .setMaxResults(100)
+    .getResultList();</code></pre>
+
+<table>
+<thead><tr><th>指标</th><th>反例(懒加载)</th><th>修复(join fetch)</th></tr></thead>
+<tbody>
+<tr><td>SQL 条数</td><td>101</td><td>1</td></tr>
+<tr><td>网络往返</td><td>101</td><td>1</td></tr>
+<tr><td>数据库 CPU</td><td>100 次查询解析</td><td>1 次解析 + 1 次 join</td></tr>
+<tr><td>单次响应时间 P50</td><td>80 ms</td><td>12 ms</td></tr>
+<tr><td>单次响应时间 P99</td><td>220 ms</td><td>28 ms</td></tr>
+<tr><td>50 QPS 下数据库 QPS</td><td>5050</td><td>50</td></tr>
+</tbody>
+</table>
+
+<h3>18.7.2 场景 B:分页 + fetch join 退化</h3>
+
+<pre><code>WARN  org.hibernate.orm.query - HHH90003004:
+firstResult/maxResults specified with collection fetch;
+applying in memory!</code></pre>
+
+<pre><code>[反例 EXPLAIN] 173 336 行内存排序 + 18 MB external merge,P99 425 ms
+
+Sort  (cost=23456.78..23890.12 rows=173336 width=64)
+      (actual time=320.1..420.5 rows=173336 loops=1)
+  Sort Key: o1_0.created_at DESC
+  Sort Method: external merge  Disk: 18432kB
+  ->  Hash Right Join  (rows=173336)
+        ->  Seq Scan on order_items i1_0
+        ->  Hash -> Seq Scan on orders o1_0
+Planning Time: 0.412 ms
+Execution Time: 425.873 ms</code></pre>
+
+<pre><code class="language-java">// 修复: 两步分页
+List&lt;Long&gt; ids = em.createQuery("""
+        select o.id from Order o order by o.createdAt desc
+        """, Long.class)
+    .setFirstResult(0)
+    .setMaxResults(20)
+    .getResultList();
+
+List&lt;Order&gt; page = em.createQuery("""
+        select distinct o from Order o
+        left join fetch o.items i
+        where o.id in :ids
+        order by o.createdAt desc
+        """, Order.class)
+    .setParameter("ids", ids)
+    .getResultList();</code></pre>
+
+<table>
+<thead><tr><th>指标</th><th>反例(fetch + LIMIT)</th><th>修复(两步分页)</th></tr></thead>
+<tbody>
+<tr><td>实际 SQL 条数</td><td>1(全量)</td><td>2</td></tr>
+<tr><td>扫描行数</td><td>173 336</td><td>20 + 56</td></tr>
+<tr><td>内存排序</td><td>18 MB external merge</td><td>0</td></tr>
+<tr><td>P99 延迟</td><td>425 ms</td><td>1.5 ms + 2.0 ms</td></tr>
+<tr><td>OOM 风险</td><td>高</td><td>低</td></tr>
+</tbody>
+</table>
+
+<h3>18.7.3 场景 C:外键缺索引</h3>
+
+<pre><code>[反例] Seq Scan 扫描 2 000 000 行,耗时 421 ms
+
+Seq Scan on orders o1_0 (rows=120 width=64)
+       (actual time=215.4..420.8 rows=128 loops=1)
+  Filter: (customer_id = 58723)
+  Rows Removed by Filter: 1999872
+
+[修复] CREATE INDEX idx_orders_customer ON orders (customer_id);
+
+Index Scan using idx_orders_customer on orders o1_0
+       (cost=0.43..32.45 rows=120 width=64)
+       (actual time=0.045..0.328 rows=128 loops=1)
+Execution Time: 0.412 ms</code></pre>
+
+<table>
+<thead><tr><th>指标</th><th>缺索引</th><th>加索引后</th></tr></thead>
+<tbody>
+<tr><td>扫描行数</td><td>2 000 000</td><td>128</td></tr>
+<tr><td>实际耗时</td><td>421 ms</td><td>0.4 ms</td></tr>
+<tr><td>100 QPS 下 DB CPU</td><td>≥ 80%</td><td>≤ 5%</td></tr>
+<tr><td>锁竞争</td><td>DELETE 父表全表 share lock</td><td>仅命中行</td></tr>
+</tbody>
+</table>
+
+<h3>18.7.4 场景 D:cascade ALL 误删</h3>
+
+<table>
+<thead><tr><th>cascade 设置</th><th>persist</th><th>merge</th><th>remove</th><th>refresh</th><th>适用场景</th></tr></thead>
+<tbody>
+<tr><td><code>ALL</code></td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>强聚合根,子对象不被共享</td></tr>
+<tr><td><code>{PERSIST, MERGE}</code></td><td>✓</td><td>✓</td><td>×</td><td>×</td><td>弱聚合,删除走显式流程</td></tr>
+<tr><td><code>{PERSIST}</code></td><td>✓</td><td>×</td><td>×</td><td>×</td><td>仅插入级联</td></tr>
+<tr><td>无 cascade</td><td>×</td><td>×</td><td>×</td><td>×</td><td>完全独立的对象</td></tr>
+</tbody>
+</table>
+
+<h3>18.7.5 场景 E:Open Session In View</h3>
+
+<table>
+<thead><tr><th>指标</th><th>OSIV 开启</th><th>OSIV 关闭 + DTO</th></tr></thead>
+<tbody>
+<tr><td>控制器返回前 SQL 数</td><td>1</td><td>1</td></tr>
+<tr><td>序列化期 SQL 数</td><td>100(N+1)</td><td>0</td></tr>
+<tr><td>连接持有时间</td><td>整个请求</td><td>仅 service 层</td></tr>
+<tr><td>池有效容量</td><td>显著下降</td><td>充分利用</td></tr>
+<tr><td>推荐生产配置</td><td>×</td><td>✓</td></tr>
+</tbody>
+</table>
+
+<h2 id="s18-8">18.8 监控与回归护栏</h2>
+
+<pre><code class="language-java">@Test
+void shouldExecuteOnlyOneSqlForJoinFetch() {
+    long before = stats.getPrepareStatementCount();
+
+    em.createQuery("""
+        select o from Order o
+        join fetch o.customer
+        where o.status = :status
+        """, Order.class)
+        .setParameter("status", OrderStatus.PAID)
+        .setMaxResults(20)
+        .getResultList();
+
+    long after = stats.getPrepareStatementCount();
+    assertThat(after - before).isEqualTo(1L);
+}
+
+@Test
+void inQueryWithPaddingShouldBindPowerOfTwoParameters() {
+    sqlCapture.clear();
+
+    repository.findAllByIdIn(List.of(10L, 11L, 12L));
+
+    SqlEvent event = sqlCapture.single();
+    assertThat(event.sql()).contains("in (?, ?, ?, ?)");
+    assertThat(event.binds()).hasSize(4);
+    assertThat(event.binds().get(3).value()).isEqualTo(12L);
+}
+
+@ParameterizedTest
+@ValueSource(strings = {"postgresql", "mysql", "sqlserver"})
+void pagingSqlShouldMatchDialect(String database) {
+    SqlEvent event = runWithDatabase(database, () -&gt;
+        repository.findWindow(PageRequest.of(2, 10, Sort.by("id")))
+    );
+
+    switch (database) {
+        case "postgresql", "sqlserver" -&gt;
+            assertThat(event.normalizedSql()).contains("offset ? rows fetch");
+        case "mysql" -&gt;
+            assertThat(event.normalizedSql()).contains("limit ?, ?");
+    }
+}</code></pre>
+
+<table>
+<thead><tr><th>守护</th><th>防御目标</th><th>断言对象</th></tr></thead>
+<tbody>
+<tr><td>SQL 快照</td><td>join 增多 / select 列暴涨</td><td>归一化 SQL</td></tr>
+<tr><td>SQL 计数</td><td>N+1 / 多余 count SQL</td><td>prepareStatementCount</td></tr>
+<tr><td>bind 数量</td><td>IN padding 失效 / 漏参</td><td>bind 数量与类型</td></tr>
+<tr><td>方言差异</td><td>迁库后语法不对</td><td>方言关键片段</td></tr>
+<tr><td>升级烟雾</td><td>Hibernate 小版本回归</td><td>代表性查询契约</td></tr>
+</tbody>
+</table>
+
+<h2 id="s18-9">18.9 设计取舍</h2>
+
+<table>
+<thead><tr><th>选择</th><th>收益</th><th>代价</th></tr></thead>
+<tbody>
+<tr><td>JPQL/Criteria 收敛到 SQM</td><td>共享语义校验、参数推断、计划缓存</td><td>内部对象多,调试门槛高</td></tr>
+<tr><td>SQM 再转 SQL AST</td><td>实体模型与关系模型边界清晰</td><td>小版本升级可能改 SQL 形状</td></tr>
+<tr><td>Dialect 独立渲染 SQL</td><td>同一查询适配不同数据库</td><td>配置错误生成"看似合法但目标库不认"的 SQL</td></tr>
+<tr><td>JDBC bind 与文本分离</td><td>防注入 + 类型安全 + 缓存</td><td>仅看 SQL 文本无法判断真实参数</td></tr>
+</tbody>
+</table>
+
+<table>
+<thead><tr><th>阶段</th><th>入口类</th><th>关键方法</th></tr></thead>
+<tbody>
+<tr><td>HQL 解析</td><td>StandardHqlTranslator</td><td>translate(String, Class)</td></tr>
+<tr><td>SQM 缓存</td><td>QueryInterpretationCacheStandardImpl</td><td>resolveSelectQueryPlan</td></tr>
+<tr><td>计划构建</td><td>ConcreteSqmSelectQueryPlan</td><td>performList</td></tr>
+<tr><td>SQM → AST</td><td>BaseSqmToSqlAstConverter</td><td>visitSelectStatement</td></tr>
+<tr><td>AST → SQL</td><td>StandardSqlAstTranslator</td><td>translate / visitQuerySpec</td></tr>
+<tr><td>方言扩展</td><td>SqlAstTranslatorFactory</td><td>buildSelectTranslator</td></tr>
+<tr><td>JDBC 执行</td><td>JdbcSelectExecutorStandardImpl</td><td>list / scroll / stream</td></tr>
+<tr><td>参数绑定</td><td>JdbcParameterBindings + BasicBinder</td><td>bind(PreparedStatement, ...)</td></tr>
+<tr><td>结果装配</td><td>StandardRowReader</td><td>readRow / DomainResultAssembler</td></tr>
+</tbody>
+</table>
+
+<h2 id="s18-10">18.10 陷阱与限制</h2>
+
+<table>
+<thead><tr><th>#</th><th>陷阱</th><th>现象</th><th>修复</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>IN 撑爆 plan cache</td><td>DB CPU 抖动</td><td>启用 in_clause_parameter_padding</td></tr>
+<tr><td>2</td><td>join fetch + 分页</td><td>HHH90003004 警告,内存占用高</td><td>两步分页</td></tr>
+<tr><td>3</td><td>仅看 show_sql</td><td>bind 类型问题难发现</td><td>TRACE jdbc.bind + datasource-proxy</td></tr>
+<tr><td>4</td><td>Dialect 自动检测错</td><td>分页/锁语法不符</td><td>显式 hibernate.dialect</td></tr>
+<tr><td>5</td><td>枚举映射变化</td><td>SQL 通过但结果空</td><td>优先 EnumType.STRING</td></tr>
+<tr><td>6</td><td>仅看 cost</td><td>cost 减小但更慢</td><td>看 actual time / rows / buffers</td></tr>
+<tr><td>7</td><td>N+1 被业务断言掩盖</td><td>功能测试通过,接口慢</td><td>SQL count 断言</td></tr>
+<tr><td>8</td><td>同一查询频繁解析</td><td>CPU 高</td><td>检查 plan_cache 大小</td></tr>
+<tr><td>9</td><td>隐式 join 暴增 select 列</td><td>列数翻倍</td><td>JPQL 显式 join + select DTO</td></tr>
+<tr><td>10</td><td>StatementInspector 改写 SQL</td><td>渲染契约破坏</td><td>仅注释,不改语句</td></tr>
+</tbody>
+</table>
+
+<h2 id="s18-summary">18.11 本章要点</h2>
+
+<div class="chapter-summary">
+<table>
+<thead><tr><th>要点</th><th>源码 / API 依据</th><th>易错点</th></tr></thead>
+<tbody>
+<tr><td>翻译管线</td><td>StandardHqlTranslator + BaseSqmToSqlAstConverter</td><td>把"最终 SQL"当排查起点</td></tr>
+<tr><td>计划缓存</td><td>hibernate.query.plan_cache_max_size</td><td>缓存键差异导致频繁解析</td></tr>
+<tr><td>方言分叉</td><td>Dialect 子类</td><td>自动检测在云数据库失真</td></tr>
+<tr><td>bind 监控</td><td>BasicBinder</td><td>仅看 show_sql 错失参数类型问题</td></tr>
+<tr><td>IN padding</td><td>in_clause_parameter_padding</td><td>bind 数量非 2 的幂</td></tr>
+<tr><td>性能量化</td><td>EXPLAIN ANALYZE</td><td>仅以 cost 比较</td></tr>
+<tr><td>回归护栏</td><td>StatementInspector + Statistics</td><td>缺少升级 smoke test</td></tr>
+</tbody>
+</table>
+</div>
+
+<table>
+<thead><tr><th>指标</th><th>来源</th><th>健康阈值</th><th>异常含义</th></tr></thead>
+<tbody>
+<tr><td>prepareStatementCount</td><td>Hibernate Statistics</td><td>与业务请求线性相关</td><td>突增暗示 N+1</td></tr>
+<tr><td>queryPlanCacheHitCount</td><td>Hibernate Statistics</td><td>命中率 &gt; 0.95</td><td>暗示动态查询拼接</td></tr>
+<tr><td>queryExecutionMaxTime</td><td>Hibernate Statistics</td><td>&lt; 200 ms</td><td>定位最慢查询</td></tr>
+<tr><td>pg_stat_statements.mean_time</td><td>PostgreSQL</td><td>与 P99 SLA 一致</td><td>整体偏慢需检查索引</td></tr>
+<tr><td>Hikari activeConnections</td><td>HikariCP MXBean</td><td>&lt; 池大小 × 0.8</td><td>持续逼近上限暗示长事务</td></tr>
+</tbody>
+</table>
+
+<p>下一章讨论连接池。本章覆盖 SQL 生成与执行计划层面;下一章进入 HikariCP 的连接获取、健康检查、泄漏检测,以及 JPA 与连接池协同的事务边界与超时模型。</p>
+
+<div class="chapter-nav">
+  <a href="17-hibernate-architecture.html">&larr; 第 17 章 &middot; Hibernate 架构</a>
+  <a href="19-connection-pool.html">第 19 章 &middot; 连接池 &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 JPA &amp; Hibernate &middot; 第 18 章 &middot; SQL 生成全链路</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

@@ -1,0 +1,865 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.10 Leader Epoch 与日志截断 — 图解 Kafka</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Kafka</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="09-replication-isr.html">上一章</a>
+  <a href="11-kraft.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s10-0">10.0 章首速览</a>
+  <a href="#s10-1">10.1 旧截断逻辑的不安全性</a>
+  <a href="#s10-2">10.2 Epoch 数据模型</a>
+  <a href="#s10-3">10.3 OffsetForLeaderEpoch 协议</a>
+  <a href="#s10-4">10.4 截断场景剖析</a>
+  <a href="#s10-5">10.5 Fetch 携带 epoch 校验</a>
+  <a href="#s10-6">10.6 与 Raft Term 的对比</a>
+  <a href="#s10-7">10.7 排障</a>
+  <a href="#s10-8">10.8 源码深潜</a>
+  <a href="#s10-9">10.9 设计取舍</a>
+  <a href="#s10-10">10.10 陷阱与限制</a>
+  <a href="#s10-summary">10.11 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 10 章 · Leader Epoch 与日志截断</h1>
+<p class="subtitle">KIP-101 · KIP-279 · OffsetForLeaderEpoch · 任期权威边界 · FencedLeaderEpoch</p>
+
+<div class="chapter-intro">
+  <p class="lead">第 9 章讲了 HW 是消费者可见边界,但有一个隐藏的暗角:<strong>follower 重启时,凭什么相信本地 HW 是对的?</strong>Kafka 0.11 以前的回答是"我读自己 highwatermark-checkpoint 文件就行" — 这个回答在连续故障场景下会让<em>已提交的消息</em>消失。KIP-101 (引入 Leader Epoch) 和 KIP-279 (修正 follower 截断逻辑) 把这个洞补上:截断点不再来自"本地观察",而是<strong>向当前 leader 查询"我那个任期的 endOffset 是多少"</strong>。</p>
+  <p>本章按 "旧问题 → epoch 数据模型 → OffsetForLeaderEpoch 协议 → 截断场景 → Fetch 校验 → 与 Raft Term 对比 → 排障 → 源码 → 取舍 → 陷阱" 组织,对应 Apache Kafka 3.7 的实现。读完后你不仅理解协议,还能预判每一种异常:为什么 follower 启动慢可能因为 OffsetForLeaderEpoch 卡住?为什么 FENCED_LEADER_EPOCH 出现在日志里不一定是 bug?</p>
+  <ul class="will-learn">
+    <li>Pre-KIP-101 的 truncate-to-local-HW 在哪两类场景下会丢已提交数据</li>
+    <li>Leader Epoch + startOffset 的形式定义、持久化文件、写入时机</li>
+    <li>OffsetForLeaderEpoch 请求/响应的字节布局,以及三种错误码的语义</li>
+    <li>Follower 重启的完整恢复路径:读本地 epoch → 查 leader → 截断 → Fetch</li>
+    <li>四种 Fetch 错误:FENCED_LEADER_EPOCH / UNKNOWN_LEADER_EPOCH / NOT_LEADER / NOT_LEADER_FOR_PARTITION</li>
+    <li>Kafka Leader Epoch 与 Raft Term / Paxos Ballot 的对应关系</li>
+    <li>常见陷阱:epoch 表损坏 / 跨主版本升级 / DumpLogSegments 工具用法</li>
+  </ul>
+  <p class="prereq">前置知识:第 9 章 ISR、HW、acks=all;基本了解 Raft 或 Paxos 中的"任期/选举编号"概念有助于理解 §10.6。本章是<strong>"正确性"</strong>这一维度的精解 — 读完才能确信 Kafka 不会"无声丢消息"。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s10-0">10.0 章首速览</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">图 10-0 · Leader Epoch 全景:从 follower 启动到加入 ISR</div>
+<svg viewBox="0 0 900 520" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+  <rect x="0" y="0" width="900" height="520" fill="#0f172a" rx="8"/>
+
+  <rect x="340" y="20" width="220" height="50" rx="8" fill="url(#g-purple)" stroke="#a78bfa"/>
+  <text x="450" y="42" text-anchor="middle" fill="#fff" font-size="14" font-weight="700">Follower 启动 / 切主</text>
+  <text x="450" y="60" text-anchor="middle" fill="#e9d5ff" font-size="11">收到 LeaderAndIsrRequest</text>
+
+  <rect x="290" y="100" width="320" height="60" rx="8" fill="url(#g-blue)" stroke="#60a5fa"/>
+  <text x="450" y="124" text-anchor="middle" fill="#fff" font-size="13" font-weight="600">读本地 leader-epoch-checkpoint</text>
+  <text x="450" y="144" text-anchor="middle" fill="#dbeafe" font-size="11">取最新 epoch=E + 本地 LEO=X</text>
+
+  <rect x="290" y="190" width="320" height="60" rx="8" fill="url(#g-blue)" stroke="#60a5fa"/>
+  <text x="450" y="214" text-anchor="middle" fill="#fff" font-size="13" font-weight="600">OffsetForLeaderEpoch(E, currentLE=CE)</text>
+  <text x="450" y="234" text-anchor="middle" fill="#dbeafe" font-size="11">查询当前 leader 该任期的 endOffset=Y</text>
+
+  <polygon points="450,280 580,320 450,360 320,320" fill="url(#g-orange)" stroke="#f59e0b"/>
+  <text x="450" y="318" text-anchor="middle" fill="#fff" font-size="13" font-weight="600">Y &lt; X ?</text>
+  <text x="450" y="336" text-anchor="middle" fill="#fef3c7" font-size="11">本地超出权威边界?</text>
+
+  <rect x="40" y="390" width="280" height="60" rx="8" fill="url(#g-red)" stroke="#ef4444"/>
+  <text x="180" y="414" text-anchor="middle" fill="#fff" font-size="13" font-weight="600">UnifiedLog.truncateTo(Y)</text>
+  <text x="180" y="434" text-anchor="middle" fill="#fecaca" font-size="11">删除孤儿尾部 — 永久</text>
+
+  <rect x="580" y="390" width="280" height="60" rx="8" fill="url(#g-green)" stroke="#22c55e"/>
+  <text x="720" y="414" text-anchor="middle" fill="#fff" font-size="13" font-weight="600">保留本地日志</text>
+  <text x="720" y="434" text-anchor="middle" fill="#dcfce7" font-size="11">本地一致,直接进入 Fetch</text>
+
+  <path d="M450 70 L450 100" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M450 160 L450 190" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M450 250 L450 280" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M380 340 L240 385" stroke="#ef4444" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="290" y="365" fill="#ef4444" font-size="11">是</text>
+  <path d="M520 340 L660 385" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="595" y="365" fill="#22c55e" font-size="11">否</text>
+
+  <rect x="290" y="475" width="320" height="35" rx="8" fill="#1e293b" stroke="#22c55e"/>
+  <text x="450" y="497" text-anchor="middle" fill="#86efac" font-size="12">Fetch(offset=min(X,Y), epoch=CE) · 追赶 · 加入 ISR</text>
+
+  <path d="M180 450 Q300 462 350 475" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M720 450 Q600 462 550 475" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+</svg>
+
+<h3>四个核心概念</h3>
+
+<table>
+  <thead>
+    <tr><th>概念</th><th>含义</th><th>持久化位置</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>epoch</code></td><td>Leader 任期编号,单调递增</td><td><code>leader-epoch-checkpoint</code></td></tr>
+    <tr><td><code>startOffset</code></td><td>该任期写入的第一条 offset</td><td><code>leader-epoch-checkpoint</code></td></tr>
+    <tr><td><code>endOffset</code></td><td>下一个 epoch 的 startOffset 或当前 LEO</td><td>由 Leader 计算返回</td></tr>
+    <tr><td><code>currentLeaderEpoch</code></td><td>Fetch 请求携带的最新已知 epoch</td><td>RPC 字段</td></tr>
+  </tbody>
+</table>
+
+<div class="diagram">
+  <div class="diagram-title">图 10-0-1 · 三句话浓缩</div>
+<pre><code>本章三句话:
+
+  1 Leader Epoch 是分区 Leader 任期编号
+    每次 Leader 变更, epoch + 1
+    每个 epoch 关联一个 startOffset
+
+  2 Follower 恢复截断点不来自本地 HW
+    而是向当前 Leader 查询该 epoch 的 endOffset
+    确保删除孤儿数据但保留已提交数据
+
+  3 Fetch 请求携带 currentLeaderEpoch
+    Broker 用它拒绝过期请求 (FENCED_LEADER_EPOCH)
+    避免使用过时元数据继续复制</code></pre>
+</div>
+
+<div class="key-insight">
+  把 Leader Epoch 当作"分区版本号"来看会更直观:每次 leader 切换 = 主版本号 +1。任何关于该分区的 RPC(Fetch / OffsetForLeaderEpoch)都要带上"我以为现在是哪个版本",broker 比对后才决定是接受、拒绝、还是要求你重新去拉元数据。这套机制让 Kafka 在网络分区、controller 切换、broker 重启等复杂情况下,始终能给出一个"权威答案",而不是各方互相猜。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s10-1">10.1 旧截断逻辑的不安全性</h2>
+<!-- ============================================================ -->
+
+<p>Pre-KIP-101 的截断逻辑非常简单 — 简单到不安全。Follower 启动时读自己 <code>highwatermark-checkpoint</code> 文件,然后把 LEO 截到 HW 上。这个逻辑的隐含假设是:"本地 HW = 集群已提交位置"。可惜这个假设在两类场景下都不成立。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 10-1-1 · 旧截断逻辑的灾难时序</div>
+<svg viewBox="0 0 900 500" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+  <rect x="0" y="0" width="900" height="500" fill="#0f172a" rx="8"/>
+
+  <line x1="120" y1="60" x2="120" y2="480" stroke="#475569" stroke-dasharray="4 3"/>
+  <line x1="360" y1="60" x2="360" y2="480" stroke="#475569" stroke-dasharray="4 3"/>
+  <line x1="600" y1="60" x2="600" y2="480" stroke="#475569" stroke-dasharray="4 3"/>
+  <line x1="820" y1="60" x2="820" y2="480" stroke="#475569" stroke-dasharray="4 3"/>
+
+  <rect x="70" y="30" width="100" height="30" rx="6" fill="url(#g-purple)"/>
+  <text x="120" y="51" text-anchor="middle" fill="#fff" font-size="12">Producer</text>
+  <rect x="310" y="30" width="100" height="30" rx="6" fill="url(#g-blue)"/>
+  <text x="360" y="51" text-anchor="middle" fill="#fff" font-size="11">Broker A (L)</text>
+  <rect x="550" y="30" width="100" height="30" rx="6" fill="url(#g-green)"/>
+  <text x="600" y="51" text-anchor="middle" fill="#fff" font-size="11">Broker B (F)</text>
+  <rect x="770" y="30" width="100" height="30" rx="6" fill="#0d1117"/>
+  <text x="820" y="51" text-anchor="middle" fill="#fff" font-size="11">Controller</text>
+
+  <path d="M120 90 L360 90" stroke="#a78bfa" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="240" y="84" text-anchor="middle" fill="#e9d5ff" font-size="11">Produce m0, m1</text>
+
+  <path d="M600 130 L360 130" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="480" y="124" text-anchor="middle" fill="#86efac" font-size="11">Fetch</text>
+  <path d="M360 155 L600 155" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="480" y="149" text-anchor="middle" fill="#86efac" font-size="11">records m0, m1, HW=0</text>
+
+  <text x="368" y="185" fill="#fbbf24" font-size="11">A: HW 推进到 2</text>
+  <text x="608" y="205" fill="#fef3c7" font-size="11">B: 本地 LEO=2, 但 HW 仍=1</text>
+  <text x="608" y="222" fill="#fef3c7" font-size="10">下一次 FetchResponse 未到达</text>
+
+  <path d="M600 250 L600 270" stroke="#ef4444" stroke-width="2" stroke-dasharray="3 2" fill="none"/>
+  <text x="608" y="265" fill="#ef4444" font-size="11">B 崩溃</text>
+  <path d="M600 290 L600 310" stroke="#ef4444" stroke-width="2" stroke-dasharray="3 2" fill="none"/>
+  <text x="608" y="307" fill="#ef4444" font-size="11">B 重启</text>
+
+  <rect x="510" y="320" width="180" height="48" rx="6" fill="url(#g-red)" stroke="#ef4444"/>
+  <text x="600" y="340" text-anchor="middle" fill="#fff" font-size="11" font-weight="600">truncateTo(localHW=1)</text>
+  <text x="600" y="358" text-anchor="middle" fill="#fecaca" font-size="10">⚠️ 删除 m1</text>
+
+  <path d="M360 395 L360 415" stroke="#ef4444" stroke-width="2" stroke-dasharray="3 2" fill="none"/>
+  <text x="368" y="412" fill="#ef4444" font-size="11">A 崩溃</text>
+
+  <path d="M820 440 L600 440" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="710" y="434" text-anchor="middle" fill="#cbd5e1" font-size="11">选 B 为新 Leader</text>
+
+  <rect x="500" y="455" width="200" height="25" rx="4" fill="url(#g-red)" stroke="#ef4444"/>
+  <text x="600" y="473" text-anchor="middle" fill="#fff" font-size="11" font-weight="600">⚠️ m1 已提交但永久丢失</text>
+</svg>
+
+<h3>旧截断逻辑的伪代码</h3>
+
+<pre><code class="language-java">// Pre-KIP-101 错误实现
+void recoverWithLocalHw(Log log) {
+    long localHw = log.readHighWatermarkCheckpoint();
+    if (log.logEndOffset() &gt; localHw) {
+        log.truncateTo(localHw);    // 用本地 HW 截断 — 不安全
+    }
+}</code></pre>
+
+<div class="warning">
+<strong>失败条件:</strong>
+<table>
+  <thead>
+    <tr><th>条件</th><th>触发概率</th><th>影响</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Follower 已复制但本地 HW 未推进</td><td>每次 FetchResponse 间隙</td><td>该 Follower 单独崩溃后重启时丢已提交数据</td></tr>
+    <tr><td>Leader 在 Follower 重启窗口崩溃</td><td>低但非零</td><td>失去权威 Leader,本地截断生效</td></tr>
+    <tr><td>后续选举该 Follower 为 Leader</td><td>ISR 内选举可达</td><td>新 Leader 历史缺数据,全集群感知数据丢失</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>KIP-101 的核心修正:<strong>截断点必须由"当前 leader 的任期权威边界"决定,而非"本地观察到的 HW"</strong>。本章其余各节展开这个修正的实现。</p>
+
+<!-- ============================================================ -->
+<h2 id="s10-2">10.2 Epoch 数据模型</h2>
+<!-- ============================================================ -->
+
+<p>Leader Epoch 是一个 <code>(epoch, startOffset)</code> 二元组的有序表。每个分区维护一份,持久化到 <code>leader-epoch-checkpoint</code>。这个表的形式语义是:"epoch K 覆盖 offset 范围 <code>[startOffset(K), startOffset(K+1))</code>"。它是一个紧凑、可追溯的"任期历史"。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 10-2-1 · Epoch 表的形式定义</div>
+<svg viewBox="0 0 900 320" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+  <rect x="0" y="0" width="900" height="320" fill="#0f172a" rx="8"/>
+
+  <!-- Epoch nodes -->
+  <rect x="40" y="60" width="220" height="90" rx="10" fill="url(#g-purple)" stroke="#a78bfa"/>
+  <text x="150" y="86" text-anchor="middle" fill="#fff" font-size="14" font-weight="700">epoch 0</text>
+  <text x="150" y="106" text-anchor="middle" fill="#e9d5ff" font-size="11">Leader A</text>
+  <text x="150" y="124" text-anchor="middle" fill="#e9d5ff" font-size="11">startOffset = 0</text>
+  <text x="150" y="142" text-anchor="middle" fill="#fbbf24" font-size="11">覆盖 [0, 5)</text>
+
+  <rect x="340" y="60" width="220" height="90" rx="10" fill="url(#g-blue)" stroke="#60a5fa"/>
+  <text x="450" y="86" text-anchor="middle" fill="#fff" font-size="14" font-weight="700">epoch 1</text>
+  <text x="450" y="106" text-anchor="middle" fill="#dbeafe" font-size="11">Leader B</text>
+  <text x="450" y="124" text-anchor="middle" fill="#dbeafe" font-size="11">startOffset = 5</text>
+  <text x="450" y="142" text-anchor="middle" fill="#fbbf24" font-size="11">覆盖 [5, 8)</text>
+
+  <rect x="640" y="60" width="220" height="90" rx="10" fill="url(#g-green)" stroke="#22c55e"/>
+  <text x="750" y="86" text-anchor="middle" fill="#fff" font-size="14" font-weight="700">epoch 2</text>
+  <text x="750" y="106" text-anchor="middle" fill="#dcfce7" font-size="11">Leader C</text>
+  <text x="750" y="124" text-anchor="middle" fill="#dcfce7" font-size="11">startOffset = 8</text>
+  <text x="750" y="142" text-anchor="middle" fill="#fbbf24" font-size="11">覆盖 [8, LEO)</text>
+
+  <path d="M260 105 L340 105" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M560 105 L640 105" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+  <!-- Log records timeline -->
+  <text x="40" y="200" fill="#cbd5e1" font-size="13" font-weight="600">日志记录:</text>
+  <g transform="translate(40,220)">
+    <rect x="0" y="0" width="50" height="50" rx="4" fill="url(#g-purple)" stroke="#a78bfa"/>
+    <text x="25" y="20" text-anchor="middle" fill="#fff" font-size="10">m0</text>
+    <text x="25" y="35" text-anchor="middle" fill="#e9d5ff" font-size="9">@0</text>
+    <text x="25" y="48" text-anchor="middle" fill="#fbbf24" font-size="9">e0</text>
+
+    <rect x="55" y="0" width="50" height="50" rx="4" fill="url(#g-purple)" stroke="#a78bfa"/>
+    <text x="80" y="20" text-anchor="middle" fill="#fff" font-size="10">m1</text>
+    <text x="80" y="35" text-anchor="middle" fill="#e9d5ff" font-size="9">@1</text>
+    <text x="80" y="48" text-anchor="middle" fill="#fbbf24" font-size="9">e0</text>
+
+    <rect x="110" y="0" width="50" height="50" rx="4" fill="url(#g-purple)" stroke="#a78bfa"/>
+    <text x="135" y="20" text-anchor="middle" fill="#fff" font-size="10">m2</text>
+    <text x="135" y="35" text-anchor="middle" fill="#e9d5ff" font-size="9">@2</text>
+    <text x="135" y="48" text-anchor="middle" fill="#fbbf24" font-size="9">e0</text>
+
+    <rect x="165" y="0" width="50" height="50" rx="4" fill="url(#g-purple)" stroke="#a78bfa"/>
+    <text x="190" y="20" text-anchor="middle" fill="#fff" font-size="10">m3</text>
+    <text x="190" y="35" text-anchor="middle" fill="#e9d5ff" font-size="9">@3</text>
+    <text x="190" y="48" text-anchor="middle" fill="#fbbf24" font-size="9">e0</text>
+
+    <rect x="220" y="0" width="50" height="50" rx="4" fill="url(#g-purple)" stroke="#a78bfa"/>
+    <text x="245" y="20" text-anchor="middle" fill="#fff" font-size="10">m4</text>
+    <text x="245" y="35" text-anchor="middle" fill="#e9d5ff" font-size="9">@4</text>
+    <text x="245" y="48" text-anchor="middle" fill="#fbbf24" font-size="9">e0</text>
+
+    <rect x="280" y="0" width="50" height="50" rx="4" fill="url(#g-blue)" stroke="#60a5fa"/>
+    <text x="305" y="20" text-anchor="middle" fill="#fff" font-size="10">m5</text>
+    <text x="305" y="35" text-anchor="middle" fill="#dbeafe" font-size="9">@5</text>
+    <text x="305" y="48" text-anchor="middle" fill="#fbbf24" font-size="9">e1</text>
+
+    <rect x="335" y="0" width="50" height="50" rx="4" fill="url(#g-blue)" stroke="#60a5fa"/>
+    <text x="360" y="20" text-anchor="middle" fill="#fff" font-size="10">m6</text>
+    <text x="360" y="35" text-anchor="middle" fill="#dbeafe" font-size="9">@6</text>
+    <text x="360" y="48" text-anchor="middle" fill="#fbbf24" font-size="9">e1</text>
+
+    <rect x="390" y="0" width="50" height="50" rx="4" fill="url(#g-blue)" stroke="#60a5fa"/>
+    <text x="415" y="20" text-anchor="middle" fill="#fff" font-size="10">m7</text>
+    <text x="415" y="35" text-anchor="middle" fill="#dbeafe" font-size="9">@7</text>
+    <text x="415" y="48" text-anchor="middle" fill="#fbbf24" font-size="9">e1</text>
+
+    <rect x="445" y="0" width="50" height="50" rx="4" fill="url(#g-green)" stroke="#22c55e"/>
+    <text x="470" y="20" text-anchor="middle" fill="#fff" font-size="10">m8</text>
+    <text x="470" y="35" text-anchor="middle" fill="#dcfce7" font-size="9">@8</text>
+    <text x="470" y="48" text-anchor="middle" fill="#fbbf24" font-size="9">e2</text>
+
+    <rect x="500" y="0" width="50" height="50" rx="4" fill="url(#g-green)" stroke="#22c55e"/>
+    <text x="525" y="20" text-anchor="middle" fill="#fff" font-size="10">m9</text>
+    <text x="525" y="35" text-anchor="middle" fill="#dcfce7" font-size="9">@9</text>
+    <text x="525" y="48" text-anchor="middle" fill="#fbbf24" font-size="9">e2</text>
+
+    <rect x="555" y="0" width="60" height="50" rx="4" fill="#1e293b" stroke="#475569" stroke-dasharray="3 2"/>
+    <text x="585" y="28" text-anchor="middle" fill="#cbd5e1" font-size="10">LEO</text>
+  </g>
+
+  <text x="40" y="295" fill="#cbd5e1" font-size="11">→ 每条 record 携带 leaderEpoch 字段(V2 RecordBatch),用于校验与追加 epoch 表</text>
+</svg>
+
+<h3>leader-epoch-checkpoint 文件结构</h3>
+
+<pre><code class="language-text">分区目录:
+/var/kafka-logs/order-created-0/
+  ├── 00000000000000000000.log
+  ├── 00000000000000000000.index
+  ├── 00000000000000000000.timeindex
+  ├── 00000000000000000000.snapshot
+  └── leader-epoch-checkpoint
+
+leader-epoch-checkpoint 内容:
+
+  0          ← 文件格式版本(固定 0)
+  3          ← 条目数(3)
+  0 0        ← epoch 0 startOffset 0
+  1 5        ← epoch 1 startOffset 5
+  2 8        ← epoch 2 startOffset 8
+
+  解读:
+    epoch 0 覆盖 [0, 5)
+    epoch 1 覆盖 [5, 8)
+    epoch 2 覆盖 [8, LEO)</code></pre>
+
+<h3>Epoch 表的写入时机</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 10-2-2 · 何时往 epoch 表追加新条目</div>
+<svg viewBox="0 0 900 380" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+  <rect x="0" y="0" width="900" height="380" fill="#0f172a" rx="8"/>
+
+  <rect x="340" y="20" width="220" height="50" rx="8" fill="url(#g-purple)" stroke="#a78bfa"/>
+  <text x="450" y="42" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">LeaderAndIsrRequest 到达</text>
+  <text x="450" y="60" text-anchor="middle" fill="#e9d5ff" font-size="11">controller 通知角色变更</text>
+
+  <polygon points="450,100 580,140 450,180 320,140" fill="url(#g-blue)" stroke="#60a5fa"/>
+  <text x="450" y="138" text-anchor="middle" fill="#fff" font-size="13" font-weight="600">该副本角色?</text>
+
+  <path d="M450 70 L450 100" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+  <!-- Leader path -->
+  <rect x="40" y="210" width="320" height="60" rx="8" fill="url(#g-green)" stroke="#22c55e"/>
+  <text x="200" y="234" text-anchor="middle" fill="#fff" font-size="13" font-weight="600">成为 Leader</text>
+  <text x="200" y="254" text-anchor="middle" fill="#dcfce7" font-size="11">epoch 表追加 (newEpoch, log.LEO)</text>
+
+  <rect x="40" y="290" width="320" height="40" rx="8" fill="#1e293b" stroke="#22c55e"/>
+  <text x="200" y="314" text-anchor="middle" fill="#86efac" font-size="11">立即 fsync leader-epoch-checkpoint</text>
+
+  <path d="M380 165 L260 210" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+  <!-- Follower path -->
+  <rect x="540" y="210" width="320" height="60" rx="8" fill="url(#g-orange)" stroke="#f59e0b"/>
+  <text x="700" y="234" text-anchor="middle" fill="#fff" font-size="13" font-weight="600">成为 Follower</text>
+  <text x="700" y="254" text-anchor="middle" fill="#fef3c7" font-size="11">不主动写,只更新 currentLeaderEpoch</text>
+
+  <rect x="540" y="290" width="320" height="40" rx="8" fill="#1e293b" stroke="#f59e0b"/>
+  <text x="700" y="314" text-anchor="middle" fill="#fde68a" font-size="11">由 Fetch 拉到的 record.epoch 触发追加</text>
+
+  <path d="M520 165 L640 210" stroke="#f59e0b" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+  <text x="450" y="360" text-anchor="middle" fill="#cbd5e1" font-size="11">→ 这一不对称设计让 Leader / Follower 的 epoch 表最终保持一致</text>
+</svg>
+
+<!-- ============================================================ -->
+<h2 id="s10-3">10.3 OffsetForLeaderEpoch 协议</h2>
+<!-- ============================================================ -->
+
+<p>OffsetForLeaderEpoch 是 Kafka 内部 RPC,只在 broker 之间(以及 consumer 检测 leader 切换时)使用。它的语义很简单:"给定 epoch <code>E</code>,告诉我 <code>E</code> 的 endOffset"。但响应里隐藏着一个关键巧思 — 它返回的 epoch 不一定等于请求的 epoch,可能返回"<em>≤ 请求 epoch 的最大已知 epoch</em>",这覆盖了 follower 落后多个任期的情况。</p>
+
+<h3>协议字节布局</h3>
+
+<pre><code class="language-text">OffsetForLeaderEpochRequest v4 关键字段:
+
+  ┌────────────────┬──────────────┬─────────────────────┐
+  │ replicaId      │ topics[]     │ partitions[]        │
+  │ int32          │ array        │  ├ partition int32  │
+  │                │              │  ├ currentLEpoch    │
+  │                │              │  └ leaderEpoch      │
+  └────────────────┴──────────────┴─────────────────────┘
+
+  replicaId           调用方 broker id (consumer 用 -1)
+  currentLeaderEpoch  调用方已知的当前 Leader epoch (用于元数据校验)
+  leaderEpoch         调用方本地最新 epoch (待查询)
+
+OffsetForLeaderEpochResponse 关键字段:
+
+  ┌────────────────┬──────────────┬─────────────────────┐
+  │ errorCode      │ leaderEpoch  │ endOffset           │
+  │ int16          │ int32        │ int64               │
+  └────────────────┴──────────────┴─────────────────────┘
+
+  errorCode = NONE (0)                  正常返回
+            = FENCED_LEADER_EPOCH (74)  请求 epoch 落后
+            = UNKNOWN_LEADER_EPOCH (75) 请求 epoch 超前
+            = NOT_LEADER (6)            非 Leader 收到查询</code></pre>
+
+<h3>一次真实查询样本</h3>
+
+<pre><code class="language-json">// Request
+{
+  "replicaId": 2,
+  "topics": [{
+    "topic": "order-created",
+    "partitions": [{
+      "partition": 0,
+      "currentLeaderEpoch": 42,
+      "leaderEpoch": 1
+    }]
+  }]
+}
+
+// Leader 本地 epoch 表 (示例):
+//   (epoch=0, startOffset=0)
+//   (epoch=1, startOffset=5)
+//   (epoch=2, startOffset=8)
+//   leaderLEO = 12
+
+// Response
+{
+  "topics": [{
+    "topic": "order-created",
+    "partitions": [{
+      "partition": 0,
+      "errorCode": 0,
+      "leaderEpoch": 1,
+      "endOffset": 8        // epoch 1 的 endOffset = epoch 2 的 startOffset = 8
+    }]
+  }]
+}</code></pre>
+
+<div class="diagram">
+  <div class="diagram-title">图 10-3-1 · OffsetForLeaderEpoch 时序与错误码</div>
+<svg viewBox="0 0 900 440" xmlns="http://www.w3.org/2000/svg">
+<defs>
+  <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+  <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+  <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+  <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+  <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+</defs>
+  <rect x="0" y="0" width="900" height="440" fill="#0f172a" rx="8"/>
+
+  <line x1="160" y1="60" x2="160" y2="420" stroke="#475569" stroke-dasharray="4 3"/>
+  <line x1="540" y1="60" x2="540" y2="420" stroke="#475569" stroke-dasharray="4 3"/>
+  <line x1="800" y1="60" x2="800" y2="420" stroke="#475569" stroke-dasharray="4 3"/>
+
+  <rect x="100" y="30" width="120" height="30" rx="6" fill="url(#g-orange)"/>
+  <text x="160" y="51" text-anchor="middle" fill="#fff" font-size="12">Recovering F</text>
+  <rect x="480" y="30" width="120" height="30" rx="6" fill="url(#g-blue)"/>
+  <text x="540" y="51" text-anchor="middle" fill="#fff" font-size="12">Current Leader</text>
+  <rect x="740" y="30" width="120" height="30" rx="6" fill="#0d1117"/>
+  <text x="800" y="51" text-anchor="middle" fill="#fff" font-size="12">EpochCache</text>
+
+  <text x="160" y="90" fill="#fef3c7" font-size="11">读本地: epoch=1, LEO=10</text>
+
+  <path d="M160 120 L535 120" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="350" y="114" text-anchor="middle" fill="#cbd5e1" font-size="11">OffsetForLeaderEpoch(epoch=1, currentLE=CE)</text>
+
+  <!-- Branch 1: CE expired -->
+  <text x="540" y="155" fill="#fbbf24" font-size="11">分支 A:CE 过期</text>
+  <path d="M540 175 L160 175" stroke="#ef4444" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="350" y="169" text-anchor="middle" fill="#fecaca" font-size="11">FENCED_LEADER_EPOCH (74)</text>
+  <text x="160" y="195" fill="#fecaca" font-size="10">→ Follower 触发 MetadataRefresh</text>
+
+  <!-- Branch 2: CE ahead -->
+  <text x="540" y="225" fill="#fbbf24" font-size="11">分支 B:CE 超前</text>
+  <path d="M540 245 L160 245" stroke="#ef4444" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="350" y="239" text-anchor="middle" fill="#fecaca" font-size="11">UNKNOWN_LEADER_EPOCH (75)</text>
+  <text x="160" y="265" fill="#fecaca" font-size="10">→ Follower 等待 controller 同步元数据</text>
+
+  <!-- Branch 3: success -->
+  <text x="540" y="295" fill="#22c55e" font-size="11">分支 C:成功</text>
+  <path d="M540 315 L800 315" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="670" y="309" text-anchor="middle" fill="#86efac" font-size="11">endOffsetFor(1)</text>
+  <path d="M800 340 L540 340" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="670" y="334" text-anchor="middle" fill="#86efac" font-size="11">(matchedEpoch=1, endOffset=8)</text>
+  <path d="M540 370 L160 370" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="350" y="364" text-anchor="middle" fill="#86efac" font-size="11">200 OK · epoch=1, endOffset=8</text>
+
+  <text x="160" y="395" fill="#fde68a" font-size="11">→ truncateTo(8) · Fetch(offset=8, epoch=CE)</text>
+</svg>
+
+<h3>三种错误码处理</h3>
+
+<table>
+  <thead>
+    <tr><th>错误码</th><th>含义</th><th>Follower 动作</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>FENCED_LEADER_EPOCH (74)</code></td><td>请求中 currentLeaderEpoch 已过期</td><td>触发 MetadataRefresh,获取新 leader 信息后重试</td></tr>
+    <tr><td><code>UNKNOWN_LEADER_EPOCH (75)</code></td><td>请求中 currentLeaderEpoch 超前(broker 还没收到 controller 更新)</td><td>短暂 sleep 后重试,等 broker 收到 LeaderAndIsr</td></tr>
+    <tr><td><code>NOT_LEADER (6)</code></td><td>broker 不是该分区的 leader</td><td>查询元数据,找到真 leader 后重试</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s10-4">10.4 截断场景剖析</h2>
+<!-- ============================================================ -->
+
+<p>截断不是一个频繁动作 — 在 Kafka 长期稳定运行时,你可能几个月看不到一次截断。但一旦发生,它意味着一段"<em>本地有 / 集群无</em>"的孤儿数据要被永久删除。理解触发场景能帮你判断"刚刚发生了什么"。</p>
+
+<h3>场景 A:Follower 重启 — 本地超出权威边界</h3>
+
+<div class="real-world">
+<pre><code class="language-text">初始状态:
+  Leader B (epoch 1) LEO=10
+  Follower X (本地 epoch 表):
+    (0, 0)
+    (1, 5)
+    本地 LEO = 8
+
+X 重启:
+  1 读本地 epoch=1, LEO=8
+  2 OffsetForLeaderEpoch(epoch=1, currentLE=1) → B
+  3 B 返回: epoch=1, endOffset=10
+  4 比较: 8 < 10 → 保留本地日志
+  5 Fetch(offset=8) 继续追赶
+
+X 重启(变种,本地超出):
+  1 读本地 epoch=1, LEO=12  (X 之前是分区中 LEO 最大的副本)
+  2 OffsetForLeaderEpoch(epoch=1) → B
+  3 B 返回: epoch=1, endOffset=10
+  4 比较: 12 > 10 → truncateTo(10)
+  5 Fetch(offset=10) 继续</code></pre>
+</div>
+
+<h3>场景 B:Leader 切换后旧 Leader 恢复</h3>
+
+<div class="real-world">
+<pre><code class="language-text">初始状态:
+  Leader A (epoch 1), LEO=10, HW=10
+  Follower B, LEO=10
+
+T0: A 网络分区, 仍接受 Producer 写入
+    A: LEO=15, 但 follower 未跟上
+T1: Controller 选 B 为新 leader (epoch=2, startOffset=10)
+    B 开始接受写入, LEO=12
+T2: A 网络恢复, 收到 LeaderAndIsr (现在是 follower)
+    A 本地: epoch=1, LEO=15
+    新 leader: B, epoch=2
+
+A 恢复流程:
+  1 OffsetForLeaderEpoch(epoch=1, currentLE=2) → B
+  2 B epoch 表: (1, 0), (2, 10) → epoch 1 endOffset = 10
+  3 A 比较 LEO(15) > endOffset(10) → truncateTo(10)
+  4 A 追加 epoch=2 项: (2, 10)
+  5 Fetch(offset=10, epoch=2)
+  6 A 现在跟得上 B,加入 ISR
+
+→ A 多写的 5 条 record (offset 10..14) 被永久删除
+→ 这是正确的,因为它们从未被复制,不算"已提交"</code></pre>
+</div>
+
+<h3>场景 C:Tiered Storage 的特殊截断</h3>
+
+<p>开启 KIP-405 Tiered Storage 后,本地只保留尾部,大部分历史已经 offload 到 S3。这种情况下的截断不再"删除字节",而是"调整 endOffset 标记 + 通知 RLM 重新计算"。详见第 18 章。</p>
+
+<!-- ============================================================ -->
+<h2 id="s10-5">10.5 Fetch 携带 epoch 校验</h2>
+<!-- ============================================================ -->
+
+<p>OffsetForLeaderEpoch 解决"截断点",但还不够 — follower 进入正常 Fetch 后,如果元数据再次过期怎么办?Kafka 的方案是<strong>每次 Fetch 请求都带上 <code>currentLeaderEpoch</code></strong>,broker 收到后比对,如果不匹配立即返回 <code>FENCED_LEADER_EPOCH</code>,强制 follower 刷新元数据。这让"使用过时 leader 信息继续复制"这种 bug 在协议层就不可能发生。</p>
+
+<h3>FetchRequest 字段</h3>
+
+<pre><code class="language-text">FetchRequest v13 (KIP-595 修订)
+  replicaId         int32
+  maxWaitMs         int32
+  minBytes          int32
+  maxBytes          int32
+  topics[]
+    topic           string
+    partitions[]
+      partition         int32
+      currentLeaderEpoch int32   ← 关键字段
+      fetchOffset       int64
+      lastFetchedEpoch  int32    ← 用于 epoch 链一致性校验
+      logStartOffset    int64
+      partitionMaxBytes int32
+
+broker 处理伪代码:
+
+  if request.currentLeaderEpoch < partition.leaderEpoch:
+      return FENCED_LEADER_EPOCH
+  if request.currentLeaderEpoch > partition.leaderEpoch:
+      return UNKNOWN_LEADER_EPOCH
+  if request.lastFetchedEpoch != null:
+      verify epoch chain (KIP-320)
+  serveFetch(...)</code></pre>
+
+<h3>KIP-320:Fetch 时校验完整 epoch 链</h3>
+
+<div class="warning">
+KIP-320 是 KIP-101 的补强 — 它解决"epoch 表跨越多次但 endOffset 仍然能对上"的边角案例。具体做法:Fetch 请求带上 <code>lastFetchedEpoch</code>,leader 不仅校验 <code>currentLeaderEpoch</code>,还校验<code>fetchOffset</code> 对应的 epoch 是不是真的等于 <code>lastFetchedEpoch</code>。
+</div>
+
+<pre><code class="language-text">KIP-320 校验流程:
+
+  Follower epoch 表: (0, 0), (1, 5)
+  Follower 本地 LEO = 8
+  Follower 发 Fetch: fetchOffset=8, lastFetchedEpoch=1, currentLE=2
+
+  Leader epoch 表: (0, 0), (2, 5)        ← epoch 1 被跳过
+  Leader 检查 offset 8 在哪个 epoch:
+    8 >= 5 → epoch 2
+  比对: lastFetchedEpoch=1 ≠ 2 → 数据不一致 → 返回 OffsetOutOfRange
+
+  Follower 收到错误后, 重新走 OffsetForLeaderEpoch 找截断点</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s10-6">10.6 与 Raft Term 的对比</h2>
+<!-- ============================================================ -->
+
+<p>读到这里你可能想:"这不就是 Raft 的 term 吗?"几乎是,但有几个微妙差异。下表对照三个常见的 leader-based 一致性协议:</p>
+
+<table>
+  <thead>
+    <tr><th>概念</th><th>Kafka Leader Epoch</th><th>Raft Term</th><th>Paxos Ballot</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>语义</td><td>分区 leader 任期</td><td>整 raft 组任期</td><td>提案编号</td></tr>
+    <tr><td>选举者</td><td>Controller (KRaft 内部用 Raft)</td><td>Raft 多数派投票</td><td>Acceptor 多数派</td></tr>
+    <tr><td>单调性</td><td>严格递增</td><td>严格递增</td><td>严格递增</td></tr>
+    <tr><td>日志关联</td><td>每个 epoch 关联 startOffset</td><td>每条 log entry 带 term</td><td>每条提案带 ballot</td></tr>
+    <tr><td>截断时机</td><td>follower 启动 / 切主</td><td>append 时校验</td><td>选主时</td></tr>
+    <tr><td>RPC</td><td>OffsetForLeaderEpoch</td><td>AppendEntries</td><td>Prepare + Accept</td></tr>
+  </tbody>
+</table>
+
+<p>Kafka 选择"分区级别的 epoch"而非"集群级别的 term",是因为 Kafka 的复制单元是<strong>分区</strong>,不是<strong>整个集群</strong>。每个分区有独立的 leader 选举,自然有独立的 epoch。这让横向扩展(partition 数)不会带来 term 协调的开销。</p>
+
+<!-- ============================================================ -->
+<h2 id="s10-7">10.7 排障</h2>
+<!-- ============================================================ -->
+
+<h3>常见日志样本</h3>
+
+<pre><code class="language-text">// 正常的 epoch 切换
+[Partition order-created-0] Becoming leader: leaderEpoch=43
+[LeaderEpochFileCache] Appending epoch 43 with startOffset 1024
+
+// follower 发现需要截断
+[ReplicaFetcherThread] Truncating partition order-created-0 to offset 1020 (epoch=42)
+  because OffsetForLeaderEpoch response endOffset=1020 &lt; local LEO=1023
+
+// FENCED_LEADER_EPOCH (通常无害,触发元数据刷新)
+[ReplicaFetcherThread] Received FENCED_LEADER_EPOCH from broker 1 for partition order-created-0
+  Refreshing metadata, will retry
+
+// UNKNOWN_LEADER_EPOCH (短暂期间,会自动恢复)
+[ReplicaFetcherThread] Received UNKNOWN_LEADER_EPOCH from broker 1 for partition order-created-0
+  Sleeping 100ms, will retry</code></pre>
+
+<h3>查看 epoch 表的命令</h3>
+
+<pre><code class="language-bash"># 1 直接读文件
+cat /var/kafka-logs/order-created-0/leader-epoch-checkpoint
+# 输出:
+# 0
+# 3
+# 0 0
+# 1 5
+# 2 8
+
+# 2 用 DumpLogSegments 查看 record 上的 epoch
+kafka-run-class.sh kafka.tools.DumpLogSegments \
+  --files /var/kafka-logs/order-created-0/00000000000000000000.log \
+  --print-data-log | head -20
+# 输出:
+# offset: 0 leaderEpoch: 0 ...
+# offset: 5 leaderEpoch: 1 ...
+
+# 3 broker 端 JMX (查询当前 epoch)
+echo 'get -b kafka.cluster:type=Partition,name=LeaderEpoch,topic=order-created,partition=0 Value' | \
+  kafka-jmxtool.sh --jmx-url service:jmx:rmi:///jndi/rmi://kafka-0:9999/jmxrmi</code></pre>
+
+<h3>典型排障场景</h3>
+
+<div class="real-world">
+<strong>场景:Follower 启动后长时间不进入 ISR</strong>
+<pre><code class="language-text">现象:
+  broker-3 重启后, kafka-topics.sh 显示 Isr 仍只有 1,2 多分钟
+  broker-3 日志: 频繁收到 UNKNOWN_LEADER_EPOCH
+
+排查:
+  1 看 controller 是否已经向 broker-3 发送 LeaderAndIsr
+    → 如果 controller GC 或慢, broker-3 拿不到新 epoch
+  2 看 broker-3 metadata cache 是否陈旧
+    → JMX MetadataCache.UpdateLatencyMs
+
+动作:
+  - 优先恢复 controller 健康
+  - 如果是单次抖动,通常 30s 内自动恢复
+  - 如果持续 > 5 min, 重启 broker-3 强制重新拉元数据</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s10-8">10.8 源码深潜</h2>
+<!-- ============================================================ -->
+
+<h3>核心类</h3>
+
+<table>
+  <thead><tr><th>文件</th><th>类</th><th>职责</th></tr></thead>
+  <tbody>
+    <tr><td><code>core/.../LeaderEpochFileCache.scala</code></td><td>LeaderEpochFileCache</td><td>内存 + 文件的 epoch 表</td></tr>
+    <tr><td><code>core/.../UnifiedLog.scala</code></td><td>UnifiedLog</td><td>append 时分配 epoch、truncate 时回滚 epoch</td></tr>
+    <tr><td><code>core/.../Partition.scala</code></td><td>Partition</td><td>切主时 append 新 epoch</td></tr>
+    <tr><td><code>core/.../ReplicaFetcherThread.scala</code></td><td>ReplicaFetcherThread</td><td>调用 OffsetForLeaderEpoch + truncate</td></tr>
+    <tr><td><code>clients/.../OffsetsForLeaderEpochRequest.java</code></td><td>RPC 定义</td><td>请求 / 响应字段</td></tr>
+  </tbody>
+</table>
+
+<h3>endOffsetFor 简化代码</h3>
+
+<pre><code class="language-scala">def endOffsetFor(requestedEpoch: Int, logEndOffset: Long): EpochEntry = {
+  // 1 已超出最高 epoch → 返回当前 LEO
+  if (requestedEpoch &gt; latestEpoch) {
+    return EpochEntry(latestEpoch, logEndOffset)
+  }
+
+  // 2 找到 ≤ requestedEpoch 的最大 epoch (entry 1)
+  val entry1 = epochEntries.findLast(_.epoch &lt;= requestedEpoch)
+    .getOrElse(return EpochEntry(-1, -1))
+
+  // 3 找到下一个 epoch (entry 2)
+  val entry2 = epochEntries.find(_.epoch &gt; entry1.epoch)
+
+  // 4 endOffset = entry2.startOffset(如有), 否则 LEO
+  val endOffset = entry2.map(_.startOffset).getOrElse(logEndOffset)
+  EpochEntry(entry1.epoch, endOffset)
+}</code></pre>
+
+<h3>truncate 实现</h3>
+
+<pre><code class="language-scala">def truncateTo(targetOffset: Long): Unit = lock.synchronized {
+  if (targetOffset &gt;= logEndOffset) return    // 已经在范围内
+
+  // 1 截断 segments(可能删除整个 segment)
+  segments.truncate(targetOffset)
+
+  // 2 截断 epoch 表(移除 startOffset &gt; targetOffset 的所有 entry)
+  leaderEpochCache.foreach(_.truncateFromEnd(targetOffset))
+
+  // 3 重新计算 LEO
+  recoveryPoint = math.min(recoveryPoint, targetOffset)
+  logEndOffsetMetadata = LogOffsetMetadata(targetOffset)
+
+  // 4 刷新 producer state snapshot(KIP-360)
+  producerStateManager.truncateFullyAndStartAt(targetOffset)
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s10-9">10.9 设计取舍</h2>
+<!-- ============================================================ -->
+
+<div class="compare-grid">
+  <div>
+    <h4>① 任期权威 vs 本地观察</h4>
+    <p>截断点来自当前 leader 的"任期权威边界",而非 follower 自己看到的 HW。代价是多一次 RPC(OffsetForLeaderEpoch),但杜绝了"无声丢消息"的可能。</p>
+  </div>
+  <div>
+    <h4>② 分区级 vs 集群级 epoch</h4>
+    <p>每个分区独立 epoch,而非整个集群一个 term。让横向扩展不带来 term 协调开销,但每个分区单独维护 epoch 表(几 KB · 几乎无成本)。</p>
+  </div>
+  <div>
+    <h4>③ 一并校验 Fetch 中的 epoch</h4>
+    <p>每次 Fetch 都带 <code>currentLeaderEpoch</code>,broker 不匹配立即拒绝。代价是 RPC 多 4 字节,收益是协议层杜绝"用过时元数据继续复制"的 bug。</p>
+  </div>
+  <div>
+    <h4>④ KIP-320 的链校验</h4>
+    <p>Fetch 也带 <code>lastFetchedEpoch</code>,即使 endOffset 对得上也要求 epoch 链一致。这是对极端边角案例的兜底。</p>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s10-10">10.10 陷阱与限制</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead>
+    <tr><th>#</th><th>陷阱</th><th>现象</th><th>修复</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td>从 0.10 升到 0.11+ 不重启 broker</td><td>epoch 表始终为空,旧 truncate 逻辑仍在</td><td>滚动重启 + 检查 <code>inter.broker.protocol.version</code></td></tr>
+    <tr><td>2</td><td>误删 <code>leader-epoch-checkpoint</code></td><td>follower 重启后从 0 开始追,可能丢数据</td><td>不要手动删,必要时整个分区目录一起删</td></tr>
+    <tr><td>3</td><td>FENCED_LEADER_EPOCH 日志当报错处理</td><td>无谓告警噪声</td><td>该日志通常是正常的元数据刷新触发器</td></tr>
+    <tr><td>4</td><td>跨版本 inter-broker protocol 不一致</td><td>OffsetForLeaderEpoch v4 字段不被识别</td><td>升级时按官方 rolling upgrade 路径</td></tr>
+    <tr><td>5</td><td>磁盘损坏导致 epoch 文件残缺</td><td>broker 启动失败 / 错误恢复</td><td>恢复时优先看 controller 元数据,而非本地</td></tr>
+    <tr><td>6</td><td>UNKNOWN_LEADER_EPOCH 持续 > 5 min</td><td>controller 同步元数据失败</td><td>重启 broker 强制重新拉元数据</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s10-summary">10.11 本章要点</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>要点</th><th>依据</th><th>易错</th></tr></thead>
+  <tbody>
+    <tr><td>截断点必须来自 leader 权威</td><td>KIP-101</td><td>用本地 HW 截断</td></tr>
+    <tr><td>epoch + startOffset 组成日志任期</td><td>leader-epoch-checkpoint</td><td>误把 epoch 当 offset</td></tr>
+    <tr><td>OffsetForLeaderEpoch 返回 ≤ 请求 epoch 的最大已知 epoch</td><td>LeaderEpochFileCache.endOffsetFor</td><td>误以为返回严格相等</td></tr>
+    <tr><td>Fetch 带 currentLeaderEpoch 防止用过时元数据复制</td><td>KIP-595</td><td>认为只在启动时校验</td></tr>
+    <tr><td>FENCED_LEADER_EPOCH 是机制,不是错误</td><td>broker 日志</td><td>当报错处理</td></tr>
+    <tr><td>Kafka epoch 是分区级别</td><td>与 Raft term 不同</td><td>误把 cluster 当统一 term</td></tr>
+  </tbody>
+</table>
+
+<div class="chapter-summary">
+  <h3>本章小结</h3>
+  <p>Leader Epoch 是 Kafka 在 0.11 版本之后的"正确性基石" — 它把"截断到哪里"这个决定从 follower 的本地观察,移到了 leader 的任期权威。本质上是承认一个事实:只有当前 leader 知道"哪些数据真正属于这一任期"。OffsetForLeaderEpoch RPC、FENCED_LEADER_EPOCH 错误码、Fetch 携带 epoch 校验,三者环环相扣,让"用过时元数据继续复制"在协议层就不可能发生。下一章 KRaft 会把这个机制再向上抽象一层:不只分区,整个 controller 元数据本身也用类似的 epoch / term 来管理,Kafka 终于不再需要 ZooKeeper。</p>
+</div>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script>hljs.highlightAll();</script>
+
+</body>
+</html>

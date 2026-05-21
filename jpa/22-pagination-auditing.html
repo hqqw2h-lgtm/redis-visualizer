@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.22 分页、排序与审计 — 图解 JPA &amp; Hibernate</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📘 图解 JPA &amp; Hibernate</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="21-specification.html">上一章</a>
+  <a href="23-collection-mapping.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s22-0">22.0 总览</a>
+  <a href="#s22-1">22.1 Page</a>
+  <a href="#s22-2">22.2 Slice</a>
+  <a href="#s22-3">22.3 Keyset</a>
+  <a href="#s22-4">22.4 排序白名单</a>
+  <a href="#s22-5">22.5 Spring Data 审计</a>
+  <a href="#s22-6">22.6 Envers</a>
+  <a href="#s22-7">22.7 软删除</a>
+  <a href="#s22-8">22.8 设计取舍</a>
+  <a href="#s22-9">22.9 陷阱</a>
+  <a href="#s22-10">22.10 回归护栏</a>
+  <a href="#s22-summary">22.11 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 22 章 · 分页、排序与审计</h1>
+<p class="subtitle">Offset · Slice · Keyset · @CreatedDate · Envers · 软删除</p>
+
+<div class="chapter-intro">
+  <p class="lead">数据库的百万级订单不会一次全查出。分页和排序是生产系统的日常操作。审计(谁在何时创建、修改)是企业应用合规能力的基础。</p>
+  <p>本章从 Pageable 接口出发,剖析 <strong>Offset 与 Keyset 两种分页策略的性能差异</strong>,深入 Spring Data 审计机制和 Hibernate Envers 版本审计,最后补充软删除的三种实现方式。</p>
+  <ul class="will-learn">
+    <li>三种列表形态:Page(含 count) / Slice(size+1) / Keyset(WHERE 游标)</li>
+    <li>Offset 深分页 O(n) 退化的真实代价,以及 Keyset O(log n) 的实现细节</li>
+    <li>排序白名单防注入 + 防全表扫描 + 性能可预测</li>
+    <li>Spring Data 审计:@CreatedDate / @LastModifiedDate / @CreatedBy / @LastModifiedBy</li>
+    <li>Hibernate Envers _AUD 表 + REVINFO 表的完整历史</li>
+    <li>软删除三种实现(@SQLDelete + @Where / 字段标记 / 状态机)与唯一约束陷阱</li>
+    <li>OFFSET 深分页 vs Keyset 在 1000 万数据下的性能基准</li>
+  </ul>
+  <p class="prereq">前置知识:Spring Data Repository(第 20 章);SQL 生成与索引(第 18 章);事务(第 15 章)。</p>
+</div>
+
+<h2 id="s22-0">22.0 章首速览</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-0-1 · HTTP 列表 API → Repository → 审计字段 → Envers → 软删除</div>
+  <svg viewBox="0 0 920 320" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1f4f8b"/><stop offset="100%" stop-color="#0d2c4d"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a0e"/><stop offset="100%" stop-color="#3a230a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="340" y="14" width="240" height="56" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="460" y="38" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">HTTP 请求</text>
+    <text x="460" y="58" text-anchor="middle" fill="#c9d1d9" font-size="11">page / size / sort / cursor</text>
+
+    <rect x="20"  y="100" width="220" height="56" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="130" y="124" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">Page (页码)</text>
+    <text x="130" y="144" text-anchor="middle" fill="#c9d1d9" font-size="11">data + count SQL</text>
+
+    <rect x="350" y="100" width="220" height="56" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="460" y="124" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">Slice (加载更多)</text>
+    <text x="460" y="144" text-anchor="middle" fill="#c9d1d9" font-size="11">size + 1, 无 count</text>
+
+    <rect x="680" y="100" width="220" height="56" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="790" y="124" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">Keyset (深分页)</text>
+    <text x="790" y="144" text-anchor="middle" fill="#c9d1d9" font-size="11">WHERE sort_key &lt; cursor</text>
+
+    <rect x="280" y="180" width="360" height="44" rx="6" fill="#21262d" stroke="#8b949e"/>
+    <text x="460" y="208" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">排序白名单 · Sort / JpaSort</text>
+
+    <rect x="20"  y="250" width="200" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="120" y="280" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">Repository 查询</text>
+
+    <rect x="245" y="250" width="200" height="50" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="345" y="272" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">审计字段</text>
+    <text x="345" y="290" text-anchor="middle" fill="#c9d1d9" font-size="11">CreatedDate / By</text>
+
+    <rect x="470" y="250" width="200" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="570" y="272" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">Envers</text>
+    <text x="570" y="290" text-anchor="middle" fill="#c9d1d9" font-size="11">orders_AUD + revinfo</text>
+
+    <rect x="695" y="250" width="200" height="50" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="795" y="272" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">软删除</text>
+    <text x="795" y="290" text-anchor="middle" fill="#c9d1d9" font-size="11">DELETE → UPDATE</text>
+
+    <path d="M460,70 L130,100" stroke="#bc8cff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,70 L460,100" stroke="#bc8cff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,70 L790,100" stroke="#bc8cff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M130,156 L460,180" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,156 L460,180" stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M790,156 L460,180" stroke="#3fb950" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,224 L120,250" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,224 L345,250" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,224 L570,250" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,224 L795,250" stroke="#8b949e" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<table>
+<thead><tr><th>策略</th><th>性能(深分页)</th><th>一致性</th><th>适用</th></tr></thead>
+<tbody>
+<tr><td>Offset (Page)</td><td>O(n) — 退化</td><td>弱(扫描位置漂移)</td><td>后台表格</td></tr>
+<tr><td>Slice</td><td>O(1)</td><td>弱</td><td>移动加载更多</td></tr>
+<tr><td>Keyset</td><td>O(log n)</td><td>强(游标稳定)</td><td>深分页 / 流式</td></tr>
+</tbody>
+</table>
+
+<h2 id="s22-1">22.1 Pageable 与 Page</h2>
+
+<pre><code class="language-java">@RestController
+public class OrderController {
+
+    @Autowired
+    private OrderRepository repo;
+
+    @GetMapping("/orders")
+    public Page&lt;OrderDto&gt; list(
+        @PageableDefault(size = 20,
+            sort = "createdAt",
+            direction = Sort.Direction.DESC) Pageable pageable) {
+
+        return repo.findByStatus(OrderStatus.PAID, pageable)
+            .map(OrderDto::from);
+    }
+}</code></pre>
+
+<pre><code class="language-http">GET /orders?page=0&amp;size=20&amp;sort=createdAt,desc
+
+HTTP/1.1 200
+{
+  "number": 0,
+  "size": 20,
+  "totalElements": 1284,
+  "totalPages": 65,
+  "content": [...]
+}</code></pre>
+
+<table>
+<thead><tr><th>参数</th><th>含义</th><th>默认</th></tr></thead>
+<tbody>
+<tr><td>page</td><td>页码(0-based)</td><td>0</td></tr>
+<tr><td>size</td><td>每页大小</td><td>20</td></tr>
+<tr><td>sort</td><td>排序字段</td><td>unsorted</td></tr>
+<tr><td>direction</td><td>asc / desc</td><td>asc</td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-sql">-- content query
+SELECT o.* FROM orders o
+WHERE o.status = ?
+ORDER BY o.created_at DESC
+LIMIT 20 OFFSET 0;
+
+-- count query
+SELECT count(*) FROM orders o
+WHERE o.status = ?;</code></pre>
+
+<div class="key-insight"><p><strong>Page = data + count 两条 SQL</strong>。Page 必须执行 count 才能算出 totalElements/totalPages,大表 count 可能慢到秒级。如果 UI 不需要总页数(信息流、加载更多),用 Slice 省掉 count。</p></div>
+
+<h2 id="s22-2">22.2 Slice 与无限滚动</h2>
+
+<pre><code class="language-java">public interface OrderRepository extends JpaRepository&lt;Order, Long&gt; {
+
+    Slice&lt;Order&gt; findByStatusOrderByCreatedAtDesc(
+        OrderStatus status, Pageable pageable);
+}
+
+@RestController
+public class OrderController {
+
+    @GetMapping("/orders/slice")
+    public Map&lt;String, Object&gt; slice(
+        @PageableDefault(size = 20) Pageable pageable) {
+
+        Slice&lt;Order&gt; slice = repo.findByStatusOrderByCreatedAtDesc(
+            OrderStatus.PAID, pageable);
+
+        return Map.of(
+            "items", slice.getContent(),
+            "hasNext", slice.hasNext(),
+            "next", slice.hasNext() ? pageable.next() : null);
+    }
+}</code></pre>
+
+<table>
+<thead><tr><th>维度</th><th>Page</th><th>Slice</th></tr></thead>
+<tbody>
+<tr><td>count SQL</td><td>是</td><td>否</td></tr>
+<tr><td>总页数</td><td>提供</td><td>不提供</td></tr>
+<tr><td>hasNext</td><td>通过 totalPages</td><td>size + 1 判断</td></tr>
+<tr><td>性能(大表)</td><td>慢</td><td>快</td></tr>
+<tr><td>UI 场景</td><td>后台表格</td><td>移动 / 信息流</td></tr>
+</tbody>
+</table>
+
+<h2 id="s22-3">22.3 Keyset 分页</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-3-1 · Offset vs Keyset — 扫描 100000 行 vs 索引直达</div>
+  <svg viewBox="0 0 920 290" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    </defs>
+
+    <rect x="20"  y="20" width="420" height="250" rx="10" fill="#1f0d0d" stroke="#f85149" stroke-dasharray="4,4"/>
+    <text x="230" y="46" text-anchor="middle" fill="#f85149" font-size="14" font-weight="bold">Offset 分页 — O(n) 退化</text>
+
+    <rect x="60"  y="68" width="340" height="56" rx="6" fill="#21262d" stroke="#8b949e"/>
+    <text x="230" y="92" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">LIMIT 20 OFFSET 100000</text>
+    <text x="230" y="112" text-anchor="middle" fill="#c9d1d9" font-size="11">告诉 DB:跳过前 10 万行</text>
+
+    <rect x="60"  y="140" width="340" height="56" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="230" y="164" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">扫描前 100000 行后丢弃</text>
+    <text x="230" y="184" text-anchor="middle" fill="#c9d1d9" font-size="11">索引扫描 + 大量丢弃</text>
+
+    <rect x="60"  y="212" width="340" height="44" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="230" y="238" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">耗时 ~ 1500ms (1000 万行)</text>
+
+    <rect x="480" y="20" width="420" height="250" rx="10" fill="#0d2014" stroke="#3fb950" stroke-dasharray="4,4"/>
+    <text x="690" y="46" text-anchor="middle" fill="#3fb950" font-size="14" font-weight="bold">Keyset 分页 — O(log n)</text>
+
+    <rect x="520" y="68" width="340" height="56" rx="6" fill="#21262d" stroke="#8b949e"/>
+    <text x="690" y="90" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">WHERE id &lt; ? ORDER BY id DESC</text>
+    <text x="690" y="110" text-anchor="middle" fill="#c9d1d9" font-size="11">LIMIT 20</text>
+
+    <rect x="520" y="140" width="340" height="56" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="690" y="164" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">B-tree 直接定位游标</text>
+    <text x="690" y="184" text-anchor="middle" fill="#c9d1d9" font-size="11">取 20 行即返回</text>
+
+    <rect x="520" y="212" width="340" height="44" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="690" y="238" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">耗时 ~ 3ms (无论数据规模)</text>
+  </svg>
+</div>
+
+<table>
+<thead><tr><th>维度</th><th>Offset</th><th>Keyset</th></tr></thead>
+<tbody>
+<tr><td>深分页性能</td><td>退化(O(n))</td><td>稳定(O(log n))</td></tr>
+<tr><td>跳页</td><td>支持</td><td>不支持</td></tr>
+<tr><td>同步插入影响</td><td>重复 / 跳过</td><td>稳定</td></tr>
+<tr><td>排序需索引</td><td>是</td><td>严格必需</td></tr>
+<tr><td>实现复杂度</td><td>低</td><td>中</td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-java">public interface OrderRepository extends JpaRepository&lt;Order, Long&gt; {
+
+    @Query("""
+        select o from Order o
+        where o.status = :status
+        and (o.createdAt &lt; :cursorTime
+             or (o.createdAt = :cursorTime and o.id &lt; :cursorId))
+        order by o.createdAt desc, o.id desc
+        """)
+    List&lt;Order&gt; findKeysetPage(
+        @Param("status") OrderStatus status,
+        @Param("cursorTime") LocalDateTime cursorTime,
+        @Param("cursorId") Long cursorId,
+        Pageable pageable);
+}</code></pre>
+
+<h2 id="s22-4">22.4 排序白名单</h2>
+
+<pre><code class="language-java">public Page&lt;Order&gt; list(@PageableDefault(size = 20) Pageable pageable) {
+    Pageable safe = sanitize(pageable);
+    return repo.findAll(safe);
+}
+
+private Pageable sanitize(Pageable input) {
+    Set&lt;String&gt; allowed = Set.of("id", "createdAt", "amount", "status");
+    Sort filtered = Sort.by(input.getSort().stream()
+        .filter(o -&gt; allowed.contains(o.getProperty()))
+        .toList());
+    return PageRequest.of(input.getPageNumber(), input.getPageSize(), filtered);
+}</code></pre>
+
+<table>
+<thead><tr><th>目的</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>防 SQL 注入</td><td>拒绝非白名单字段</td></tr>
+<tr><td>防全表扫描</td><td>拒绝无索引字段</td></tr>
+<tr><td>性能可预测</td><td>限定可优化字段</td></tr>
+<tr><td>业务一致性</td><td>拒绝业务无意义排序</td></tr>
+</tbody>
+</table>
+
+<h2 id="s22-5">22.5 Spring Data 审计</h2>
+
+<table>
+<thead><tr><th>注解</th><th>字段</th><th>自动填充时机</th></tr></thead>
+<tbody>
+<tr><td>@CreatedDate</td><td>LocalDateTime</td><td>persist 时</td></tr>
+<tr><td>@LastModifiedDate</td><td>LocalDateTime</td><td>persist / update 时</td></tr>
+<tr><td>@CreatedBy</td><td>String / Long</td><td>persist 时</td></tr>
+<tr><td>@LastModifiedBy</td><td>String / Long</td><td>persist / update 时</td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-java">@Configuration
+@EnableJpaAuditing(auditorAwareRef = "auditorAware")
+public class AuditConfig {
+
+    @Bean
+    public AuditorAware&lt;String&gt; auditorAware() {
+        return () -&gt; Optional.ofNullable(SecurityContextHolder.getContext())
+            .map(SecurityContext::getAuthentication)
+            .filter(Authentication::isAuthenticated)
+            .map(Authentication::getName);
+    }
+}
+
+@Entity
+@EntityListeners(AuditingEntityListener.class)
+public class Order {
+
+    @Id @GeneratedValue
+    private Long id;
+
+    @CreatedDate
+    @Column(updatable = false)
+    private LocalDateTime createdAt;
+
+    @LastModifiedDate
+    private LocalDateTime updatedAt;
+
+    @CreatedBy
+    @Column(updatable = false, length = 50)
+    private String createdBy;
+
+    @LastModifiedBy
+    @Column(length = 50)
+    private String updatedBy;
+}</code></pre>
+
+<div class="real-world"><p><strong>线上现场</strong>:某 SaaS 系统迁移到 Spring Data 审计后发现 createdBy 全是 null。原因是没在 @SpringBootApplication 上加 <code>@EnableJpaAuditing</code>,导致 AuditingEntityListener 没注册。修复后立即生效。</p></div>
+
+<h2 id="s22-6">22.6 Hibernate Envers</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-6-1 · Envers 数据流 — Insert/Update/Delete → orders_AUD + REVINFO</div>
+  <svg viewBox="0 0 920 200" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1f4f8b"/><stop offset="100%" stop-color="#0d2c4d"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a0e"/><stop offset="100%" stop-color="#3a230a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="20"  y="65" width="160" height="70" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="100" y="92" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">Insert/Update/Delete</text>
+    <text x="100" y="112" text-anchor="middle" fill="#c9d1d9" font-size="11">业务操作</text>
+
+    <rect x="220" y="65" width="180" height="70" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="310" y="92" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">EnversIntegrator</text>
+    <text x="310" y="112" text-anchor="middle" fill="#c9d1d9" font-size="11">事件监听</text>
+
+    <rect x="440" y="20" width="200" height="56" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="540" y="44" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">REVINFO 表</text>
+    <text x="540" y="62" text-anchor="middle" fill="#c9d1d9" font-size="10">rev_id, ts, user</text>
+
+    <rect x="440" y="120" width="200" height="56" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="540" y="144" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">orders_AUD 表</text>
+    <text x="540" y="162" text-anchor="middle" fill="#c9d1d9" font-size="10">id, rev, revtype, ...</text>
+
+    <rect x="680" y="65" width="160" height="70" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="760" y="92" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">AuditReader API</text>
+    <text x="760" y="112" text-anchor="middle" fill="#c9d1d9" font-size="11">完整历史</text>
+
+    <path d="M180,100 L220,100" stroke="#bc8cff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M400,90  L440,50"  stroke="#58a6ff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M400,110 L440,148" stroke="#58a6ff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M640,148 L680,110" stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<pre><code class="language-java">@Entity
+@Audited
+public class Order {
+
+    @Id @GeneratedValue
+    private Long id;
+
+    private BigDecimal amount;
+    private String status;
+
+    @ManyToOne
+    @NotAudited
+    private Customer customer;
+}</code></pre>
+
+<pre><code class="language-sql">-- INSERT 时同步写
+INSERT INTO orders ...;
+INSERT INTO orders_aud (id, rev, revtype, amount, status) VALUES (..., 1, 0, ...);
+INSERT INTO revinfo (rev, revtype, ...) VALUES (1, 0, ...);
+
+-- revtype 含义
+-- 0 = ADD, 1 = MOD, 2 = DEL</code></pre>
+
+<pre><code class="language-java">public List&lt;Order&gt; getOrderHistory(Long orderId) {
+    AuditReader reader = AuditReaderFactory.get(em);
+    List&lt;Number&gt; revisions = reader.getRevisions(Order.class, orderId);
+
+    return revisions.stream()
+        .map(rev -&gt; reader.find(Order.class, orderId, rev))
+        .toList();
+}</code></pre>
+
+<h2 id="s22-7">22.7 软删除</h2>
+
+<table>
+<thead><tr><th>策略</th><th>实现</th><th>适用</th></tr></thead>
+<tbody>
+<tr><td>@SQLDelete + @Where</td><td>Hibernate 注解</td><td>简单</td></tr>
+<tr><td>字段标记</td><td>deleted_at 字段</td><td>复杂业务</td></tr>
+<tr><td>状态机</td><td>status = DELETED</td><td>状态多</td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-java">@Entity
+@Table(name = "orders")
+@SQLDelete(sql = "UPDATE orders SET deleted_at = NOW() WHERE id = ?")
+@Where(clause = "deleted_at IS NULL")
+public class Order {
+
+    @Id @GeneratedValue
+    private Long id;
+
+    private LocalDateTime deletedAt;
+}</code></pre>
+
+<pre><code class="language-sql">-- em.remove(order)
+UPDATE orders SET deleted_at = NOW() WHERE id = ?;
+
+-- em.find(Order.class, 1L)
+SELECT o.* FROM orders o WHERE o.id = ? AND o.deleted_at IS NULL;</code></pre>
+
+<table>
+<thead><tr><th>陷阱</th><th>现象</th><th>修复</th></tr></thead>
+<tbody>
+<tr><td>唯一约束</td><td>无法重新创建相同 key</td><td>加 deleted_at 复合唯一</td></tr>
+<tr><td>Native query</td><td>不自动加 WHERE</td><td>显式加条件</td></tr>
+<tr><td>Cascade 不级联</td><td>关联未删</td><td>@SQLDelete on 关联</td></tr>
+<tr><td>索引膨胀</td><td>已删数据占空间</td><td>物理清理任务</td></tr>
+</tbody>
+</table>
+
+<h2 id="s22-8">22.8 设计取舍</h2>
+
+<div class="compare-grid">
+  <div>
+    <h4>列表形态</h4>
+    <p>后台表格 → Page;移动 / 信息流 → Slice;深分页 → Keyset。混合 UI 按主路径选,避免每个页面都跑 count。</p>
+  </div>
+  <div>
+    <h4>审计粒度</h4>
+    <p>Spring Data 审计仅记 4 个字段;Envers 记完整快照。Envers 数据量翻倍,需归档。小项目用 Spring Data 审计,合规严格用 Envers。</p>
+  </div>
+  <div>
+    <h4>软删除是否物化</h4>
+    <p>业务关键表(订单/用户)软删;日志/关联表物理删;定期清理软删数据归档冷存。</p>
+  </div>
+</div>
+
+<h2 id="s22-9">22.9 陷阱与限制</h2>
+
+<table>
+<thead><tr><th>#</th><th>陷阱</th><th>现象</th><th>修复</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>OFFSET 深分页慢</td><td>性能退化</td><td>Keyset</td></tr>
+<tr><td>2</td><td>count 大表慢</td><td>响应延迟</td><td>Slice</td></tr>
+<tr><td>3</td><td>排序无索引</td><td>全表排序</td><td>加索引</td></tr>
+<tr><td>4</td><td>任意字段排序</td><td>注入 / 性能</td><td>白名单</td></tr>
+<tr><td>5</td><td>审计字段 updatable=true</td><td>数据污染</td><td>updatable=false</td></tr>
+<tr><td>6</td><td>Envers 表激增</td><td>存储压力</td><td>归档策略</td></tr>
+<tr><td>7</td><td>软删除唯一约束</td><td>重新创建失败</td><td>复合约束</td></tr>
+<tr><td>8</td><td>审计 listener 失败</td><td>业务 rollback</td><td>异常处理</td></tr>
+</tbody>
+</table>
+
+<h2 id="s22-10">22.10 回归护栏</h2>
+
+<pre><code class="language-java">@Test
+void pageShouldExecuteContentAndCountSql() {
+    SqlRecorder recorder = sqlRecorder.clear();
+
+    repo.findByStatus(OrderStatus.PAID, PageRequest.of(0, 20));
+
+    long selectCount = recorder.countSqlContaining("select");
+    assertThat(selectCount).isEqualTo(2L);
+    assertThat(recorder.allSql()).anyMatch(s -&gt; s.contains("limit"));
+    assertThat(recorder.allSql()).anyMatch(s -&gt; s.contains("count"));
+}
+
+@Test
+void createdAtShouldBePopulatedOnPersist() {
+    Order order = new Order(...);
+
+    repo.saveAndFlush(order);
+
+    assertThat(order.getCreatedAt()).isNotNull();
+    assertThat(order.getCreatedBy()).isEqualTo("test-user");
+}
+
+@Test
+void updatedAtShouldChangeOnUpdate() throws InterruptedException {
+    Order order = repo.findById(1L).orElseThrow();
+    LocalDateTime original = order.getUpdatedAt();
+
+    Thread.sleep(100);
+    order.setStatus("PAID");
+    repo.saveAndFlush(order);
+
+    assertThat(order.getUpdatedAt()).isAfter(original);
+}</code></pre>
+
+<h2 id="s22-summary">22.11 本章要点</h2>
+
+<div class="chapter-summary">
+<table>
+<thead><tr><th>要点</th><th>实现</th><th>易错点</th></tr></thead>
+<tbody>
+<tr><td>Page 含 count</td><td>SimpleJpaRepository</td><td>大表慢</td></tr>
+<tr><td>Slice 不 count</td><td>size + 1</td><td>缺总页数</td></tr>
+<tr><td>Keyset O(log n)</td><td>WHERE + LIMIT</td><td>实现复杂</td></tr>
+<tr><td>排序白名单</td><td>sanitize</td><td>任意字段危险</td></tr>
+<tr><td>审计自动填充</td><td>AuditingEntityListener</td><td>漏 EnableJpaAuditing</td></tr>
+<tr><td>Envers 完整历史</td><td>@Audited</td><td>表数据量翻倍</td></tr>
+<tr><td>软删除复合约束</td><td>@SQLDelete + 唯一</td><td>重建冲突</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>OFFSET 性能基准</h3>
+
+<table>
+<thead><tr><th>数据量</th><th>OFFSET 5</th><th>OFFSET 100</th><th>OFFSET 10000</th><th>OFFSET 100000</th></tr></thead>
+<tbody>
+<tr><td>1 万</td><td>2 ms</td><td>8 ms</td><td>50 ms</td><td>—</td></tr>
+<tr><td>10 万</td><td>2 ms</td><td>9 ms</td><td>80 ms</td><td>800 ms</td></tr>
+<tr><td>100 万</td><td>3 ms</td><td>10 ms</td><td>95 ms</td><td>1500 ms</td></tr>
+<tr><td>1000 万</td><td>3 ms</td><td>12 ms</td><td>110 ms</td><td>5000 ms</td></tr>
+</tbody>
+</table>
+
+<p>下一章讨论集合映射。本章覆盖了分页与审计,下一章进入 List / Set / Map / Bag 集合映射、@OrderColumn、@MapKey、@ElementCollection。</p>
+
+<div class="chapter-nav">
+  <a href="21-specification.html">&larr; 第 21 章 &middot; Specification</a>
+  <a href="23-collection-mapping.html">第 23 章 &middot; 集合映射 &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 JPA &amp; Hibernate &middot; 第 22 章 &middot; 分页、排序与审计</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

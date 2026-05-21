@@ -1,0 +1,918 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-book="blaze">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 2 章 · 项目搭建 — 图解 Blaze-Persistence</title>
+<link rel="stylesheet" href="books.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <a class="brand" href="index.html">📖 图解 Blaze-Persistence</a>
+  <span class="sep">|</span>
+  <a href="ch01-overview.html">1 全景概览</a>
+  <a href="ch02-setup.html" style="color:var(--accent);">2 项目搭建</a>
+  <a href="ch03-criteria.html">3 CriteriaBuilder</a>
+</nav>
+
+<aside class="toc">
+  <a href="#intro">章节导读</a>
+  <a href="#s2-1">2.1 Maven/Gradle 依赖配置</a>
+  <a href="#s2-1-bom" class="depth-2">版本 BOM</a>
+  <a href="#s2-2">2.2 CriteriaBuilderFactory 初始化</a>
+  <a href="#s2-2-lifecycle" class="depth-2">生命周期</a>
+  <a href="#s2-2-code" class="depth-2">代码示例</a>
+  <a href="#s2-3">2.3 EntityViewManager 初始化</a>
+  <a href="#s2-3-scan" class="depth-2">扫描与注册</a>
+  <a href="#s2-4">2.4 Spring Boot Auto-Configuration</a>
+  <a href="#s2-4-compare" class="depth-2">手动 vs 自动</a>
+  <a href="#s2-5">2.5 多数据源配置</a>
+  <a href="#s2-6">2.6 陷阱与限制</a>
+  <a href="#summary">本章小结</a>
+</aside>
+
+<article class="article">
+
+<h1>第 2 章 · 项目搭建</h1>
+<p class="subtitle">CriteriaBuilderFactory · EntityViewManager · Maven · Spring Boot Starter</p>
+
+<div class="chapter-intro" id="intro">
+  <p class="lead">
+    Blaze-Persistence 并非一个"加到 classpath 就能用"的库——它需要正确初始化两个核心工厂：
+    <code>CriteriaBuilderFactory</code> 和 <code>EntityViewManager</code>。
+    本章用图解方式拆解完整的搭建流程，从 Maven 依赖到 Spring Boot 自动配置，帮助你在 10 分钟内跑通第一个查询。
+  </p>
+  <ul class="will-learn">
+    <li>理解 Blaze-Persistence 模块拆分与依赖关系</li>
+    <li>掌握 <code>CriteriaBuilderFactory</code> 和 <code>EntityViewManager</code> 的初始化流程</li>
+    <li>使用 Spring Boot Starter 实现零配置搭建</li>
+    <li>配置多数据源场景下的多工厂实例</li>
+    <li>规避搭建阶段最常见的 5 类陷阱</li>
+  </ul>
+  <p class="prereq">
+    前置阅读：<a href="ch01-overview.html">第 1 章 · 全景概览</a> — 了解 Blaze-Persistence 的定位与架构分层。
+  </p>
+</div>
+
+<!-- ============================================================ -->
+<!-- 2.1 Maven/Gradle 依赖配置 -->
+<!-- ============================================================ -->
+<h2 id="s2-1">2.1 Maven/Gradle 依赖配置</h2>
+
+<p>
+  Blaze-Persistence 将功能拆分为多个细粒度模块，遵循 API / 实现分离原则。
+  下图展示了核心模块之间的依赖关系——箭头方向表示"依赖于"。
+</p>
+
+<div class="diagram">
+<div class="diagram-title">图 2-1 · Blaze-Persistence 模块依赖树</div>
+<div class="mermaid">
+flowchart TD
+    BOM["blaze-persistence-bom<br/><small>版本统一管理</small>"]
+
+    subgraph CORE["核心查询引擎"]
+      API["core-api<br/><small>接口 &amp; SPI</small>"]
+      IMPL["core-impl<br/><small>JPQL 生成器</small>"]
+      HIB["core-impl-hibernate<br/><small>Hibernate 集成适配</small>"]
+    end
+
+    subgraph EV["Entity View 投影"]
+      EVAPI["entity-view-api<br/><small>注解 &amp; 接口</small>"]
+      EVIMPL["entity-view-impl<br/><small>运行时映射</small>"]
+    end
+
+    subgraph INT["Spring 集成"]
+      SD["integration-spring-data<br/><small>Repository 支持</small>"]
+      BOOT["spring-boot-starter<br/><small>自动配置</small>"]
+    end
+
+    BOM -.->|管理版本| API
+    BOM -.->|管理版本| EVAPI
+    BOM -.->|管理版本| SD
+
+    IMPL --> API
+    HIB --> IMPL
+    EVIMPL --> EVAPI
+    EVIMPL --> IMPL
+    SD --> EVIMPL
+    SD --> HIB
+    BOOT --> SD
+
+    style BOM fill:#2d1f4e,stroke:#bc8cff
+    style API fill:#1e3a5f,stroke:#58a6ff
+    style IMPL fill:#1e3a5f,stroke:#58a6ff
+    style HIB fill:#1e3a5f,stroke:#58a6ff
+    style EVAPI fill:#1a3a2a,stroke:#3fb950
+    style EVIMPL fill:#1a3a2a,stroke:#3fb950
+    style SD fill:#3a2a1a,stroke:#d29922
+    style BOOT fill:#3a2a1a,stroke:#d29922
+</div>
+</div>
+
+<p>
+  理解这张图之后，你只需根据项目需求选择引入哪些模块。最小可用集合是
+  <code>core-api</code> + <code>core-impl</code> + <code>core-impl-hibernate</code>；
+  如果需要 Entity View 则追加 <code>entity-view-api</code> + <code>entity-view-impl</code>。
+</p>
+
+<h3 id="s2-1-bom">版本 BOM</h3>
+
+<p>推荐使用 <code>blaze-persistence-bom</code> 统一管理版本号，避免模块间版本不一致：</p>
+
+<pre><code>&lt;!-- pom.xml --&gt;
+&lt;dependencyManagement&gt;
+  &lt;dependencies&gt;
+    &lt;dependency&gt;
+      &lt;groupId&gt;com.blazebit&lt;/groupId&gt;
+      &lt;artifactId&gt;blaze-persistence-bom&lt;/artifactId&gt;
+      &lt;version&gt;1.6.11&lt;/version&gt;
+      &lt;type&gt;pom&lt;/type&gt;
+      &lt;scope&gt;import&lt;/scope&gt;
+    &lt;/dependency&gt;
+  &lt;/dependencies&gt;
+&lt;/dependencyManagement&gt;
+
+&lt;dependencies&gt;
+  &lt;!-- 核心查询引擎 --&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;com.blazebit&lt;/groupId&gt;
+    &lt;artifactId&gt;blaze-persistence-core-api&lt;/artifactId&gt;
+    &lt;scope&gt;compile&lt;/scope&gt;
+  &lt;/dependency&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;com.blazebit&lt;/groupId&gt;
+    &lt;artifactId&gt;blaze-persistence-core-impl&lt;/artifactId&gt;
+    &lt;scope&gt;runtime&lt;/scope&gt;
+  &lt;/dependency&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;com.blazebit&lt;/groupId&gt;
+    &lt;artifactId&gt;blaze-persistence-core-impl-hibernate-6.2&lt;/artifactId&gt;
+    &lt;scope&gt;runtime&lt;/scope&gt;
+  &lt;/dependency&gt;
+
+  &lt;!-- Entity View 投影（可选） --&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;com.blazebit&lt;/groupId&gt;
+    &lt;artifactId&gt;blaze-persistence-entity-view-api&lt;/artifactId&gt;
+    &lt;scope&gt;compile&lt;/scope&gt;
+  &lt;/dependency&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;com.blazebit&lt;/groupId&gt;
+    &lt;artifactId&gt;blaze-persistence-entity-view-impl&lt;/artifactId&gt;
+    &lt;scope&gt;runtime&lt;/scope&gt;
+  &lt;/dependency&gt;
+
+  &lt;!-- Spring Data 集成（可选） --&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;com.blazebit&lt;/groupId&gt;
+    &lt;artifactId&gt;blaze-persistence-integration-spring-data-3.3&lt;/artifactId&gt;
+  &lt;/dependency&gt;
+&lt;/dependencies&gt;</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">图 2-2 · scope 规则：API compile、实现 runtime</div>
+<div class="mermaid">
+flowchart LR
+    APP["你的应用代码"]
+    API_C["core-api<br/><b>compile</b>"]
+    IMPL_R["core-impl<br/><b>runtime</b>"]
+    HIB_R["core-impl-hibernate<br/><b>runtime</b>"]
+    EVAPI_C["entity-view-api<br/><b>compile</b>"]
+    EVIMPL_R["entity-view-impl<br/><b>runtime</b>"]
+
+    APP -->|"编码时引用接口"| API_C
+    APP -->|"编码时用注解"| EVAPI_C
+    API_C -.->|"运行时加载"| IMPL_R
+    IMPL_R -.->|"运行时加载"| HIB_R
+    EVAPI_C -.->|"运行时加载"| EVIMPL_R
+
+    style APP fill:#0d1117,stroke:#58a6ff,stroke-width:2px
+    style API_C fill:#1e3a5f,stroke:#58a6ff
+    style EVAPI_C fill:#1a3a2a,stroke:#3fb950
+    style IMPL_R fill:#2d1f4e,stroke:#bc8cff
+    style HIB_R fill:#2d1f4e,stroke:#bc8cff
+    style EVIMPL_R fill:#2d1f4e,stroke:#bc8cff
+</div>
+</div>
+
+<div class="key-insight">
+  <strong>💡 为什么 impl 是 runtime？</strong>
+  应用代码只依赖 <code>core-api</code> 和 <code>entity-view-api</code> 中的接口与注解。
+  实现类通过 <code>ServiceLoader</code> 在运行时自动发现，确保编译期零耦合。
+</div>
+
+<!-- ============================================================ -->
+<!-- 2.2 CriteriaBuilderFactory 初始化 -->
+<!-- ============================================================ -->
+<h2 id="s2-2">2.2 CriteriaBuilderFactory 初始化</h2>
+
+<p>
+  <code>CriteriaBuilderFactory</code> 是 Blaze-Persistence 的查询入口——
+  所有 <code>CriteriaBuilder</code> 实例都从它创建。
+  它的初始化遵循 <strong>Configuration → Factory</strong> 模式：先通过可变的配置对象注册属性，
+  然后调用 <code>createCriteriaBuilderFactory()</code> 生成不可变的工厂实例。
+</p>
+
+<h3 id="s2-2-lifecycle">生命周期</h3>
+
+<div class="diagram">
+<div class="diagram-title">图 2-3 · CriteriaBuilderFactory 初始化时序图</div>
+<div class="mermaid">
+sequenceDiagram
+    participant App as 应用启动
+    participant EMF as EntityManagerFactory
+    participant Cfg as CriteriaBuilderConfiguration
+    participant SL as ServiceLoader
+    participant CBF as CriteriaBuilderFactory
+
+    App->>EMF: Persistence.createEntityManagerFactory()
+    activate EMF
+    EMF-->>App: emf 实例
+    deactivate EMF
+
+    App->>Cfg: Criteria.getDefault()
+    activate Cfg
+    Cfg->>SL: 加载 CriteriaBuilderConfigurationProvider
+    SL-->>Cfg: 默认实现
+    Cfg-->>App: configuration 实例
+    deactivate Cfg
+
+    App->>Cfg: setProperty("key", "value")
+    App->>Cfg: registerFunction(...)
+
+    App->>Cfg: createCriteriaBuilderFactory(emf)
+    activate Cfg
+    Cfg->>Cfg: 验证配置 + 解析 JPA 元模型
+    Cfg->>CBF: 构建不可变工厂
+    CBF-->>App: cbf 实例（线程安全）
+    deactivate Cfg
+
+    Note over CBF: 此后 CBF 不可修改<br/>可在多线程间共享
+</div>
+</div>
+
+<div class="key-insight">
+  <strong>💡 线程安全保证</strong>
+  <code>CriteriaBuilderFactory</code> 创建后是不可变的（immutable），
+  可以安全地作为单例存储在 Spring 容器或静态字段中，供任意线程并发调用。
+</div>
+
+<h3 id="s2-2-code">代码示例：手动初始化</h3>
+
+<pre><code>// 1. 获取 JPA EntityManagerFactory（通常来自 persistence.xml）
+EntityManagerFactory emf =
+    Persistence.createEntityManagerFactory("my-pu");
+
+// 2. 创建 CriteriaBuilderConfiguration
+CriteriaBuilderConfiguration config =
+    Criteria.getDefault();
+
+// 3. 可选：注册自定义配置
+config.setProperty(
+    ConfigurationProperties.COMPATIBLE_MODE,
+    "false"
+);
+
+// 4. 构建不可变工厂
+CriteriaBuilderFactory cbf =
+    config.createCriteriaBuilderFactory(emf);
+
+// 5. 使用 —— 从 cbf 创建查询
+CriteriaBuilder&lt;Cat&gt; cb = cbf.create(em, Cat.class);
+List&lt;Cat&gt; cats = cb.where("age").gt(3).getResultList();</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">图 2-4 · CriteriaBuilderFactory 内部组件</div>
+<div class="mermaid">
+flowchart TD
+    CBF["CriteriaBuilderFactory<br/><small>不可变单例</small>"]
+
+    subgraph 内部组件
+      META["JPA 元模型缓存<br/><small>实体/属性映射</small>"]
+      FUNC["自定义函数注册表<br/><small>JPQL 函数扩展</small>"]
+      DIALECT["数据库方言<br/><small>SQL 差异适配</small>"]
+      PROPS["配置属性<br/><small>行为开关</small>"]
+    end
+
+    CBF --> META
+    CBF --> FUNC
+    CBF --> DIALECT
+    CBF --> PROPS
+
+    CB1["CriteriaBuilder #1"] -.->|创建自| CBF
+    CB2["CriteriaBuilder #2"] -.->|创建自| CBF
+    CB3["CriteriaBuilder #3"] -.->|创建自| CBF
+
+    style CBF fill:#1e3a5f,stroke:#58a6ff,stroke-width:2px
+    style META fill:#1a3a2a,stroke:#3fb950
+    style FUNC fill:#1a3a2a,stroke:#3fb950
+    style DIALECT fill:#1a3a2a,stroke:#3fb950
+    style PROPS fill:#1a3a2a,stroke:#3fb950
+    style CB1 fill:#2d1f4e,stroke:#bc8cff
+    style CB2 fill:#2d1f4e,stroke:#bc8cff
+    style CB3 fill:#2d1f4e,stroke:#bc8cff
+</div>
+</div>
+
+<!-- ============================================================ -->
+<!-- 2.3 EntityViewManager 初始化 -->
+<!-- ============================================================ -->
+<h2 id="s2-3">2.3 EntityViewManager 初始化</h2>
+
+<p>
+  <code>EntityViewManager</code> 是 Entity View 子系统的核心工厂。
+  它扫描并注册所有带 <code>@EntityView</code> 注解的接口/抽象类，
+  然后生成运行时代理。初始化流程同样遵循 Configuration → Factory 模式。
+</p>
+
+<div class="diagram">
+<div class="diagram-title">图 2-5 · EntityViewManager 初始化流程</div>
+<div class="mermaid">
+flowchart TD
+    START(["开始"]) --> CREATE_CFG["创建 EntityViewConfiguration"]
+    CREATE_CFG --> SCAN{"扫描方式？"}
+
+    SCAN -->|"手动注册"| MANUAL["addEntityView(CatView.class)<br/>addEntityView(PersonView.class)<br/>...逐个注册"]
+    SCAN -->|"包扫描"| PKG["addEntityViewPackage('com.demo.view')<br/>自动发现 @EntityView 类"]
+
+    MANUAL --> VALIDATE
+    PKG --> VALIDATE
+
+    VALIDATE["验证映射一致性<br/><small>属性名 ↔ 实体字段</small>"]
+    VALIDATE -->|通过| BUILD["createEntityViewManager(cbf)"]
+    VALIDATE -->|失败| ERR["抛出 IllegalArgumentException<br/><small>包含详细映射错误</small>"]
+
+    BUILD --> EVM["EntityViewManager<br/><small>不可变 · 线程安全</small>"]
+    EVM --> USE1["apply(setting, query)"]
+    EVM --> USE2["convert(entity, ViewClass)"]
+    EVM --> USE3["saveFull(em, view)"]
+
+    style START fill:#0d1117,stroke:#58a6ff
+    style EVM fill:#1e3a5f,stroke:#58a6ff,stroke-width:2px
+    style ERR fill:#3a1a1a,stroke:#f85149
+    style VALIDATE fill:#3a2a1a,stroke:#d29922
+    style MANUAL fill:#1a3a2a,stroke:#3fb950
+    style PKG fill:#1a3a2a,stroke:#3fb950
+</div>
+</div>
+
+<h3 id="s2-3-scan">两种注册方式对比</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad" style="border-color:rgba(214,153,34,.4);background:rgba(214,153,34,.06);">
+    <div style="font-size:11px;font-weight:700;color:var(--orange);margin-bottom:10px;">📌 手动逐个注册</div>
+<pre><code>EntityViewConfiguration cfg =
+    EntityViews.createDefaultConfiguration();
+
+cfg.addEntityView(CatView.class);
+cfg.addEntityView(PersonView.class);
+cfg.addEntityView(OrderSummary.class);
+// ... 每新增一个 View 都要加一行
+
+EntityViewManager evm =
+    cfg.createEntityViewManager(cbf);</code></pre>
+    <p style="font-size:13px;color:var(--text-muted);margin-top:10px;">适合微型项目或测试场景，但随着 View 数量增加维护成本线性增长。</p>
+  </div>
+  <div class="compare-good" style="border-color:rgba(63,185,80,.4);background:rgba(63,185,80,.06);">
+    <div style="font-size:11px;font-weight:700;color:var(--green);margin-bottom:10px;">✅ 包扫描自动发现</div>
+<pre><code>EntityViewConfiguration cfg =
+    EntityViews.createDefaultConfiguration();
+
+cfg.addEntityViewPackage("com.demo.view");
+
+EntityViewManager evm =
+    cfg.createEntityViewManager(cbf);</code></pre>
+    <p style="font-size:13px;color:var(--text-muted);margin-top:10px;">推荐方式——新增 View 无需修改配置代码，扫描器自动发现所有 <code>@EntityView</code> 类。</p>
+  </div>
+</div>
+
+<div class="diagram">
+<div class="diagram-title">图 2-6 · EntityView 扫描与代理生成</div>
+<div class="mermaid">
+flowchart LR
+    PKG["com.demo.view 包"]
+
+    subgraph 扫描发现
+      CV["CatView<br/><small>@EntityView(Cat.class)</small>"]
+      PV["PersonView<br/><small>@EntityView(Person.class)</small>"]
+      OV["OrderSummary<br/><small>@EntityView(Order.class)</small>"]
+    end
+
+    PKG --> CV
+    PKG --> PV
+    PKG --> OV
+
+    CV --> REG["EntityViewManager<br/>内部注册表"]
+    PV --> REG
+    OV --> REG
+
+    REG --> P1["CatView$Proxy<br/><small>运行时生成</small>"]
+    REG --> P2["PersonView$Proxy<br/><small>运行时生成</small>"]
+    REG --> P3["OrderSummary$Proxy<br/><small>运行时生成</small>"]
+
+    style PKG fill:#0d1117,stroke:#58a6ff
+    style REG fill:#1e3a5f,stroke:#58a6ff,stroke-width:2px
+    style CV fill:#1a3a2a,stroke:#3fb950
+    style PV fill:#1a3a2a,stroke:#3fb950
+    style OV fill:#1a3a2a,stroke:#3fb950
+    style P1 fill:#2d1f4e,stroke:#bc8cff
+    style P2 fill:#2d1f4e,stroke:#bc8cff
+    style P3 fill:#2d1f4e,stroke:#bc8cff
+</div>
+</div>
+
+<div class="warning">
+  <strong>⚠️ 顺序陷阱</strong>
+  <code>EntityViewManager</code> 必须在所有 Entity View 注册完毕之后再调用
+  <code>createEntityViewManager(cbf)</code>——创建后不可追加新的 View 类。
+</div>
+
+<!-- ============================================================ -->
+<!-- 2.4 Spring Boot Auto-Configuration -->
+<!-- ============================================================ -->
+<h2 id="s2-4">2.4 Spring Boot Auto-Configuration</h2>
+
+<p>
+  如果项目使用 Spring Boot，引入 <code>blaze-persistence-integration-spring-boot-starter</code>
+  即可省去所有手动初始化代码。Starter 通过 <code>@AutoConfiguration</code> 自动完成以下工作：
+</p>
+
+<div class="diagram">
+<div class="diagram-title">图 2-7 · Spring Boot Starter 自动配置链</div>
+<div class="mermaid">
+flowchart TD
+    BOOT(["Spring Boot 启动"]) --> AC["BlazeAutoConfiguration<br/><small>@AutoConfiguration</small>"]
+
+    AC --> CHK_EMF{"检测到<br/>EntityManagerFactory?"}
+    CHK_EMF -->|否| SKIP["跳过 Blaze 配置"]
+    CHK_EMF -->|是| CBF_BEAN
+
+    CBF_BEAN["注册 Bean:<br/>CriteriaBuilderFactory"]
+    CBF_BEAN --> CHK_EV{"classpath 含<br/>entity-view-impl?"}
+
+    CHK_EV -->|否| DONE1(["完成：仅核心查询"])
+    CHK_EV -->|是| EV_SCAN
+
+    EV_SCAN["扫描 @EntityView<br/><small>基于 @EntityScan 包路径</small>"]
+    EV_SCAN --> EVM_BEAN["注册 Bean:<br/>EntityViewManager"]
+
+    EVM_BEAN --> CHK_SD{"classpath 含<br/>spring-data 集成?"}
+    CHK_SD -->|否| DONE2(["完成：核心 + Entity View"])
+    CHK_SD -->|是| SD_BEAN["启用<br/>EntityViewRepository<br/>支持"]
+    SD_BEAN --> DONE3(["完成：全功能"])
+
+    style BOOT fill:#0d1117,stroke:#58a6ff
+    style AC fill:#3a2a1a,stroke:#d29922,stroke-width:2px
+    style CBF_BEAN fill:#1e3a5f,stroke:#58a6ff
+    style EVM_BEAN fill:#1a3a2a,stroke:#3fb950
+    style SD_BEAN fill:#2d1f4e,stroke:#bc8cff
+    style SKIP fill:#3a1a1a,stroke:#f85149
+</div>
+</div>
+
+<p>整个过程只需两步：添加依赖，写 <code>application.yml</code>。</p>
+
+<h4>最小依赖配置</h4>
+
+<pre><code>&lt;!-- pom.xml —— 一个 Starter 搞定一切 --&gt;
+&lt;dependency&gt;
+  &lt;groupId&gt;com.blazebit&lt;/groupId&gt;
+  &lt;artifactId&gt;blaze-persistence-integration-spring-boot-starter&lt;/artifactId&gt;
+  &lt;version&gt;1.6.11&lt;/version&gt;
+&lt;/dependency&gt;</code></pre>
+
+<h4>application.yml 属性</h4>
+
+<pre><code># application.yml
+blaze:
+  persistence:
+    # Entity View 扫描包（默认与 @SpringBootApplication 相同）
+    view:
+      entity-view-packages: com.demo.view
+    # 可选：全局配置属性
+    properties:
+      com.blazebit.persistence.returning_clause_enabled: "true"</code></pre>
+
+<h3 id="s2-4-compare">手动 vs 自动配置对比</h3>
+
+<div class="diagram">
+<div class="diagram-title">图 2-8 · 代码量对比：手动初始化 vs Spring Boot Starter</div>
+<div style="display:flex;flex-wrap:wrap;gap:20px;justify-content:center;padding:16px 0;">
+  <div style="flex:1;min-width:260px;max-width:400px;border:1px solid #f85149;border-radius:10px;padding:18px;background:rgba(248,81,73,.06);">
+    <div style="font-weight:bold;color:#f85149;margin-bottom:10px;">❌ 手动初始化 · ~25 行</div>
+    <div style="display:flex;flex-direction:column;gap:4px;">
+      <div style="background:rgba(248,81,73,.08);border-radius:6px;padding:5px 10px;color:#e6edf3;font-size:13px;">创建 EMF</div>
+      <div style="color:#8b949e;text-align:center;font-size:12px;">↓</div>
+      <div style="background:rgba(248,81,73,.08);border-radius:6px;padding:5px 10px;color:#e6edf3;font-size:13px;">Criteria.getDefault()</div>
+      <div style="color:#8b949e;text-align:center;font-size:12px;">↓</div>
+      <div style="background:rgba(248,81,73,.08);border-radius:6px;padding:5px 10px;color:#e6edf3;font-size:13px;">设置属性</div>
+      <div style="color:#8b949e;text-align:center;font-size:12px;">↓</div>
+      <div style="background:rgba(248,81,73,.08);border-radius:6px;padding:5px 10px;color:#e6edf3;font-size:13px;">createCriteriaBuilderFactory()</div>
+      <div style="color:#8b949e;text-align:center;font-size:12px;">↓</div>
+      <div style="background:rgba(248,81,73,.08);border-radius:6px;padding:5px 10px;color:#e6edf3;font-size:13px;">EntityViews 配置 + 包扫描</div>
+      <div style="color:#8b949e;text-align:center;font-size:12px;">↓</div>
+      <div style="background:rgba(248,81,73,.08);border-radius:6px;padding:5px 10px;color:#e6edf3;font-size:13px;">createEntityViewManager()</div>
+      <div style="color:#8b949e;text-align:center;font-size:12px;">↓</div>
+      <div style="background:rgba(248,81,73,.08);border-radius:6px;padding:5px 10px;color:#e6edf3;font-size:13px;">注册到容器</div>
+    </div>
+  </div>
+  <div style="flex:1;min-width:260px;max-width:400px;border:1px solid #3fb950;border-radius:10px;padding:18px;background:rgba(63,185,80,.06);">
+    <div style="font-weight:bold;color:#3fb950;margin-bottom:10px;">✅ Spring Boot · ~2 行</div>
+    <div style="display:flex;flex-direction:column;gap:4px;">
+      <div style="background:rgba(63,185,80,.08);border-radius:6px;padding:5px 10px;color:#e6edf3;font-size:13px;">添加 Starter 依赖</div>
+      <div style="color:#8b949e;text-align:center;font-size:12px;">↓</div>
+      <div style="background:rgba(63,185,80,.08);border-radius:6px;padding:5px 10px;color:#e6edf3;font-size:13px;">配置 yml</div>
+    </div>
+    <div style="color:#3fb950;font-size:13px;margin-top:14px;text-align:center;">自动检测 EMF · 自动扫描 View · 自动注册 Bean</div>
+  </div>
+</div>
+</div>
+
+<div class="compare-grid">
+  <div class="compare-bad" style="border-color:rgba(248,81,73,.4);">
+    <div style="font-size:11px;font-weight:700;color:var(--red);margin-bottom:10px;">❌ 手动配置 · ~25 行 Java</div>
+<pre><code>@Configuration
+public class BlazePersistenceConfig {
+
+  @PersistenceUnit
+  private EntityManagerFactory emf;
+
+  @Bean
+  @Scope(SCOPE_SINGLETON)
+  @Lazy(false)
+  public CriteriaBuilderFactory cbf() {
+    CriteriaBuilderConfiguration cfg =
+        Criteria.getDefault();
+    cfg.setProperty(...);
+    return cfg
+      .createCriteriaBuilderFactory(emf);
+  }
+
+  @Bean
+  @Scope(SCOPE_SINGLETON)
+  @Lazy(false)
+  public EntityViewManager evm(
+      CriteriaBuilderFactory cbf) {
+    EntityViewConfiguration cfg =
+        EntityViews.createDefaultConfiguration();
+    cfg.addEntityViewPackage(
+        "com.demo.view");
+    return cfg
+      .createEntityViewManager(cbf);
+  }
+}</code></pre>
+  </div>
+  <div class="compare-good" style="border-color:rgba(63,185,80,.4);">
+    <div style="font-size:11px;font-weight:700;color:var(--green);margin-bottom:10px;">✅ Spring Boot · 2 行</div>
+<pre><code>&lt;!-- pom.xml --&gt;
+&lt;dependency&gt;
+  &lt;groupId&gt;com.blazebit&lt;/groupId&gt;
+  &lt;artifactId&gt;blaze-persistence-integration
+    -spring-boot-starter&lt;/artifactId&gt;
+&lt;/dependency&gt;</code></pre>
+<pre><code># application.yml
+blaze:
+  persistence:
+    view:
+      entity-view-packages:
+        com.demo.view</code></pre>
+    <p style="font-size:13px;color:var(--text-muted);margin-top:10px;">
+      Starter 自动检测 <code>EntityManagerFactory</code>，
+      自动扫描 Entity View，自动注册所有 Bean。
+    </p>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- 2.5 多数据源配置 -->
+<!-- ============================================================ -->
+<h2 id="s2-5">2.5 多数据源配置</h2>
+
+<p>
+  在微服务或多租户架构中，一个应用可能需要连接多个数据库。
+  此时需要为每个 <code>EntityManagerFactory</code> 创建独立的
+  <code>CriteriaBuilderFactory</code> 和 <code>EntityViewManager</code>。
+</p>
+
+<div class="diagram">
+<div class="diagram-title">图 2-9 · 多数据源架构：每个数据源独立工厂链</div>
+<div class="mermaid">
+flowchart TD
+    APP["Spring Boot 应用"]
+
+    subgraph DS1["数据源 A · 订单库"]
+      DS_A["DataSource A<br/><small>jdbc:mysql://order-db</small>"]
+      EMF_A["EntityManagerFactory A"]
+      CBF_A["CriteriaBuilderFactory A"]
+      EVM_A["EntityViewManager A<br/><small>OrderView, ItemView</small>"]
+    end
+
+    subgraph DS2["数据源 B · 用户库"]
+      DS_B["DataSource B<br/><small>jdbc:postgresql://user-db</small>"]
+      EMF_B["EntityManagerFactory B"]
+      CBF_B["CriteriaBuilderFactory B"]
+      EVM_B["EntityViewManager B<br/><small>UserView, RoleView</small>"]
+    end
+
+    APP --> DS_A
+    APP --> DS_B
+    DS_A --> EMF_A --> CBF_A --> EVM_A
+    DS_B --> EMF_B --> CBF_B --> EVM_B
+
+    style APP fill:#0d1117,stroke:#58a6ff,stroke-width:2px
+    style DS_A fill:#3a2a1a,stroke:#d29922
+    style EMF_A fill:#1e3a5f,stroke:#58a6ff
+    style CBF_A fill:#1e3a5f,stroke:#58a6ff
+    style EVM_A fill:#1a3a2a,stroke:#3fb950
+    style DS_B fill:#3a2a1a,stroke:#d29922
+    style EMF_B fill:#2d1f4e,stroke:#bc8cff
+    style CBF_B fill:#2d1f4e,stroke:#bc8cff
+    style EVM_B fill:#1a3a2a,stroke:#3fb950
+</div>
+</div>
+
+<p>使用 <code>@Qualifier</code> 区分多个工厂 Bean：</p>
+
+<pre><code>@Configuration
+public class MultiDataSourceBlazeConfig {
+
+    @Bean @Qualifier("order")
+    public CriteriaBuilderFactory orderCbf(
+            @Qualifier("order") EntityManagerFactory emf) {
+        return Criteria.getDefault()
+            .createCriteriaBuilderFactory(emf);
+    }
+
+    @Bean @Qualifier("user")
+    public CriteriaBuilderFactory userCbf(
+            @Qualifier("user") EntityManagerFactory emf) {
+        return Criteria.getDefault()
+            .createCriteriaBuilderFactory(emf);
+    }
+
+    @Bean @Qualifier("order")
+    public EntityViewManager orderEvm(
+            @Qualifier("order") CriteriaBuilderFactory cbf) {
+        EntityViewConfiguration cfg =
+            EntityViews.createDefaultConfiguration();
+        cfg.addEntityViewPackage("com.demo.order.view");
+        return cfg.createEntityViewManager(cbf);
+    }
+
+    @Bean @Qualifier("user")
+    public EntityViewManager userEvm(
+            @Qualifier("user") CriteriaBuilderFactory cbf) {
+        EntityViewConfiguration cfg =
+            EntityViews.createDefaultConfiguration();
+        cfg.addEntityViewPackage("com.demo.user.view");
+        return cfg.createEntityViewManager(cbf);
+    }
+}</code></pre>
+
+<div class="warning">
+  <strong>⚠️ Entity View 不能跨工厂共享</strong>
+  一个 <code>EntityViewManager</code> 只认识它注册时所绑定的
+  <code>CriteriaBuilderFactory</code>。
+  跨数据源使用错误的 EVM 会导致运行时异常。
+</div>
+
+<div class="diagram">
+<div class="diagram-title">图 2-10 · 多数据源 Bean 注入关系</div>
+<div class="mermaid">
+flowchart LR
+    subgraph 订单服务
+      OS["OrderService"]
+      OS -->|"@Qualifier('order')"| CBF_A["orderCbf"]
+      OS -->|"@Qualifier('order')"| EVM_A["orderEvm"]
+    end
+
+    subgraph 用户服务
+      US["UserService"]
+      US -->|"@Qualifier('user')"| CBF_B["userCbf"]
+      US -->|"@Qualifier('user')"| EVM_B["userEvm"]
+    end
+
+    CBF_A -.->|绑定| EMF_A["orderEmf"]
+    CBF_B -.->|绑定| EMF_B["userEmf"]
+
+    style OS fill:#1e3a5f,stroke:#58a6ff
+    style US fill:#2d1f4e,stroke:#bc8cff
+    style CBF_A fill:#1a3a2a,stroke:#3fb950
+    style EVM_A fill:#1a3a2a,stroke:#3fb950
+    style CBF_B fill:#1a3a2a,stroke:#3fb950
+    style EVM_B fill:#1a3a2a,stroke:#3fb950
+</div>
+</div>
+
+<!-- ============================================================ -->
+<!-- 2.6 陷阱与限制 -->
+<!-- ============================================================ -->
+<h2 id="s2-6">2.6 陷阱与限制</h2>
+
+<p>
+  搭建阶段的错误往往在运行时才暴露，且异常信息不够直观。
+  下面梳理最常见的 5 类陷阱及其解决方案。
+</p>
+
+<div class="diagram">
+<div class="diagram-title">图 2-11 · 搭建阶段常见陷阱决策树</div>
+<div class="mermaid">
+flowchart TD
+    ERR(["启动报错"]) --> T1{"ClassNotFoundException<br/>或 NoClassDefFoundError?"}
+    T1 -->|是| FIX1["检查 impl 模块是否在 classpath<br/><small>core-impl / entity-view-impl</small>"]
+    T1 -->|否| T2{"IllegalArgumentException<br/>映射验证失败?"}
+
+    T2 -->|是| FIX2["检查 @EntityView 注解的<br/>实体类是否在 persistence.xml"]
+    T2 -->|否| T3{"NoSuchMethodError<br/>或 AbstractMethodError?"}
+
+    T3 -->|是| FIX3["Hibernate 与 Blaze-Persistence<br/>版本不兼容 → 查兼容矩阵"]
+    T3 -->|否| T4{"Spring Bean<br/>创建失败?"}
+
+    T4 -->|是| FIX4["确认 EMF Bean 先于<br/>CBF Bean 初始化"]
+    T4 -->|否| T5{"查询时 NPE<br/>或 LazyInitException?"}
+
+    T5 -->|是| FIX5["确认 EntityManager<br/>在事务上下文内使用"]
+
+    style ERR fill:#3a1a1a,stroke:#f85149,stroke-width:2px
+    style FIX1 fill:#1a3a2a,stroke:#3fb950
+    style FIX2 fill:#1a3a2a,stroke:#3fb950
+    style FIX3 fill:#1a3a2a,stroke:#3fb950
+    style FIX4 fill:#1a3a2a,stroke:#3fb950
+    style FIX5 fill:#1a3a2a,stroke:#3fb950
+</div>
+</div>
+
+<h3>陷阱 1：版本不匹配</h3>
+
+<p>
+  Blaze-Persistence 对 Hibernate 版本有严格要求，使用错误的集成模块会触发
+  <code>NoSuchMethodError</code>。
+</p>
+
+<table>
+  <thead>
+    <tr><th>Blaze-Persistence</th><th>Hibernate 版本</th><th>集成模块 artifactId</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1.6.x</td><td>5.6.x</td><td><code>core-impl-hibernate-5.6</code></td></tr>
+    <tr><td>1.6.x</td><td>6.2.x</td><td><code>core-impl-hibernate-6.2</code></td></tr>
+    <tr><td>1.6.x</td><td>6.4.x+</td><td><code>core-impl-hibernate-6.2</code> (兼容)</td></tr>
+    <tr><td>1.5.x</td><td>5.4.x</td><td><code>core-impl-hibernate-5.4</code></td></tr>
+  </tbody>
+</table>
+
+<div class="os-note">
+  <strong>🔧 排查技巧</strong>
+  在 Maven 中运行 <code>mvn dependency:tree | grep hibernate</code> 确认实际传递的 Hibernate 版本，
+  然后对照上表选择正确的集成模块。
+</div>
+
+<h3>陷阱 2：EntityView 注册遗漏</h3>
+
+<div class="diagram">
+<div class="diagram-title">图 2-12 · 未注册 EntityView 的错误链路</div>
+<div class="mermaid">
+sequenceDiagram
+    participant App as 应用
+    participant EVM as EntityViewManager
+    participant Q as CriteriaBuilder
+
+    App->>Q: cbf.create(em, Cat.class)
+    App->>EVM: evm.applySetting(setting, query)
+    EVM->>EVM: 查找 CatView 映射
+    EVM-->>App: IllegalArgumentException<br/>"No entity view mapping found<br/>for class CatView"
+
+    Note over App,EVM: 原因：CatView 未通过<br/>addEntityView() 或包扫描注册
+</div>
+</div>
+
+<h3>陷阱 3：Spring Bean 初始化顺序</h3>
+
+<p>
+  <code>CriteriaBuilderFactory</code> 依赖 <code>EntityManagerFactory</code>，
+  <code>EntityViewManager</code> 依赖 <code>CriteriaBuilderFactory</code>。
+  如果使用 <code>@Lazy</code> 或条件装配，可能打断依赖链。
+</p>
+
+<div class="steps">
+  <div class="step">
+    <div class="step-num">1</div>
+    <div class="step-body">
+      <strong>EntityManagerFactory</strong> 必须最先就绪（由 Spring JPA 自动配置保证）
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num">2</div>
+    <div class="step-body">
+      <strong>CriteriaBuilderFactory</strong> 在 EMF 之后创建，标记 <code>@Lazy(false)</code>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num">3</div>
+    <div class="step-body">
+      <strong>EntityViewManager</strong> 在 CBF 之后创建，同样 <code>@Lazy(false)</code>
+    </div>
+  </div>
+  <div class="step">
+    <div class="step-num">4</div>
+    <div class="step-body">
+      <strong>业务 Service / Repository</strong> 最后注入 CBF 和 EVM
+    </div>
+  </div>
+</div>
+
+<h3>陷阱 4：Spring Boot Starter 版本选择</h3>
+
+<p>
+  Starter 模块的命名从 1.6.9 开始区分 Spring Boot 2.x 和 3.x。
+  使用错误版本将导致自动配置完全失效但不报错。
+</p>
+
+<table>
+  <thead>
+    <tr><th>Spring Boot</th><th>Starter artifactId</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>2.7.x</td><td><code>blaze-persistence-integration-spring-boot-starter</code></td></tr>
+    <tr><td>3.0 ~ 3.3</td><td><code>blaze-persistence-integration-spring-boot-3.1-starter</code></td></tr>
+  </tbody>
+</table>
+
+<h3>陷阱 5：scope 误用</h3>
+
+<div class="diagram">
+<div class="diagram-title">图 2-13 · scope 误用导致编译失败场景</div>
+<div style="display:flex;flex-wrap:wrap;gap:16px;justify-content:center;padding:16px 0;">
+  <div style="border:1px solid #f85149;border-radius:8px;padding:14px 18px;min-width:200px;max-width:260px;background:rgba(248,81,73,.06);text-align:center;">
+    <div style="font-weight:bold;color:#f85149;margin-bottom:6px;">❌ 错误：API 用 runtime</div>
+    <div style="color:#e6edf3;font-size:13px;"><code>core-api</code> → <b>runtime</b></div>
+    <div style="color:#f85149;font-size:12px;margin-top:6px;">编译错误：cannot find symbol CriteriaBuilder</div>
+  </div>
+  <div style="border:1px solid #3fb950;border-radius:8px;padding:14px 18px;min-width:200px;max-width:260px;background:rgba(63,185,80,.06);text-align:center;">
+    <div style="font-weight:bold;color:#3fb950;margin-bottom:6px;">✅ 正确：API 用 compile</div>
+    <div style="color:#e6edf3;font-size:13px;"><code>core-api</code> → <b>compile</b></div>
+    <div style="color:#3fb950;font-size:12px;margin-top:6px;">CriteriaBuilder 正常引用</div>
+  </div>
+  <div style="border:1px solid #d29922;border-radius:8px;padding:14px 18px;min-width:200px;max-width:260px;background:rgba(210,153,34,.06);text-align:center;">
+    <div style="font-weight:bold;color:#d29922;margin-bottom:6px;">⚠️ 警告：impl 用 compile</div>
+    <div style="color:#e6edf3;font-size:13px;"><code>core-impl</code> → <b>compile</b></div>
+    <div style="color:#d29922;font-size:12px;margin-top:6px;">不影响编译，但违反封装原则</div>
+  </div>
+</div>
+</div>
+
+<div class="key-insight">
+  <strong>💡 黄金法则</strong>
+  API 模块（<code>core-api</code>、<code>entity-view-api</code>）用
+  <code>compile</code> scope；
+  实现模块（<code>core-impl</code>、<code>entity-view-impl</code>、<code>core-impl-hibernate-*</code>）用
+  <code>runtime</code> scope。
+</div>
+
+<!-- ============================================================ -->
+<!-- 本章小结 -->
+<!-- ============================================================ -->
+<div class="chapter-summary" id="summary">
+  <h2>📝 本章小结</h2>
+  <ul>
+    <li>Blaze-Persistence 采用<strong>模块化设计</strong>，通过 BOM 统一版本，API 与实现分离</li>
+    <li><code>CriteriaBuilderFactory</code> 是查询入口，创建后<strong>不可变且线程安全</strong></li>
+    <li><code>EntityViewManager</code> 负责 DTO 投影，需在所有 View 注册后一次性构建</li>
+    <li>Spring Boot Starter 将 ~25 行配置代码缩减为 <strong>2 行依赖 + yml</strong></li>
+    <li>多数据源场景需要为每个 DataSource 创建<strong>独立的工厂链</strong></li>
+    <li>最常见的 5 类陷阱：版本不匹配、View 未注册、Bean 顺序、Starter 版本选错、scope 误用</li>
+  </ul>
+  <p class="next-hint">
+    下一章 <a href="ch03-criteria.html">第 3 章 · CriteriaBuilder 查询引擎</a>
+    将深入 <code>CriteriaBuilder</code> 的类型安全查询构建机制——
+    从 WHERE / ORDER BY 到动态条件拼接，全部以 Mermaid 图解呈现。
+  </p>
+</div>
+
+<nav class="chapter-nav">
+  <a href="ch01-overview.html">&larr; 第 1 章 · 全景概览</a>
+  <a href="ch03-criteria.html">第 3 章 · CriteriaBuilder 查询引擎 &rarr;</a>
+</nav>
+
+<p class="footer">&copy; 2026 图解 Blaze-Persistence &middot; 第 2 章 &middot; 项目搭建</p>
+
+</article>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+mermaid.initialize({
+  theme: 'dark',
+  themeVariables: {
+    primaryColor: '#58a6ff', primaryTextColor: '#e6edf3', primaryBorderColor: '#30363d',
+    lineColor: '#8b949e', secondaryColor: '#161b22', tertiaryColor: '#0d1117',
+    background: '#161b22', mainBkg: '#161b22', nodeBorder: '#30363d',
+    clusterBkg: 'rgba(22,27,34,.5)', clusterBorder: '#30363d', titleColor: '#e6edf3',
+    edgeLabelBackground: '#161b22',
+  },
+  flowchart: { curve: 'basis', padding: 15 },
+  sequence: { actorMargin: 50, messageMargin: 30 },
+});
+</script>
+</body>
+</html>

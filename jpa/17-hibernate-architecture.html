@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.17 Hibernate 架构全景 — 图解 JPA &amp; Hibernate</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📘 图解 JPA &amp; Hibernate</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="16-locking.html">上一章</a>
+  <a href="18-sql-generation.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s17-0">17.0 整体架构</a>
+  <a href="#s17-1">17.1 SessionFactory 构建</a>
+  <a href="#s17-2">17.2 SessionImpl 工作单元</a>
+  <a href="#s17-3">17.3 事件监听</a>
+  <a href="#s17-4">17.4 ActionQueue</a>
+  <a href="#s17-5">17.5 查询引擎</a>
+  <a href="#s17-6">17.6 SPI 扩展</a>
+  <a href="#s17-7">17.7 Statistics</a>
+  <a href="#s17-8">17.8 版本演进</a>
+  <a href="#s17-9">17.9 设计取舍</a>
+  <a href="#s17-10">17.10 陷阱</a>
+  <a href="#s17-11">17.11 回归护栏</a>
+  <a href="#s17-summary">17.12 本章要点</a>
+  <a href="#s17-13">17.13 扩展</a>
+</aside>
+
+<div class="article">
+
+<h1>第 17 章 · Hibernate 架构全景</h1>
+<p class="subtitle">SessionFactory 单例 · Session 工作单元 · ActionQueue · EventListener · SQM + SQL AST · Statistics</p>
+
+<div class="chapter-intro">
+  <p class="lead">Hibernate 是 JPA 的参考实现。本章系统拆解 <strong>SessionFactory 构建链、SessionImpl 工作单元、事件监听系统、Action Queue 写入队列、查询引擎、SPI 扩展点</strong>。</p>
+  <p>排查路径是把问题<strong>落到组件层</strong>:启动慢看 Metadata,内存涨看 PersistenceContext,SQL 异常看 QueryEngine,顺序异常看 ActionQueue,审计扩展看事件系统。</p>
+  <ul class="will-learn">
+    <li>SessionFactory 构建链:StandardServiceRegistry → MetadataSources → Metadata → SessionFactoryImpl</li>
+    <li>SessionImpl 内部组件:PersistenceContext + ActionQueue + EventSource + TransactionCoordinator + JdbcCoordinator</li>
+    <li>8 类核心事件:PreInsert/Update/Delete/Load + Flush + AutoFlush + DirtyCheck + Persist</li>
+    <li>ActionQueue 的 6 阶段严格顺序:Insert → Update → CollDel → CollUpd → CollIns → Delete</li>
+    <li>Hibernate 6 的 SQM(语义查询模型)+ SQL AST 两阶段编译模型</li>
+    <li>8 大 SPI 扩展点:Interceptor / EventListener / StatementInspector / Dialect / IdGen / Converter / MultiTenant</li>
+    <li>Hibernate Statistics 8 项指标 + Micrometer 暴露</li>
+    <li>Hibernate 3.x → 6.4 的演进时间线 + 三大设计取舍</li>
+    <li>SessionFactory 重 Session 轻、Action 延迟写入、事件系统而非 AOP 的源头</li>
+    <li>启动配置推荐 9 项 + Bytecode Enhancement 配置</li>
+  </ul>
+  <p class="prereq">前置知识:第 3 章 PersistenceContext;第 14 章批量与 JDBC Batching;Spring AOP 与 IoC 容器基础;ANTLR 解析器与 AST 的基本概念。</p>
+</div>
+
+<h2 id="s17-0">17.0 整体架构</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 17-0-1 · Hibernate 整体架构 — 启动链 + 运行链</div>
+  <svg viewBox="0 0 920 490" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="20"  y="20" width="280" height="52" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="160" y="42" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">配置</text>
+    <text x="160" y="60" text-anchor="middle" fill="#c9d1d9" font-size="11">persistence.xml / properties</text>
+
+    <rect x="340" y="20" width="280" height="52" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="480" y="42" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">StandardServiceRegistry</text>
+    <text x="480" y="60" text-anchor="middle" fill="#c9d1d9" font-size="11">ConnectionProvider + Dialect</text>
+
+    <rect x="660" y="20" width="240" height="52" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="780" y="42" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">MetadataSources</text>
+    <text x="780" y="60" text-anchor="middle" fill="#c9d1d9" font-size="11">注解 + XML 映射</text>
+
+    <rect x="340" y="106" width="280" height="52" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="480" y="128" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">Metadata</text>
+    <text x="480" y="146" text-anchor="middle" fill="#c9d1d9" font-size="11">实体映射模型</text>
+
+    <rect x="340" y="190" width="280" height="52" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="480" y="212" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">SessionFactory</text>
+    <text x="480" y="230" text-anchor="middle" fill="#c9d1d9" font-size="11">线程安全应用级单例</text>
+
+    <rect x="660" y="190" width="240" height="52" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="780" y="212" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">L2 Cache / Statistics</text>
+    <text x="780" y="230" text-anchor="middle" fill="#c9d1d9" font-size="11">应用级共享资源</text>
+
+    <rect x="340" y="270" width="280" height="52" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="480" y="292" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">SessionImpl</text>
+    <text x="480" y="310" text-anchor="middle" fill="#c9d1d9" font-size="11">工作单元 · 非线程安全</text>
+
+    <rect x="20"  y="350" width="190" height="48" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="115" y="370" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">PersistenceContext</text>
+    <text x="115" y="386" text-anchor="middle" fill="#c9d1d9" font-size="11">L1 + Snapshot</text>
+
+    <rect x="230" y="350" width="180" height="48" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="320" y="370" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">ActionQueue</text>
+    <text x="320" y="386" text-anchor="middle" fill="#c9d1d9" font-size="11">Insert/Update/Delete</text>
+
+    <rect x="430" y="350" width="180" height="48" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="520" y="370" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">EventListener</text>
+    <text x="520" y="386" text-anchor="middle" fill="#c9d1d9" font-size="11">Persist/Flush/Load</text>
+
+    <rect x="630" y="350" width="270" height="48" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="765" y="370" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">QueryEngine</text>
+    <text x="765" y="386" text-anchor="middle" fill="#c9d1d9" font-size="11">SQM → SQL AST → Translator</text>
+
+    <rect x="280" y="425" width="380" height="50" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="470" y="448" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">JdbcMutationExecutor + JDBC</text>
+    <text x="470" y="464" text-anchor="middle" fill="#c9d1d9" font-size="11">数据库</text>
+
+    <path d="M300,46  L340,46"  stroke="#bc8cff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M620,46  L660,46"  stroke="#58a6ff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M780,72  L530,106" stroke="#58a6ff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M480,72  L480,106" stroke="#58a6ff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M480,158 L480,190" stroke="#d29922" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <path d="M620,212 L660,212" stroke="#3fb950" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M480,242 L480,270" stroke="#3fb950" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <path d="M420,322 L115,350" stroke="#3fb950" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,322 L320,350" stroke="#3fb950" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M500,322 L520,350" stroke="#3fb950" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M540,322 L765,350" stroke="#3fb950" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M320,398 L460,425" stroke="#f85149" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M765,398 L480,425" stroke="#f85149" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<table>
+<thead><tr><th>组件</th><th>作用</th><th>关注点</th></tr></thead>
+<tbody>
+<tr><td>StandardServiceRegistry</td><td>服务容器</td><td>启动配置</td></tr>
+<tr><td>Metadata</td><td>映射模型</td><td>启动慢</td></tr>
+<tr><td>SessionFactory</td><td>应用级单例</td><td>重量,线程安全</td></tr>
+<tr><td>SessionImpl</td><td>工作单元</td><td>短期,非线程安全</td></tr>
+<tr><td>PersistenceContext</td><td>L1 + 快照</td><td>内存</td></tr>
+<tr><td>ActionQueue</td><td>写入队列</td><td>顺序</td></tr>
+<tr><td>EventListener</td><td>钩子</td><td>审计 / 扩展</td></tr>
+<tr><td>QueryEngine</td><td>查询编译执行</td><td>SQL 不符预期</td></tr>
+</tbody>
+</table>
+
+<h2 id="s17-1">17.1 SessionFactory 构建链</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 17-1-1 · 启动流程 — 7 步从配置到单例</div>
+  <svg viewBox="0 0 920 230" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="20"  y="80" width="160" height="50" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="100" y="102" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">读配置</text>
+    <text x="100" y="120" text-anchor="middle" fill="#c9d1d9" font-size="11">persistence.xml</text>
+
+    <rect x="200" y="80" width="160" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="280" y="102" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">ServiceRegistry</text>
+    <text x="280" y="120" text-anchor="middle" fill="#c9d1d9" font-size="11">注册 Service</text>
+
+    <rect x="380" y="80" width="160" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="460" y="102" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">MetadataSources</text>
+    <text x="460" y="120" text-anchor="middle" fill="#c9d1d9" font-size="11">扫描注解/XML</text>
+
+    <rect x="560" y="80" width="160" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="640" y="102" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">EntityPersister</text>
+    <text x="640" y="120" text-anchor="middle" fill="#c9d1d9" font-size="11">实体编译</text>
+
+    <rect x="740" y="80" width="160" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="820" y="102" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">SessionFactory</text>
+    <text x="820" y="120" text-anchor="middle" fill="#c9d1d9" font-size="11">单例返回</text>
+
+    <path d="M180,105 L200,105" stroke="#bc8cff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M360,105 L380,105" stroke="#58a6ff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M540,105 L560,105" stroke="#58a6ff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M720,105 L740,105" stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="100" y="160" width="720" height="50" rx="6" fill="#0f2438" stroke="#58a6ff"/>
+    <text x="460" y="182" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">SessionFactory built in ~1842 ms</text>
+    <text x="460" y="200" text-anchor="middle" fill="#c9d1d9" font-size="11">类扫描 30% · 映射解析 20% · Persister 构建 25% · L2/QueryEngine 15% · DDL validate 10%</text>
+  </svg>
+</div>
+
+<table>
+<thead><tr><th>阶段</th><th>比重</th><th>优化点</th></tr></thead>
+<tbody>
+<tr><td>类扫描</td><td>30%</td><td>限定包</td></tr>
+<tr><td>映射解析</td><td>20%</td><td>减少注解</td></tr>
+<tr><td>Persister 构建</td><td>25%</td><td>实体数量</td></tr>
+<tr><td>L2 / QueryEngine</td><td>15%</td><td>按需启用</td></tr>
+<tr><td>DDL validate</td><td>10%</td><td>hbm2ddl.auto 配置</td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-java">StandardServiceRegistry registry = new StandardServiceRegistryBuilder()
+    .applySetting("hibernate.connection.url", jdbcUrl)
+    .applySetting("hibernate.connection.username", username)
+    .applySetting("hibernate.connection.password", password)
+    .applySetting("hibernate.hbm2ddl.auto", "validate")
+    .build();
+
+Metadata metadata = new MetadataSources(registry)
+    .addAnnotatedClass(Order.class)
+    .addAnnotatedClass(OrderLine.class)
+    .buildMetadata();
+
+SessionFactory sessionFactory = metadata.buildSessionFactory();</code></pre>
+
+<pre><code>HHH000412: Hibernate ORM core version 6.4.x
+HHH000400: Using dialect: org.hibernate.dialect.PostgreSQLDialect
+HHH000204: Processing PersistenceUnitInfo [name: jpa-visualizer]
+HHH000021: Bytecode provider name : bytebuddy
+HHH10001005: Database info: PostgreSQL 16
+SessionFactory built in 1842 ms</code></pre>
+
+<div class="key-insight"><p><strong>启动只能发生 1 次</strong>。每请求重建会消耗类扫描、映射解析、DDL validate、缓存初始化的全部成本(秒级)。</p></div>
+
+<h2 id="s17-2">17.2 SessionImpl 工作单元</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 17-2-1 · Session 内部组件 — 6 大子系统 + PC 三类索引</div>
+  <svg viewBox="0 0 920 390" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="340" y="20" width="240" height="52" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="460" y="42" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">SessionImpl</text>
+    <text x="460" y="60" text-anchor="middle" fill="#c9d1d9" font-size="11">工作单元</text>
+
+    <rect x="20"  y="110" width="170" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="105" y="132" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">PersistenceContext</text>
+    <text x="105" y="148" text-anchor="middle" fill="#c9d1d9" font-size="11">L1 + Snapshot</text>
+
+    <rect x="210" y="110" width="170" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="295" y="132" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">ActionQueue</text>
+    <text x="295" y="148" text-anchor="middle" fill="#c9d1d9" font-size="11">写入队列</text>
+
+    <rect x="400" y="110" width="170" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="485" y="132" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">EventSource</text>
+    <text x="485" y="148" text-anchor="middle" fill="#c9d1d9" font-size="11">事件分发</text>
+
+    <rect x="590" y="110" width="170" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="675" y="132" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">TxCoordinator</text>
+    <text x="675" y="148" text-anchor="middle" fill="#c9d1d9" font-size="11">事务边界</text>
+
+    <rect x="780" y="110" width="120" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="840" y="132" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">JdbcCoord</text>
+    <text x="840" y="148" text-anchor="middle" fill="#c9d1d9" font-size="11">JDBC 资源</text>
+
+    <path d="M420,72 L105,110" stroke="#3fb950" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M445,72 L295,110" stroke="#3fb950" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M470,72 L485,110" stroke="#3fb950" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M495,72 L675,110" stroke="#3fb950" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M520,72 L840,110" stroke="#3fb950" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="20"  y="225" width="280" height="56" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="160" y="248" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">entitiesByKey</text>
+    <text x="160" y="266" text-anchor="middle" fill="#c9d1d9" font-size="11">EntityKey → Entity</text>
+
+    <rect x="320" y="225" width="280" height="56" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="460" y="248" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">entitySnapshotsByKey</text>
+    <text x="460" y="266" text-anchor="middle" fill="#c9d1d9" font-size="11">EntityKey → loadedState[]</text>
+
+    <rect x="620" y="225" width="280" height="56" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="760" y="248" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">collectionEntries</text>
+    <text x="760" y="266" text-anchor="middle" fill="#c9d1d9" font-size="11">PersistentCollection 跟踪</text>
+
+    <path d="M105,160 L160,225" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M105,160 L460,225" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M105,160 L760,225" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="20"  y="325" width="200" height="50" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="120" y="354" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">EntityInsertAction</text>
+
+    <rect x="240" y="325" width="200" height="50" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="340" y="354" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">EntityUpdateAction</text>
+
+    <rect x="460" y="325" width="200" height="50" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="560" y="354" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">EntityDeleteAction</text>
+
+    <rect x="680" y="325" width="220" height="50" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="790" y="354" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">CollectionUpdateAction</text>
+
+    <path d="M295,160 L120,325" stroke="#f85149" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M295,160 L340,325" stroke="#f85149" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M295,160 L560,325" stroke="#f85149" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M295,160 L790,325" stroke="#f85149" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<table>
+<thead><tr><th>字段</th><th>类型</th><th>作用</th></tr></thead>
+<tbody>
+<tr><td>persistenceContext</td><td>StatefulPersistenceContext</td><td>L1 + 快照</td></tr>
+<tr><td>actionQueue</td><td>ActionQueue</td><td>写入队列</td></tr>
+<tr><td>transactionCoordinator</td><td>TransactionCoordinator</td><td>事务边界</td></tr>
+<tr><td>jdbcCoordinator</td><td>JdbcCoordinator</td><td>JDBC 资源</td></tr>
+<tr><td>eventListenerGroups</td><td>EventListenerRegistry</td><td>事件钩子</td></tr>
+<tr><td>flushMode</td><td>FlushModeType</td><td>自动 flush 策略</td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-java">@Transactional
+public void inspectSession(EntityManager em) {
+    Session session = em.unwrap(Session.class);
+
+    Order order = session.find(Order.class, 42L);
+    order.changeStatus(OrderStatus.PAID);
+
+    boolean dirtyBeforeFlush = session.isDirty();
+    session.flush();
+    boolean dirtyAfterFlush = session.isDirty();
+}</code></pre>
+
+<h2 id="s17-3">17.3 事件监听系统</h2>
+
+<table>
+<thead><tr><th>事件</th><th>触发</th><th>监听器</th></tr></thead>
+<tbody>
+<tr><td>PreInsert / PostInsert</td><td>persist 前后</td><td>PreInsertEventListener</td></tr>
+<tr><td>PreUpdate / PostUpdate</td><td>dirty checking 后</td><td>PreUpdateEventListener</td></tr>
+<tr><td>PreDelete / PostDelete</td><td>remove 前后</td><td>PreDeleteEventListener</td></tr>
+<tr><td>PreLoad / PostLoad</td><td>find / query 前后</td><td>PreLoadEventListener</td></tr>
+<tr><td>Flush / FlushEntity</td><td>flush 时</td><td>FlushEventListener</td></tr>
+<tr><td>Persist / Merge</td><td>em.persist / em.merge</td><td>PersistEventListener</td></tr>
+<tr><td>AutoFlush</td><td>查询前自动 flush</td><td>AutoFlushEventListener</td></tr>
+<tr><td>DirtyCheck</td><td>flush 时脏检查</td><td>DirtyCheckEventListener</td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-java">public final class AuditPreInsertListener implements PreInsertEventListener {
+
+    @Override
+    public boolean onPreInsert(PreInsertEvent event) {
+        if (event.getEntity() instanceof Auditable auditable) {
+            auditable.setCreatedBy(SecurityContext.currentUser());
+            auditable.setCreatedAt(Instant.now());
+        }
+        return false;
+    }
+}
+
+@Configuration
+public class HibernateEventConfig {
+
+    @Autowired
+    private EntityManagerFactory emf;
+
+    @PostConstruct
+    public void register() {
+        SessionFactoryImpl sfi = emf.unwrap(SessionFactoryImpl.class);
+        EventListenerRegistry registry = sfi.getServiceRegistry()
+            .getService(EventListenerRegistry.class);
+        registry.appendListeners(EventType.PRE_INSERT,
+            new AuditPreInsertListener());
+    }
+}</code></pre>
+
+<h2 id="s17-4">17.4 ActionQueue 写入队列</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 17-4-1 · Action 严格顺序 — 6 阶段避免 FK 冲突</div>
+  <svg viewBox="0 0 920 250" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="20"  y="20"  width="160" height="44" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="100" y="46"  text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">业务代码</text>
+
+    <rect x="20"  y="120" width="160" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="100" y="142" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">1. INSERT</text>
+    <text x="100" y="158" text-anchor="middle" fill="#c9d1d9" font-size="10">父表主键</text>
+
+    <rect x="200" y="120" width="160" height="50" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="280" y="142" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">2. UPDATE</text>
+    <text x="280" y="158" text-anchor="middle" fill="#c9d1d9" font-size="10">关联新主键</text>
+
+    <rect x="380" y="120" width="160" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="460" y="142" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">3. Coll DELETE</text>
+    <text x="460" y="158" text-anchor="middle" fill="#c9d1d9" font-size="10">释放 FK</text>
+
+    <rect x="560" y="120" width="160" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="640" y="148" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">4. Coll UPDATE</text>
+
+    <rect x="740" y="120" width="160" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="820" y="148" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">5. Coll INSERT</text>
+
+    <rect x="380" y="186" width="160" height="50" rx="6" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="460" y="208" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">6. DELETE</text>
+    <text x="460" y="224" text-anchor="middle" fill="#c9d1d9" font-size="10">FK 允许删除</text>
+
+    <path d="M100,64  L100,120" stroke="#bc8cff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M180,145 L200,145" stroke="#3fb950" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M360,145 L380,145" stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M540,145 L560,145" stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M720,145 L740,145" stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M820,170 L460,186" stroke="#f85149" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<table>
+<thead><tr><th>步骤</th><th>原因</th></tr></thead>
+<tbody>
+<tr><td>INSERT 先</td><td>父表主键先存在</td></tr>
+<tr><td>UPDATE 次</td><td>关联可能依赖新主键</td></tr>
+<tr><td>Collection DELETE</td><td>释放 FK 约束</td></tr>
+<tr><td>Collection UPDATE</td><td>调整成员</td></tr>
+<tr><td>Collection INSERT</td><td>添加新成员</td></tr>
+<tr><td>DELETE 最后</td><td>FK 约束允许删除</td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-java">@Transactional
+public void reassign(Long parentId, Long oldChildId, Long newChildId) {
+    Parent p = em.find(Parent.class, parentId);
+    p.removeChild(oldChildId);
+    p.addChild(em.find(Child.class, newChildId));
+}</code></pre>
+
+<pre><code class="language-sql">[ActionQueue 自动重排]
+1. UPDATE child SET parent_id = NULL WHERE id = oldChildId;
+2. UPDATE child SET parent_id = parentId WHERE id = newChildId;
+3. (UPDATE parent ...)
+
+[原因] 避免唯一约束冲突</code></pre>
+
+<h2 id="s17-5">17.5 查询引擎(Hibernate 6)</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 17-5-1 · JPQL 编译执行 — SQM + SQL AST 两阶段</div>
+  <svg viewBox="0 0 920 210" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="20"  y="80" width="130" height="46" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="85"  y="108" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">JPQL 字符串</text>
+
+    <rect x="170" y="80" width="130" height="46" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="235" y="108" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">HQL Parser</text>
+
+    <rect x="320" y="80" width="150" height="46" rx="6" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="395" y="100" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">SQM (实体级)</text>
+    <text x="395" y="118" text-anchor="middle" fill="#c9d1d9" font-size="10">Semantic Query Model</text>
+
+    <rect x="490" y="80" width="150" height="46" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="565" y="100" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">SQL AST</text>
+    <text x="565" y="118" text-anchor="middle" fill="#c9d1d9" font-size="10">SQL 级</text>
+
+    <rect x="660" y="80" width="120" height="46" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="720" y="108" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">Translator</text>
+
+    <rect x="800" y="80" width="100" height="46" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="850" y="108" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">SQL 字符串</text>
+
+    <rect x="280" y="156" width="380" height="46" rx="6" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="470" y="183" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">JdbcSelectExecutor → ResultSet → Hydration</text>
+
+    <path d="M150,103 L170,103" stroke="#bc8cff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M300,103 L320,103" stroke="#58a6ff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M470,103 L490,103" stroke="#58a6ff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M640,103 L660,103" stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M780,103 L800,103" stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M850,126 L470,156" stroke="#f85149" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<table>
+<thead><tr><th>维度</th><th>5.x</th><th>6.x</th></tr></thead>
+<tbody>
+<tr><td>查询模型</td><td>HQL → SQL AST</td><td>HQL → SQM → SQL AST</td></tr>
+<tr><td>类型系统</td><td>Type</td><td>JavaType + JdbcType</td></tr>
+<tr><td>加载计划</td><td>LoadPlan</td><td>DomainResult</td></tr>
+<tr><td>性能</td><td>中</td><td>高(SQM 缓存)</td></tr>
+<tr><td>Java 版本</td><td>8+</td><td>11+</td></tr>
+</tbody>
+</table>
+
+<h2 id="s17-6">17.6 SPI 扩展点</h2>
+
+<table>
+<thead><tr><th>SPI</th><th>作用</th><th>何时用</th></tr></thead>
+<tbody>
+<tr><td>Interceptor</td><td>全局拦截</td><td>审计 / 加密</td></tr>
+<tr><td>EventListener</td><td>事件钩子</td><td>细粒度扩展</td></tr>
+<tr><td>StatementInspector</td><td>SQL 拦截</td><td>改写 / 监控</td></tr>
+<tr><td>ConnectionProvider</td><td>JDBC 连接</td><td>自定义池</td></tr>
+<tr><td>Dialect</td><td>SQL 方言</td><td>不支持的数据库</td></tr>
+<tr><td>IdentifierGenerator</td><td>主键生成</td><td>业务规则</td></tr>
+<tr><td>AttributeConverter</td><td>类型转换</td><td>值对象</td></tr>
+<tr><td>MultiTenantConnectionProvider</td><td>多租户</td><td>SaaS</td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-java">public class SqlMetricsInspector implements StatementInspector {
+
+    @Override
+    public String inspect(String sql) {
+        if (sql.contains("SELECT")) {
+            metrics.incrementSelectCount();
+        } else if (sql.contains("UPDATE")) {
+            metrics.incrementUpdateCount();
+        }
+        return sql;
+    }
+}</code></pre>
+
+<pre><code class="language-yaml">spring:
+  jpa:
+    properties:
+      hibernate:
+        session_factory:
+          statement_inspector: com.acme.SqlMetricsInspector</code></pre>
+
+<h2 id="s17-7">17.7 Hibernate Statistics</h2>
+
+<table>
+<thead><tr><th>指标</th><th>getter</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>EntityInsertCount</td><td>getEntityInsertCount</td><td>INSERT 数</td></tr>
+<tr><td>EntityUpdateCount</td><td>getEntityUpdateCount</td><td>UPDATE 数</td></tr>
+<tr><td>EntityDeleteCount</td><td>getEntityDeleteCount</td><td>DELETE 数</td></tr>
+<tr><td>EntityFetchCount</td><td>getEntityFetchCount</td><td>实体查询次数</td></tr>
+<tr><td>QueryExecutionCount</td><td>getQueryExecutionCount</td><td>JPQL/Criteria 执行次数</td></tr>
+<tr><td>PrepareStatementCount</td><td>getPrepareStatementCount</td><td>JDBC 预编译次数</td></tr>
+<tr><td>SecondLevelCacheHitCount</td><td>getSecondLevelCacheHitCount</td><td>L2 命中</td></tr>
+<tr><td>SecondLevelCacheMissCount</td><td>getSecondLevelCacheMissCount</td><td>L2 未命中</td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-yaml">spring:
+  jpa:
+    properties:
+      hibernate:
+        generate_statistics: true</code></pre>
+
+<pre><code class="language-java">@Bean
+MeterBinder hibernateMetrics(EntityManagerFactory emf) {
+    return registry -&gt; {
+        SessionFactory sf = emf.unwrap(SessionFactory.class);
+        Statistics stats = sf.getStatistics();
+        Gauge.builder("hibernate.entity.inserts", stats,
+                Statistics::getEntityInsertCount)
+            .register(registry);
+        Gauge.builder("hibernate.query.cache.hits", stats,
+                Statistics::getQueryCacheHitCount)
+            .register(registry);
+    };
+}</code></pre>
+
+<h2 id="s17-8">17.8 Hibernate 4 / 5 / 6 演进</h2>
+
+<table>
+<thead><tr><th>版本</th><th>关键变化</th></tr></thead>
+<tbody>
+<tr><td>3.x</td><td>XML 映射,Session API</td></tr>
+<tr><td>4.x</td><td>JPA 2.0,稳定基础</td></tr>
+<tr><td>5.x</td><td>JPA 2.1,SQL AST 雏形</td></tr>
+<tr><td>5.6.x</td><td>JPA 2.2 + Java 8 时间</td></tr>
+<tr><td>6.0.x</td><td>SQM 引入,Java 11+,Jakarta</td></tr>
+<tr><td>6.4.x</td><td>LoadAccess.fetchGraph 等 API 完善</td></tr>
+</tbody>
+</table>
+
+<div class="diagram">
+  <div class="diagram-title">图 17-8-1 · Hibernate 主线时间线</div>
+  <svg viewBox="0 0 920 170" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <line x1="60" y1="85" x2="880" y2="85" stroke="#30363d" stroke-width="2"/>
+
+    <circle cx="80"  cy="85" r="8"  fill="#bc8cff" stroke="#bc8cff"/>
+    <text x="80"  y="55"  text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">2003</text>
+    <text x="80"  y="115" text-anchor="middle" fill="#c9d1d9" font-size="10">1.0</text>
+
+    <circle cx="200" cy="85" r="8"  fill="#bc8cff" stroke="#bc8cff"/>
+    <text x="200" y="55"  text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">2010</text>
+    <text x="200" y="115" text-anchor="middle" fill="#c9d1d9" font-size="10">3.6 JPA 2.0</text>
+
+    <circle cx="340" cy="85" r="8"  fill="#58a6ff" stroke="#58a6ff"/>
+    <text x="340" y="55"  text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">2014</text>
+    <text x="340" y="115" text-anchor="middle" fill="#c9d1d9" font-size="10">4.3 稳定</text>
+
+    <circle cx="490" cy="85" r="8"  fill="#58a6ff" stroke="#58a6ff"/>
+    <text x="490" y="55"  text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">2016</text>
+    <text x="490" y="115" text-anchor="middle" fill="#c9d1d9" font-size="10">5.0 SQL AST</text>
+
+    <circle cx="630" cy="85" r="8"  fill="#3fb950" stroke="#3fb950"/>
+    <text x="630" y="55"  text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">2019</text>
+    <text x="630" y="115" text-anchor="middle" fill="#c9d1d9" font-size="10">5.4 JPA 2.2</text>
+
+    <circle cx="780" cy="85" r="10" fill="#3fb950" stroke="#3fb950" stroke-width="2"/>
+    <text x="780" y="55"  text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">2022</text>
+    <text x="780" y="115" text-anchor="middle" fill="#c9d1d9" font-size="10">6.0 SQM/Jakarta</text>
+
+    <circle cx="870" cy="85" r="8"  fill="#d29922" stroke="#d29922"/>
+    <text x="870" y="55"  text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">2024</text>
+    <text x="870" y="115" text-anchor="middle" fill="#c9d1d9" font-size="10">6.4</text>
+  </svg>
+</div>
+
+<h2 id="s17-9">17.9 设计取舍</h2>
+
+<p><strong>取舍 1:SessionFactory 重 / Session 轻</strong>。SessionFactory 是线程安全的应用级单例,保留映射元数据 / 缓存 / 连接池;Session 是非线程安全的请求级对象,保留 PersistenceContext 与事务边界。这种二元设计借鉴了 JDBC ConnectionPool / Connection 模型,平衡资源开销与并发模型。</p>
+
+<p><strong>取舍 2:Action 队列与延迟写入</strong>。不立即发 SQL 而是排队,目的是 ① 启用 JDBC Batching ② 自动重排避免 FK 冲突 ③ 与 dirty checking 配合实现透明持久化。代价是无法在业务代码中精确控制 SQL 时机,需要 <code>flush()</code> / <code>flushMode</code> 显式干预。</p>
+
+<p><strong>取舍 3:事件系统而非 AOP</strong>。Hibernate 选择事件系统而非 Spring AOP 实现钩子。原因:事件触发点比方法调用更精细(例如 dirty checking 后才能触发 PreUpdate),且不依赖代理。代价是配置复杂,需要 <code>EventListenerRegistry</code> 编程注册。</p>
+
+<h2 id="s17-10">17.10 陷阱与限制</h2>
+
+<table>
+<thead><tr><th>#</th><th>陷阱</th><th>现象</th><th>修复</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Session 跨请求共享</td><td>并发污染</td><td>每请求新建</td></tr>
+<tr><td>2</td><td>SessionFactory 每请求新建</td><td>启动开销</td><td>应用级单例</td></tr>
+<tr><td>3</td><td>事件中调用 em</td><td>无限递归</td><td>仅修改字段</td></tr>
+<tr><td>4</td><td>StatementInspector 阻塞</td><td>性能下降</td><td>异步监控</td></tr>
+<tr><td>5</td><td>自定义 Interceptor 不当</td><td>状态污染</td><td>审慎 / 测试</td></tr>
+<tr><td>6</td><td>hbm2ddl.auto=update 生产</td><td>DDL 风险</td><td>用 Flyway</td></tr>
+<tr><td>7</td><td>关闭 Statistics 后无监控</td><td>排查困难</td><td>始终开启</td></tr>
+</tbody>
+</table>
+
+<h2 id="s17-11">17.11 回归护栏</h2>
+
+<pre><code class="language-java">@Test
+void sessionFactoryStartupShouldBeFast() {
+    long start = System.currentTimeMillis();
+    SessionFactory sf = buildSessionFactory();
+    long elapsed = System.currentTimeMillis() - start;
+
+    assertThat(elapsed).isLessThan(5000L);
+    sf.close();
+}
+
+@Test
+void preInsertListenerShouldFireOnce() {
+    AtomicInteger count = new AtomicInteger();
+
+    sf.unwrap(SessionFactoryImpl.class).getServiceRegistry()
+        .getService(EventListenerRegistry.class)
+        .appendListeners(EventType.PRE_INSERT, event -&gt; {
+            count.incrementAndGet();
+            return false;
+        });
+
+    em.persist(new Order(...));
+    em.flush();
+
+    assertThat(count.get()).isEqualTo(1);
+}</code></pre>
+
+<h2 id="s17-summary">17.12 本章要点</h2>
+
+<div class="chapter-summary">
+<table>
+<thead><tr><th>要点</th><th>源码依据</th><th>易错点</th></tr></thead>
+<tbody>
+<tr><td>SessionFactory 单例</td><td>SessionFactoryImpl</td><td>每请求新建</td></tr>
+<tr><td>Session 工作单元</td><td>SessionImpl</td><td>跨请求共享</td></tr>
+<tr><td>Action 严格顺序</td><td>ActionQueue</td><td>顺序违反</td></tr>
+<tr><td>事件系统</td><td>EventListenerRegistry</td><td>业务用 AOP 替代</td></tr>
+<tr><td>QueryEngine 编译</td><td>SQM + SQL AST</td><td>缓存未命中</td></tr>
+<tr><td>Statistics 必开</td><td>hibernate.generate_statistics</td><td>生产无监控</td></tr>
+<tr><td>StatementInspector</td><td>statement_inspector</td><td>阻塞主线程</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2 id="s17-13">17.13 扩展实践</h2>
+
+<table>
+<thead><tr><th>属性</th><th>默认</th><th>推荐</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>hibernate.dialect</td><td>自动检测</td><td>显式</td><td>显式更可控</td></tr>
+<tr><td>hibernate.show_sql</td><td>false</td><td>dev: true</td><td>生产 false</td></tr>
+<tr><td>hibernate.format_sql</td><td>false</td><td>dev: true</td><td>调试可读</td></tr>
+<tr><td>hibernate.use_sql_comments</td><td>false</td><td>dev: true</td><td>SQL 含注释</td></tr>
+<tr><td>hibernate.generate_statistics</td><td>false</td><td>true</td><td>监控必开</td></tr>
+<tr><td>hibernate.jdbc.batch_size</td><td>0</td><td>25-50</td><td>批处理</td></tr>
+<tr><td>hibernate.order_inserts</td><td>false</td><td>true</td><td>批量优化</td></tr>
+<tr><td>hibernate.order_updates</td><td>false</td><td>true</td><td>同上</td></tr>
+<tr><td>provider_disables_autocommit</td><td>false</td><td>true</td><td>HikariCP 兼容</td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-yaml">spring:
+  jpa:
+    properties:
+      hibernate.bytecode.use_reflection_optimizer: true
+      hibernate.bytecode.allow_enhancement_as_proxy: true</code></pre>
+
+<table>
+<thead><tr><th>特性</th><th>说明</th><th>影响</th></tr></thead>
+<tbody>
+<tr><td>SQM</td><td>语义查询模型</td><td>解析复用</td></tr>
+<tr><td>Jakarta migration</td><td>javax → jakarta</td><td>包路径变</td></tr>
+<tr><td>Java 11+</td><td>现代 JVM</td><td>性能</td></tr>
+<tr><td>Type 改进</td><td>JavaType + JdbcType</td><td>灵活</td></tr>
+<tr><td>@SoftDelete</td><td>内置</td><td>6.4+</td></tr>
+</tbody>
+</table>
+
+<p>下一章讨论 SQL 生成。本章覆盖了 Hibernate 架构,下一章深入 SQM、SQL AST、Translator、Dialect 的 SQL 生成全链路。</p>
+
+<div class="chapter-nav">
+  <a href="16-locking.html">&larr; 第 16 章 &middot; 锁机制</a>
+  <a href="18-sql-generation.html">第 18 章 &middot; SQL 生成 &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 JPA &amp; Hibernate &middot; 第 17 章 &middot; Hibernate 架构全景</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

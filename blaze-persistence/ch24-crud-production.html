@@ -1,0 +1,1901 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 24 章 · 生产级特性与最佳实践 — 图解 Blaze-Persistence</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Blaze-Persistence</span>
+  <span class="sep">|</span>
+  <a href="index.html">目录</a>
+  <span class="sep">|</span>
+  <a href="ch23-crud-advanced.html">← 第 23 章</a>
+  <span class="sep">|</span>
+  <a href="ch25-references.html">下一章: 论文与延伸阅读 →</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s24-1">24.1 多租户隔离 — ViewFilter</a>
+  <a href="#s24-2">24.2 软删除 — ViewFilter</a>
+  <a href="#s24-3">24.3 审计 — EntityViewListener</a>
+  <a href="#s24-4">24.4 Keyset 分页 — 高性能列表</a>
+  <a href="#s24-5">24.5 批量操作 — 订单归档</a>
+  <a href="#s24-6">24.6 乐观锁 — @Version</a>
+  <a href="#s24-7">24.7 测试 — Testcontainers</a>
+  <a href="#s24-8">24.8 监控与可观测性</a>
+  <a href="#s24-9">24.9 Spring Data Integration</a>
+  <a href="#s24-10">24.10 完整项目结构总览</a>
+  <a href="#s24-11">24.11 生产检查清单</a>
+  <a href="#s24-12">24.12 常见问题 FAQ</a>
+  <a href="#s24-pitfalls">24.13 陷阱与限制</a>
+  <a href="#summary">本章小结</a>
+</aside>
+
+<article class="article">
+
+<h1>第 24 章 · 生产级特性与最佳实践</h1>
+<p class="subtitle">多租户 · 软删除 · 审计 · Keyset 分页 · 批量操作 · 乐观锁 · 测试 · 监控 · Spring Data · 生产检查清单 · FAQ</p>
+
+<div class="chapter-intro">
+  <p class="lead">前 23 章从 CriteriaBuilder 基础一路走到 CRUD 高级模式——Entity View 投影、DML 批量操作、Spring Data 集成、GraphQL 适配……所有拼图已就位。但真正的考验在生产环境：<strong>多租户如何隔离数据？审计字段如何自动填充？百万行列表如何保持毫秒级翻页？并发更新如何避免脏写？</strong>本章是全书的终极总结，把前 23 章的知识融合成一套可直接部署到生产的完整方案。</p>
+  <ul class="will-learn">
+    <li>安全与审计：<code>@ViewFilter</code> 多租户/软删除 · EntityViewListener 审计 · <code>@Version</code> 乐观锁</li>
+    <li>性能优化：Keyset 分页 · 批量归档 INSERT…SELECT · Spring Data + Blaze 集成</li>
+    <li>运维就绪：Testcontainers 测试 · Micrometer 监控 · 生产检查清单</li>
+  </ul>
+  <p class="prereq">前置知识：<a href="ch04-entityview.html">第 4 章 · Entity View</a>、<a href="ch06-updatable.html">第 6 章 · Updatable Entity View</a>、<a href="ch10-pagination.html">第 10 章 · 分页</a>、<a href="ch11-dml.html">第 11 章 · DML</a>、<a href="ch12-spring.html">第 12 章 · Spring 集成</a>。建议先完成 <a href="ch23-crud-advanced.html">第 23 章 · CRUD 高级模式</a>。</p>
+</div>
+
+<!-- ============================================================ -->
+<!-- 24.0  全景图 -->
+<!-- ============================================================ -->
+
+<div class="diagram">
+<div class="diagram-title">Fig 24-1 生产级特性全景图</div>
+<div style="display:flex;flex-wrap:wrap;gap:16px;justify-content:center;padding:16px 0;">
+  <div style="border:1px solid #58a6ff;border-radius:8px;padding:14px 18px;min-width:160px;max-width:220px;background:rgba(30,58,95,.06);">
+    <div style="font-weight:bold;color:#58a6ff;margin-bottom:6px;">① 数据隔离</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">多租户 — @ViewFilter + tenantId<br/>软删除 — @ViewFilter + deletedAt</div>
+  </div>
+  <div style="border:1px solid #bc8cff;border-radius:8px;padding:14px 18px;min-width:160px;max-width:220px;background:rgba(188,140,255,.06);">
+    <div style="font-weight:bold;color:#bc8cff;margin-bottom:6px;">② 审计与安全</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">审计字段 — EntityViewListener<br/>乐观锁 — @Version</div>
+  </div>
+  <div style="border:1px solid #3fb950;border-radius:8px;padding:14px 18px;min-width:160px;max-width:220px;background:rgba(63,185,80,.06);">
+    <div style="font-weight:bold;color:#3fb950;margin-bottom:6px;">③ 性能与规模</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">Keyset 分页 — 百万行 O(1)<br/>批量归档 — INSERT...SELECT</div>
+  </div>
+  <div style="border:1px solid #d29922;border-radius:8px;padding:14px 18px;min-width:160px;max-width:220px;background:rgba(210,153,34,.06);">
+    <div style="font-weight:bold;color:#d29922;margin-bottom:6px;">④ 运维</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">Testcontainers — 集成测试<br/>Micrometer — 可观测性</div>
+  </div>
+  <div style="border:1px solid #f778ba;border-radius:8px;padding:14px 18px;min-width:160px;max-width:220px;background:rgba(247,120,186,.06);">
+    <div style="font-weight:bold;color:#f778ba;margin-bottom:6px;">⑤ 架构</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">Spring Data — 完整集成<br/>项目结构 — 分层架构</div>
+  </div>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<!-- 24.1  多租户隔离 -->
+<!-- ============================================================ -->
+
+<h2 id="s24-1">24.1 多租户隔离 — ViewFilter</h2>
+
+<p>SaaS 应用最核心的安全需求是<strong>租户数据隔离</strong>。传统做法是在每个 Repository 方法中手动加 <code>WHERE tenant_id = ?</code>——这种方式脆弱、易遗漏。Blaze-Persistence 的 <code>@ViewFilter</code> 提供声明式的全局过滤器，在 Entity View 层面自动注入租户条件。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 24-2 多租户 ViewFilter 工作流</div>
+<div class="mermaid">
+sequenceDiagram
+    participant C as Controller
+    participant S as Service
+    participant EVM as EntityViewManager
+    participant CB as CriteriaBuilder
+    participant DB as Database
+
+    C->>S: GET /api/orders
+    S->>S: TenantContext.current() → "T001"
+    S->>EVM: EntityViewSetting.create(OrderListView)
+    S->>EVM: setting.addAttributeFilter("tenantFilter", "T001")
+    EVM->>CB: applySetting(setting, cb)
+    Note over CB: 自动注入<br/>WHERE o.tenant_id = 'T001'
+    CB->>DB: SELECT o.id, o.status, ...<br/>FROM orders o<br/>WHERE o.tenant_id = 'T001'
+    DB-->>CB: Result Set
+    CB-->>EVM: List&lt;OrderListView&gt;
+    EVM-->>S: 已过滤的租户数据
+    S-->>C: JSON Response
+</div>
+</div>
+
+<h3>租户上下文（ThreadLocal）</h3>
+
+<pre><code>public class TenantContext {
+    private static final ThreadLocal&lt;String&gt; CURRENT = new ThreadLocal&lt;&gt;();
+
+    public static String current() {
+        String tenant = CURRENT.get();
+        if (tenant == null) throw new IllegalStateException("No tenant set");
+        return tenant;
+    }
+
+    public static void set(String tenantId) { CURRENT.set(tenantId); }
+    public static void clear() { CURRENT.remove(); }
+}</code></pre>
+
+<h3>租户拦截器</h3>
+
+<pre><code>@Component
+public class TenantInterceptor implements HandlerInterceptor {
+    @Override
+    public boolean preHandle(HttpServletRequest request,
+                             HttpServletResponse response,
+                             Object handler) {
+        String tenantId = request.getHeader("X-Tenant-Id");
+        if (tenantId == null) {
+            response.setStatus(400);
+            return false;
+        }
+        TenantContext.set(tenantId);
+        return true;
+    }
+
+    @Override
+    public void afterCompletion(HttpServletRequest request,
+                                HttpServletResponse response,
+                                Object handler, Exception ex) {
+        TenantContext.clear();
+    }
+}</code></pre>
+
+<h3>Entity View 声明租户过滤器</h3>
+
+<pre><code>@EntityView(Order.class)
+@ViewFilter(name = "tenantFilter", value = "tenantId = :tenantId")
+public interface OrderListView {
+    @IdMapping
+    Long getId();
+
+    String getOrderNumber();
+    OrderStatus getStatus();
+    BigDecimal getTotalAmount();
+    Instant getCreatedAt();
+
+    @Mapping("customer.name")
+    String getCustomerName();
+}</code></pre>
+
+<h3>Service 层应用过滤器</h3>
+
+<pre><code>@Service
+@RequiredArgsConstructor
+public class OrderQueryService {
+
+    private final CriteriaBuilderFactory cbf;
+    private final EntityViewManager evm;
+    private final EntityManager em;
+
+    public List&lt;OrderListView&gt; listOrders() {
+        EntityViewSetting&lt;OrderListView, CriteriaBuilder&lt;OrderListView&gt;&gt; setting =
+            EntityViewSetting.create(OrderListView.class);
+        setting.addAttributeFilter("tenantFilter", TenantContext.current());
+
+        CriteriaBuilder&lt;OrderListView&gt; cb = evm.applySetting(setting,
+            cbf.create(em, Order.class));
+
+        return cb.getResultList();
+    }
+}</code></pre>
+
+<div class="key-insight">
+  <strong>自动注入原理：</strong><code>@ViewFilter</code> 的 <code>value</code> 是 JPQL 表达式，<code>:tenantId</code> 是命名参数。当 <code>addAttributeFilter("tenantFilter", value)</code> 被调用时，Blaze-Persistence 将该条件合并到 WHERE 子句中——开发者无需手动拼接条件，也不会遗漏。
+</div>
+
+<h3>生成的 SQL</h3>
+
+<pre><code>-- 自动生成的 SQL（租户 T001）
+SELECT o.id,
+       o.order_number,
+       o.status,
+       o.total_amount,
+       o.created_at,
+       c.name
+FROM   orders o
+JOIN   customers c ON c.id = o.customer_id
+WHERE  o.tenant_id = 'T001'    -- ViewFilter 自动注入</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">Fig 24-3 多租户数据隔离架构</div>
+<div style="display:flex;align-items:center;gap:6px;justify-content:center;flex-wrap:wrap;padding:16px 0;">
+  <div style="border:1px solid #58a6ff;border-radius:8px;padding:10px 16px;background:rgba(88,166,255,.08);text-align:center;">
+    <div style="font-weight:bold;color:#58a6ff;font-size:13px;">HTTP 请求</div>
+    <div style="color:#e6edf3;font-size:12px;">Tenant A: X-Tenant-Id: T001<br/>Tenant B: X-Tenant-Id: T002</div>
+  </div>
+  <span style="color:#8b949e;font-size:16px;">→</span>
+  <div style="border:1px solid #bc8cff;border-radius:8px;padding:10px 16px;background:rgba(188,140,255,.08);text-align:center;">
+    <div style="font-weight:bold;color:#bc8cff;font-size:13px;">TenantInterceptor</div>
+    <div style="color:#e6edf3;font-size:12px;">ThreadLocal<br/>TenantContext</div>
+  </div>
+  <span style="color:#8b949e;font-size:16px;">→</span>
+  <div style="border:1px solid #3fb950;border-radius:8px;padding:10px 16px;background:rgba(63,185,80,.08);text-align:center;">
+    <div style="font-weight:bold;color:#3fb950;font-size:13px;">@ViewFilter</div>
+    <div style="color:#e6edf3;font-size:12px;">WHERE tenant_id = :tenantId</div>
+  </div>
+  <span style="color:#8b949e;font-size:16px;">→</span>
+  <div style="border:1px solid #d29922;border-radius:8px;padding:10px 16px;background:rgba(210,153,34,.08);text-align:center;">
+    <div style="font-weight:bold;color:#d29922;font-size:13px;">数据库</div>
+    <div style="color:#58a6ff;font-size:12px;">orders (T001)</div>
+    <div style="color:#d29922;font-size:12px;">orders (T002)</div>
+  </div>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<!-- 24.2  软删除 -->
+<!-- ============================================================ -->
+
+<h2 id="s24-2">24.2 软删除 — ViewFilter</h2>
+
+<p>生产系统几乎不做物理删除。软删除通过 <code>deletedAt</code> 字段标记已删除记录，查询时自动排除。<code>@ViewFilter</code> 让这一逻辑对业务代码完全透明。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 24-4 软删除生命周期</div>
+<div class="mermaid">
+stateDiagram-v2
+    [*] --> Active : 创建订单
+    Active --> Active : 更新状态
+    Active --> SoftDeleted : softDelete()
+    SoftDeleted --> Active : restore()
+    SoftDeleted --> PermanentlyDeleted : purge()（定期清理）
+    PermanentlyDeleted --> [*]
+
+    state Active {
+        [*] --> Visible
+        Visible : deletedAt = NULL
+        Visible : 正常查询可见
+    }
+    state SoftDeleted {
+        [*] --> Hidden
+        Hidden : deletedAt = 2024-01-15T10:30:00Z
+        Hidden : 正常查询不可见
+        Hidden : 管理员查询可见
+    }
+</div>
+</div>
+
+<h3>Entity View 声明软删除过滤器</h3>
+
+<pre><code>@EntityView(Order.class)
+@ViewFilters({
+    @ViewFilter(name = "activeOnly", value = "deletedAt IS NULL"),
+    @ViewFilter(name = "tenantFilter", value = "tenantId = :tenantId")
+})
+public interface OrderListView {
+    @IdMapping Long getId();
+    String getOrderNumber();
+    OrderStatus getStatus();
+    BigDecimal getTotalAmount();
+    Instant getCreatedAt();
+}</code></pre>
+
+<h3>软删除实现</h3>
+
+<pre><code>@Service
+@RequiredArgsConstructor
+public class OrderLifecycleService {
+
+    private final CriteriaBuilderFactory cbf;
+    private final EntityManager em;
+
+    @Transactional
+    public void softDelete(Long orderId) {
+        int updated = cbf.update(em, Order.class, "o")
+            .set("o.deletedAt", Instant.now())
+            .set("o.deletedBy", SecurityContext.currentUser())
+            .where("o.id").eq(orderId)
+            .where("o.tenantId").eq(TenantContext.current())
+            .where("o.deletedAt").isNull()
+            .executeUpdate();
+
+        if (updated == 0) {
+            throw new OrderNotFoundException(orderId);
+        }
+    }
+
+    @Transactional
+    public void restore(Long orderId) {
+        cbf.update(em, Order.class, "o")
+            .setExpression("o.deletedAt", "NULL")
+            .setExpression("o.deletedBy", "NULL")
+            .where("o.id").eq(orderId)
+            .where("o.tenantId").eq(TenantContext.current())
+            .where("o.deletedAt").isNotNull()
+            .executeUpdate();
+    }
+}</code></pre>
+
+<h3>组合过滤器使用</h3>
+
+<pre><code>public List&lt;OrderListView&gt; listActiveOrders() {
+    EntityViewSetting&lt;OrderListView, CriteriaBuilder&lt;OrderListView&gt;&gt; setting =
+        EntityViewSetting.create(OrderListView.class);
+
+    // 同时激活两个过滤器
+    setting.addAttributeFilter("activeOnly");
+    setting.addAttributeFilter("tenantFilter", TenantContext.current());
+
+    return evm.applySetting(setting,
+        cbf.create(em, Order.class)
+           .orderByDesc("createdAt"))
+        .getResultList();
+}
+
+// 管理员视图——包含已删除记录
+public List&lt;OrderListView&gt; listAllOrdersIncludeDeleted() {
+    EntityViewSetting&lt;OrderListView, CriteriaBuilder&lt;OrderListView&gt;&gt; setting =
+        EntityViewSetting.create(OrderListView.class);
+
+    // 只加租户过滤器，不加 activeOnly
+    setting.addAttributeFilter("tenantFilter", TenantContext.current());
+
+    return evm.applySetting(setting,
+        cbf.create(em, Order.class)
+           .orderByDesc("createdAt"))
+        .getResultList();
+}</code></pre>
+
+<pre><code>-- 普通用户查询 SQL
+SELECT o.id, o.order_number, o.status, o.total_amount, o.created_at
+FROM   orders o
+WHERE  o.deleted_at IS NULL         -- activeOnly
+AND    o.tenant_id = 'T001'         -- tenantFilter
+
+-- 管理员查询 SQL（包含已删除）
+SELECT o.id, o.order_number, o.status, o.total_amount, o.created_at
+FROM   orders o
+WHERE  o.tenant_id = 'T001'         -- 仅 tenantFilter</code></pre>
+
+<!-- ============================================================ -->
+<!-- 24.3  审计 -->
+<!-- ============================================================ -->
+
+<h2 id="s24-3">24.3 审计 — EntityViewListener</h2>
+
+<p>每条记录的 <code>createdAt</code>、<code>createdBy</code>、<code>updatedAt</code>、<code>updatedBy</code> 必须自动填充。Blaze-Persistence 的 <code>EntityViewListener</code> 在 Entity View 持久化/更新前自动注入这些字段——无需手动赋值，无需 JPA <code>@PrePersist</code> 回调。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 24-5 审计监听器生命周期</div>
+<div class="mermaid">
+sequenceDiagram
+    participant C as Controller
+    participant S as Service
+    participant L as AuditViewListener
+    participant EVM as EntityViewManager
+    participant DB as Database
+
+    C->>S: createOrder(createView)
+    S->>EVM: evm.save(em, createView)
+    EVM->>L: onPrePersist(createView)
+    Note over L: 设置 createdAt = now()<br/>createdBy = currentUser<br/>updatedAt = now()<br/>updatedBy = currentUser
+    L-->>EVM: 字段已填充
+    EVM->>DB: INSERT INTO orders (...) VALUES (...)
+    DB-->>EVM: OK
+    EVM-->>S: 持久化完成
+
+    Note over C,DB: ── 更新流程 ──
+
+    C->>S: updateOrder(updateView)
+    S->>EVM: evm.save(em, updateView)
+    EVM->>L: onPreUpdate(updateView)
+    Note over L: 设置 updatedAt = now()<br/>updatedBy = currentUser
+    L-->>EVM: 字段已填充
+    EVM->>DB: UPDATE orders SET ... WHERE id = ?
+    DB-->>EVM: OK
+</div>
+</div>
+
+<h3>Auditable 接口</h3>
+
+<pre><code>public interface Auditable {
+    void setCreatedAt(Instant createdAt);
+    void setCreatedBy(String createdBy);
+    void setUpdatedAt(Instant updatedAt);
+    void setUpdatedBy(String updatedBy);
+}</code></pre>
+
+<h3>审计监听器</h3>
+
+<pre><code>@ViewListener
+public class AuditViewListener implements PrePersistEntityListener&lt;Object&gt;,
+                                           PreUpdateEntityListener&lt;Object&gt; {
+    @Override
+    public void onPrePersist(Object view) {
+        if (view instanceof Auditable a) {
+            a.setCreatedAt(Instant.now());
+            a.setCreatedBy(SecurityContext.currentUser());
+            a.setUpdatedAt(Instant.now());
+            a.setUpdatedBy(SecurityContext.currentUser());
+        }
+    }
+
+    @Override
+    public void onPreUpdate(Object view) {
+        if (view instanceof Auditable a) {
+            a.setUpdatedAt(Instant.now());
+            a.setUpdatedBy(SecurityContext.currentUser());
+        }
+    }
+}</code></pre>
+
+<h3>Creatable Entity View 示例</h3>
+
+<pre><code>@CreatableEntityView
+@EntityView(Order.class)
+public interface OrderCreateView extends Auditable {
+    @IdMapping
+    Long getId();
+
+    void setOrderNumber(String orderNumber);
+    void setStatus(OrderStatus status);
+    void setTotalAmount(BigDecimal totalAmount);
+    void setTenantId(String tenantId);
+
+    // Auditable 方法自动继承
+    // createdAt, createdBy, updatedAt, updatedBy
+    // 由 AuditViewListener 自动填充
+}</code></pre>
+
+<h3>Updatable Entity View 示例</h3>
+
+<pre><code>@UpdatableEntityView
+@EntityView(Order.class)
+public interface OrderUpdateView extends Auditable {
+    @IdMapping
+    Long getId();
+
+    OrderStatus getStatus();
+    void setStatus(OrderStatus status);
+
+    String getShippingAddress();
+    void setShippingAddress(String shippingAddress);
+
+    // updatedAt, updatedBy 由监听器自动填充
+}</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">Fig 24-6 审计字段自动填充流程</div>
+<svg viewBox="0 0 900 360" style="width:100%;max-width:900px;margin:0 auto;display:block" font-family="Inter,'Microsoft YaHei',system-ui,sans-serif">
+  <defs>
+    <marker id="arr24-6" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto"><path d="M0,0 L10,3.5 L0,7z" fill="#8b949e"/></marker>
+  </defs>
+  <!-- Left: CREATE -->
+  <rect x="20" y="10" width="410" height="340" rx="10" fill="none" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="6,3" opacity=".5"/>
+  <text x="225" y="38" text-anchor="middle" fill="#58a6ff" font-size="15" font-weight="bold">创建流程 (CREATE)</text>
+  <rect x="55" y="55" width="340" height="42" rx="8" fill="#0d1b2a" stroke="#58a6ff" stroke-width="1.3"/><text x="225" y="81" text-anchor="middle" fill="#58a6ff" font-size="14">OrderCreateView</text>
+  <line x1="225" y1="97" x2="225" y2="115" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr24-6)"/>
+  <rect x="55" y="118" width="340" height="42" rx="8" fill="#1e1e3a" stroke="#bc8cff" stroke-width="1.3"/><text x="225" y="144" text-anchor="middle" fill="#bc8cff" font-size="14">AuditViewListener · onPrePersist()</text>
+  <line x1="225" y1="160" x2="225" y2="178" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr24-6)"/>
+  <rect x="55" y="181" width="340" height="62" rx="8" fill="#1a3a2a" stroke="#3fb950" stroke-width="1.3"/>
+  <text x="225" y="205" text-anchor="middle" fill="#3fb950" font-size="13">createdAt = now()  ·  createdBy = 'admin'</text>
+  <text x="225" y="225" text-anchor="middle" fill="#3fb950" font-size="13">updatedAt = now()  ·  updatedBy = 'admin'</text>
+  <line x1="225" y1="243" x2="225" y2="261" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr24-6)"/>
+  <rect x="55" y="264" width="340" height="42" rx="8" fill="#3a2a1a" stroke="#d29922" stroke-width="1.3"/><text x="225" y="290" text-anchor="middle" fill="#d29922" font-size="14">INSERT INTO orders (...)</text>
+
+  <!-- Right: UPDATE -->
+  <rect x="470" y="10" width="410" height="340" rx="10" fill="none" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="6,3" opacity=".5"/>
+  <text x="675" y="38" text-anchor="middle" fill="#bc8cff" font-size="15" font-weight="bold">更新流程 (UPDATE)</text>
+  <rect x="505" y="55" width="340" height="42" rx="8" fill="#0d1b2a" stroke="#58a6ff" stroke-width="1.3"/><text x="675" y="81" text-anchor="middle" fill="#58a6ff" font-size="14">OrderUpdateView</text>
+  <line x1="675" y1="97" x2="675" y2="115" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr24-6)"/>
+  <rect x="505" y="118" width="340" height="42" rx="8" fill="#1e1e3a" stroke="#bc8cff" stroke-width="1.3"/><text x="675" y="144" text-anchor="middle" fill="#bc8cff" font-size="14">AuditViewListener · onPreUpdate()</text>
+  <line x1="675" y1="160" x2="675" y2="178" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr24-6)"/>
+  <rect x="505" y="181" width="340" height="62" rx="8" fill="#1a3a2a" stroke="#3fb950" stroke-width="1.3"/>
+  <text x="675" y="210" text-anchor="middle" fill="#3fb950" font-size="13">updatedAt = now()</text>
+  <text x="675" y="230" text-anchor="middle" fill="#3fb950" font-size="13">updatedBy = 'admin'</text>
+  <line x1="675" y1="243" x2="675" y2="261" stroke="#8b949e" stroke-width="1.2" marker-end="url(#arr24-6)"/>
+  <rect x="505" y="264" width="340" height="42" rx="8" fill="#3a2a1a" stroke="#d29922" stroke-width="1.3"/><text x="675" y="290" text-anchor="middle" fill="#d29922" font-size="14">UPDATE orders SET ...</text>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<!-- 24.4  Keyset 分页 -->
+<!-- ============================================================ -->
+
+<h2 id="s24-4">24.4 Keyset 分页 — 高性能列表</h2>
+
+<p>OFFSET 分页在数据量超过 10 万行后性能急剧下降——数据库必须扫描并丢弃前 N 行。Keyset 分页通过 <code>WHERE (created_at, id) &lt; (?, ?)</code> 直接跳到目标位置，翻页耗时恒定 O(1)。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 24-7 OFFSET vs Keyset 分页性能对比</div>
+<div style="max-width:620px;margin:0 auto;padding:16px 0;">
+      <div style="display:flex;align-items:flex-end;justify-content:center;gap:24px;height:220px;padding:0 8px;margin-bottom:8px;border-left:2px solid #30363d;border-bottom:2px solid #30363d;">
+        <div style="display:flex;flex-direction:column;align-items:center;gap:4px;flex:1;">
+          <div style="display:flex;align-items:flex-end;gap:4px;height:200px;">
+            <div style="width:28px;background:linear-gradient(180deg,#f85149,#d29922);border-radius:3px 3px 0 0;height:1px;min-height:1px;" title="OFFSET: 5ms"></div>
+            <div style="width:28px;background:linear-gradient(180deg,#1e3a5f,#58a6ff);border-radius:3px 3px 0 0;height:1px;min-height:1px;" title="Keyset: 5ms"></div>
+          </div>
+          <div style="color:#8b949e;font-size:11px;white-space:nowrap;">第1页</div>
+        </div>
+        <div style="display:flex;flex-direction:column;align-items:center;gap:4px;flex:1;">
+          <div style="display:flex;align-items:flex-end;gap:4px;height:200px;">
+            <div style="width:28px;background:linear-gradient(180deg,#f85149,#d29922);border-radius:3px 3px 0 0;height:1px;min-height:1px;" title="OFFSET: 12ms"></div>
+            <div style="width:28px;background:linear-gradient(180deg,#1e3a5f,#58a6ff);border-radius:3px 3px 0 0;height:1px;min-height:1px;" title="Keyset: 5ms"></div>
+          </div>
+          <div style="color:#8b949e;font-size:11px;white-space:nowrap;">第100页</div>
+        </div>
+        <div style="display:flex;flex-direction:column;align-items:center;gap:4px;flex:1;">
+          <div style="display:flex;align-items:flex-end;gap:4px;height:200px;">
+            <div style="width:28px;background:linear-gradient(180deg,#f85149,#d29922);border-radius:3px 3px 0 0;height:9px;" title="OFFSET: 85ms"></div>
+            <div style="width:28px;background:linear-gradient(180deg,#1e3a5f,#58a6ff);border-radius:3px 3px 0 0;height:1px;min-height:1px;" title="Keyset: 6ms"></div>
+          </div>
+          <div style="color:#8b949e;font-size:11px;white-space:nowrap;">第1000页</div>
+        </div>
+        <div style="display:flex;flex-direction:column;align-items:center;gap:4px;flex:1;">
+          <div style="display:flex;align-items:flex-end;gap:4px;height:200px;">
+            <div style="width:28px;background:linear-gradient(180deg,#f85149,#d29922);border-radius:3px 3px 0 0;height:47px;" title="OFFSET: 420ms"></div>
+            <div style="width:28px;background:linear-gradient(180deg,#1e3a5f,#58a6ff);border-radius:3px 3px 0 0;height:1px;min-height:1px;" title="Keyset: 6ms"></div>
+          </div>
+          <div style="color:#8b949e;font-size:11px;white-space:nowrap;">第5000页</div>
+        </div>
+        <div style="display:flex;flex-direction:column;align-items:center;gap:4px;flex:1;">
+          <div style="display:flex;align-items:flex-end;gap:4px;height:200px;">
+            <div style="width:28px;background:linear-gradient(180deg,#f85149,#d29922);border-radius:3px 3px 0 0;height:200px;" title="OFFSET: 1800ms"></div>
+            <div style="width:28px;background:linear-gradient(180deg,#1e3a5f,#58a6ff);border-radius:3px 3px 0 0;height:1px;min-height:1px;" title="Keyset: 7ms"></div>
+          </div>
+          <div style="color:#8b949e;font-size:11px;white-space:nowrap;">第10000页</div>
+        </div>
+      </div>
+      <div style="display:flex;justify-content:center;gap:24px;padding:8px 0;">
+        <div style="display:flex;align-items:center;gap:6px;">
+          <div style="width:14px;height:14px;background:linear-gradient(180deg,#f85149,#d29922);border-radius:3px;"></div>
+          <span style="color:#f85149;font-size:12px;font-weight:bold;">OFFSET 分页</span>
+          <span style="color:#8b949e;font-size:11px;">5 → 1800ms</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;">
+          <div style="width:14px;height:14px;background:linear-gradient(180deg,#1e3a5f,#58a6ff);border-radius:3px;"></div>
+          <span style="color:#58a6ff;font-size:12px;font-weight:bold;">Keyset 分页</span>
+          <span style="color:#8b949e;font-size:11px;">5 → 7ms</span>
+        </div>
+      </div>
+    </div>
+</div>
+
+<div class="key-insight">
+  <strong>Bar = OFFSET 分页, Line = Keyset 分页。</strong>OFFSET 在第 10000 页需要 1.8 秒，Keyset 始终在 7ms 以内。
+</div>
+
+<h3>Keyset 分页 DTO</h3>
+
+<pre><code>@Data
+@AllArgsConstructor
+public class KeysetPageResult&lt;T&gt; {
+    private List&lt;T&gt; content;
+    private long totalSize;
+    private String nextCursor;
+    private int totalPages;
+
+    public boolean hasNext() {
+        return nextCursor != null;
+    }
+}</code></pre>
+
+<h3>Controller 实现</h3>
+
+<pre><code>@RestController
+@RequestMapping("/api/orders")
+@RequiredArgsConstructor
+public class OrderController {
+
+    private final CriteriaBuilderFactory cbf;
+    private final EntityViewManager evm;
+    private final EntityManager em;
+
+    @GetMapping
+    public KeysetPageResult&lt;OrderListView&gt; listOrders(
+            @RequestParam(required = false) String afterKey,
+            @RequestParam(defaultValue = "20") int size) {
+
+        KeysetPage keyset = afterKey != null
+            ? deserializeKeyset(afterKey) : null;
+
+        EntityViewSetting&lt;OrderListView,
+            PaginatedCriteriaBuilder&lt;OrderListView&gt;&gt; setting =
+                keyset != null
+                    ? EntityViewSetting.create(OrderListView.class, keyset, size)
+                    : EntityViewSetting.create(OrderListView.class, 0, size);
+
+        setting.addAttributeFilter("activeOnly");
+        setting.addAttributeFilter("tenantFilter", TenantContext.current());
+
+        PaginatedCriteriaBuilder&lt;OrderListView&gt; cb = evm.applySetting(setting,
+            cbf.create(em, Order.class)
+               .orderByDesc("createdAt")
+               .orderByDesc("id"));
+
+        PagedList&lt;OrderListView&gt; page = cb.getResultList();
+
+        return new KeysetPageResult&lt;&gt;(
+            page,
+            page.getTotalSize(),
+            serializeKeyset(page.getKeysetPage()),
+            page.getTotalPages()
+        );
+    }
+
+    private String serializeKeyset(KeysetPage keysetPage) {
+        if (keysetPage == null || keysetPage.getHighest() == null) return null;
+        try {
+            return Base64.getUrlEncoder().encodeToString(
+                new ObjectMapper().writeValueAsBytes(keysetPage.getHighest().getTuple()));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private KeysetPage deserializeKeyset(String encoded) {
+        // 反序列化 keyset 游标
+        byte[] bytes = Base64.getUrlDecoder().decode(encoded);
+        // ... 重建 KeysetPage 对象
+        return null; // 简化示例
+    }
+}</code></pre>
+
+<pre><code>-- Keyset 分页生成的 SQL（第 2 页之后）
+SELECT o.id, o.order_number, o.status, o.total_amount, o.created_at, c.name
+FROM   orders o
+JOIN   customers c ON c.id = o.customer_id
+WHERE  o.deleted_at IS NULL
+AND    o.tenant_id = 'T001'
+AND    (o.created_at, o.id) &lt; (TIMESTAMP '2024-01-15 10:30:00', 1042)
+ORDER  BY o.created_at DESC, o.id DESC
+FETCH  FIRST 20 ROWS ONLY</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">Fig 24-8 Keyset 分页数据流</div>
+<div class="mermaid">
+flowchart LR
+    subgraph CLIENT ["前端"]
+        C1["第 1 页请求<br/>GET /api/orders?size=20"]
+        C2["第 2 页请求<br/>GET /api/orders?afterKey=xxx&size=20"]
+    end
+
+    subgraph SERVER ["后端"]
+        S1["EntityViewSetting<br/>firstResult=0, maxResults=20"]
+        S2["EntityViewSetting<br/>keyset=xxx, maxResults=20"]
+    end
+
+    subgraph DB ["数据库"]
+        D1["ORDER BY created_at DESC, id DESC<br/>FETCH FIRST 20 ROWS"]
+        D2["WHERE (created_at, id) < (?, ?)<br/>FETCH FIRST 20 ROWS"]
+    end
+
+    C1 --> S1 --> D1
+    C2 --> S2 --> D2
+
+    D1 -. "响应含 nextCursor" .-> C2
+
+    style C1 fill:#1e3a5f,stroke:#58a6ff
+    style C2 fill:#1e3a5f,stroke:#58a6ff
+    style S1 fill:#2d1f4e,stroke:#bc8cff
+    style S2 fill:#2d1f4e,stroke:#bc8cff
+    style D1 fill:#1a3a2a,stroke:#3fb950
+    style D2 fill:#1a3a2a,stroke:#3fb950
+</div>
+</div>
+
+<!-- ============================================================ -->
+<!-- 24.5  批量操作 -->
+<!-- ============================================================ -->
+
+<h2 id="s24-5">24.5 批量操作 — 订单归档</h2>
+
+<p>历史订单如果一直留在热表中，查询性能会随数据量线性下降。生产系统需要定期将已完成/已取消的旧订单<strong>归档到冷表</strong>，然后从热表中删除。Blaze-Persistence 的 <code>INSERT...SELECT</code> + 批量 DELETE 可以在单条 SQL 中完成这项工作。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 24-9 订单归档流程</div>
+<div class="mermaid">
+flowchart TD
+    START["定时任务触发<br/>@Scheduled(cron)"] --> CHECK["查询符合条件的订单<br/>createdAt < 90天前<br/>status IN (COMPLETED, CANCELLED)"]
+    CHECK --> COUNT{"数量 > 0?"}
+    COUNT -- "否" --> SKIP["跳过本次执行"]
+    COUNT -- "是" --> INSERT["INSERT INTO order_archive<br/>SELECT FROM orders<br/>一条 SQL 批量复制"]
+    INSERT --> DELETE["DELETE FROM orders<br/>WHERE 条件匹配<br/>一条 SQL 批量删除"]
+    DELETE --> LOG["记录归档日志<br/>archived: N, deleted: N"]
+    LOG --> END["完成"]
+
+    style START fill:#2d1f4e,stroke:#bc8cff
+    style INSERT fill:#1a3a2a,stroke:#3fb950
+    style DELETE fill:#5c1a1a,stroke:#f85149
+    style LOG fill:#3a2a1a,stroke:#d29922
+</div>
+</div>
+
+<h3>归档目标实体</h3>
+
+<pre><code>@Entity
+@Table(name = "order_archive")
+public class OrderArchive {
+    @Id
+    private Long id;
+    private Long customerId;
+    private OrderStatus status;
+    private BigDecimal totalAmount;
+    private Instant originalCreatedAt;
+    private Instant archivedAt;
+    private String archivedBy;
+}</code></pre>
+
+<h3>归档服务</h3>
+
+<pre><code>@Service
+@RequiredArgsConstructor
+@Slf4j
+public class OrderArchiveService {
+
+    private final CriteriaBuilderFactory cbf;
+    private final EntityManager em;
+
+    @Transactional
+    public ArchiveResult archiveOldOrders(LocalDateTime before) {
+        // Step 1: INSERT INTO order_archive SELECT FROM orders
+        int archived = cbf.insert(em, OrderArchive.class)
+            .from(Order.class, "o")
+            .bind("id").select("o.id")
+            .bind("customerId").select("o.customer.id")
+            .bind("status").select("o.status")
+            .bind("totalAmount").select("o.totalAmount")
+            .bind("originalCreatedAt").select("o.createdAt")
+            .bind("archivedAt").select("CURRENT_TIMESTAMP")
+            .bind("archivedBy").select("'SYSTEM'")
+            .where("o.createdAt").lt(before)
+            .where("o.status").in(OrderStatus.COMPLETED, OrderStatus.CANCELLED)
+            .where("o.deletedAt").isNull()
+            .executeUpdate();
+
+        // Step 2: DELETE archived orders from hot table
+        int deleted = cbf.delete(em, Order.class, "o")
+            .where("o.createdAt").lt(before)
+            .where("o.status").in(OrderStatus.COMPLETED, OrderStatus.CANCELLED)
+            .where("o.deletedAt").isNull()
+            .executeUpdate();
+
+        log.info("Archived {} orders, deleted {} from hot table", archived, deleted);
+        return new ArchiveResult(archived, deleted);
+    }
+}
+
+public record ArchiveResult(int archived, int deleted) {}</code></pre>
+
+<h3>定时调度</h3>
+
+<pre><code>@Component
+@RequiredArgsConstructor
+public class ArchiveScheduler {
+
+    private final OrderArchiveService archiveService;
+
+    @Scheduled(cron = "0 0 3 * * SUN")  // 每周日凌晨 3 点
+    public void weeklyArchive() {
+        LocalDateTime cutoff = LocalDateTime.now().minusDays(90);
+        ArchiveResult result = archiveService.archiveOldOrders(cutoff);
+        // metrics / alerting
+    }
+}</code></pre>
+
+<pre><code>-- Step 1: INSERT...SELECT (一条 SQL 归档)
+INSERT INTO order_archive (id, customer_id, status, total_amount,
+                           original_created_at, archived_at, archived_by)
+SELECT o.id, o.customer_id, o.status, o.total_amount,
+       o.created_at, CURRENT_TIMESTAMP, 'SYSTEM'
+FROM   orders o
+WHERE  o.created_at &lt; '2024-10-15T00:00:00'
+AND    o.status IN ('COMPLETED', 'CANCELLED')
+AND    o.deleted_at IS NULL;
+
+-- Step 2: DELETE (一条 SQL 清理)
+DELETE FROM orders o
+WHERE  o.created_at &lt; '2024-10-15T00:00:00'
+AND    o.status IN ('COMPLETED', 'CANCELLED')
+AND    o.deleted_at IS NULL;</code></pre>
+
+<div class="warning">
+  <strong>事务一致性：</strong>INSERT 和 DELETE 必须在<strong>同一个事务</strong>中执行。如果 DELETE 在 INSERT 之前执行（或分属不同事务），数据会丢失。<code>@Transactional</code> 确保两步操作的原子性。
+</div>
+
+<!-- ============================================================ -->
+<!-- 24.6  乐观锁 -->
+<!-- ============================================================ -->
+
+<h2 id="s24-6">24.6 乐观锁 — @Version</h2>
+
+<p>当两个用户同时编辑同一订单时，后提交的更新会覆盖先提交的修改——这就是"丢失更新"问题。JPA 的 <code>@Version</code> 字段配合 Blaze-Persistence 的 Updatable Entity View 可以自动检测并拒绝冲突更新。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 24-10 乐观锁冲突检测时序</div>
+<div class="mermaid">
+sequenceDiagram
+    participant U1 as 用户 A
+    participant U2 as 用户 B
+    participant S as Server
+    participant DB as Database
+
+    U1->>S: GET /orders/42 → version=1
+    U2->>S: GET /orders/42 → version=1
+
+    U1->>S: PUT /orders/42 {status: SHIPPED, version: 1}
+    S->>DB: UPDATE orders SET status='SHIPPED', version=2<br/>WHERE id=42 AND version=1
+    DB-->>S: 1 row updated ✅
+    S-->>U1: 200 OK
+
+    U2->>S: PUT /orders/42 {status: CANCELLED, version: 1}
+    S->>DB: UPDATE orders SET status='CANCELLED', version=2<br/>WHERE id=42 AND version=1
+    DB-->>S: 0 rows updated ❌
+    S-->>U2: 409 Conflict<br/>OptimisticLockException
+</div>
+</div>
+
+<h3>Entity 定义</h3>
+
+<pre><code>@Entity
+@Table(name = "orders")
+public class Order {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Version
+    private Integer version;
+
+    private String orderNumber;
+    private OrderStatus status;
+    private BigDecimal totalAmount;
+    private Instant createdAt;
+    private Instant updatedAt;
+    private String tenantId;
+    private Instant deletedAt;
+    private String deletedBy;
+
+    // getters / setters
+}</code></pre>
+
+<h3>Updatable Entity View（自动携带 version）</h3>
+
+<pre><code>@UpdatableEntityView
+@EntityView(Order.class)
+public interface OrderUpdateView {
+    @IdMapping
+    Long getId();
+
+    OrderStatus getStatus();
+    void setStatus(OrderStatus status);
+
+    String getShippingAddress();
+    void setShippingAddress(String shippingAddress);
+
+    BigDecimal getTotalAmount();
+    void setTotalAmount(BigDecimal totalAmount);
+
+    // @Version 字段由 JPA 自动管理
+    // Blaze-Persistence 在 flush 时携带 version 条件
+}</code></pre>
+
+<h3>Controller 层冲突处理</h3>
+
+<pre><code>@PutMapping("/api/orders/{id}")
+public ResponseEntity&lt;?&gt; updateOrder(@PathVariable Long id,
+                                      @RequestBody OrderUpdateRequest request) {
+    try {
+        OrderDetailView result = orderService.updateOrder(id, request);
+        return ResponseEntity.ok(result);
+    } catch (OptimisticLockException e) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+            .body(Map.of(
+                "error", "CONFLICT",
+                "message", "订单已被其他用户修改，请刷新后重试",
+                "currentVersion", orderService.getCurrentVersion(id)
+            ));
+    }
+}</code></pre>
+
+<pre><code>-- 乐观锁生成的 SQL
+UPDATE orders
+SET    status = 'SHIPPED',
+       shipping_address = '上海市浦东新区xxx路',
+       updated_at = '2024-01-15T10:30:00Z',
+       updated_by = 'admin',
+       version = 2            -- version + 1
+WHERE  id = 42
+AND    version = 1            -- 条件：version 必须匹配
+
+-- 如果返回 0 rows updated → OptimisticLockException</code></pre>
+
+<!-- ============================================================ -->
+<!-- 24.7  测试 -->
+<!-- ============================================================ -->
+
+<h2 id="s24-7">24.7 测试 — Testcontainers + Spring Boot Test</h2>
+
+<p>集成测试必须使用真实数据库——H2 的 SQL 方言与 PostgreSQL 有大量差异，用 H2 测试通过的 CTE / 窗口函数查询到生产环境可能立即失败。Testcontainers 启动真正的 PostgreSQL 容器，确保测试环境与生产一致。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 24-11 Testcontainers 测试架构</div>
+<div class="mermaid">
+flowchart LR
+    subgraph CI ["CI / 开发机"]
+        T["JUnit 5<br/>@SpringBootTest"]
+        TC["Testcontainers<br/>PostgreSQL 16"]
+    end
+
+    subgraph DOCKER ["Docker"]
+        PG["PostgreSQL 16<br/>Container"]
+    end
+
+    subgraph APP ["Spring Context"]
+        DS["DataSource<br/>jdbc:postgresql://..."]
+        JPA["Hibernate / JPA"]
+        BP["Blaze-Persistence<br/>CriteriaBuilderFactory<br/>EntityViewManager"]
+    end
+
+    T --> TC
+    TC --> PG
+    PG -. "JDBC URL 动态注入" .-> DS
+    DS --> JPA --> BP
+    T --> APP
+
+    style T fill:#1e3a5f,stroke:#58a6ff
+    style TC fill:#3a2a1a,stroke:#d29922
+    style PG fill:#1a3a2a,stroke:#3fb950
+    style BP fill:#2d1f4e,stroke:#bc8cff
+</div>
+</div>
+
+<h3>测试基类</h3>
+
+<pre><code>@SpringBootTest
+@Testcontainers
+@ActiveProfiles("test")
+abstract class BaseIntegrationTest {
+
+    @Container
+    static PostgreSQLContainer&lt;?&gt; pg =
+        new PostgreSQLContainer&lt;&gt;("postgres:16-alpine")
+            .withDatabaseName("testdb")
+            .withUsername("test")
+            .withPassword("test");
+
+    @DynamicPropertySource
+    static void configure(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", pg::getJdbcUrl);
+        registry.add("spring.datasource.username", pg::getUsername);
+        registry.add("spring.datasource.password", pg::getPassword);
+        registry.add("spring.jpa.hibernate.ddl-auto", () -> "create-drop");
+    }
+}</code></pre>
+
+<h3>OrderService 集成测试</h3>
+
+<pre><code>class OrderServiceTest extends BaseIntegrationTest {
+
+    @Autowired OrderService orderService;
+    @Autowired EntityManager em;
+
+    @BeforeEach
+    void setUp() {
+        TenantContext.set("TEST_TENANT");
+    }
+
+    @AfterEach
+    void tearDown() {
+        TenantContext.clear();
+    }
+
+    @Test
+    void createOrder_shouldReturnDetailView() {
+        OrderCreateRequest request = new OrderCreateRequest();
+        request.setCustomerId(1L);
+        request.setItems(List.of(
+            new OrderItemRequest(101L, 2, new BigDecimal("29.99")),
+            new OrderItemRequest(102L, 1, new BigDecimal("49.99"))
+        ));
+
+        OrderDetailView result = orderService.createOrder(request);
+
+        assertThat(result.getId()).isNotNull();
+        assertThat(result.getStatus()).isEqualTo(OrderStatus.PENDING);
+        assertThat(result.getTotalAmount())
+            .isEqualByComparingTo(new BigDecimal("109.97"));
+        assertThat(result.getCreatedAt()).isNotNull();
+        assertThat(result.getCreatedBy()).isEqualTo("SYSTEM");
+    }
+
+    @Test
+    void searchOrders_withFilters() {
+        // Given: 准备测试数据
+        createTestOrders(50);
+
+        // When: 搜索 PENDING 状态的订单
+        OrderSearchCriteria criteria = new OrderSearchCriteria();
+        criteria.setStatus(OrderStatus.PENDING);
+        criteria.setMinAmount(new BigDecimal("100.00"));
+
+        List&lt;OrderListView&gt; results = orderService.searchOrders(criteria);
+
+        // Then: 只返回符合条件的订单
+        assertThat(results)
+            .isNotEmpty()
+            .allSatisfy(order -> {
+                assertThat(order.getStatus()).isEqualTo(OrderStatus.PENDING);
+                assertThat(order.getTotalAmount())
+                    .isGreaterThanOrEqualTo(new BigDecimal("100.00"));
+            });
+    }
+
+    @Test
+    void keysetPagination_shouldMaintainOrder() {
+        createTestOrders(100);
+
+        // 第 1 页
+        KeysetPageResult&lt;OrderListView&gt; page1 =
+            orderService.listOrders(null, 20);
+        assertThat(page1.getContent()).hasSize(20);
+        assertThat(page1.hasNext()).isTrue();
+
+        // 第 2 页
+        KeysetPageResult&lt;OrderListView&gt; page2 =
+            orderService.listOrders(page1.getNextCursor(), 20);
+        assertThat(page2.getContent()).hasSize(20);
+
+        // 确保无重复
+        Set&lt;Long&gt; page1Ids = page1.getContent().stream()
+            .map(OrderListView::getId).collect(Collectors.toSet());
+        Set&lt;Long&gt; page2Ids = page2.getContent().stream()
+            .map(OrderListView::getId).collect(Collectors.toSet());
+        assertThat(page1Ids).doesNotContainAnyElementsOf(page2Ids);
+    }
+
+    @Test
+    void softDelete_shouldHideFromNormalQuery() {
+        OrderDetailView order = createTestOrder();
+        orderService.softDelete(order.getId());
+
+        List&lt;OrderListView&gt; activeOrders = orderService.listActiveOrders();
+        assertThat(activeOrders)
+            .extracting(OrderListView::getId)
+            .doesNotContain(order.getId());
+    }
+
+    @Test
+    void optimisticLock_shouldDetectConflict() {
+        OrderDetailView order = createTestOrder();
+
+        // 模拟并发更新
+        OrderUpdateRequest req1 = new OrderUpdateRequest();
+        req1.setStatus(OrderStatus.SHIPPED);
+        orderService.updateOrder(order.getId(), req1);
+
+        // 用旧版本再次更新 → 应抛出异常
+        OrderUpdateRequest req2 = new OrderUpdateRequest();
+        req2.setStatus(OrderStatus.CANCELLED);
+        assertThatThrownBy(() ->
+            orderService.updateOrderWithVersion(order.getId(), req2, 1))
+            .isInstanceOf(OptimisticLockException.class);
+    }
+}</code></pre>
+
+<!-- ============================================================ -->
+<!-- 24.8  监控与可观测性 -->
+<!-- ============================================================ -->
+
+<h2 id="s24-8">24.8 监控与可观测性</h2>
+
+<p>生产系统必须回答三个问题：<strong>（1）查询慢不慢？（2）Entity View 渲染花多长时间？（3）连接池是否健康？</strong>通过 Hibernate Statistics + Micrometer + Spring Actuator 可以构建完整的可观测体系。</p>
+
+<div class="diagram">
+<div class="diagram-title">Fig 24-12 可观测性三层架构</div>
+<div class="mermaid">
+flowchart TB
+    subgraph METRICS ["① 指标采集"]
+        M1["Hibernate Statistics<br/>查询次数 / 慢查询 / 缓存命中"]
+        M2["Entity View Metrics<br/>渲染耗时 / 对象数"]
+        M3["Connection Pool<br/>活跃连接 / 等待线程"]
+    end
+
+    subgraph EXPORT ["② 指标导出"]
+        E1["Micrometer<br/>MeterRegistry"]
+        E2["/actuator/prometheus"]
+    end
+
+    subgraph VIZ ["③ 可视化"]
+        V1["Grafana Dashboard"]
+        V2["Prometheus"]
+        V3["AlertManager<br/>慢查询告警"]
+    end
+
+    M1 --> E1
+    M2 --> E1
+    M3 --> E1
+    E1 --> E2
+    E2 --> V2
+    V2 --> V1
+    V2 --> V3
+
+    style M1 fill:#1e3a5f,stroke:#58a6ff
+    style M2 fill:#2d1f4e,stroke:#bc8cff
+    style M3 fill:#1a3a2a,stroke:#3fb950
+    style E1 fill:#3a2a1a,stroke:#d29922
+    style V1 fill:#3a1a2a,stroke:#f778ba
+    style V2 fill:#3a1a2a,stroke:#f778ba
+    style V3 fill:#5c1a1a,stroke:#f85149
+</div>
+</div>
+
+<h3>Hibernate Statistics 配置</h3>
+
+<pre><code># application.yml
+spring:
+  jpa:
+    properties:
+      hibernate:
+        generate_statistics: true
+        session.events.log.LOG_QUERIES_SLOWER_THAN_MS: 100
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  metrics:
+    tags:
+      application: order-service</code></pre>
+
+<h3>Entity View 渲染指标</h3>
+
+<pre><code>@Component
+@RequiredArgsConstructor
+public class EntityViewMetrics {
+
+    private final MeterRegistry meterRegistry;
+
+    public &lt;T&gt; T timeViewRendering(String viewName, Supplier&lt;T&gt; operation) {
+        Timer.Sample sample = Timer.start(meterRegistry);
+        try {
+            T result = operation.get();
+            sample.stop(Timer.builder("blaze.entityview.render")
+                .tag("view", viewName)
+                .tag("status", "success")
+                .description("Entity View rendering time")
+                .register(meterRegistry));
+            return result;
+        } catch (Exception e) {
+            sample.stop(Timer.builder("blaze.entityview.render")
+                .tag("view", viewName)
+                .tag("status", "error")
+                .register(meterRegistry));
+            throw e;
+        }
+    }
+}</code></pre>
+
+<h3>使用示例</h3>
+
+<pre><code>@Service
+@RequiredArgsConstructor
+public class MonitoredOrderService {
+
+    private final EntityViewMetrics metrics;
+    private final CriteriaBuilderFactory cbf;
+    private final EntityViewManager evm;
+    private final EntityManager em;
+
+    public List&lt;OrderListView&gt; listOrders() {
+        return metrics.timeViewRendering("OrderListView", () -> {
+            EntityViewSetting&lt;OrderListView,
+                CriteriaBuilder&lt;OrderListView&gt;&gt; setting =
+                    EntityViewSetting.create(OrderListView.class);
+            setting.addAttributeFilter("activeOnly");
+            setting.addAttributeFilter("tenantFilter", TenantContext.current());
+
+            return evm.applySetting(setting,
+                cbf.create(em, Order.class)
+                   .orderByDesc("createdAt"))
+                .getResultList();
+        });
+    }
+}</code></pre>
+
+<h3>自定义健康检查</h3>
+
+<pre><code>@Component
+public class BlazePersistenceHealthIndicator implements HealthIndicator {
+
+    private final CriteriaBuilderFactory cbf;
+    private final EntityManager em;
+
+    public BlazePersistenceHealthIndicator(CriteriaBuilderFactory cbf,
+                                           EntityManager em) {
+        this.cbf = cbf;
+        this.em = em;
+    }
+
+    @Override
+    public Health health() {
+        try {
+            long count = cbf.create(em, Order.class)
+                .select("COUNT(*)")
+                .getSingleResult();
+
+            return Health.up()
+                .withDetail("orderCount", count)
+                .withDetail("cbfVersion", cbf.getClass().getPackage()
+                    .getImplementationVersion())
+                .build();
+        } catch (Exception e) {
+            return Health.down()
+                .withException(e)
+                .build();
+        }
+    }
+}</code></pre>
+
+<table>
+<tr><th>指标名称</th><th>类型</th><th>说明</th><th>告警阈值</th></tr>
+<tr><td><code>blaze.entityview.render</code></td><td>Timer</td><td>Entity View 渲染耗时</td><td>p99 > 200ms</td></tr>
+<tr><td><code>hibernate.query.executions</code></td><td>Counter</td><td>查询执行次数</td><td>突增 > 200%</td></tr>
+<tr><td><code>hibernate.query.plan.cache.hit</code></td><td>Gauge</td><td>查询计划缓存命中率</td><td>< 90%</td></tr>
+<tr><td><code>hikaricp.connections.active</code></td><td>Gauge</td><td>活跃连接数</td><td>> 80% max</td></tr>
+<tr><td><code>hikaricp.connections.pending</code></td><td>Gauge</td><td>等待连接的线程数</td><td>> 5</td></tr>
+<tr><td><code>jvm.gc.pause</code></td><td>Timer</td><td>GC 停顿时间</td><td>p99 > 500ms</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<!-- 24.9  Spring Data Integration -->
+<!-- ============================================================ -->
+
+<h2 id="s24-9">24.9 Spring Data Integration 完整示例</h2>
+
+<p>Spring Data + Blaze-Persistence 的集成通过 <code>blaze-persistence-integration-spring-data-3.3</code> 模块实现。它提供自定义 Repository 基类 <code>EntityViewRepository</code>，支持 Entity View 的自动投影查询。</p>
+
+<h3>依赖配置</h3>
+
+<pre><code>&lt;!-- pom.xml --&gt;
+&lt;dependencies&gt;
+    &lt;dependency&gt;
+        &lt;groupId&gt;com.blazebit&lt;/groupId&gt;
+        &lt;artifactId&gt;blaze-persistence-integration-spring-data-3.3&lt;/artifactId&gt;
+        &lt;version&gt;${blaze.version}&lt;/version&gt;
+    &lt;/dependency&gt;
+    &lt;dependency&gt;
+        &lt;groupId&gt;com.blazebit&lt;/groupId&gt;
+        &lt;artifactId&gt;blaze-persistence-integration-entity-view-spring-6.0&lt;/artifactId&gt;
+        &lt;version&gt;${blaze.version}&lt;/version&gt;
+    &lt;/dependency&gt;
+    &lt;dependency&gt;
+        &lt;groupId&gt;com.blazebit&lt;/groupId&gt;
+        &lt;artifactId&gt;blaze-persistence-integration-hibernate-6.2&lt;/artifactId&gt;
+        &lt;version&gt;${blaze.version}&lt;/version&gt;
+        &lt;scope&gt;runtime&lt;/scope&gt;
+    &lt;/dependency&gt;
+&lt;/dependencies&gt;</code></pre>
+
+<h3>Repository 接口定义</h3>
+
+<pre><code>// 基本 Entity View Repository
+@Repository
+@Transactional(readOnly = true)
+public interface OrderViewRepository
+    extends EntityViewRepository&lt;OrderListView, Long&gt; {
+
+    // 方法名查询 → 自动映射到 Entity View
+    List&lt;OrderListView&gt; findByStatus(OrderStatus status);
+
+    // 分页查询
+    Page&lt;OrderListView&gt; findByStatusIn(
+        Collection&lt;OrderStatus&gt; statuses, Pageable pageable);
+
+    // Keyset 分页
+    KeysetAwarePage&lt;OrderListView&gt; findAll(
+        KeysetPageable pageable);
+}
+
+// 详情视图 Repository
+@Repository
+@Transactional(readOnly = true)
+public interface OrderDetailRepository
+    extends EntityViewRepository&lt;OrderDetailView, Long&gt; {
+
+    Optional&lt;OrderDetailView&gt; findByIdAndTenantId(
+        Long id, String tenantId);
+}
+
+// 可更新视图 Repository
+@Repository
+public interface OrderUpdateRepository
+    extends EntityViewRepository&lt;OrderUpdateView, Long&gt; {
+    // save() 方法由基类提供
+}</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">Fig 24-13 Spring Data + Blaze Repository 层次</div>
+<div class="mermaid">
+classDiagram
+    class Repository~T,ID~ {
+        &lt;&lt;interface&gt;&gt;
+    }
+    class CrudRepository~T,ID~ {
+        &lt;&lt;interface&gt;&gt;
+        +save(entity) T
+        +findById(id) Optional~T~
+        +deleteById(id) void
+    }
+    class EntityViewRepository~T,ID~ {
+        &lt;&lt;interface&gt;&gt;
+        +findAll() List~T~
+        +findAll(Pageable) Page~T~
+        +findAll(KeysetPageable) KeysetAwarePage~T~
+    }
+    class OrderViewRepository {
+        &lt;&lt;interface&gt;&gt;
+        +findByStatus(status) List
+        +findByStatusIn(statuses, pageable) Page
+    }
+    class OrderDetailRepository {
+        &lt;&lt;interface&gt;&gt;
+        +findByIdAndTenantId(id, tenantId) Optional
+    }
+    class OrderUpdateRepository {
+        &lt;&lt;interface&gt;&gt;
+    }
+
+    Repository <|-- CrudRepository
+    CrudRepository <|-- EntityViewRepository
+    EntityViewRepository <|-- OrderViewRepository
+    EntityViewRepository <|-- OrderDetailRepository
+    EntityViewRepository <|-- OrderUpdateRepository
+
+    style EntityViewRepository fill:#1e3a5f,stroke:#58a6ff
+    style OrderViewRepository fill:#1a3a2a,stroke:#3fb950
+    style OrderDetailRepository fill:#2d1f4e,stroke:#bc8cff
+    style OrderUpdateRepository fill:#3a2a1a,stroke:#d29922
+</div>
+</div>
+
+<h3>Service 层调用</h3>
+
+<pre><code>@Service
+@RequiredArgsConstructor
+public class OrderSpringDataService {
+
+    private final OrderViewRepository orderViewRepo;
+    private final OrderDetailRepository orderDetailRepo;
+    private final OrderUpdateRepository orderUpdateRepo;
+
+    public Page&lt;OrderListView&gt; listOrders(Pageable pageable) {
+        return orderViewRepo.findByStatusIn(
+            List.of(OrderStatus.PENDING, OrderStatus.PROCESSING),
+            pageable);
+    }
+
+    public OrderDetailView getOrder(Long id) {
+        return orderDetailRepo.findByIdAndTenantId(
+                id, TenantContext.current())
+            .orElseThrow(() -> new OrderNotFoundException(id));
+    }
+
+    @Transactional
+    public void updateOrderStatus(Long id, OrderStatus newStatus) {
+        OrderUpdateView view = orderUpdateRepo.findById(id)
+            .orElseThrow(() -> new OrderNotFoundException(id));
+        view.setStatus(newStatus);
+        orderUpdateRepo.save(view);
+    }
+}</code></pre>
+
+<h3>Spring Boot 自动配置</h3>
+
+<pre><code>@Configuration
+@EnableBlazeRepositories(
+    basePackages = "com.example.order.repository",
+    entityManagerFactoryRef = "entityManagerFactory"
+)
+@EnableEntityViews(
+    basePackages = "com.example.order.view"
+)
+public class BlazePersistenceConfig {
+
+    @Bean
+    @Scope(ConfigurableBeanFactory.SCOPE_SINGLETON)
+    @Lazy(false)
+    public CriteriaBuilderFactory criteriaBuilderFactory(
+            EntityManagerFactory emf) {
+        CriteriaBuilderConfiguration config =
+            Criteria.getDefault();
+        return config.createCriteriaBuilderFactory(emf);
+    }
+
+    @Bean
+    @Scope(ConfigurableBeanFactory.SCOPE_SINGLETON)
+    @Lazy(false)
+    public EntityViewManager entityViewManager(
+            CriteriaBuilderFactory cbf,
+            EntityViewConfiguration entityViewConfig) {
+        return entityViewConfig
+            .createEntityViewManager(cbf);
+    }
+}</code></pre>
+
+<!-- ============================================================ -->
+<!-- 24.10  完整项目结构 -->
+<!-- ============================================================ -->
+
+<h2 id="s24-10">24.10 完整项目结构总览</h2>
+
+<div class="diagram">
+<div class="diagram-title">Fig 24-14 生产项目分层架构</div>
+<div style="display:flex;flex-wrap:wrap;gap:16px;justify-content:center;padding:16px 0;">
+  <div style="border:1px solid #58a6ff;border-radius:8px;padding:14px 18px;min-width:200px;max-width:260px;background:rgba(88,166,255,.06);">
+    <div style="font-weight:bold;color:#58a6ff;margin-bottom:8px;">表示层</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">OrderController — REST 端点<br/>GlobalExceptionHandler — 异常处理<br/>CorsConfig — 跨域配置</div>
+  </div>
+  <div style="border:1px solid #bc8cff;border-radius:8px;padding:14px 18px;min-width:200px;max-width:260px;background:rgba(188,140,255,.06);">
+    <div style="font-weight:bold;color:#bc8cff;margin-bottom:8px;">应用层</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">OrderService — 业务逻辑编排<br/>OrderSearchService — 复杂查询<br/>OrderArchiveService — 批量归档</div>
+  </div>
+  <div style="border:1px solid #3fb950;border-radius:8px;padding:14px 18px;min-width:200px;max-width:260px;background:rgba(63,185,80,.06);">
+    <div style="font-weight:bold;color:#3fb950;margin-bottom:8px;">领域层</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">Order / OrderItem / Customer — JPA Entity<br/>OrderListView / OrderDetailView — 只读 View<br/>OrderCreateView / OrderUpdateView — 可写 View</div>
+  </div>
+  <div style="border:1px solid #d29922;border-radius:8px;padding:14px 18px;min-width:200px;max-width:260px;background:rgba(210,153,34,.06);">
+    <div style="font-weight:bold;color:#d29922;margin-bottom:8px;">基础设施层</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">OrderViewRepository — Spring Data + Blaze<br/>BlazePersistenceConfig — CBF + EVM<br/>AuditViewListener · TenantInterceptor<br/>EntityViewMetrics · HealthIndicator</div>
+  </div>
+</div>
+</div>
+
+<h3>目录结构</h3>
+
+<pre><code>order-service/
+├── src/main/java/com/example/order/
+│   ├── OrderServiceApplication.java
+│   │
+│   ├── config/
+│   │   ├── BlazePersistenceConfig.java       # CBF + EVM Bean
+│   │   ├── WebMvcConfig.java                 # TenantInterceptor 注册
+│   │   └── SecurityConfig.java               # Spring Security
+│   │
+│   ├── controller/
+│   │   ├── OrderController.java              # REST 端点
+│   │   └── GlobalExceptionHandler.java       # 统一异常处理
+│   │
+│   ├── service/
+│   │   ├── OrderService.java                 # 核心业务逻辑
+│   │   ├── OrderSearchService.java           # 搜索 + 过滤
+│   │   ├── OrderArchiveService.java          # 归档服务
+│   │   └── MonitoredOrderService.java        # 带监控的包装
+│   │
+│   ├── domain/
+│   │   ├── entity/
+│   │   │   ├── Order.java                    # JPA Entity
+│   │   │   ├── OrderItem.java
+│   │   │   ├── Customer.java
+│   │   │   ├── Product.java
+│   │   │   └── OrderArchive.java
+│   │   └── enums/
+│   │       └── OrderStatus.java
+│   │
+│   ├── view/
+│   │   ├── order/
+│   │   │   ├── OrderListView.java            # 列表投影
+│   │   │   ├── OrderDetailView.java          # 详情投影
+│   │   │   ├── OrderCreateView.java          # 创建视图
+│   │   │   └── OrderUpdateView.java          # 更新视图
+│   │   └── customer/
+│   │       └── CustomerSummaryView.java
+│   │
+│   ├── repository/
+│   │   ├── OrderViewRepository.java          # Entity View Repository
+│   │   ├── OrderDetailRepository.java
+│   │   └── OrderUpdateRepository.java
+│   │
+│   ├── listener/
+│   │   └── AuditViewListener.java            # 审计监听
+│   │
+│   ├── interceptor/
+│   │   └── TenantInterceptor.java            # 多租户
+│   │
+│   ├── metrics/
+│   │   ├── EntityViewMetrics.java            # 渲染指标
+│   │   └── BlazePersistenceHealthIndicator.java
+│   │
+│   └── context/
+│       ├── TenantContext.java                # 租户上下文
+│       └── SecurityContext.java              # 安全上下文
+│
+├── src/main/resources/
+│   ├── application.yml                       # 主配置
+│   ├── application-prod.yml                  # 生产配置
+│   └── application-test.yml                  # 测试配置
+│
+├── src/test/java/com/example/order/
+│   ├── BaseIntegrationTest.java              # Testcontainers 基类
+│   ├── service/
+│   │   └── OrderServiceTest.java
+│   └── controller/
+│       └── OrderControllerTest.java
+│
+├── docker-compose.yml                        # 本地开发环境
+├── Dockerfile                                # 生产镜像
+└── pom.xml</code></pre>
+
+<!-- ============================================================ -->
+<!-- 24.11  生产检查清单 -->
+<!-- ============================================================ -->
+
+<h2 id="s24-11">24.11 生产检查清单</h2>
+
+<p>部署到生产环境前，逐项检查以下清单。每一项都有对应的章节引用。</p>
+
+<table>
+<tr><th>类别</th><th>检查项</th><th>状态</th><th>参考</th></tr>
+<tr><td rowspan="3"><strong>数据隔离</strong></td>
+    <td>所有 Entity View 声明 <code>@ViewFilter("tenantFilter")</code></td><td>□</td><td>24.1</td></tr>
+<tr><td>TenantInterceptor 拦截所有 API 请求</td><td>□</td><td>24.1</td></tr>
+<tr><td>后台定时任务手动设置 TenantContext</td><td>□</td><td>24.1</td></tr>
+<tr><td rowspan="3"><strong>软删除</strong></td>
+    <td>所有查询 Entity View 声明 <code>@ViewFilter("activeOnly")</code></td><td>□</td><td>24.2</td></tr>
+<tr><td>管理员视图可查看已删除记录</td><td>□</td><td>24.2</td></tr>
+<tr><td>定期清理超过保留期的软删除记录</td><td>□</td><td>24.5</td></tr>
+<tr><td rowspan="2"><strong>审计</strong></td>
+    <td>AuditViewListener 注册到 EntityViewManager</td><td>□</td><td>24.3</td></tr>
+<tr><td>所有 Creatable/Updatable View 实现 Auditable 接口</td><td>□</td><td>24.3</td></tr>
+<tr><td rowspan="2"><strong>分页</strong></td>
+    <td>列表 API 使用 Keyset 分页（非 OFFSET）</td><td>□</td><td>24.4</td></tr>
+<tr><td>ORDER BY 包含唯一列（如 id）作为 tiebreaker</td><td>□</td><td>24.4</td></tr>
+<tr><td rowspan="2"><strong>并发</strong></td>
+    <td>Entity 定义 <code>@Version</code> 字段</td><td>□</td><td>24.6</td></tr>
+<tr><td>Controller 捕获 OptimisticLockException 返回 409</td><td>□</td><td>24.6</td></tr>
+<tr><td rowspan="3"><strong>性能</strong></td>
+    <td>Entity View 仅投影需要的列</td><td>□</td><td><a href="ch04-entityview.html">第 4 章</a></td></tr>
+<tr><td>N+1 问题已通过 MULTISET / @BatchFetch 解决</td><td>□</td><td><a href="ch21-optimization.html">第 21 章</a></td></tr>
+<tr><td>Hibernate Statistics 开启慢查询日志</td><td>□</td><td>24.8</td></tr>
+<tr><td rowspan="3"><strong>测试</strong></td>
+    <td>集成测试使用 Testcontainers（非 H2）</td><td>□</td><td>24.7</td></tr>
+<tr><td>覆盖 CRUD + 分页 + 过滤 + 并发场景</td><td>□</td><td>24.7</td></tr>
+<tr><td>CI 流水线包含集成测试</td><td>□</td><td>24.7</td></tr>
+<tr><td rowspan="3"><strong>运维</strong></td>
+    <td>Micrometer 指标暴露到 Prometheus</td><td>□</td><td>24.8</td></tr>
+<tr><td>Grafana Dashboard 配置完成</td><td>□</td><td>24.8</td></tr>
+<tr><td>健康检查端点 /actuator/health 可访问</td><td>□</td><td>24.8</td></tr>
+<tr><td rowspan="3"><strong>连接池</strong></td>
+    <td>HikariCP maximumPoolSize 根据 CPU 核心数配置</td><td>□</td><td>24.12</td></tr>
+<tr><td>connectionTimeout 设置合理值（≤ 5s）</td><td>□</td><td>24.12</td></tr>
+<tr><td>leakDetectionThreshold 开启泄漏检测</td><td>□</td><td>24.12</td></tr>
+</table>
+
+<!-- ============================================================ -->
+<!-- 24.12  FAQ -->
+<!-- ============================================================ -->
+
+<h2 id="s24-12">24.12 常见问题 FAQ</h2>
+
+<h3>Q1: Entity View vs DTO 投影，什么时候选哪个？</h3>
+
+<div class="diagram">
+<div class="diagram-title">Fig 24-15 Entity View vs DTO 投影决策树</div>
+<div class="mermaid">
+flowchart TD
+    START["需要从数据库查询数据"] --> Q1{"需要更新吗？"}
+    Q1 -- "是" --> EV_UPD["@UpdatableEntityView<br/>支持脏追踪 + flush"]
+    Q1 -- "否" --> Q2{"有嵌套关联吗？"}
+    Q2 -- "是" --> Q3{"关联深度 > 2？"}
+    Q3 -- "是" --> EV_READ["@EntityView<br/>MULTISET 子查询"]
+    Q3 -- "否" --> Q4{"需要 ViewFilter？"}
+    Q4 -- "是" --> EV_READ
+    Q4 -- "否" --> DTO["DTO 投影<br/>new DTO(...)"]
+    Q2 -- "否" --> Q5{"需要复用/组合？"}
+    Q5 -- "是" --> EV_READ
+    Q5 -- "否" --> DTO
+
+    style EV_UPD fill:#1a3a2a,stroke:#3fb950
+    style EV_READ fill:#1e3a5f,stroke:#58a6ff
+    style DTO fill:#3a2a1a,stroke:#d29922
+</div>
+</div>
+
+<table>
+<tr><th>维度</th><th>Entity View</th><th>DTO 投影</th></tr>
+<tr><td>定义方式</td><td>接口 + 注解</td><td>Class / Record + 构造器</td></tr>
+<tr><td>嵌套关联</td><td>自动生成子查询 / JOIN</td><td>手动编写</td></tr>
+<tr><td>可更新</td><td>@UpdatableEntityView 脏追踪</td><td>需手动 merge</td></tr>
+<tr><td>过滤器</td><td>@ViewFilter 声明式</td><td>手动拼接 WHERE</td></tr>
+<tr><td>复用性</td><td>接口继承组合</td><td>组合较困难</td></tr>
+<tr><td>适用场景</td><td>业务实体投影（CRUD 主路径）</td><td>简单聚合 / 报表查询</td></tr>
+</table>
+
+<h3>Q2: 何时用 CriteriaBuilder，何时用 Spring Data 方法名查询？</h3>
+
+<pre><code>// ✅ 方法名查询 — 简单条件
+List&lt;OrderListView&gt; findByStatus(OrderStatus status);
+Page&lt;OrderListView&gt; findByCustomerId(Long customerId, Pageable pageable);
+
+// ✅ CriteriaBuilder — 动态条件组合
+public List&lt;OrderListView&gt; search(OrderSearchCriteria criteria) {
+    CriteriaBuilder&lt;Order&gt; cb = cbf.create(em, Order.class, "o");
+    if (criteria.getStatus() != null)
+        cb.where("o.status").eq(criteria.getStatus());
+    if (criteria.getMinAmount() != null)
+        cb.where("o.totalAmount").ge(criteria.getMinAmount());
+    if (criteria.getCustomerName() != null)
+        cb.where("o.customer.name").like()
+          .value("%" + criteria.getCustomerName() + "%").noEscape();
+    // ...
+    return evm.applySetting(
+        EntityViewSetting.create(OrderListView.class), cb)
+        .getResultList();
+}
+
+// ✅ CriteriaBuilder — CTE / 窗口函数 / 批量 DML
+// Spring Data 方法名不支持这些高级特性</code></pre>
+
+<table>
+<tr><th>场景</th><th>推荐方式</th><th>理由</th></tr>
+<tr><td>固定条件查询</td><td>Spring Data 方法名</td><td>零样板代码</td></tr>
+<tr><td>2-3 个可选过滤条件</td><td>CriteriaBuilder</td><td>动态组合更灵活</td></tr>
+<tr><td>CTE / 窗口函数</td><td>CriteriaBuilder</td><td>方法名不支持</td></tr>
+<tr><td>批量 DML</td><td>CriteriaBuilder</td><td>INSERT/UPDATE/DELETE 批量</td></tr>
+<tr><td>Keyset 分页</td><td>CriteriaBuilder 或 EntityViewRepository</td><td>两者均支持</td></tr>
+</table>
+
+<h3>Q3: 连接池如何调优？</h3>
+
+<pre><code># application-prod.yml
+spring:
+  datasource:
+    hikari:
+      # 最大连接数 = CPU 核心数 * 2 + 磁盘数
+      # 4 核 CPU + 1 SSD → 4 * 2 + 1 = 9 ≈ 10
+      maximum-pool-size: 10
+      minimum-idle: 5
+
+      # 等待连接超时（超过则抛异常）
+      connection-timeout: 5000
+
+      # 连接最大存活时间（避免数据库端超时）
+      max-lifetime: 1800000   # 30 分钟
+
+      # 空闲连接超时
+      idle-timeout: 600000    # 10 分钟
+
+      # 泄漏检测阈值
+      leak-detection-threshold: 30000  # 30 秒</code></pre>
+
+<div class="warning">
+  <strong>常见错误：</strong>把 <code>maximum-pool-size</code> 设置为 50 或 100。过多连接会导致数据库上下文切换开销增大，反而降低吞吐量。PostgreSQL 官方建议单实例不超过 <code>CPU * 2 + disk</code>。
+</div>
+
+<h3>Q4: 二级缓存与 Entity View 如何配合？</h3>
+
+<pre><code>@Entity
+@Cacheable  // 开启二级缓存
+@Cache(usage = CacheConcurrencyStrategy.READ_WRITE)
+@Table(name = "products")
+public class Product {
+    @Id private Long id;
+    private String name;
+    private BigDecimal price;
+    private String category;
+}
+
+// Entity View 查询时，如果底层 Entity 命中二级缓存，
+// Hibernate 不会发送 SQL 查询
+@EntityView(Product.class)
+public interface ProductSummaryView {
+    @IdMapping Long getId();
+    String getName();
+    BigDecimal getPrice();
+}</code></pre>
+
+<pre><code># 二级缓存配置
+spring:
+  jpa:
+    properties:
+      hibernate:
+        cache:
+          use_second_level_cache: true
+          use_query_cache: true
+          region:
+            factory_class: org.hibernate.cache.jcache.JCacheRegionFactory
+        javax:
+          cache:
+            provider: org.ehcache.jsr107.EhcacheCachingProvider</code></pre>
+
+<div class="key-insight">
+  <strong>缓存与 ViewFilter 的关系：</strong>查询缓存会缓存查询 SQL + 参数的结果 ID 列表。由于 <code>@ViewFilter</code> 会改变 WHERE 条件，不同租户的查询会产生不同的缓存键——缓存隔离是自动的。
+</div>
+
+<!-- ============================================================ -->
+<!-- 24.13  陷阱与限制 -->
+<!-- ============================================================ -->
+
+<h2 id="s24-pitfalls">24.13 陷阱与限制</h2>
+
+<h3>陷阱 1: ViewFilter 遗漏</h3>
+
+<pre><code>// ❌ 危险：忘记为新的 Entity View 添加 tenantFilter
+@EntityView(Order.class)
+public interface OrderExportView {
+    @IdMapping Long getId();
+    // ... 没有 @ViewFilter → 可以查到所有租户的数据！
+}
+
+// ✅ 正确：所有 Entity View 都声明 tenantFilter
+@EntityView(Order.class)
+@ViewFilter(name = "tenantFilter", value = "tenantId = :tenantId")
+public interface OrderExportView {
+    @IdMapping Long getId();
+    // ...
+}</code></pre>
+
+<h3>陷阱 2: Keyset 分页缺少唯一列</h3>
+
+<pre><code>// ❌ 错误：仅按 createdAt 排序（可能有重复值）
+cbf.create(em, Order.class)
+   .orderByDesc("createdAt");
+// 如果两行 createdAt 相同 → 数据可能重复或丢失
+
+// ✅ 正确：添加唯一列作为 tiebreaker
+cbf.create(em, Order.class)
+   .orderByDesc("createdAt")
+   .orderByDesc("id");         // id 是唯一的</code></pre>
+
+<h3>陷阱 3: 定时任务中的 TenantContext</h3>
+
+<pre><code>// ❌ 错误：定时任务未设置 TenantContext
+@Scheduled(cron = "0 0 3 * * SUN")
+public void weeklyCleanup() {
+    orderService.cleanupExpired();  // TenantContext.current() → NPE!
+}
+
+// ✅ 正确：遍历所有租户逐个处理
+@Scheduled(cron = "0 0 3 * * SUN")
+public void weeklyCleanup() {
+    List&lt;String&gt; tenants = tenantService.getAllTenantIds();
+    for (String tenant : tenants) {
+        try {
+            TenantContext.set(tenant);
+            orderService.cleanupExpired();
+        } finally {
+            TenantContext.clear();
+        }
+    }
+}</code></pre>
+
+<h3>陷阱 4: 乐观锁与批量更新冲突</h3>
+
+<pre><code>// ❌ 危险：批量 UPDATE 不走 @Version 机制
+cbf.update(em, Order.class, "o")
+   .set("o.status", OrderStatus.CANCELLED)
+   .where("o.createdAt").lt(cutoff)
+   .executeUpdate();
+// 不会检查 version → 可能覆盖并发修改
+
+// ✅ 如果需要版本检查，必须逐条处理
+// 批量操作适用于没有并发冲突的场景（如归档、清理）</code></pre>
+
+<h3>陷阱 5: EntityViewListener 中的事务边界</h3>
+
+<pre><code>// ❌ 错误：在 Listener 中发起新的数据库查询
+@ViewListener
+public class BadListener implements PrePersistEntityListener&lt;Object&gt; {
+    @Inject EntityManager em;
+
+    @Override
+    public void onPrePersist(Object view) {
+        // 在 flush 过程中查询 → 可能导致死锁或脏读
+        em.createQuery("...").getResultList();
+    }
+}
+
+// ✅ 正确：Listener 仅做字段赋值，不做数据库操作
+@ViewListener
+public class GoodListener implements PrePersistEntityListener&lt;Object&gt; {
+    @Override
+    public void onPrePersist(Object view) {
+        if (view instanceof Auditable a) {
+            a.setCreatedAt(Instant.now());
+            a.setCreatedBy(SecurityContext.currentUser());
+        }
+    }
+}</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">Fig 24-16 常见陷阱速查</div>
+<svg viewBox="0 0 900 420" style="width:100%;max-width:900px;margin:0 auto;display:block" font-family="Inter,'Microsoft YaHei',system-ui,sans-serif">
+  <defs>
+    <marker id="arr24-16" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto"><path d="M0,0 L10,3.5 L0,7z" fill="#8b949e"/></marker>
+  </defs>
+  <!-- Left: TRAP -->
+  <rect x="20" y="10" width="360" height="400" rx="10" fill="none" stroke="#f85149" stroke-width="1.5" stroke-dasharray="6,3" opacity=".5"/>
+  <text x="200" y="38" text-anchor="middle" fill="#f85149" font-size="15" font-weight="bold">❌ 陷阱</text>
+  <rect x="40" y="55" width="320" height="42" rx="8" fill="#5c1a1a" stroke="#f85149" stroke-width="1.3"/><text x="200" y="81" text-anchor="middle" fill="#f85149" font-size="14">ViewFilter 遗漏</text>
+  <rect x="40" y="115" width="320" height="42" rx="8" fill="#5c1a1a" stroke="#f85149" stroke-width="1.3"/><text x="200" y="141" text-anchor="middle" fill="#f85149" font-size="14">Keyset 缺唯一列</text>
+  <rect x="40" y="175" width="320" height="42" rx="8" fill="#5c1a1a" stroke="#f85149" stroke-width="1.3"/><text x="200" y="201" text-anchor="middle" fill="#f85149" font-size="14">定时任务无 Tenant</text>
+  <rect x="40" y="235" width="320" height="42" rx="8" fill="#5c1a1a" stroke="#f85149" stroke-width="1.3"/><text x="200" y="261" text-anchor="middle" fill="#f85149" font-size="14">批量 DML 跳过 @Version</text>
+  <rect x="40" y="295" width="320" height="42" rx="8" fill="#5c1a1a" stroke="#f85149" stroke-width="1.3"/><text x="200" y="321" text-anchor="middle" fill="#f85149" font-size="14">Listener 中做 DB 查询</text>
+
+  <!-- Right: FIX -->
+  <rect x="520" y="10" width="360" height="400" rx="10" fill="none" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6,3" opacity=".5"/>
+  <text x="700" y="38" text-anchor="middle" fill="#3fb950" font-size="15" font-weight="bold">✅ 修复</text>
+  <rect x="540" y="55" width="320" height="42" rx="8" fill="#1a3a2a" stroke="#3fb950" stroke-width="1.3"/><text x="700" y="81" text-anchor="middle" fill="#3fb950" font-size="14">所有 View 加 @ViewFilter</text>
+  <rect x="540" y="115" width="320" height="42" rx="8" fill="#1a3a2a" stroke="#3fb950" stroke-width="1.3"/><text x="700" y="141" text-anchor="middle" fill="#3fb950" font-size="14">ORDER BY 加 id 作 tiebreaker</text>
+  <rect x="540" y="175" width="320" height="42" rx="8" fill="#1a3a2a" stroke="#3fb950" stroke-width="1.3"/><text x="700" y="201" text-anchor="middle" fill="#3fb950" font-size="14">遍历 tenants + try-finally</text>
+  <rect x="540" y="235" width="320" height="42" rx="8" fill="#1a3a2a" stroke="#3fb950" stroke-width="1.3"/><text x="700" y="261" text-anchor="middle" fill="#3fb950" font-size="14">批量仅用于无冲突场景</text>
+  <rect x="540" y="295" width="320" height="42" rx="8" fill="#1a3a2a" stroke="#3fb950" stroke-width="1.3"/><text x="700" y="321" text-anchor="middle" fill="#3fb950" font-size="14">Listener 仅做字段赋值</text>
+
+  <!-- Arrows: TRAP → FIX -->
+  <line x1="360" y1="76" x2="538" y2="76" stroke="#8b949e" stroke-width="1.3" marker-end="url(#arr24-16)"/>
+  <line x1="360" y1="136" x2="538" y2="136" stroke="#8b949e" stroke-width="1.3" marker-end="url(#arr24-16)"/>
+  <line x1="360" y1="196" x2="538" y2="196" stroke="#8b949e" stroke-width="1.3" marker-end="url(#arr24-16)"/>
+  <line x1="360" y1="256" x2="538" y2="256" stroke="#8b949e" stroke-width="1.3" marker-end="url(#arr24-16)"/>
+  <line x1="360" y1="316" x2="538" y2="316" stroke="#8b949e" stroke-width="1.3" marker-end="url(#arr24-16)"/>
+
+  <!-- Arrow labels -->
+  <text x="450" y="70" text-anchor="middle" fill="#8b949e" font-size="13">→</text>
+  <text x="450" y="372" text-anchor="middle" fill="#8b949e" font-size="13" font-style="italic">每个陷阱都有明确的修复方案</text>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<!-- 本章小结 -->
+<!-- ============================================================ -->
+
+<div class="chapter-summary" id="summary">
+  <h2>本章小结</h2>
+  <ul>
+    <li><strong>多租户隔离</strong>：<code>@ViewFilter("tenantFilter")</code> 在 Entity View 层声明租户条件，配合 <code>TenantInterceptor</code> 和 <code>TenantContext</code> 实现请求级自动隔离，杜绝人工遗漏。</li>
+    <li><strong>软删除</strong>：<code>@ViewFilter("activeOnly")</code> 透明过滤已删除记录，<code>cbf.update()</code> 设置 <code>deletedAt</code> 实现软删除，管理员可跳过过滤器查看全部数据。</li>
+    <li><strong>审计</strong>：<code>AuditViewListener</code> 在 <code>onPrePersist</code> / <code>onPreUpdate</code> 回调中自动填充 <code>createdAt</code>、<code>createdBy</code>、<code>updatedAt</code>、<code>updatedBy</code>。</li>
+    <li><strong>Keyset 分页</strong>：通过 <code>WHERE (created_at, id) &lt; (?, ?)</code> 游标实现恒定 O(1) 翻页，百万行列表仍在 7ms 以内。</li>
+    <li><strong>批量归档</strong>：<code>INSERT...SELECT</code> + 批量 <code>DELETE</code> 在两条 SQL 中完成历史订单的归档和清理。</li>
+    <li><strong>乐观锁</strong>：JPA <code>@Version</code> 配合 Updatable Entity View，在 <code>WHERE id = ? AND version = ?</code> 条件下自动检测并发冲突。</li>
+    <li><strong>集成测试</strong>：Testcontainers 启动真实 PostgreSQL 容器，确保测试 SQL 方言与生产完全一致。</li>
+    <li><strong>可观测性</strong>：Hibernate Statistics + Micrometer + Actuator 构建三层指标体系，覆盖查询耗时、渲染指标、连接池健康。</li>
+    <li><strong>Spring Data 集成</strong>：<code>EntityViewRepository</code> 提供方法名查询 + Keyset 分页 + 自动投影的完整能力。</li>
+    <li><strong>项目结构</strong>：表示层 → 应用层 → 领域层 → 基础设施层的四层分包，职责清晰、可测试。</li>
+  </ul>
+  <p class="next-hint">恭喜你完成了全部 24 章的学习！从 CriteriaBuilder 的第一个查询到生产级部署，你已经掌握了 Blaze-Persistence 的全部核心知识。回到 <a href="index.html">目录</a> 回顾完整的学习路线图，或跳转到感兴趣的章节进行深入研究。</p>
+</div>
+
+<div class="chapter-nav">
+  <a href="ch23-crud-advanced.html">← 第 23 章 · CRUD 高级模式</a>
+  <a href="index.html">目录 →</a>
+</div>
+
+<p class="footer">© 图解 Blaze-Persistence · 第 24 章 · 生产级特性与最佳实践</p>
+
+</article>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+<script>
+mermaid.initialize({
+  startOnLoad: true,
+  theme: 'dark',
+  themeVariables: {
+    primaryColor: '#1e3a5f',
+    primaryTextColor: '#e6edf3',
+    primaryBorderColor: '#58a6ff',
+    lineColor: '#8b949e',
+    secondaryColor: '#2d1f4e',
+    tertiaryColor: '#1a3a2a',
+    fontFamily: 'Segoe UI, system-ui, sans-serif',
+    fontSize: '14px'
+  },
+  flowchart: { curve: 'basis', useMaxWidth: true },
+  sequence: { useMaxWidth: true }
+});
+</script>
+
+</body>
+</html>

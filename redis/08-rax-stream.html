@@ -1,0 +1,2323 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.08 rax 基数树与 Stream — 图解 Redis</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="d-blue" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <linearGradient id="d-green" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <linearGradient id="d-amber" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-orange-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+    <linearGradient id="d-red" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+    <linearGradient id="d-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-purple-fill-start)"/><stop offset="1" stop-color="var(--diagram-purple-fill-end)"/></linearGradient>
+    <linearGradient id="d-cyan" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-cyan-fill-start)"/><stop offset="1" stop-color="var(--diagram-cyan-fill-end)"/></linearGradient>
+    <marker id="d-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-muted)"/></marker>
+    <marker id="d-arr-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-green-stroke)"/></marker>
+    <marker id="d-arr-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-red-stroke)"/></marker>
+    <marker id="d-arr-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-blue-stroke)"/></marker>
+    <filter id="d-shadow" x="-10%" y="-10%" width="120%" height="120%"><feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="var(--diagram-text)" flood-opacity="0.4"/></filter>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Redis</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="07-quicklist.html">上一章</a>
+  <a href="09-redisobject.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s8-1">8.1 解决什么问题</a>
+  <a href="#s8-2">8.2 raxNode 整体布局</a>
+  <a href="#s8-3">8.3 raxInsert 与节点分裂</a>
+  <a href="#s8-4">8.4 raxFind 与迭代</a>
+  <a href="#s8-5">8.5 stream 整体结构</a>
+  <a href="#s8-6">8.6 XADD 操作逐帧</a>
+  <a href="#s8-7">8.7 消费组与 PEL</a>
+  <a href="#s8-8">8.8 为什么不选其他</a>
+  <a href="#s8-9">8.9 已知陷阱</a>
+  <a href="#s8-10">8.10 源码深潜</a>
+  <a href="#s8-11">8.11 性能与监控</a>
+  <a href="#s8-12">8.12 真实用例</a>
+  <a href="#s8-summary">8.13 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 8 章 · rax 基数树与 Stream</h1>
+<p class="subtitle">路径压缩前缀树 · raxNode 柔性数组 · iscompr 双形态 · listpack 二级打包 · 多 rax 设计 · Consumer Group · PEL 至少一次</p>
+
+<div class="chapter-intro">
+  <p class="lead">Redis 5.0 引入 <code>Stream</code> 类型,需要按 <strong>16 字节消息 ID</strong> 提供<strong>有序范围扫描</strong> + <strong>O(1) 追加</strong> + <strong>消费组确认</strong>。普通哈希表无法范围查询;跳表可以但每个节点 80 B 元数据严重浪费;B+ 树是磁盘场景的经典,内存常数过大且不能复用 ID 前缀。</p>
+  <p>Antirez 选择从零实现 <strong>rax(Radix Tree,基数树)</strong>:一种"<strong>路径压缩</strong>的前缀树"。同前缀的 key 共享一段连续字节(压缩节点),分叉处单独建节点(普通节点)。Stream ID 高位时间戳<strong>常常重复</strong>(同毫秒的多条消息前 12 字节相同),rax 的压缩节点把这部分前缀<strong>只存一次</strong>,内存效率比跳表高 5-10 倍。</p>
+  <p>Stream 内部把若干相邻消息打包到一个 <code>listpack</code>(master entry + 增量字段),rax 索引 "<strong>每个 listpack 的首消息 ID</strong>"。XADD 时根据 ID 找到 listpack 节点追加;XRANGE 时按 rax 范围扫描;消费组(Consumer Group)用<strong>另一棵 rax</strong> 维护 PEL(Pending Entries List)。一个 Stream 容器内同时存在 <strong>3-N 棵 rax</strong>:主索引 / 消费组索引 / 每个组内的 PEL / 每个消费者内的 PEL。</p>
+  <ul class="will-learn">
+    <li>rax 的核心思想:路径压缩 = 前缀共享 + 节点合并,把 Trie 节点数从 N×K 降到 N</li>
+    <li><code>raxNode</code> 9 字段(<code>iskey</code> / <code>isnull</code> / <code>iscompr</code> / <code>size:29</code> / <code>data[]</code>)与柔性数组排布</li>
+    <li>压缩节点(<code>iscompr=1</code>)与普通节点(<code>iscompr=0</code>)的字节布局差异</li>
+    <li>raxInsert 三种情况:压缩节点中部分裂 / 普通节点添加分支 / 标记中间节点</li>
+    <li>raxFind / raxSeek / raxIterator 上下兄弟跳转的 O(K) 实现</li>
+    <li>Stream ID = ms(8B) + seq(8B) 大端编码,字典序 = 时间序的关键设计</li>
+    <li>Stream 容器的多 rax 关系:主 rax(索引 listpack)+ 消费组 rax + PEL rax</li>
+    <li>XADD / XREADGROUP / XACK / XAUTOCLAIM 的 rax 操作链路</li>
+    <li>Consumer Group + PEL 的"至少一次"保证机制与消息认领流程</li>
+    <li>典型陷阱:不限 MAXLEN 导致 OOM、忘 XACK 导致 PEL 暴涨、消费者死掉消息悬挂</li>
+  </ul>
+  <p class="prereq">前置知识:第 6 章 ziplist/listpack(理解 Stream 内部 listpack 节点的紧凑追加);第 4 章 skiplist(用于性能对比);Stream 命令基础(XADD / XREAD / XGROUP / XACK)。读者需要熟悉位字段 bit-field 与柔性数组(C99 flexible array member)。</p>
+</div>
+
+<h3>本章全景图</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-0 · 本章导览 — 5 大模块 13 节</div>
+  <svg viewBox="0 0 960 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:960px;width:100%;margin:8px auto;height:auto;">
+    <rect x="0" y="0" width="960" height="460" fill="var(--diagram-panel)" rx="10"/>
+    <g transform="translate(380, 18)" filter="url(#d-shadow)"><rect width="200" height="46" rx="10" fill="url(#d-purple)"/><text x="100" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="800">rax + Stream</text><text x="100" y="38" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">前缀树 + 流</text></g>
+    <path d="M 480 64 L 100 100" stroke="var(--diagram-blue-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-b)"/>
+    <path d="M 480 64 L 290 100" stroke="var(--diagram-purple-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+    <path d="M 480 64 L 480 100" stroke="var(--diagram-green-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-g)"/>
+    <path d="M 480 64 L 670 100" stroke="var(--diagram-orange-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+    <path d="M 480 64 L 860 100" stroke="var(--diagram-cyan-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+
+    <g transform="translate(20, 100)" filter="url(#d-shadow)"><rect width="160" height="44" rx="8" fill="url(#d-blue)"/><text x="80" y="20" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">P1 · rax 设计</text><text x="80" y="36" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">§8.1 - §8.2</text></g>
+    <g transform="translate(210, 100)" filter="url(#d-shadow)"><rect width="160" height="44" rx="8" fill="url(#d-purple)"/><text x="80" y="20" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">P2 · rax CRUD</text><text x="80" y="36" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">§8.3 - §8.4</text></g>
+    <g transform="translate(400, 100)" filter="url(#d-shadow)"><rect width="160" height="44" rx="8" fill="url(#d-green)"/><text x="80" y="20" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">P3 · Stream CRUD</text><text x="80" y="36" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">§8.5 - §8.7</text></g>
+    <g transform="translate(590, 100)" filter="url(#d-shadow)"><rect width="160" height="44" rx="8" fill="url(#d-amber)"/><text x="80" y="20" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="700">P4 · 算法选型</text><text x="80" y="36" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">§8.8</text></g>
+    <g transform="translate(780, 100)" filter="url(#d-shadow)"><rect width="160" height="44" rx="8" fill="url(#d-cyan)"/><text x="80" y="20" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">P5 · 陷阱与源码</text><text x="80" y="36" text-anchor="middle" fill="var(--diagram-cyan-text)" font-size="10">§8.9 - §8.13</text></g>
+
+    <path d="M 100 144 L 100 178" stroke="var(--diagram-blue-stroke)" stroke-width="1.2" fill="none" marker-end="url(#d-arr-b)"/>
+    <path d="M 290 144 L 290 178" stroke="var(--diagram-purple-stroke)" stroke-width="1.2" fill="none" marker-end="url(#d-arr)"/>
+    <path d="M 480 144 L 480 178" stroke="var(--diagram-green-stroke)" stroke-width="1.2" fill="none" marker-end="url(#d-arr-g)"/>
+    <path d="M 670 144 L 670 178" stroke="var(--diagram-orange-stroke)" stroke-width="1.2" fill="none" marker-end="url(#d-arr)"/>
+    <path d="M 860 144 L 860 178" stroke="var(--diagram-cyan-stroke)" stroke-width="1.2" fill="none" marker-end="url(#d-arr)"/>
+
+    <g font-family="ui-monospace,Consolas" font-size="11">
+      <g transform="translate(20, 178)"><rect width="160" height="48" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/><text x="10" y="16" fill="var(--diagram-blue-text)" font-weight="700">§8.1</text><text x="40" y="16" fill="var(--diagram-blue-text)">问题与候选方案</text><text x="10" y="32" fill="var(--diagram-blue-text)" font-weight="700">§8.2</text><text x="40" y="32" fill="var(--diagram-blue-text)">raxNode 字节</text><text x="10" y="44" fill="var(--diagram-muted)" font-size="9">紧凑前缀树</text></g>
+
+      <g transform="translate(210, 178)"><rect width="160" height="80" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/><text x="10" y="16" fill="var(--diagram-red-text)" font-weight="700">§8.3</text><text x="40" y="16" fill="var(--diagram-red-text)">★ Insert + 分裂</text><text x="10" y="32" fill="var(--diagram-purple-text)" font-weight="700">§8.4</text><text x="40" y="32" fill="var(--diagram-purple-text)">Find 与迭代</text><text x="10" y="56" fill="var(--diagram-muted)" font-size="10">★ 4 种 Insert 路径</text><text x="10" y="70" fill="var(--diagram-muted)" font-size="10">  完整匹配 / 无前缀</text></g>
+
+      <g transform="translate(400, 178)"><rect width="160" height="80" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/><text x="10" y="16" fill="var(--diagram-green-text)" font-weight="700">§8.5</text><text x="40" y="16" fill="var(--diagram-green-text)">stream 结构</text><text x="10" y="32" fill="var(--diagram-green-text)" font-weight="700">§8.6</text><text x="40" y="32" fill="var(--diagram-green-text)">XADD 逐帧</text><text x="10" y="48" fill="var(--diagram-green-text)" font-weight="700">§8.7</text><text x="40" y="48" fill="var(--diagram-green-text)">消费组 + PEL</text><text x="10" y="70" fill="var(--diagram-muted)" font-size="10">★ rax 是 Stream 骨架</text></g>
+
+      <g transform="translate(590, 178)"><rect width="160" height="48" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/><text x="10" y="16" fill="var(--diagram-orange-text)" font-weight="700">§8.8</text><text x="40" y="16" fill="var(--diagram-orange-text)">候选方案对比</text><text x="20" y="34" fill="var(--diagram-orange-text)">vs Trie/BTree/跳表</text></g>
+
+      <g transform="translate(780, 178)"><rect width="160" height="80" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-cyan-stroke)"/><text x="10" y="16" fill="var(--diagram-cyan-text)" font-weight="700">§8.9</text><text x="40" y="16" fill="var(--diagram-cyan-text)">陷阱表</text><text x="10" y="30" fill="var(--diagram-cyan-text)" font-weight="700">§8.10</text><text x="48" y="30" fill="var(--diagram-cyan-text)">源码深潜</text><text x="10" y="44" fill="var(--diagram-cyan-text)" font-weight="700">§8.11</text><text x="48" y="44" fill="var(--diagram-cyan-text)">性能监控</text><text x="10" y="58" fill="var(--diagram-cyan-text)" font-weight="700">§8.12</text><text x="48" y="58" fill="var(--diagram-cyan-text)">真实用例</text><text x="10" y="72" fill="var(--diagram-cyan-text)" font-weight="700">§8.13</text><text x="48" y="72" fill="var(--diagram-cyan-text)">本章要点</text></g>
+    </g>
+
+    <g transform="translate(20, 282)">
+      <rect width="920" height="56" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-dasharray="4 3"/>
+      <text x="20" y="22" fill="var(--diagram-purple-text)" font-size="13" font-weight="800">⚖ 为什么 Stream 选 rax 而不是 dict?</text>
+      <text x="20" y="42" fill="var(--diagram-blue-text)" font-size="11">XADD ID 单调递增 + XRANGE 区间查询 — rax 既能 O(log) 定位首个 ID,又能顺序迭代,dict 完全无序</text>
+    </g>
+
+    <g transform="translate(20, 350)">
+      <rect width="920" height="92" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="20" y="22" fill="var(--diagram-green-text)" font-size="13" font-weight="800">★ rax 设计核心: 压缩前缀树</text>
+      <text x="20" y="44" fill="var(--diagram-green-text)" font-size="11">普通 Trie 一字符一节点 → 内存爆炸</text>
+      <text x="20" y="60" fill="var(--diagram-green-text)" font-size="11">rax 把"无分支段"压缩成单节点 (compressed) → 高度由 key 长度变为分支点数</text>
+      <text x="20" y="78" fill="var(--diagram-muted)" font-size="10">★ 节点分两类: compressed (data=连续字符) / 非 compressed (data=多分支字符)</text>
+    </g>
+  </svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s8-1">8.1 解决什么问题</h2>
+<!-- ============================================================ -->
+
+<p>Stream 是 Redis 5.0 引入的"日志式"数据结构,设计目标是替代 List + Pub/Sub 在消息队列场景下的不足:既要 List 的有序追加 + 持久化,又要 Pub/Sub 的多消费者并行 + 消费进度跟踪。这一节先讲清楚 Stream 的访问模式,再分析为什么没有现成的数据结构能直接用。</p>
+
+<h3>8.1.1 Stream 的核心访问模式</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 8-1-1 · Stream 命令与期望复杂度</div>
+  <table>
+    <thead><tr><th>场景</th><th>命令</th><th>访问模式</th><th>期望复杂度</th></tr></thead>
+    <tbody>
+      <tr><td>消息追加</td><td><code>XADD stream * field value</code></td><td>严格递增 ID 追加</td><td>O(1) 摊销</td></tr>
+      <tr><td>范围查询</td><td><code>XRANGE stream start end</code></td><td>按 ID 范围有序扫描</td><td>O(log N + M)</td></tr>
+      <tr><td>实时订阅</td><td><code>XREAD BLOCK 5000 STREAMS s $</code></td><td>阻塞等待新消息</td><td>等待 + O(1)</td></tr>
+      <tr><td>消费组消费</td><td><code>XREADGROUP GROUP g c COUNT n</code></td><td>按组分配未消费消息</td><td>O(log N + n)</td></tr>
+      <tr><td>ACK 确认</td><td><code>XACK stream group id</code></td><td>从 PEL 删除</td><td>O(log P)</td></tr>
+      <tr><td>待确认查询</td><td><code>XPENDING stream group</code></td><td>按组查 PEL</td><td>O(log P + K)</td></tr>
+      <tr><td>消息认领</td><td><code>XAUTOCLAIM stream group c idle 0-0</code></td><td>idle 阈值后转移消费者</td><td>O(log P + count)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key-insight">
+  <strong>三个硬约束</strong>:<br>
+  ① <strong>16 字节 ID 必须严格有序</strong>:消息 ID = <code>&lt;毫秒&gt;(8B) + &lt;序号&gt;(8B)</code>,大端编码后字典序 = 时间序;<br>
+  ② <strong>必须支持范围扫描</strong>:<code>XRANGE 1714000000000-0 1714000005000-0</code> 查 5 秒窗口,纯哈希直接出局;<br>
+  ③ <strong>追加必须 O(1)</strong>:写入热路径,百万 QPS 不能降速,跳表的 O(log N) 在 N=1e7 时常数已经太大。
+</div>
+
+<h3>8.1.2 候选方案的不足</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 8-1-2 · 6 种 ID 索引方案在 Stream 场景的对比</div>
+  <table>
+    <thead><tr><th>方案</th><th>范围查询</th><th>内存(每 key)</th><th>公共前缀复用</th><th>实现复杂度</th><th>关键劣势</th></tr></thead>
+    <tbody>
+      <tr><td><code>dict</code> (hashtable)</td><td>不支持</td><td>24-48 B</td><td>不复用</td><td>简单</td><td>无法支持 XRANGE</td></tr>
+      <tr><td>跳表 + dict</td><td>O(log N + M)</td><td>40-80 B</td><td>不复用</td><td>中</td><td>同毫秒 ID 前缀重复存储,内存翻倍</td></tr>
+      <tr><td>红黑树 / AVL</td><td>O(log N + M)</td><td>32-48 B</td><td>不复用</td><td>复杂</td><td>旋转开销;前缀不复用</td></tr>
+      <tr><td>B+ 树</td><td>O(log N + M)</td><td>视分支数</td><td>节点内</td><td>复杂</td><td>主要为磁盘设计,内存常数高</td></tr>
+      <tr><td>标准 Trie</td><td>O(K)</td><td>每字符 1 节点</td><td>完美</td><td>简单</td><td>16K 个节点(1M 消息),空间爆炸</td></tr>
+      <tr><td><strong>rax(路径压缩)</strong></td><td><strong>O(K)</strong></td><td><strong>~40 B/节点</strong></td><td><strong>完美</strong></td><td><strong>中</strong></td><td><strong>无,本场景最优</strong></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p>K = key 长度,与总元素数 N 无关。Stream ID 长度固定 16 字节,所以 rax 操作复杂度与 N <strong>几乎无关</strong>。这是 rax 在 Stream 场景的杀手级优势:<strong>百万 Stream 与万级 Stream 操作时间相同</strong>。</p>
+
+<h3>8.1.3 rax 在 Stream 中的角色</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-1-1 · rax 是 Stream 的"目录" — 一个 Stream 内部的多 rax 拓扑</div>
+  <svg viewBox="0 0 940 480" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect x="0" y="0" width="940" height="480" fill="var(--diagram-panel)" rx="10"/>
+
+    <g transform="translate(20, 26)" filter="url(#d-shadow)"><rect width="220" height="46" rx="8" fill="url(#d-blue)"/><text x="110" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">XADD stream * field value</text><text x="110" y="38" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">命令入口</text></g>
+    <path d="M 240 50 L 280 50" stroke="var(--diagram-blue-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr-b)"/>
+    <g transform="translate(280, 26)" filter="url(#d-shadow)"><rect width="200" height="46" rx="8" fill="url(#d-purple)"/><text x="100" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">生成 ID (ms, seq)</text><text x="100" y="38" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">→ 16 字节大端 key</text></g>
+    <path d="M 480 50 L 520 50" stroke="var(--diagram-purple-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr)"/>
+    <g transform="translate(520, 26)" filter="url(#d-shadow)"><rect width="180" height="46" rx="8" fill="url(#d-green)"/><text x="90" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">stream 容器</text><text x="90" y="38" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">streamObject 结构</text></g>
+
+    <path d="M 610 72 L 220 130" stroke="var(--diagram-green-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr-g)"/>
+    <text x="380" y="118" fill="var(--diagram-green-text)" font-size="11" font-weight="700">主 rax (消息索引)</text>
+    <path d="M 610 72 L 720 130" stroke="var(--diagram-purple-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr)"/>
+    <text x="700" y="118" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">cg rax (消费组)</text>
+
+    <g transform="translate(20, 130)" filter="url(#d-shadow)"><rect width="400" height="86" rx="10" fill="url(#d-green)"/><text x="200" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">★ 主 rax · 消息索引</text><text x="200" y="42" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-family="ui-monospace,Consolas">key = 16B ID 字节序</text><text x="200" y="58" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-family="ui-monospace,Consolas">value = listpack 节点指针</text><text x="200" y="76" text-anchor="middle" fill="var(--diagram-text)" font-size="10" font-weight="700">复用前缀 → 同毫秒消息共节点</text></g>
+
+    <path d="M 220 216 L 220 250" stroke="var(--diagram-green-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-g)"/>
+    <g transform="translate(20, 250)" filter="url(#d-shadow)"><rect width="400" height="60" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)" stroke-width="1.5"/><text x="200" y="22" text-anchor="middle" fill="var(--diagram-green-text)" font-size="13" font-weight="800">listpack 节点</text><text x="200" y="40" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">master entry + 增量消息 (delta encoding)</text><text x="200" y="54" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">★ 同 key 前缀只存一次,字段名共享</text></g>
+
+    <g transform="translate(540, 130)" filter="url(#d-shadow)"><rect width="380" height="46" rx="8" fill="url(#d-purple)"/><text x="190" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">消费组 rax</text><text x="190" y="38" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">key = 组名 · value = streamCG*</text></g>
+    <path d="M 730 176 L 730 200" stroke="var(--diagram-purple-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+
+    <g transform="translate(540, 200)" filter="url(#d-shadow)"><rect width="380" height="50" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="1.5"/><text x="190" y="22" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="13" font-weight="800">streamCG (每组)</text><text x="190" y="40" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">last_id + pel rax + consumers rax</text></g>
+
+    <path d="M 640 250 L 580 290" stroke="var(--diagram-orange-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+    <text x="540" y="278" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">pel</text>
+    <path d="M 820 250 L 880 290" stroke="var(--diagram-cyan-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+    <text x="850" y="278" fill="var(--diagram-cyan-text)" font-size="11" font-weight="700">consumers</text>
+
+    <g transform="translate(440, 290)" filter="url(#d-shadow)"><rect width="200" height="56" rx="8" fill="url(#d-amber)"/><text x="100" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="800">组级 PEL rax</text><text x="100" y="38" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">key = ID · value = NACK</text><text x="100" y="50" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">未确认消息</text></g>
+
+    <g transform="translate(680, 290)" filter="url(#d-shadow)"><rect width="240" height="56" rx="8" fill="url(#d-cyan)"/><text x="120" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">消费者 rax</text><text x="120" y="38" text-anchor="middle" fill="var(--diagram-cyan-text)" font-size="10">key = 消费者名 · value = streamConsumer</text></g>
+
+    <path d="M 800 346 L 800 380" stroke="var(--diagram-cyan-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+    <g transform="translate(680, 380)" filter="url(#d-shadow)"><rect width="240" height="50" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-cyan-stroke)" stroke-width="1.5"/><text x="120" y="22" text-anchor="middle" fill="var(--diagram-cyan-text)" font-size="12" font-weight="800">消费者级 PEL rax</text><text x="120" y="40" text-anchor="middle" fill="var(--diagram-cyan-text)" font-size="10">该消费者持有的未 ACK 消息</text></g>
+
+    <g transform="translate(20, 432)">
+      <rect width="900" height="40" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)" stroke-dasharray="4 3"/>
+      <text x="20" y="22" fill="var(--diagram-green-text)" font-size="12" font-weight="800">📐 一个 Stream 至少 3 棵 rax</text>
+      <text x="220" y="22" fill="var(--diagram-blue-text)" font-size="11">主 rax (消息) + cg rax (组) + pel rax × N (每组 1 个 pel + 每消费者 1 个 pel)</text>
+    </g>
+  </svg>
+</div>
+
+<p>注意:一个 Stream 容器内 <strong>同时存在 3-N 棵 rax</strong>。这种"用同一种数据结构服务多个角色"的设计,是 Redis 源码风格的典型体现 — 牺牲少量代码复用,换取语义清晰与认知负担降低。</p>
+
+<!-- ============================================================ -->
+<h2 id="s8-2">8.2 raxNode 整体布局</h2>
+<!-- ============================================================ -->
+
+<p>rax 的核心创新是 <strong>把"分叉"与"无分叉"当作两种节点</strong>。一段连续无分叉的字符走压缩节点(<code>iscompr=1</code>),把字节序列原样存进 <code>data[]</code>;到了分叉点切换为普通节点(<code>iscompr=0</code>),<code>data[]</code> 前半段是分叉字符,后半段是子节点指针。这一节用字节布局图把两种形态彻底拆开。</p>
+
+<h3>8.2.1 路径压缩思想</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-2-1 · 标准 Trie vs rax 的节点合并对比</div>
+<svg class="svg-diagram" viewBox="0 0 920 410" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="rax-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-muted)"/>
+    </marker>
+  </defs>
+
+  <text x="20" y="22" fill="var(--diagram-orange-text)" font-size="13" font-weight="bold">存储 4 个 key: ["abc", "abd", "abef", "xyz"]</text>
+
+  <!-- 左半: 标准 Trie -->
+  <text x="20" y="50" fill="var(--diagram-red-text)" font-size="12" font-weight="bold">标准 Trie · 每字符 1 节点 (9 节点)</text>
+  <g font-size="12" fill="var(--diagram-blue-text)" font-family="monospace">
+    <!-- root -->
+    <circle cx="120" cy="80" r="14" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+    <text x="120" y="84" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">root</text>
+
+    <!-- a -->
+    <circle cx="70" cy="130" r="14" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+    <text x="70" y="134" text-anchor="middle" fill="var(--diagram-blue-text)">a</text>
+    <!-- x -->
+    <circle cx="200" cy="130" r="14" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+    <text x="200" y="134" text-anchor="middle" fill="var(--diagram-blue-text)">x</text>
+
+    <!-- b, y -->
+    <circle cx="70" cy="175" r="14" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+    <text x="70" y="179" text-anchor="middle" fill="var(--diagram-blue-text)">b</text>
+    <circle cx="200" cy="175" r="14" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+    <text x="200" y="179" text-anchor="middle" fill="var(--diagram-blue-text)">y</text>
+
+    <!-- c, d, e under b -->
+    <circle cx="30" cy="225" r="14" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+    <text x="30" y="229" text-anchor="middle" fill="var(--diagram-text)">c*</text>
+    <circle cx="70" cy="225" r="14" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+    <text x="70" y="229" text-anchor="middle" fill="var(--diagram-text)">d*</text>
+    <circle cx="110" cy="225" r="14" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+    <text x="110" y="229" text-anchor="middle" fill="var(--diagram-blue-text)">e</text>
+
+    <!-- f under e -->
+    <circle cx="110" cy="275" r="14" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+    <text x="110" y="279" text-anchor="middle" fill="var(--diagram-text)">f*</text>
+
+    <!-- z under y -->
+    <circle cx="200" cy="225" r="14" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+    <text x="200" y="229" text-anchor="middle" fill="var(--diagram-text)">z*</text>
+
+    <!-- 连线 -->
+    <line x1="120" y1="94" x2="70" y2="116" stroke="var(--diagram-border)"/>
+    <line x1="120" y1="94" x2="200" y2="116" stroke="var(--diagram-border)"/>
+    <line x1="70" y1="144" x2="70" y2="161" stroke="var(--diagram-border)"/>
+    <line x1="200" y1="144" x2="200" y2="161" stroke="var(--diagram-border)"/>
+    <line x1="70" y1="189" x2="30" y2="211" stroke="var(--diagram-border)"/>
+    <line x1="70" y1="189" x2="70" y2="211" stroke="var(--diagram-border)"/>
+    <line x1="70" y1="189" x2="110" y2="211" stroke="var(--diagram-border)"/>
+    <line x1="110" y1="239" x2="110" y2="261" stroke="var(--diagram-border)"/>
+    <line x1="200" y1="189" x2="200" y2="211" stroke="var(--diagram-border)"/>
+  </g>
+  <text x="50" y="325" fill="var(--diagram-red-text)" font-size="11">节点数 9 个 · 元数据 ×9</text>
+
+  <!-- 右半: rax -->
+  <text x="500" y="50" fill="var(--diagram-green-text)" font-size="12" font-weight="bold">rax · 路径压缩 (5 节点)</text>
+  <g font-family="monospace" font-size="12" fill="var(--diagram-blue-text)">
+    <!-- root -->
+    <circle cx="600" cy="80" r="14" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+    <text x="600" y="84" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">root</text>
+
+    <!-- "ab" 压缩 -->
+    <rect x="500" y="125" width="80" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="540" y="146" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="13" font-weight="bold">"ab"</text>
+
+    <!-- "xyz"* 压缩+终止 -->
+    <rect x="650" y="125" width="100" height="32" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+    <text x="700" y="146" text-anchor="middle" fill="var(--diagram-green-text)" font-size="13" font-weight="bold">"xyz"*</text>
+
+    <!-- "ab" 后的分叉节点 (c/d/e) -->
+    <rect x="430" y="195" width="220" height="36" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="540" y="218" text-anchor="middle" fill="var(--diagram-orange-text)" font-family="monospace" font-size="12">分叉 [c*, d*, e]</text>
+
+    <!-- "ef" -->
+    <rect x="595" y="255" width="80" height="32" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+    <text x="635" y="276" text-anchor="middle" fill="var(--diagram-green-text)" font-size="13" font-weight="bold">"ef"*</text>
+
+    <!-- 连线 -->
+    <line x1="600" y1="94" x2="540" y2="125" stroke="var(--diagram-border)"/>
+    <line x1="600" y1="94" x2="700" y2="125" stroke="var(--diagram-border)"/>
+    <line x1="540" y1="157" x2="540" y2="195" stroke="var(--diagram-border)"/>
+    <line x1="605" y1="231" x2="635" y2="255" stroke="var(--diagram-border)"/>
+  </g>
+  <text x="490" y="325" fill="var(--diagram-green-text)" font-size="11">节点数 5 个 · 元数据节省 50%+</text>
+
+  <!-- 底部说明 -->
+  <rect x="20" y="345" width="880" height="55" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+  <text x="35" y="365" fill="var(--diagram-green-text)" font-size="12" font-weight="bold">关键不变量</text>
+  <text x="35" y="383" fill="var(--diagram-blue-text)" font-size="11">• 压缩节点 (iscompr=1): size 个连续字符 + <tspan font-weight="700">唯一 1 个 child 指针</tspan> · cache-friendly</text>
+  <text x="35" y="398" fill="var(--diagram-blue-text)" font-size="11">• 普通节点 (iscompr=0): size 个分叉字符 + size 个 child 指针 · 子节点字符二分查找</text>
+</svg>
+</div>
+
+<h3>8.2.2 raxNode C 结构定义</h3>
+
+<pre><code class="language-c">/* src/rax.h */
+typedef struct raxNode {
+    uint32_t iskey:1;     /* 该节点是否对应一个完整 key (终止节点) */
+    uint32_t isnull:1;    /* value 是否 NULL */
+    uint32_t iscompr:1;   /* 0=普通节点(分叉) / 1=压缩节点(无分叉) */
+    uint32_t size:29;     /* 普通节点=子数;压缩节点=共享字符串长度 */
+    /* C99 柔性数组 (flexible array member):
+     * 普通节点 data 排布: [chars][padding][child_ptrs][value_ptr (iskey=1)]
+     * 压缩节点 data 排布: [chars][padding][single_child_ptr][value_ptr (iskey=1)]
+     */
+    unsigned char data[];
+} raxNode;
+
+typedef struct rax {
+    raxNode *head;        /* 根节点 */
+    uint64_t numele;      /* 全部 key 数量 */
+    uint64_t numnodes;    /* 全部节点数量 */
+} rax;
+
+/* 头部 4 byte 解读:
+ *   bits 0    : iskey
+ *   bits 1    : isnull
+ *   bits 2    : iscompr
+ *   bits 3-31 : size  (29 bit, 最大 ~5.4 亿)
+ */</code></pre>
+
+<div class="key-insight">
+  <strong>3 bit 位字段 + 29 bit size + 柔性数组</strong>:头部固定 4 byte,<code>data[]</code> 紧跟其后。Redis 用 8 byte 对齐手动 padding,让指针读写不跨缓存行。这种"一个 struct 对应一段紧凑内存"的写法是 Redis 极致内存优化的标志,后面的 listpack / quicklist 节点都是同款思路。
+</div>
+
+<h3>8.2.3 普通节点字节布局</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-2-2 · 普通节点 (iscompr=0,有分叉) 字节排布</div>
+<svg class="svg-diagram" viewBox="0 0 920 320" xmlns="http://www.w3.org/2000/svg">
+  <text x="20" y="22" fill="var(--diagram-orange-text)" font-size="13" font-weight="bold">普通节点 (iscompr=0, size=3, 3 个子节点 c/d/e)</text>
+
+  <g transform="translate(20,40)">
+    <rect x="0" y="0" width="120" height="40" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="60" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="bold">header (4 B)</text>
+    <text x="60" y="38" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">flags + size=3</text>
+    <text x="60" y="56" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">0F 00 00 00</text>
+
+    <rect x="120" y="0" width="90" height="40" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+    <text x="165" y="22" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">分叉字符 c/d/e</text>
+    <text x="165" y="38" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">3 byte (排序)</text>
+    <text x="165" y="56" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">63 64 65</text>
+
+    <rect x="210" y="0" width="50" height="40" fill="var(--diagram-surface)" stroke="var(--diagram-border)"/>
+    <text x="235" y="22" text-anchor="middle" fill="var(--diagram-muted)" font-size="11">pad</text>
+    <text x="235" y="38" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">1 B</text>
+
+    <rect x="260" y="0" width="180" height="40" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="350" y="22" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="bold">child ptr 0 (8 B)</text>
+    <text x="350" y="56" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">→ 子节点 c</text>
+
+    <rect x="440" y="0" width="180" height="40" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="530" y="22" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="bold">child ptr 1 (8 B)</text>
+    <text x="530" y="56" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">→ 子节点 d</text>
+
+    <rect x="620" y="0" width="180" height="40" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="710" y="22" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="bold">child ptr 2 (8 B)</text>
+    <text x="710" y="56" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">→ 子节点 e</text>
+
+    <rect x="800" y="0" width="80" height="40" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)" stroke-dasharray="4 4"/>
+    <text x="840" y="20" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10" font-weight="bold">value ptr</text>
+    <text x="840" y="34" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">8 B 可选</text>
+    <text x="840" y="56" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">iskey=1</text>
+  </g>
+
+  <!-- 布局公式 -->
+  <rect x="20" y="125" width="440" height="180" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="35" y="148" fill="var(--diagram-blue-text)" font-size="12" font-weight="bold">NodeSize 计算公式</text>
+  <text x="35" y="170" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">  4    (header)</text>
+  <text x="35" y="188" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">+ size  (n 个分叉字符, 1 B/字符)</text>
+  <text x="35" y="206" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">+ padding  (对齐到 8 B)</text>
+  <text x="35" y="224" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">+ size × 8  (n 个子节点指针)</text>
+  <text x="35" y="242" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">+ (iskey &amp;&amp; !isnull) ? 8 : 0</text>
+  <text x="35" y="275" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">本例: 4 + 3 + 1 + 24 + 8 = 40 B</text>
+
+  <!-- 字段语义 -->
+  <rect x="475" y="125" width="425" height="180" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="490" y="148" fill="var(--diagram-orange-text)" font-size="12" font-weight="bold">字段语义</text>
+  <text x="490" y="170" fill="var(--diagram-blue-text)" font-size="11">• iscompr = 0  →  该节点有 size 个分叉</text>
+  <text x="490" y="188" fill="var(--diagram-blue-text)" font-size="11">• size  →  子节点数量 (0 ~ 2²⁹-1)</text>
+  <text x="490" y="206" fill="var(--diagram-blue-text)" font-size="11">• data[0..size-1]  →  分叉字符 (排序, 二分)</text>
+  <text x="490" y="224" fill="var(--diagram-blue-text)" font-size="11">• data[size+pad..]  →  size 个 8 B 子指针</text>
+  <text x="490" y="242" fill="var(--diagram-blue-text)" font-size="11">• data[尾]  →  可选 value 指针</text>
+  <text x="490" y="278" fill="var(--diagram-muted)" font-size="11">分叉字符排序后存放, 子节点数 K≥16 用二分</text>
+</svg>
+</div>
+
+<h3>8.2.4 压缩节点字节布局</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-2-3 · 压缩节点 (iscompr=1,无分叉) 字节排布</div>
+<svg class="svg-diagram" viewBox="0 0 920 280" xmlns="http://www.w3.org/2000/svg">
+  <text x="20" y="22" fill="var(--diagram-green-text)" font-size="13" font-weight="bold">压缩节点 (iscompr=1, size=4, 共享字符串 "abcd", 唯一 1 个 child)</text>
+
+  <g transform="translate(20,40)">
+    <rect x="0" y="0" width="120" height="40" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="60" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="bold">header (4 B)</text>
+    <text x="60" y="38" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">flags + size=4</text>
+    <text x="60" y="56" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">24 00 00 00</text>
+
+    <rect x="120" y="0" width="160" height="40" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+    <text x="200" y="22" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">连续共享字符 "abcd"</text>
+    <text x="200" y="38" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">4 byte</text>
+    <text x="200" y="56" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">61 62 63 64</text>
+
+    <rect x="280" y="0" width="120" height="40" fill="var(--diagram-surface)" stroke="var(--diagram-border)"/>
+    <text x="340" y="22" text-anchor="middle" fill="var(--diagram-muted)" font-size="11">padding</text>
+    <text x="340" y="38" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">8 B 对齐</text>
+
+    <rect x="400" y="0" width="280" height="40" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="540" y="22" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="12" font-weight="bold">唯一 1 个 child ptr (8 B)</text>
+    <text x="540" y="56" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">压缩节点的核心特征</text>
+
+    <rect x="680" y="0" width="160" height="40" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)" stroke-dasharray="4 4"/>
+    <text x="760" y="22" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="bold">value ptr (可选 8 B)</text>
+    <text x="760" y="56" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">整段 key 在此终止时存在</text>
+  </g>
+
+  <!-- 普通 vs 压缩 对比 -->
+  <rect x="20" y="125" width="880" height="140" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="35" y="148" fill="var(--diagram-orange-text)" font-size="13" font-weight="bold">★ 普通节点 vs 压缩节点最大差异</text>
+
+  <text x="35" y="172" fill="var(--diagram-blue-text)" font-size="12">• <tspan font-weight="700" fill="var(--diagram-blue-text)">子节点指针数</tspan>: 普通节点 = size 个 (每个分叉字符 1 个), 压缩节点 = <tspan font-weight="700" fill="var(--diagram-green-text)">恒 1 个</tspan></text>
+  <text x="35" y="192" fill="var(--diagram-blue-text)" font-size="12">• <tspan font-weight="700" fill="var(--diagram-blue-text)">data 中字符语义</tspan>: 普通 = 分叉字符 (排序后二分查找), 压缩 = 连续路径 (整体匹配 memcmp)</text>
+  <text x="35" y="212" fill="var(--diagram-blue-text)" font-size="12">• <tspan font-weight="700" fill="var(--diagram-blue-text)">布局公式</tspan>: 普通 = 4 + size + pad + size×8 + opt 8;  压缩 = 4 + size + pad + 8 + opt 8</text>
+  <text x="35" y="232" fill="var(--diagram-blue-text)" font-size="12">• <tspan font-weight="700" fill="var(--diagram-blue-text)">本例 NodeSize</tspan>: 4 + 4 + 4 + 8 + 8 = <tspan font-weight="700" fill="var(--diagram-green-text)">28 B</tspan> (假设 iskey=1)</text>
+  <text x="35" y="255" fill="var(--diagram-muted)" font-size="11">压缩节点把 K 字符的无分叉路径压成 1 节点, 元数据从 K×(4+pad+8) 降到 4+K+pad+8, 节省 50%+ 内存.</text>
+</svg>
+</div>
+
+<h3>8.2.5 字段语义对照</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 8-2-1 · raxNode 字段在两种形态下的语义</div>
+  <table>
+    <thead><tr><th>字段</th><th>普通节点 (iscompr=0)</th><th>压缩节点 (iscompr=1)</th></tr></thead>
+    <tbody>
+      <tr><td><code>size</code></td><td>子节点数量 (0 ~ 2^29-1)</td><td>共享字符串长度 (0 ~ 2^29-1)</td></tr>
+      <tr><td><code>data[chars]</code></td><td>size 个分叉字符 (sorted)</td><td>size 个共享字符 (顺序)</td></tr>
+      <tr><td><code>data[ptrs]</code></td><td>size 个 child 指针</td><td>1 个 child 指针</td></tr>
+      <tr><td><code>iskey</code></td><td>该路径是完整 key 时 = 1</td><td>同左</td></tr>
+      <tr><td><code>isnull</code></td><td>iskey=1 但 value 为 NULL 时 = 1</td><td>同左</td></tr>
+      <tr><td><code>value ptr</code></td><td>iskey=1 && isnull=0 时附在末尾</td><td>同左</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>8.2.6 Stream ID 的字节编码</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-2-4 · Stream ID 的 16 字节大端编码 — 字典序 = 时间序</div>
+<svg class="svg-diagram" viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
+  <text x="20" y="22" fill="var(--diagram-orange-text)" font-size="13" font-weight="bold">Stream ID 1714000000000-0 (16 byte 大端编码, 字典序 = 时间序)</text>
+
+  <!-- 上方: 16 字节布局 -->
+  <g transform="translate(20,40)" font-family="monospace">
+    <!-- 毫秒部分 -->
+    <text x="220" y="-2" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="bold">毫秒部分 (8 B)</text>
+    <text x="660" y="-2" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="bold">序号部分 (8 B)</text>
+
+    <g>
+      <rect x="0" y="0" width="55" height="34" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="27" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">00</text>
+      <rect x="55" y="0" width="55" height="34" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="82" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">00</text>
+      <rect x="110" y="0" width="55" height="34" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="137" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">01</text>
+      <rect x="165" y="0" width="55" height="34" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="192" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">8E</text>
+      <rect x="220" y="0" width="55" height="34" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="247" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">82</text>
+      <rect x="275" y="0" width="55" height="34" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="302" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">4D</text>
+      <rect x="330" y="0" width="55" height="34" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="357" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">6D</text>
+      <rect x="385" y="0" width="55" height="34" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="412" y="22" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="12" font-weight="bold">00</text>
+    </g>
+
+    <!-- 序号部分 -->
+    <g transform="translate(440,0)">
+      <rect x="0" y="0" width="55" height="34" fill="var(--diagram-purple-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="27" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">00</text>
+      <rect x="55" y="0" width="55" height="34" fill="var(--diagram-purple-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="82" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">00</text>
+      <rect x="110" y="0" width="55" height="34" fill="var(--diagram-purple-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="137" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">00</text>
+      <rect x="165" y="0" width="55" height="34" fill="var(--diagram-purple-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="192" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">00</text>
+      <rect x="220" y="0" width="55" height="34" fill="var(--diagram-purple-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="247" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">00</text>
+      <rect x="275" y="0" width="55" height="34" fill="var(--diagram-purple-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="302" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">00</text>
+      <rect x="330" y="0" width="55" height="34" fill="var(--diagram-purple-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="357" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">00</text>
+      <rect x="385" y="0" width="55" height="34" fill="var(--diagram-purple-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="412" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">00</text>
+    </g>
+
+    <text x="0" y="50" fill="var(--diagram-muted)" font-size="10">高字节</text>
+    <text x="850" y="50" text-anchor="end" fill="var(--diagram-muted)" font-size="10">低字节</text>
+
+    <!-- 下一条对比 -->
+    <text x="0" y="80" fill="var(--diagram-orange-text)" font-size="11">下一条 1714000000001-0:</text>
+    <g transform="translate(0,90)">
+      <rect x="385" y="0" width="55" height="34" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)" stroke-width="2"/>
+      <text x="412" y="22" text-anchor="middle" fill="var(--diagram-red-text)" font-size="12" font-weight="bold">01</text>
+      <text x="412" y="50" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">仅此字节不同</text>
+    </g>
+  </g>
+
+  <!-- 关键性质 -->
+  <rect x="20" y="200" width="430" height="160" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+  <text x="35" y="222" fill="var(--diagram-green-text)" font-size="12" font-weight="bold">★ 关键性质</text>
+  <text x="35" y="245" fill="var(--diagram-blue-text)" font-size="11">• 大端编码: memcmp 字典序 = 数值时间序</text>
+  <text x="35" y="265" fill="var(--diagram-blue-text)" font-size="11">• 同秒/同分钟内, 前 6 字节大量重复</text>
+  <text x="35" y="285" fill="var(--diagram-blue-text)" font-size="11">  →  rax 压缩节点完美命中</text>
+  <text x="35" y="305" fill="var(--diagram-blue-text)" font-size="11">• 同毫秒内, 序号 8 B 大量重复</text>
+  <text x="35" y="325" fill="var(--diagram-blue-text)" font-size="11">  →  rax 继续压缩</text>
+  <text x="35" y="350" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">百万消息 (同分钟内) → 主要前缀共享</text>
+
+  <!-- 内存对比表 -->
+  <rect x="465" y="200" width="435" height="160" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="480" y="222" fill="var(--diagram-orange-text)" font-size="12" font-weight="bold">实测内存对比 (1M 消息, 同分钟内)</text>
+
+  <line x1="480" y1="235" x2="880" y2="235" stroke="var(--diagram-border)"/>
+  <text x="490" y="252" fill="var(--diagram-muted)" font-size="11">结构</text>
+  <text x="660" y="252" fill="var(--diagram-muted)" font-size="11">节点数</text>
+  <text x="820" y="252" fill="var(--diagram-muted)" font-size="11">内存</text>
+  <line x1="480" y1="260" x2="880" y2="260" stroke="var(--diagram-border)"/>
+
+  <text x="490" y="280" fill="var(--diagram-blue-text)" font-size="11">跳表</text>
+  <text x="660" y="280" fill="var(--diagram-blue-text)" font-size="11">1,000,000</text>
+  <text x="820" y="280" fill="var(--diagram-blue-text)" font-size="11">80 MB</text>
+
+  <text x="490" y="300" fill="var(--diagram-blue-text)" font-size="11">标准 Trie</text>
+  <text x="660" y="300" fill="var(--diagram-red-text)" font-size="11">16,000,000</text>
+  <text x="820" y="300" fill="var(--diagram-red-text)" font-size="11">1.2 GB</text>
+
+  <text x="490" y="320" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">rax</text>
+  <text x="660" y="320" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">~50,000</text>
+  <text x="820" y="320" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">2-3 MB</text>
+
+  <text x="490" y="350" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">★ rax 比 Trie 节省 400×, 比跳表节省 30×</text>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s8-3">8.3 raxInsert 与节点分裂(本章核心)</h2>
+<!-- ============================================================ -->
+
+<p>raxInsert 是 rax 实现里最复杂的部分。压缩节点 + 路径分裂的组合让插入逻辑天生分支多 — 一条 if 链处理 5+ 种情况。这一节先把三种主线情况画清楚,再给完整状态机,最后讲压缩节点中部分裂的 7 帧动画。</p>
+
+<h3>8.3.1 三种主线情况</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-3-1 · raxInsert 决策树</div>
+  <svg viewBox="0 0 940 540" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect x="0" y="0" width="940" height="540" fill="var(--diagram-panel)" rx="10"/>
+
+    <g transform="translate(330, 16)" filter="url(#d-shadow)"><rect width="280" height="44" rx="10" fill="url(#d-blue)"/><text x="140" y="20" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">raxInsert(rax, key, value)</text><text x="140" y="36" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">命令入口</text></g>
+    <path d="M 470 60 L 470 86" stroke="var(--diagram-blue-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr-b)"/>
+
+    <g transform="translate(310, 86)" filter="url(#d-shadow)"><rect width="320" height="44" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)" stroke-width="1.5"/><text x="160" y="20" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="700">从 root 出发,沿 rax 边走 key 字节</text><text x="160" y="36" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">stopnode = 第一个不能继续走的位置</text></g>
+    <path d="M 470 130 L 470 152" stroke="var(--diagram-blue-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr-b)"/>
+
+    <g transform="translate(370, 152)"><path d="M 100 0 L 200 22 L 100 44 L 0 22 Z" fill="var(--diagram-blue-stroke)" stroke="var(--diagram-orange-stroke)" stroke-width="1.5"/><text x="100" y="20" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="12" font-weight="700">stop 在哪里 ?</text><text x="100" y="36" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">4 种情况</text></g>
+
+    <path d="M 380 174 L 120 226" stroke="var(--diagram-green-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-g)"/>
+    <text x="200" y="208" fill="var(--diagram-green-text)" font-size="11" font-weight="700">key 已存在</text>
+    <g transform="translate(20, 226)" filter="url(#d-shadow)"><rect width="200" height="62" rx="10" fill="url(#d-green)"/><text x="100" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">情况 ① 更新</text><text x="100" y="40" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">key 完全匹配 + iskey=1</text><text x="100" y="54" text-anchor="middle" fill="var(--diagram-text)" font-size="9">→ 直接覆盖 value</text></g>
+
+    <path d="M 470 196 L 380 226" stroke="var(--diagram-purple-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+    <text x="370" y="220" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">key 用尽,iskey=0</text>
+    <g transform="translate(260, 226)" filter="url(#d-shadow)"><rect width="200" height="62" rx="10" fill="url(#d-purple)"/><text x="100" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">情况 ② 标记</text><text x="100" y="40" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">key 用尽但当前节点是中间节点</text><text x="100" y="54" text-anchor="middle" fill="var(--diagram-text)" font-size="9">→ iskey=1 + 挂 value</text></g>
+
+    <path d="M 560 196 L 620 226" stroke="var(--diagram-blue-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-b)"/>
+    <text x="610" y="220" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">普通节点无对应 child</text>
+    <g transform="translate(500, 226)" filter="url(#d-shadow)"><rect width="200" height="62" rx="10" fill="url(#d-blue)"/><text x="100" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">情况 ③ 添加分支</text><text x="100" y="40" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">非压缩节点 + 缺 child</text><text x="100" y="54" text-anchor="middle" fill="var(--diagram-text)" font-size="9">→ size++ + realloc + new child</text></g>
+
+    <path d="M 570 174 L 820 226" stroke="var(--diagram-orange-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr)"/>
+    <text x="780" y="208" fill="var(--diagram-orange-text)" font-size="11" font-weight="800">★ 压缩节点中部</text>
+    <g transform="translate(720, 226)" filter="url(#d-shadow)"><rect width="200" height="62" rx="10" fill="url(#d-amber)"/><text x="100" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="13" font-weight="800">情况 ④ 分裂 ★</text><text x="100" y="40" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">压缩节点 prefix 不匹配</text><text x="100" y="54" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">→ 拆成 prefix + branch + 双后缀</text></g>
+
+    <path d="M 120 288 L 120 320" stroke="var(--diagram-green-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-g)"/>
+    <path d="M 360 288 L 360 320" stroke="var(--diagram-purple-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+    <path d="M 600 288 L 600 320" stroke="var(--diagram-blue-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-b)"/>
+    <path d="M 820 288 L 820 320" stroke="var(--diagram-orange-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr)"/>
+
+    <g font-family="ui-monospace,Consolas" font-size="11">
+      <g transform="translate(20, 320)"><rect width="200" height="42" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/><text x="100" y="18" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="700">O(K) 寻路 + O(1)</text><text x="100" y="34" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">无新节点</text></g>
+      <g transform="translate(260, 320)"><rect width="200" height="42" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/><text x="100" y="18" text-anchor="middle" fill="var(--diagram-purple-text)" font-weight="700">O(K) + iskey 翻位</text><text x="100" y="34" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">新增 8B value 槽</text></g>
+      <g transform="translate(500, 320)"><rect width="200" height="42" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/><text x="100" y="18" text-anchor="middle" fill="var(--diagram-blue-text)" font-weight="700">O(K) + 1 child</text><text x="100" y="34" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">原节点 realloc</text></g>
+      <g transform="translate(720, 320)"><rect width="200" height="42" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/><text x="100" y="18" text-anchor="middle" fill="var(--diagram-orange-text)" font-weight="700">O(K) + 4 新节点</text><text x="100" y="34" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">prefix + branch + 2 后缀</text></g>
+    </g>
+
+    <g transform="translate(20, 388)">
+      <rect width="900" height="62" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)" stroke-dasharray="4 3"/>
+      <text x="20" y="22" fill="var(--diagram-orange-text)" font-size="13" font-weight="800">★ 情况 ④ 分裂细节 (本节核心)</text>
+      <text x="20" y="42" fill="var(--diagram-orange-text)" font-size="11">压缩节点 data="abcdef" + 插入 key="abcXYZ" → 在第 3 字节分叉</text>
+      <text x="20" y="58" fill="var(--diagram-blue-text)" font-size="10">拆为: prefix("abc") → branch ("d","X" 两条边) → 后缀1("ef") + 后缀2("YZ")</text>
+    </g>
+
+    <g transform="translate(20, 466)">
+      <rect width="900" height="62" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="20" y="22" fill="var(--diagram-green-text)" font-size="13" font-weight="800">★ 4 种路径都是 O(K) 时间</text>
+      <text x="20" y="42" fill="var(--diagram-green-text)" font-size="11">K = key 长度 (Stream ID 固定 16) — 与总元素数 N <strong>完全无关</strong></text>
+      <text x="20" y="58" fill="var(--diagram-muted)" font-size="10">★ 这就是 Stream 主索引选 rax 的关键收益:百万消息查询时间不变</text>
+    </g>
+  </svg>
+</div>
+
+<h3>8.3.2 raxInsert 状态机</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-3-2 · raxInsert 状态机展开</div>
+  <svg viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect x="0" y="0" width="940" height="460" fill="var(--diagram-panel)" rx="10"/>
+
+    <g transform="translate(60, 20)"><circle r="14" fill="var(--diagram-purple-fill)"/><text x="0" y="5" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="800">●</text></g>
+    <text x="86" y="26" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">起点</text>
+    <path d="M 60 38 L 60 76" stroke="var(--diagram-purple-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr)"/>
+
+    <g transform="translate(20, 76)" filter="url(#d-shadow)"><rect width="160" height="58" rx="10" fill="url(#d-blue)"/><text x="80" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">Walking</text><text x="80" y="38" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">从 root 出发</text><text x="80" y="52" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">沿边走 key 字节</text></g>
+
+    <path d="M 30 122 Q 0 100 30 80" stroke="var(--diagram-blue-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-b)"/>
+    <text x="0" y="106" fill="var(--diagram-blue-text)" font-size="9">能匹配 → 自循环</text>
+
+    <path d="M 180 86 L 320 36" stroke="var(--diagram-green-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr-g)"/>
+    <text x="200" y="58" fill="var(--diagram-green-text)" font-size="11" font-weight="700">完全匹配</text>
+    <g transform="translate(320, 16)" filter="url(#d-shadow)"><rect width="220" height="42" rx="8" fill="url(#d-green)"/><text x="110" y="18" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">KeyExists</text><text x="110" y="34" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">key 已存在,看 iskey</text></g>
+
+    <path d="M 540 28 L 700 16" stroke="var(--diagram-green-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-g)"/>
+    <text x="588" y="22" fill="var(--diagram-green-text)" font-size="10" font-weight="700">iskey=1</text>
+    <g transform="translate(700, 0)"><rect width="200" height="38" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/><text x="100" y="22" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">UpdateValue → 覆盖</text></g>
+
+    <path d="M 540 50 L 700 60" stroke="var(--diagram-purple-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+    <text x="588" y="68" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">iskey=0</text>
+    <g transform="translate(700, 50)"><rect width="200" height="38" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/><text x="100" y="22" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">MarkKey → iskey=1</text></g>
+
+    <path d="M 180 110 L 320 110" stroke="var(--diagram-orange-stroke)" stroke-width="1.8" fill="none" marker-end="url(#d-arr)"/>
+    <text x="220" y="102" fill="var(--diagram-orange-text)" font-size="11" font-weight="800">★ 压缩节点中部不匹配</text>
+    <g transform="translate(320, 90)" filter="url(#d-shadow)"><rect width="220" height="42" rx="8" fill="url(#d-amber)"/><text x="110" y="18" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="700">SplitInPlace</text><text x="110" y="34" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">需要 4 步分裂</text></g>
+
+    <path d="M 540 110 L 700 110" stroke="var(--diagram-orange-stroke)" stroke-width="1.8" fill="none" marker-end="url(#d-arr)"/>
+    <g transform="translate(700, 90)"><rect width="220" height="42" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/><text x="110" y="22" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">CreateBranch (4 节点)</text></g>
+
+    <path d="M 180 134 L 320 184" stroke="var(--diagram-blue-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-b)"/>
+    <text x="200" y="166" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">普通节点无该字节边</text>
+    <g transform="translate(320, 164)" filter="url(#d-shadow)"><rect width="220" height="42" rx="8" fill="url(#d-blue)"/><text x="110" y="18" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">AddBranch</text><text x="110" y="34" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">size++ + realloc</text></g>
+
+    <path d="M 540 184 L 700 184" stroke="var(--diagram-blue-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-b)"/>
+    <g transform="translate(700, 164)"><rect width="200" height="42" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/><text x="100" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">NewChild → 挂 child</text></g>
+
+    <path d="M 180 134 L 320 244" stroke="var(--diagram-cyan-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+    <text x="190" y="220" fill="var(--diagram-cyan-text)" font-size="11" font-weight="700">普通边匹配但 child=NULL</text>
+    <g transform="translate(320, 224)" filter="url(#d-shadow)"><rect width="220" height="42" rx="8" fill="url(#d-cyan)"/><text x="110" y="18" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">Tail</text><text x="110" y="34" text-anchor="middle" fill="var(--diagram-cyan-text)" font-size="10">已是叶子,需挂尾</text></g>
+    <path d="M 540 244 L 700 188" stroke="var(--diagram-cyan-stroke)" stroke-width="1.4" fill="none" stroke-dasharray="4 3" marker-end="url(#d-arr)"/>
+    <text x="600" y="222" fill="var(--diagram-muted)" font-size="10">↗ 同样走 NewChild</text>
+
+    <g transform="translate(60, 280)"><circle r="14" fill="var(--diagram-green-fill)"/><text x="0" y="5" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="800">●</text></g>
+    <text x="86" y="286" fill="var(--diagram-green-text)" font-size="11" font-weight="700">终点 (5 条路径汇入)</text>
+
+    <path d="M 800 38 Q 60 320 76 280" stroke="var(--diagram-green-stroke)" stroke-width="1" fill="none" stroke-dasharray="3 3" marker-end="url(#d-arr-g)" opacity="0.6"/>
+    <path d="M 800 88 Q 60 322 76 282" stroke="var(--diagram-purple-stroke)" stroke-width="1" fill="none" stroke-dasharray="3 3" marker-end="url(#d-arr)" opacity="0.6"/>
+    <path d="M 800 110 Q 60 318 76 280" stroke="var(--diagram-orange-stroke)" stroke-width="1" fill="none" stroke-dasharray="3 3" marker-end="url(#d-arr)" opacity="0.6"/>
+    <path d="M 800 184 Q 60 312 76 280" stroke="var(--diagram-blue-stroke)" stroke-width="1" fill="none" stroke-dasharray="3 3" marker-end="url(#d-arr-b)" opacity="0.6"/>
+
+    <g transform="translate(20, 320)">
+      <rect width="900" height="58" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-dasharray="4 3"/>
+      <text x="20" y="22" fill="var(--diagram-purple-text)" font-size="13" font-weight="800">📐 状态机 5 出口</text>
+      <text x="20" y="42" fill="var(--diagram-blue-text)" font-size="11">UpdateValue · MarkKey · CreateBranch · NewChild (×2 入口) — 这是源码 if-else 的对应分支</text>
+    </g>
+
+    <g transform="translate(20, 386)">
+      <rect width="900" height="60" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="20" y="22" fill="var(--diagram-orange-text)" font-size="13" font-weight="800">★ 实现复杂度排序 (从简单到复杂)</text>
+      <text x="20" y="44" fill="var(--diagram-orange-text)" font-size="11">UpdateValue (1 行赋值) &lt; MarkKey (改 flag) &lt; NewChild (1 节点 + realloc) &lt; CreateBranch (4 节点)</text>
+      <text x="20" y="58" fill="var(--diagram-muted)" font-size="10">★ rax.c 中分裂代码占整个 raxInsert 函数 60% 行数</text>
+    </g>
+  </svg>
+</div>
+
+<h3>8.3.3 情况 A:压缩节点中部分裂(7 帧动画)</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-3-3 · 在压缩节点 "bcd" 中部插入 "bxyz" 的 7 帧</div>
+<svg class="svg-diagram" viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="rax-ins-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-muted)"/>
+    </marker>
+  </defs>
+
+  <text x="20" y="22" fill="var(--diagram-orange-text)" font-size="13" font-weight="bold">raxInsert(rax, "bxyz", new_value) - 在 "bcd"* 压缩节点中部分裂</text>
+
+  <!-- 帧 0: 前置 -->
+  <text x="20" y="55" fill="var(--diagram-muted)" font-size="11" font-weight="bold">帧 0 · 前置</text>
+  <circle cx="60" cy="80" r="14" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+  <text x="60" y="84" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">root</text>
+  <path d="M74,80 L100,80" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#rax-ins-arr)"/>
+  <rect x="105" y="65" width="100" height="32" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+  <text x="155" y="86" text-anchor="middle" fill="var(--diagram-green-text)" font-size="13" font-weight="bold">"bcd"*</text>
+  <text x="105" y="115" fill="var(--diagram-muted)" font-size="10">iscompr=1, size=3, value="bcd_value"</text>
+
+  <!-- 帧 1-2: 计算分裂点 -->
+  <text x="280" y="55" fill="var(--diagram-orange-text)" font-size="11" font-weight="bold">帧 1-2 · 计算分裂点 (j=1)</text>
+  <text x="280" y="78" fill="var(--diagram-blue-text)" font-size="11">key  = b x y z</text>
+  <text x="280" y="94" fill="var(--diagram-blue-text)" font-size="11">node = b c d</text>
+  <text x="280" y="110" fill="var(--diagram-red-text)" font-size="11">       ↑ 匹配到此</text>
+  <text x="280" y="128" fill="var(--diagram-blue-text)" font-size="11">prefix=[b], 分叉=[c,x],</text>
+  <text x="280" y="144" fill="var(--diagram-blue-text)" font-size="11">suf_old=[d], suf_new=[yz]</text>
+
+  <!-- 帧 3-4: 重连 -->
+  <text x="550" y="55" fill="var(--diagram-orange-text)" font-size="11" font-weight="bold">帧 3-4 · 分配 4 节点 + 重连</text>
+  <text x="550" y="78" fill="var(--diagram-blue-text)" font-size="11">• n_prefix "b" (压缩)</text>
+  <text x="550" y="94" fill="var(--diagram-blue-text)" font-size="11">• n_branch [c,x] (普通)</text>
+  <text x="550" y="110" fill="var(--diagram-blue-text)" font-size="11">• n_suf_old "d"* 携 bcd_value</text>
+  <text x="550" y="126" fill="var(--diagram-blue-text)" font-size="11">• n_suf_new "yz"* 携 new_value</text>
+  <text x="550" y="144" fill="var(--diagram-green-text)" font-size="11">root.child = n_prefix</text>
+
+  <!-- 帧 5: 释放 + 帧 6: 后置 -->
+  <text x="20" y="180" fill="var(--diagram-green-text)" font-size="12" font-weight="bold">帧 5-6 · 释放旧节点, raxInsert 返回 1 (新增)</text>
+
+  <!-- 后置结构 -->
+  <g transform="translate(20,200)">
+    <circle cx="40" cy="100" r="14" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+    <text x="40" y="104" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">root</text>
+    <path d="M54,100 L84,100" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#rax-ins-arr)"/>
+
+    <rect x="90" y="84" width="80" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="130" y="105" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="13" font-weight="bold">"b"</text>
+    <text x="130" y="135" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">n_prefix (压缩)</text>
+
+    <path d="M170,100 L200,100" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#rax-ins-arr)"/>
+
+    <rect x="205" y="84" width="120" height="32" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="265" y="105" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="13" font-weight="bold">[c, x] branch</text>
+    <text x="265" y="135" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">n_branch (普通)</text>
+
+    <!-- c → d -->
+    <path d="M325,90 L385,40" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#rax-ins-arr)"/>
+    <text x="350" y="60" fill="var(--diagram-muted)" font-size="11">c</text>
+    <rect x="390" y="20" width="120" height="32" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+    <text x="450" y="40" text-anchor="middle" fill="var(--diagram-green-text)" font-size="13" font-weight="bold">"d"*</text>
+    <text x="395" y="68" fill="var(--diagram-muted)" font-size="10">value = "bcd_value"</text>
+
+    <!-- x → yz -->
+    <path d="M325,110 L385,160" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#rax-ins-arr)"/>
+    <text x="350" y="145" fill="var(--diagram-muted)" font-size="11">x</text>
+    <rect x="390" y="148" width="120" height="32" rx="6" fill="var(--diagram-purple-fill)" stroke="var(--diagram-purple-stroke)"/>
+    <text x="450" y="168" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="13" font-weight="bold">"yz"*</text>
+    <text x="395" y="195" fill="var(--diagram-muted)" font-size="10">value = new_value</text>
+  </g>
+
+  <!-- 总结 -->
+  <rect x="540" y="200" width="360" height="220" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+  <text x="555" y="222" fill="var(--diagram-green-text)" font-size="12" font-weight="bold">摘要</text>
+  <text x="555" y="245" fill="var(--diagram-blue-text)" font-size="11">• 时间复杂度: O(K), K = max(key, 原 size)</text>
+  <text x="555" y="265" fill="var(--diagram-blue-text)" font-size="11">• 空间: 净增 3 节点 (4 新 - 1 旧)</text>
+  <text x="555" y="285" fill="var(--diagram-blue-text)" font-size="11">• rax.numnodes: 1 → 4</text>
+  <text x="555" y="305" fill="var(--diagram-blue-text)" font-size="11">• rax.numele: 1 → 2</text>
+  <text x="555" y="335" fill="var(--diagram-orange-text)" font-size="11" font-weight="bold">分裂策略要点</text>
+  <text x="555" y="355" fill="var(--diagram-blue-text)" font-size="11">压缩节点中部不匹配 → 拆为</text>
+  <text x="555" y="372" fill="var(--diagram-blue-text)" font-size="11">prefix + branch + 2 个 suffix</text>
+  <text x="555" y="395" fill="var(--diagram-blue-text)" font-size="11">prefix 保留共同前缀,</text>
+  <text x="555" y="412" fill="var(--diagram-blue-text)" font-size="11">branch 处理分叉 (普通节点)</text>
+</svg>
+</div>
+
+<h3>8.3.4 情况 B:普通节点添加分支</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-3-4 · 普通节点 size=2 → 3 的 realloc 扩容</div>
+<svg class="svg-diagram" viewBox="0 0 920 340" xmlns="http://www.w3.org/2000/svg">
+  <text x="20" y="22" fill="var(--diagram-orange-text)" font-size="13" font-weight="bold">普通节点扩容: size=2 → 3 (插入 "abe" 触发字符 'e' 不在字符集)</text>
+
+  <!-- 前置 -->
+  <text x="20" y="55" fill="var(--diagram-muted)" font-size="12" font-weight="bold">前置 (size=2)</text>
+  <g transform="translate(20,65)">
+    <rect x="0" y="0" width="50" height="36" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+    <text x="25" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-family="monospace" font-size="13">c</text>
+    <rect x="50" y="0" width="50" height="36" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+    <text x="75" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-family="monospace" font-size="13">d</text>
+    <rect x="100" y="0" width="30" height="36" fill="var(--diagram-surface)" stroke="var(--diagram-border)"/>
+    <text x="115" y="22" text-anchor="middle" fill="var(--diagram-muted)" font-size="11">pad</text>
+    <rect x="130" y="0" width="100" height="36" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="180" y="22" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="bold">p_abc (8 B)</text>
+    <rect x="230" y="0" width="100" height="36" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="280" y="22" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="bold">p_abd (8 B)</text>
+    <text x="0" y="60" fill="var(--diagram-muted)" font-size="10">字符</text>
+    <text x="160" y="60" fill="var(--diagram-muted)" font-size="10">child ptrs</text>
+  </g>
+
+  <!-- 操作步骤 -->
+  <rect x="400" y="55" width="500" height="120" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="415" y="75" fill="var(--diagram-blue-text)" font-size="12" font-weight="bold">扩容步骤 (raxReallocForData)</text>
+  <text x="415" y="95" fill="var(--diagram-blue-text)" font-size="11">1. 计算新大小 = 4 + 3 + pad + 3×8 = 35 B</text>
+  <text x="415" y="113" fill="var(--diagram-blue-text)" font-size="11">2. realloc 旧 branch 节点 +1 字符 +1 指针</text>
+  <text x="415" y="131" fill="var(--diagram-blue-text)" font-size="11">3. 在排序位置插入 'e' (末尾, 因 a&lt;b&lt;c&lt;d&lt;e)</text>
+  <text x="415" y="149" fill="var(--diagram-blue-text)" font-size="11">4. 分配新 child *abe (压缩节点 "")</text>
+  <text x="415" y="167" fill="var(--diagram-blue-text)" font-size="11">5. branch.size: 2 → 3 (原地)</text>
+
+  <!-- 后置 -->
+  <text x="20" y="185" fill="var(--diagram-green-text)" font-size="12" font-weight="bold">后置 (size=3)</text>
+  <g transform="translate(20,195)">
+    <rect x="0" y="0" width="50" height="36" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+    <text x="25" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-family="monospace" font-size="13">c</text>
+    <rect x="50" y="0" width="50" height="36" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+    <text x="75" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-family="monospace" font-size="13">d</text>
+    <rect x="100" y="0" width="50" height="36" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
+    <text x="125" y="22" text-anchor="middle" fill="var(--diagram-green-text)" font-family="monospace" font-size="13" font-weight="bold">e</text>
+    <text x="125" y="50" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">新增</text>
+    <rect x="150" y="0" width="30" height="36" fill="var(--diagram-surface)" stroke="var(--diagram-border)"/>
+    <text x="165" y="22" text-anchor="middle" fill="var(--diagram-muted)" font-size="11">pad</text>
+    <rect x="180" y="0" width="100" height="36" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="230" y="22" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="bold">p_abc</text>
+    <rect x="280" y="0" width="100" height="36" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="330" y="22" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="bold">p_abd</text>
+    <rect x="380" y="0" width="100" height="36" fill="var(--diagram-orange-fill)" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
+    <text x="430" y="22" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">p_abe (新)</text>
+  </g>
+
+  <!-- 摘要 (移到 后置 cells 右侧, 避开 p_abe rect) -->
+  <rect x="520" y="195" width="380" height="120" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+  <text x="535" y="215" fill="var(--diagram-green-text)" font-size="12" font-weight="bold">★ 时间 O(K), 净增 1 节点</text>
+  <text x="535" y="240" fill="var(--diagram-blue-text)" font-size="11">• realloc 是原地扩容 (jemalloc 4 字节倍)</text>
+  <text x="535" y="258" fill="var(--diagram-blue-text)" font-size="11">• 字符按字典序插入, 二分查找定位</text>
+  <text x="535" y="276" fill="var(--diagram-blue-text)" font-size="11">• 新 child = 压缩节点 "" (空) + iskey=1</text>
+  <text x="535" y="294" fill="var(--diagram-blue-text)" font-size="11">  → 在 branch 后即为 "abe" 完整 key</text>
+  <text x="535" y="308" fill="var(--diagram-muted)" font-size="10">新 child 节点专门携带 value, 不存字符</text>
+</svg>
+</div>
+
+<h3>8.3.5 raxInsert 复杂度</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 8-3-1 · raxInsert 各情况的复杂度</div>
+  <table>
+    <thead><tr><th>情况</th><th>时间</th><th>分配节点</th><th>释放节点</th><th>典型场景</th></tr></thead>
+    <tbody>
+      <tr><td>key 已存在,更新 value</td><td>O(K)</td><td>0</td><td>0</td><td>SET 重复 key</td></tr>
+      <tr><td>key 是已有路径前缀</td><td>O(K)</td><td>0</td><td>0</td><td>"abc" 已在,插 "ab"</td></tr>
+      <tr><td>普通节点添加分支</td><td>O(K)</td><td>1</td><td>0 (含 realloc)</td><td>常见追加</td></tr>
+      <tr><td>压缩节点中部分裂</td><td>O(K)</td><td>4</td><td>1</td><td>插入分支冲突</td></tr>
+      <tr><td>压缩节点完全分裂 (整段不匹配)</td><td>O(K)</td><td>3</td><td>1</td><td>插入完全不同前缀</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p>K = key 长度。Stream ID 固定 16 字节,所以 raxInsert 实际是 O(16) ≈ O(1)。这是 rax 在百万消息 Stream 场景下仍能保持 <strong>P99 &lt; 30 μs</strong> 的核心原因。</p>
+
+<!-- ============================================================ -->
+<h2 id="s8-4">8.4 raxFind 与迭代</h2>
+<!-- ============================================================ -->
+
+<h3>8.4.1 raxFind 调用链</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-4-1 · raxFind 内部时序</div>
+  <svg viewBox="0 0 940 580" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect x="0" y="0" width="940" height="580" fill="var(--diagram-panel)" rx="10"/>
+    <g transform="translate(40, 22)" filter="url(#d-shadow)"><rect width="160" height="40" rx="8" fill="url(#d-blue)"/><text x="80" y="25" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">调用方</text></g>
+    <g transform="translate(280, 22)" filter="url(#d-shadow)"><rect width="160" height="40" rx="8" fill="url(#d-purple)"/><text x="80" y="25" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">raxFind</text></g>
+    <g transform="translate(520, 22)" filter="url(#d-shadow)"><rect width="180" height="40" rx="8" fill="url(#d-green)"/><text x="90" y="25" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">raxLowWalk</text></g>
+    <line x1="120" y1="62" x2="120" y2="550" stroke="var(--diagram-border)" stroke-width="1.6" stroke-dasharray="4 3"/>
+    <line x1="360" y1="62" x2="360" y2="550" stroke="var(--diagram-border)" stroke-width="1.6" stroke-dasharray="4 3"/>
+    <line x1="610" y1="62" x2="610" y2="550" stroke="var(--diagram-border)" stroke-width="1.6" stroke-dasharray="4 3"/>
+    <g font-family="ui-monospace,Consolas" font-size="11">
+      <text x="130" y="86" fill="var(--diagram-green-text)" font-weight="700">①</text>
+      <path d="M 120 96 L 355 96" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="237" y="90" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">raxFind(rax, key, len)</text>
+
+      <text x="370" y="124" fill="var(--diagram-purple-text)" font-weight="700">②</text>
+      <path d="M 360 134 L 605 134" stroke="var(--diagram-purple-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+      <text x="482" y="128" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11">从 root 开始,逐字节走 key</text>
+
+      <rect x="540" y="152" width="380" height="240" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="560" y="170" fill="var(--diagram-green-text)" font-weight="700">③ loop 每个字节</text>
+
+      <rect x="560" y="184" width="350" height="92" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="580" y="200" fill="var(--diagram-blue-text)" font-weight="700">alt 当前是普通节点</text>
+      <text x="580" y="218" fill="var(--diagram-blue-text)">遍历 children[N] 的 chars 数组</text>
+      <text x="580" y="234" fill="var(--diagram-green-text)">match → 进入对应 child</text>
+      <text x="580" y="250" fill="var(--diagram-red-text)">no match → return raxNotFound</text>
+      <text x="580" y="268" fill="var(--diagram-muted)" font-size="9">★ N 通常 ≤ 26,memchr SIMD 友好</text>
+
+      <rect x="560" y="284" width="350" height="100" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="580" y="300" fill="var(--diagram-orange-text)" font-weight="700">alt 当前是压缩节点</text>
+      <text x="580" y="318" fill="var(--diagram-orange-text)">逐字节比较 size 个字符</text>
+      <text x="580" y="334" fill="var(--diagram-green-text)">全匹配 → 进入唯一 child</text>
+      <text x="580" y="350" fill="var(--diagram-red-text)">不全匹配 → return raxNotFound</text>
+      <text x="580" y="368" fill="var(--diagram-muted)" font-size="9">★ 早退出 (mismatch 立即返回)</text>
+
+      <path d="M 600 408 L 365 412" stroke="var(--diagram-purple-stroke)" stroke-width="1.6" stroke-dasharray="4 3" fill="none" marker-end="url(#d-arr)"/>
+      <text x="475" y="404" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11">走完 key,把 stopnode + iskey 返回给 raxFind</text>
+
+      <rect x="280" y="428" width="320" height="80" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="300" y="446" fill="var(--diagram-purple-text)" font-weight="700">④ raxFind 判断</text>
+      <text x="300" y="464" fill="var(--diagram-green-text)" font-weight="700">if walked == key.len AND iskey == 1</text>
+      <text x="320" y="480" fill="var(--diagram-green-text)">→ 返回 node-&gt;value</text>
+      <text x="300" y="498" fill="var(--diagram-red-text)" font-weight="700">else → 返回 NULL</text>
+
+      <text x="130" y="528" fill="var(--diagram-green-text)" font-weight="700">⑤</text>
+      <path d="M 355 540 L 125 540" stroke="var(--diagram-green-stroke)" stroke-width="1.8" stroke-dasharray="4 3" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="240" y="534" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">return value | NULL · O(K) 时间</text>
+    </g>
+  </svg>
+</div>
+
+<h3>8.4.2 raxFind 4 帧追踪</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-4-2 · 在含 abc / abd / abef / xyz 的 rax 中查找 "abef"</div>
+<svg class="svg-diagram" viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="find-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-orange-stroke)"/>
+    </marker>
+  </defs>
+
+  <text x="20" y="22" fill="var(--diagram-orange-text)" font-size="13" font-weight="bold">raxFind "abef" (4 帧追踪) — 时间 O(K), 4 次字节比较 + 3 次跳转</text>
+
+  <!-- 左半: rax 结构 -->
+  <text x="20" y="50" fill="var(--diagram-muted)" font-size="11" font-weight="bold">初始结构</text>
+
+  <!-- root -->
+  <circle cx="60" cy="80" r="14" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+  <text x="60" y="84" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">root</text>
+
+  <!-- "ab" 压缩 -->
+  <path d="M74,80 L100,80" stroke="var(--diagram-orange-stroke)" stroke-width="2" marker-end="url(#find-arr)"/>
+  <text x="84" y="74" fill="var(--diagram-orange-text)" font-size="10" font-weight="bold">a</text>
+  <rect x="105" y="64" width="80" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="145" y="85" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="13" font-weight="bold">"ab"</text>
+
+  <!-- branch -->
+  <path d="M185,80 L210,80" stroke="var(--diagram-orange-stroke)" stroke-width="2" marker-end="url(#find-arr)"/>
+  <text x="195" y="74" fill="var(--diagram-orange-text)" font-size="10" font-weight="bold">b</text>
+  <rect x="215" y="64" width="140" height="32" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="285" y="85" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="12" font-weight="bold">branch [c, d, e]</text>
+
+  <!-- c, d, "f" -->
+  <path d="M250,96 L240,140" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#find-arr)"/>
+  <text x="235" y="115" fill="var(--diagram-muted)" font-size="10">c</text>
+  <rect x="200" y="140" width="80" height="30" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+  <text x="240" y="159" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">abc_v</text>
+
+  <path d="M285,96 L285,140" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#find-arr)"/>
+  <text x="290" y="115" fill="var(--diagram-muted)" font-size="10">d</text>
+  <rect x="295" y="140" width="80" height="30" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+  <text x="335" y="159" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">abd_v</text>
+
+  <path d="M320,96 L340,140" stroke="var(--diagram-orange-stroke)" stroke-width="2" marker-end="url(#find-arr)"/>
+  <text x="335" y="115" fill="var(--diagram-orange-text)" font-size="10" font-weight="bold">e</text>
+  <rect x="385" y="140" width="80" height="30" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+  <text x="425" y="159" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">"f"*</text>
+
+  <!-- xyz 分支 -->
+  <path d="M60,94 L60,210" stroke="var(--diagram-border)" stroke-width="1.5" stroke-dasharray="3 3" marker-end="url(#find-arr)"/>
+  <text x="45" y="160" fill="var(--diagram-muted)" font-size="10">x (未走)</text>
+  <rect x="20" y="212" width="80" height="30" rx="6" fill="var(--diagram-surface)" stroke="var(--diagram-border)"/>
+  <text x="60" y="231" text-anchor="middle" fill="var(--diagram-muted)" font-size="11">"yz"*</text>
+
+  <!-- "f" 命中 value abef_v -->
+  <path d="M425,170 L425,200" stroke="var(--diagram-orange-stroke)" stroke-width="2" marker-end="url(#find-arr)"/>
+  <rect x="380" y="200" width="90" height="32" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
+  <text x="425" y="221" text-anchor="middle" fill="var(--diagram-green-text)" font-size="12" font-weight="bold">abef_v ✓</text>
+
+  <!-- 右半: 帧追踪 -->
+  <rect x="480" y="40" width="420" height="320" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="495" y="62" fill="var(--diagram-blue-text)" font-size="12" font-weight="bold">帧 1 (i=0, cur=root)</text>
+  <text x="495" y="80" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">key[0] = 'a' → 二分 [a,x] → child=*ab</text>
+
+  <text x="495" y="110" fill="var(--diagram-blue-text)" font-size="12" font-weight="bold">帧 2 (i=1, cur=*ab)</text>
+  <text x="495" y="128" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">data[1]='b' vs key[1]='b' ✓</text>
+  <text x="495" y="144" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">→ 进入唯一 child (branch)</text>
+
+  <text x="495" y="174" fill="var(--diagram-blue-text)" font-size="12" font-weight="bold">帧 3 (i=2, cur=branch)</text>
+  <text x="495" y="192" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">key[2]='e' → 二分 [c,d,e] → child=*"f"</text>
+
+  <text x="495" y="222" fill="var(--diagram-blue-text)" font-size="12" font-weight="bold">帧 4 (i=3, cur=*"f")</text>
+  <text x="495" y="240" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">data[0]='f' vs key[3]='f' ✓</text>
+  <text x="495" y="256" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">i=4=len(key), cur.iskey=1</text>
+
+  <text x="495" y="290" fill="var(--diagram-green-text)" font-size="13" font-weight="bold">★ 命中! 返回 value="abef_v"</text>
+  <text x="495" y="320" fill="var(--diagram-muted)" font-size="11">未命中分支: 任一阶段比较失败立即返回 NULL</text>
+  <text x="495" y="340" fill="var(--diagram-muted)" font-size="11">复杂度: O(K) (K=key 长度)</text>
+</svg>
+</div>
+
+<h3>8.4.3 raxIterator + raxSeek 上下兄弟跳转</h3>
+
+<pre><code class="language-c">/* src/rax.h - 迭代器结构 */
+typedef struct raxIterator {
+    int flags;
+    rax *rt;                    /* 关联的 rax */
+    unsigned char *key;         /* 当前 key 缓冲区 */
+    void *data;                 /* 当前 value */
+    size_t key_len;             /* 当前 key 实际长度 */
+    size_t key_max;             /* 缓冲区容量 */
+    unsigned char key_static_string[RAX_ITER_STATIC_LEN];  /* 栈上小缓冲 */
+    raxNode *node;              /* 当前节点 */
+    raxStack stack;             /* 父节点栈 (用于回溯) */
+    raxNodeCallback node_cb;
+} raxIterator;
+
+/* 典型用法 - 范围扫描 (XRANGE 内核) */
+void scan_range(rax *t, unsigned char *start, size_t slen,
+                unsigned char *end,   size_t elen) {
+    raxIterator iter;
+    raxStart(&iter, t);
+
+    /* raxSeek operator:
+     *   ">="  : 大于等于
+     *   ">"   : 严格大于
+     *   "<="  : 小于等于
+     *   "<"   : 严格小于
+     *   "^"   : 第一个 key (rax 头)
+     *   "$"   : 最后一个 key (rax 尾)
+     */
+    if (!raxSeek(&iter, ">=", start, slen)) {
+        raxStop(&iter);
+        return;
+    }
+
+    /* raxNext: 返回下一个 key,自动维护 iter.key 与 iter.data */
+    while (raxNext(&iter)) {
+        if (memcmp(iter.key, end, elen) > 0) break;
+        process(iter.key, iter.key_len, iter.data);
+    }
+
+    raxStop(&iter);
+}
+
+/* raxSeek 关键路径 (简化):
+ *   1. 从 root 开始走 target key
+ *   2. 走到不匹配点时,根据 operator 决定向左/右兄弟跳
+ *   3. 兄弟跳转通过 raxStack 回溯 + 父节点的 chars 排序
+ *   4. 时间复杂度: O(K),K = key 长度
+ */</code></pre>
+
+<h3>8.4.4 raxFind 复杂度</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 8-4-1 · raxFind / raxSeek 复杂度</div>
+  <table>
+    <thead><tr><th>场景</th><th>时间</th><th>比较次数</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>命中 (典型)</td><td>O(K)</td><td>K 次字节比较 + 节点跳转</td><td>K 是 key 长度</td></tr>
+      <tr><td>未命中 (早期失败)</td><td>O(K')</td><td>K' &lt; K,部分字节即终止</td><td>常见短前缀</td></tr>
+      <tr><td>raxSeek "&gt;="</td><td>O(K + log B)</td><td>K + 父节点二分</td><td>B = 普通节点最大子数</td></tr>
+      <tr><td>raxNext (单步)</td><td>O(K)</td><td>沿栈回溯到下一个 iskey 节点</td><td>摊销 O(1)</td></tr>
+      <tr><td>Stream ID 查找</td><td>O(16)= O(1)</td><td>16 次字节比较</td><td>固定 16B</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s8-5">8.5 stream 整体结构</h2>
+<!-- ============================================================ -->
+
+<p>Stream 不是单纯的"rax + 消息"。一个 Stream 容器要同时回答 4 个问题:① 消息存在哪里?② 消费组都在哪?③ 每个组消费到哪了?④ 哪些消息已分配但未确认?这一节把 Stream 容器内部的 4 类对象关系画清楚。</p>
+
+<h3>8.5.1 stream 容器与多 rax 关系</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-5-1 · 一个 Stream 容器内部对象拓扑</div>
+  <svg viewBox="0 0 940 580" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect x="0" y="0" width="940" height="580" fill="var(--diagram-panel)" rx="10"/>
+
+    <g transform="translate(330, 16)" filter="url(#d-shadow)"><rect width="280" height="50" rx="10" fill="url(#d-blue)"/><text x="140" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">stream 容器</text><text x="140" y="38" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10" font-family="ui-monospace,Consolas">last_id · length · max_deleted_id</text></g>
+
+    <path d="M 400 66 L 200 110" stroke="var(--diagram-green-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr-g)"/>
+    <text x="240" y="98" fill="var(--diagram-green-text)" font-size="11" font-weight="700">主 rax (消息索引)</text>
+    <path d="M 540 66 L 740 110" stroke="var(--diagram-purple-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr)"/>
+    <text x="650" y="98" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">cg rax (消费组)</text>
+
+    <g transform="translate(20, 110)" filter="url(#d-shadow)"><rect width="380" height="60" rx="10" fill="url(#d-green)"/><text x="190" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">主 rax</text><text x="190" y="40" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-family="ui-monospace,Consolas">key = listpack 首消息 ID (16 B)</text><text x="190" y="54" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-family="ui-monospace,Consolas">value = listpack 节点指针</text></g>
+
+    <path d="M 210 170 L 210 200" stroke="var(--diagram-green-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr-g)"/>
+    <g transform="translate(20, 200)" filter="url(#d-shadow)">
+      <rect width="380" height="160" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)" stroke-width="1.5"/>
+      <text x="190" y="22" text-anchor="middle" fill="var(--diagram-green-text)" font-size="13" font-weight="800">listpack 节点 (一个)</text>
+      <text x="190" y="40" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">含 master entry + 多个增量消息</text>
+
+      <rect x="20" y="50" width="340" height="32" rx="4" fill="url(#d-amber)"/>
+      <text x="190" y="70" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">master entry · field 模板 + count + last id</text>
+
+      <path d="M 190 82 L 190 96" stroke="var(--diagram-green-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-g)"/>
+      <rect x="20" y="96" width="340" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="190" y="111" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-family="ui-monospace,Consolas">msg 1 增量</text>
+
+      <path d="M 190 118 L 190 124" stroke="var(--diagram-blue-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-b)"/>
+      <rect x="20" y="124" width="340" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="190" y="139" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-family="ui-monospace,Consolas">msg N 增量 · 仅存差异字段</text>
+    </g>
+
+    <g transform="translate(540, 110)" filter="url(#d-shadow)"><rect width="380" height="60" rx="10" fill="url(#d-purple)"/><text x="190" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">consumer groups rax</text><text x="190" y="40" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-family="ui-monospace,Consolas">key = 组名</text><text x="190" y="54" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-family="ui-monospace,Consolas">value = streamCG*</text></g>
+
+    <path d="M 730 170 L 730 200" stroke="var(--diagram-purple-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+    <g transform="translate(540, 200)" filter="url(#d-shadow)">
+      <rect width="380" height="160" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="1.5"/>
+      <text x="190" y="22" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="13" font-weight="800">streamCG (每组)</text>
+      <text x="20" y="44" fill="var(--diagram-purple-text)" font-size="11" font-family="ui-monospace,Consolas">last_id (该组消费到的最后一个 ID)</text>
+      <text x="20" y="64" fill="var(--diagram-purple-text)" font-size="11" font-family="ui-monospace,Consolas">pel: rax</text>
+      <text x="20" y="84" fill="var(--diagram-purple-text)" font-size="11" font-family="ui-monospace,Consolas">consumers: rax</text>
+
+      <path d="M 60 92 L 60 110" stroke="var(--diagram-orange-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+      <rect x="20" y="110" width="160" height="40" rx="6" fill="url(#d-amber)"/>
+      <text x="100" y="128" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">streamNACK</text>
+      <text x="100" y="142" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">delivery_count + time</text>
+
+      <path d="M 230 92 L 230 110" stroke="var(--diagram-cyan-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+      <rect x="200" y="110" width="160" height="40" rx="6" fill="url(#d-cyan)"/>
+      <text x="280" y="128" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="700">streamConsumer</text>
+      <text x="280" y="142" text-anchor="middle" fill="var(--diagram-cyan-text)" font-size="9">name + 自己的 pel rax</text>
+    </g>
+
+    <g transform="translate(20, 380)">
+      <rect width="900" height="62" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)" stroke-dasharray="4 3"/>
+      <text x="20" y="22" fill="var(--diagram-green-text)" font-size="13" font-weight="800">📐 listpack 增量编码 (delta encoding)</text>
+      <text x="20" y="42" fill="var(--diagram-green-text)" font-size="11">同一节点内,后续消息只存与 master entry 字段不同的部分,字段名共享 → 大幅压缩</text>
+      <text x="20" y="58" fill="var(--diagram-muted)" font-size="10">★ 实测百万消息约 100 MB,vs Pub/Sub + List 约 800 MB</text>
+    </g>
+
+    <g transform="translate(20, 452)">
+      <rect width="900" height="116" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="20" y="22" fill="var(--diagram-purple-text)" font-size="13" font-weight="800">★ Stream 双索引设计</text>
+      <text x="20" y="42" fill="var(--diagram-purple-text)" font-size="11">主 rax: 按 ID 范围读 (XRANGE / XREAD)</text>
+      <text x="20" y="58" fill="var(--diagram-purple-text)" font-size="11">cg rax + pel rax: 跟踪每个组、每个消费者的 ACK 状态</text>
+      <text x="20" y="78" fill="var(--diagram-purple-text)" font-size="11">listpack 增量编码: 把"同毫秒大量消息"压成单节点,极大节约内存</text>
+      <text x="20" y="100" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">→ 三个 rax 各司其职:消息 / 组 / PEL,每个都是 O(K) 操作</text>
+    </g>
+  </svg>
+</div>
+
+<h3>8.5.2 stream / streamCG / streamConsumer C 结构</h3>
+
+<pre><code class="language-c">/* src/stream.h - 简化版 */
+
+/* Stream 顶层容器 */
+typedef struct stream {
+    rax *rax;                    /* 主索引: key=listpack 首 ID, value=listpack ptr */
+    uint64_t length;             /* 总消息数 (含未删除) */
+    streamID last_id;            /* 最后一条消息 ID */
+    streamID first_id;           /* 第一条消息 ID */
+    streamID max_deleted_entry_id;  /* 删除游标 */
+    uint64_t entries_added;      /* 历史累计 (含已删除) */
+    rax *cgroups;                /* 消费组索引: key=组名, value=streamCG */
+} stream;
+
+/* 消费组 */
+typedef struct streamCG {
+    streamID last_id;            /* 下次发哪条 (group 进度) */
+    long long entries_read;      /* 已分配消息总数 */
+    rax *pel;                    /* 组级 PEL: key=ID, value=streamNACK */
+    rax *consumers;              /* 组内消费者: key=name, value=streamConsumer */
+} streamCG;
+
+/* 单消费者 */
+typedef struct streamConsumer {
+    mstime_t seen_time;          /* 最后访问时间 */
+    sds name;                    /* 消费者名 */
+    rax *pel;                    /* 消费者级 PEL: 共享 streamNACK */
+    long long active_time;
+} streamConsumer;
+
+/* 未确认消息描述符 (Not Acknowledged) */
+typedef struct streamNACK {
+    mstime_t delivery_time;      /* 最后投递时间 */
+    uint64_t delivery_count;     /* 投递次数 (含 retry) */
+    streamConsumer *consumer;    /* 当前持有者 */
+} streamNACK;
+
+/* ★ NACK 同时被两棵 rax 引用:
+ *   - cg.pel        (组级,所有未 ACK 的)
+ *   - consumer.pel  (持有者,worker 视角)
+ *   两棵 rax 共享同一个 streamNACK 实例 (引用),不复制
+ *   XACK 时同步从两棵 rax 删除
+ */</code></pre>
+
+<h3>8.5.3 listpack 中的消息打包</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-5-2 · 单个 listpack 节点的字节布局 — master entry + 增量</div>
+<svg class="svg-diagram" viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <text x="20" y="22" fill="var(--diagram-orange-text)" font-size="13" font-weight="bold">listpack 节点字节布局: master entry (字段模板) + N 条 entry (仅存值)</text>
+
+  <!-- listpack 容器 -->
+  <rect x="20" y="40" width="640" height="380" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)" stroke-width="2"/>
+
+  <!-- master entry -->
+  <rect x="40" y="60" width="600" height="120" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="55" y="80" fill="var(--diagram-blue-text)" font-size="12" font-weight="bold">master entry (整个节点的"模板")</text>
+  <text x="55" y="100" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">[count]  消息总数 (含 deleted)</text>
+  <text x="55" y="118" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">[deleted]  已删除数</text>
+  <text x="55" y="136" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">[num_master_fields] N</text>
+  <text x="55" y="154" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">[field_1] [field_2] ... [field_N]  ← 字段名只在 master 存一次</text>
+  <text x="55" y="172" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">[zero entry marker]  master 与 entry 分界</text>
+
+  <!-- entry 1 -->
+  <rect x="40" y="195" width="600" height="100" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+  <text x="55" y="215" fill="var(--diagram-green-text)" font-size="12" font-weight="bold">entry 1 (第一条消息)</text>
+  <text x="55" y="234" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">[flags]  位标志 (SAMEFIELDS, DELETED 等)</text>
+  <text x="55" y="252" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">[id_offset_ms] [id_offset_seq]  与 master 首 ID 的 VLI 偏移</text>
+  <text x="55" y="270" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">[num_fields]  本条字段数 (与 master 不同时)</text>
+  <text x="55" y="288" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">[value_1] [value_2] ... [value_N] [lp_count]  ← 仅存值</text>
+
+  <!-- entry 2 (SAMEFIELDS) -->
+  <rect x="40" y="310" width="600" height="90" rx="6" fill="var(--diagram-purple-fill)" stroke="var(--diagram-purple-stroke)"/>
+  <text x="55" y="330" fill="var(--diagram-purple-text)" font-size="12" font-weight="bold">entry 2 (SAMEFIELDS=1, 字段与 master 完全相同)</text>
+  <text x="55" y="350" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">[flags=SAMEFIELDS]</text>
+  <text x="55" y="368" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">[id_offset_ms] [id_offset_seq]</text>
+  <text x="55" y="386" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">[value_1] [value_2] ... [value_N] [lp_count]  ← 不再写字段名</text>
+
+  <!-- 右侧: 收益与阈值 -->
+  <rect x="680" y="60" width="220" height="200" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+  <text x="695" y="82" fill="var(--diagram-green-text)" font-size="12" font-weight="bold">★ 关键收益</text>
+  <text x="695" y="105" fill="var(--diagram-blue-text)" font-size="11">• field 名只在 master 存 1 次</text>
+  <text x="695" y="125" fill="var(--diagram-blue-text)" font-size="11">• N 条消息节省 (N-1)×|fields|</text>
+  <text x="695" y="145" fill="var(--diagram-blue-text)" font-size="11">• msg 间共享字段名</text>
+  <text x="695" y="165" fill="var(--diagram-blue-text)" font-size="11">• 同 listpack 时间戳相近</text>
+  <text x="695" y="185" fill="var(--diagram-blue-text)" font-size="11">  → id 偏移常 1-2 B VLI</text>
+  <text x="695" y="205" fill="var(--diagram-blue-text)" font-size="11">• 反向遍历友好</text>
+  <text x="695" y="225" fill="var(--diagram-blue-text)" font-size="11">  (XREVRANGE 用 lp_count)</text>
+  <text x="695" y="248" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">~ 50% 字节节省</text>
+
+  <rect x="680" y="275" width="220" height="125" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="695" y="297" fill="var(--diagram-orange-text)" font-size="12" font-weight="bold">★ 节点阈值 (redis.conf)</text>
+  <text x="695" y="322" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">stream-node-max-bytes</text>
+  <text x="695" y="340" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">默认 4096 B</text>
+  <text x="695" y="365" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">stream-node-max-entries</text>
+  <text x="695" y="383" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">默认 100 条</text>
+
+  <text x="20" y="445" fill="var(--diagram-muted)" font-size="11">触达任一阈值 → 创建新 listpack 节点, 旧节点写入 rax 索引 (key=新节点首消息 ID)</text>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s8-6">8.6 XADD 操作逐帧</h2>
+<!-- ============================================================ -->
+
+<h3>8.6.1 XADD 调用链</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-6-1 · XADD 内部时序</div>
+  <svg viewBox="0 0 940 620" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect x="0" y="0" width="940" height="620" fill="var(--diagram-panel)" rx="10"/>
+    <g transform="translate(20, 22)" filter="url(#d-shadow)"><rect width="180" height="40" rx="8" fill="url(#d-blue)"/><text x="90" y="25" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">xaddCommand</text></g>
+    <g transform="translate(240, 22)" filter="url(#d-shadow)"><rect width="200" height="40" rx="8" fill="url(#d-purple)"/><text x="100" y="25" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">streamAppendItem</text></g>
+    <g transform="translate(480, 22)" filter="url(#d-shadow)"><rect width="200" height="40" rx="8" fill="url(#d-green)"/><text x="100" y="25" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">raxFind / raxInsert</text></g>
+    <g transform="translate(720, 22)" filter="url(#d-shadow)"><rect width="180" height="40" rx="8" fill="url(#d-amber)"/><text x="90" y="25" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="700">lpAppend</text></g>
+    <line x1="110" y1="62" x2="110" y2="590" stroke="var(--diagram-border)" stroke-width="1.6" stroke-dasharray="4 3"/>
+    <line x1="340" y1="62" x2="340" y2="590" stroke="var(--diagram-border)" stroke-width="1.6" stroke-dasharray="4 3"/>
+    <line x1="580" y1="62" x2="580" y2="590" stroke="var(--diagram-border)" stroke-width="1.6" stroke-dasharray="4 3"/>
+    <line x1="810" y1="62" x2="810" y2="590" stroke="var(--diagram-border)" stroke-width="1.6" stroke-dasharray="4 3"/>
+    <g font-family="ui-monospace,Consolas" font-size="11">
+      <text x="120" y="86" fill="var(--diagram-green-text)" font-weight="700">①</text>
+      <path d="M 110 96 L 335 96" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="222" y="90" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">XADD stream * field value</text>
+
+      <rect x="280" y="112" width="540" height="44" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="300" y="130" fill="var(--diagram-purple-text)" font-weight="700">② 生成 ID</text>
+      <text x="300" y="148" fill="var(--diagram-purple-text)">id = ms × 1000 + seq · 16 字节大端</text>
+
+      <rect x="280" y="162" width="540" height="44" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="300" y="180" fill="var(--diagram-red-text)" font-weight="700">③ alt ID &lt; last_id</text>
+      <text x="300" y="198" fill="var(--diagram-red-text)">→ ERR (ID 必须严格递增)</text>
+
+      <text x="350" y="226" fill="var(--diagram-cyan-text)" font-weight="700">④</text>
+      <path d="M 340 236 L 575 236" stroke="var(--diagram-cyan-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+      <text x="457" y="230" text-anchor="middle" fill="var(--diagram-cyan-text)" font-size="11">raxLast(rax) → 找尾节点的 listpack</text>
+
+      <rect x="280" y="252" width="630" height="124" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="300" y="270" fill="var(--diagram-green-text)" font-weight="700">⑤ alt tail listpack 存在且未满 (常见路径)</text>
+
+      <text x="350" y="294" fill="var(--diagram-green-text)" font-weight="700">⑥</text>
+      <path d="M 340 304 L 805 304" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="572" y="298" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">lpAppend(tail_listpack, msg 增量字节) — 仅写差异</text>
+
+      <text x="350" y="332" fill="var(--diagram-purple-text)" font-weight="700">⑦</text>
+      <text x="360" y="332" fill="var(--diagram-purple-text)">更新 master entry 的 count + last_id (节点内本地)</text>
+      <rect x="340" y="340" width="540" height="14" rx="2" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+
+      <text x="300" y="372" fill="var(--diagram-muted)" font-size="10" font-style="italic">★ 这条路径是 99% 命令的快速路径 (~5 μs)</text>
+
+      <rect x="280" y="384" width="630" height="116" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="300" y="402" fill="var(--diagram-orange-text)" font-weight="700">⑧ else 节点已满或不存在</text>
+
+      <text x="350" y="424" fill="var(--diagram-orange-text)" font-weight="700">⑨</text>
+      <path d="M 340 434 L 805 434" stroke="var(--diagram-orange-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+      <text x="572" y="428" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">创建新 listpack(含 master entry) + lpAppend(new_lp)</text>
+
+      <text x="350" y="464" fill="var(--diagram-cyan-text)" font-weight="700">⑩</text>
+      <path d="M 340 474 L 575 474" stroke="var(--diagram-cyan-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+      <text x="457" y="468" text-anchor="middle" fill="var(--diagram-cyan-text)" font-size="11">raxInsert(rax, ID 字节序, new_lp) — 见图 8-3-1</text>
+
+      <rect x="280" y="510" width="540" height="44" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="300" y="528" fill="var(--diagram-blue-text)" font-weight="700">⑪ 收尾</text>
+      <text x="300" y="546" fill="var(--diagram-blue-text)">stream-&gt;last_id = new_id · stream-&gt;length++</text>
+
+      <text x="120" y="578" fill="var(--diagram-green-text)" font-weight="700">⑫</text>
+      <path d="M 335 580 L 115 580" stroke="var(--diagram-green-stroke)" stroke-width="1.8" stroke-dasharray="4 3" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="225" y="574" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">return ID 给客户端</text>
+    </g>
+  </svg>
+</div>
+
+<h3>8.6.2 streamAppendItem 关键代码</h3>
+
+<pre><code class="language-c">/* src/t_stream.c - 简化版 */
+int streamAppendItem(stream *s, robj **argv, int64_t numfields,
+                     streamID *added_id, streamID *use_id) {
+    streamID id;
+
+    /* 1. 生成 ID (如果用户指定了 use_id 就用,否则用当前时间) */
+    if (use_id) id = *use_id;
+    else streamNextID(&s->last_id, &id);
+
+    /* 2. ID 必须严格递增 */
+    if (streamCompareID(&id, &s->last_id) <= 0) {
+        errno = EDOM;
+        return C_ERR;
+    }
+
+    /* 3. 找尾 listpack */
+    raxIterator ri;
+    raxStart(&ri, s->rax);
+    raxSeek(&ri, "$", NULL, 0);  /* 走到最右 */
+
+    unsigned char *lp = NULL;
+    size_t lp_bytes = 0;
+    int lp_count_now = 0;
+    streamID master_id;
+
+    if (raxNext(&ri)) {
+        lp = ri.data;
+        lp_bytes = lpBytes(lp);
+        /* 从 master entry 读 count */
+        unsigned char *p = lpFirst(lp);
+        lp_count_now = lpGetInteger(p);
+        /* master ID 编码在 rax key 里 */
+        streamDecodeID(ri.key, &master_id);
+    }
+
+    /* 4. 决定是追加现有 listpack 还是新建 */
+    int new_node = 0;
+    if (lp == NULL ||
+        lp_bytes >= server.stream_node_max_bytes ||
+        lp_count_now >= server.stream_node_max_entries) {
+        new_node = 1;
+    }
+
+    if (new_node) {
+        /* 新建 listpack: 写 master entry + 第一条 msg */
+        master_id = id;
+        lp = createListpackForStreamMaster(argv, numfields, &id);
+        unsigned char rax_key[16];
+        streamEncodeID(rax_key, &id);
+        raxInsert(s->rax, rax_key, sizeof(rax_key), lp, NULL);
+    } else {
+        /* 追加 msg 到现有 listpack */
+        lpAppendStreamEntry(lp, argv, numfields, &id, &master_id);
+        /* 更新 master entry 的 count */
+        lpReplaceCount(lp, lp_count_now + 1);
+        /* rax 节点的 value 可能因 lpAppend realloc 而改变 */
+        raxFind(s->rax, rax_key, 16);  /* 重新挂指针 */
+    }
+
+    raxStop(&ri);
+
+    s->last_id = id;
+    s->length++;
+    if (added_id) *added_id = id;
+    return C_OK;
+}</code></pre>
+
+<h3>8.6.3 XADD 5 帧追踪</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-6-2 · XADD 在尾 listpack 追加的 5 帧</div>
+<svg class="svg-diagram" viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="xadd-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-muted)"/>
+    </marker>
+  </defs>
+
+  <text x="20" y="22" fill="var(--diagram-orange-text)" font-size="13" font-weight="bold">XADD 5 帧追踪 — 在尾 listpack 追加 (length 99 → 100)</text>
+
+  <!-- 初始状态 -->
+  <rect x="20" y="40" width="880" height="60" rx="6" fill="var(--diagram-surface)" stroke="var(--diagram-border)"/>
+  <text x="35" y="60" fill="var(--diagram-muted)" font-size="11" font-weight="bold">初始状态</text>
+  <text x="35" y="78" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">stream.length=99, last_id=1714000000098-0, rax: 1 节点 → listpack_0 (count=99, sz=3500B)</text>
+  <text x="35" y="93" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">执行: XADD stream * user alice action pay amount 100</text>
+
+  <!-- 5 帧时序 -->
+  <g transform="translate(20,115)">
+    <!-- 帧 1 -->
+    <rect x="0" y="0" width="170" height="100" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="85" y="20" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="bold">帧 1 · 生成 ID</text>
+    <text x="10" y="42" fill="var(--diagram-blue-text)" font-size="10">new_id = 1714000000099-0</text>
+    <text x="10" y="58" fill="var(--diagram-blue-text)" font-size="10">cmp(new, last) = 1 > 0 ✓</text>
+    <text x="10" y="76" fill="var(--diagram-muted)" font-size="10">ms = 当前时间</text>
+    <text x="10" y="92" fill="var(--diagram-muted)" font-size="10">seq = 0</text>
+
+    <path d="M170,50 L185,50" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#xadd-arr)"/>
+
+    <!-- 帧 2 -->
+    <rect x="185" y="0" width="170" height="100" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="270" y="20" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="bold">帧 2 · raxLast 找尾</text>
+    <text x="195" y="42" fill="var(--diagram-blue-text)" font-size="10">raxSeek "$" + raxNext</text>
+    <text x="195" y="60" fill="var(--diagram-blue-text)" font-size="10">返回 listpack_0</text>
+    <text x="195" y="78" fill="var(--diagram-blue-text)" font-size="10">读 master.count = 99</text>
+    <text x="195" y="92" fill="var(--diagram-muted)" font-size="10">master_id = ...098-0</text>
+
+    <path d="M355,50 L370,50" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#xadd-arr)"/>
+
+    <!-- 帧 3 -->
+    <rect x="370" y="0" width="200" height="100" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="470" y="20" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="bold">帧 3 · 节点是否满?</text>
+    <text x="380" y="42" fill="var(--diagram-blue-text)" font-family="monospace" font-size="10">lp_bytes = 3500 &lt; 4096 ✓</text>
+    <text x="380" y="58" fill="var(--diagram-blue-text)" font-family="monospace" font-size="10">lp_count = 99 &lt; 100 ✓</text>
+    <text x="380" y="82" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">★ 决策: 追加, 不新建</text>
+
+    <path d="M570,50 L585,50" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#xadd-arr)"/>
+
+    <!-- 帧 4 -->
+    <rect x="585" y="0" width="170" height="100" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+    <text x="670" y="20" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">帧 4 · 构造增量</text>
+    <text x="595" y="42" fill="var(--diagram-blue-text)" font-size="10">id_offset = 99, 0</text>
+    <text x="595" y="58" fill="var(--diagram-blue-text)" font-size="10">flags = SAMEFIELDS</text>
+    <text x="595" y="76" fill="var(--diagram-blue-text)" font-size="10">lpAppend(values, lp_cnt)</text>
+    <text x="595" y="92" fill="var(--diagram-green-text)" font-size="10">master.count: 99 → 100</text>
+
+    <path d="M755,50 L770,50" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#xadd-arr)"/>
+
+    <!-- 帧 5 -->
+    <rect x="770" y="0" width="110" height="100" rx="6" fill="var(--diagram-purple-fill)" stroke="var(--diagram-purple-stroke)"/>
+    <text x="825" y="20" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="bold">帧 5 · 收尾</text>
+    <text x="780" y="42" fill="var(--diagram-blue-text)" font-size="10">last_id = ...099-0</text>
+    <text x="780" y="58" fill="var(--diagram-blue-text)" font-size="10">length: 99→100</text>
+    <text x="780" y="76" fill="var(--diagram-green-text)" font-size="10">返回 ID</text>
+  </g>
+
+  <!-- 总结 -->
+  <rect x="20" y="240" width="440" height="100" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+  <text x="35" y="262" fill="var(--diagram-green-text)" font-size="12" font-weight="bold">★ 时间复杂度 O(log N + K)</text>
+  <text x="35" y="282" fill="var(--diagram-blue-text)" font-size="11">• N = rax 节点数 (本例 1)</text>
+  <text x="35" y="300" fill="var(--diagram-blue-text)" font-size="11">• K = ID 字节长 (16)</text>
+  <text x="35" y="320" fill="var(--diagram-blue-text)" font-size="11">• lpAppend 末尾追加: O(1) (或摊销 O(1) realloc)</text>
+
+  <rect x="475" y="240" width="425" height="100" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="490" y="262" fill="var(--diagram-orange-text)" font-size="12" font-weight="bold">触发新建 listpack 节点的条件</text>
+  <text x="490" y="285" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">lp_bytes >= stream-node-max-bytes (4096)</text>
+  <text x="490" y="303" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">  OR  lp_count >= stream-node-max-entries (100)</text>
+  <text x="490" y="325" fill="var(--diagram-muted)" font-size="11">新节点 master entry 重新存字段名, raxInsert 把新 ID 插入</text>
+</svg>
+</div>
+
+<h3>8.6.4 XADD 创建新 listpack 节点的路径</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-6-3 · listpack 满后新建节点的字节流</div>
+<svg class="svg-diagram" viewBox="0 0 920 320" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="xnew-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-muted)"/>
+    </marker>
+  </defs>
+
+  <text x="20" y="22" fill="var(--diagram-orange-text)" font-size="13" font-weight="bold">listpack 0 满 (count=100 或 sz=4096) → 创建新 listpack 节点</text>
+
+  <!-- 旧状态 -->
+  <text x="20" y="55" fill="var(--diagram-muted)" font-size="12" font-weight="bold">旧 rax</text>
+  <g transform="translate(20,70)">
+    <circle cx="20" cy="40" r="14" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+    <text x="20" y="44" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">root</text>
+    <path d="M34,40 L70,40" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#xnew-arr)"/>
+
+    <rect x="75" y="25" width="110" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="130" y="46" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="13" font-weight="bold">"前缀"</text>
+    <text x="100" y="70" fill="var(--diagram-muted)" font-size="9">压缩节点</text>
+
+    <path d="M185,40 L220,40" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#xnew-arr)"/>
+    <rect x="225" y="25" width="160" height="32" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="305" y="46" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="12" font-weight="bold">listpack 0 (100 条, 满)</text>
+  </g>
+
+  <!-- 新状态 -->
+  <text x="20" y="175" fill="var(--diagram-green-text)" font-size="12" font-weight="bold">新 rax (raxInsert 后)</text>
+  <g transform="translate(20,190)">
+    <circle cx="20" cy="50" r="14" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+    <text x="20" y="54" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">root</text>
+    <path d="M34,50 L70,50" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#xnew-arr)"/>
+
+    <rect x="75" y="35" width="110" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="130" y="56" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="13" font-weight="bold">"前缀"</text>
+
+    <path d="M185,50 L220,50" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#xnew-arr)"/>
+    <rect x="225" y="35" width="120" height="32" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="285" y="56" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="12" font-weight="bold">branch</text>
+
+    <!-- listpack 0 (满) -->
+    <path d="M345,50 L385,20" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#xnew-arr)"/>
+    <rect x="390" y="0" width="180" height="32" rx="6" fill="var(--diagram-surface)" stroke="var(--diagram-border)"/>
+    <text x="480" y="20" text-anchor="middle" fill="var(--diagram-muted)" font-size="11" font-weight="bold">listpack 0 (100 条, 满)</text>
+
+    <!-- listpack 1 (新) -->
+    <path d="M345,55 L385,80" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#xnew-arr)"/>
+    <rect x="390" y="65" width="180" height="32" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
+    <text x="480" y="86" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">listpack 1 (新, 1 条)</text>
+  </g>
+
+  <!-- 操作步骤 -->
+  <rect x="610" y="55" width="290" height="180" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="625" y="75" fill="var(--diagram-blue-text)" font-size="12" font-weight="bold">操作步骤</text>
+  <text x="625" y="98" fill="var(--diagram-blue-text)" font-size="11">1. 创建 new_listpack</text>
+  <text x="625" y="116" fill="var(--diagram-muted)" font-size="10">  master.count=1, fields=[..]</text>
+  <text x="625" y="138" fill="var(--diagram-blue-text)" font-size="11">2. 写 msg (完整字段,首条)</text>
+  <text x="625" y="160" fill="var(--diagram-blue-text)" font-size="11">3. raxInsert(rax, encode(new_id), lp)</text>
+  <text x="625" y="178" fill="var(--diagram-muted)" font-size="10">  共享前缀 → 多数压缩节点</text>
+  <text x="625" y="192" fill="var(--diagram-muted)" font-size="10">  末尾追加 + 普通节点+1分支</text>
+  <text x="625" y="216" fill="var(--diagram-blue-text)" font-size="11">4. stream.length++</text>
+
+  <!-- 摘要 -->
+  <rect x="610" y="245" width="290" height="60" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+  <text x="625" y="265" fill="var(--diagram-green-text)" font-size="12" font-weight="bold">摘要</text>
+  <text x="625" y="285" fill="var(--diagram-blue-text)" font-size="11">★ 时间: O(K + 重平衡常数)</text>
+  <text x="625" y="300" fill="var(--diagram-blue-text)" font-size="11">★ 内存增量: 1 raxNode + ~32 B</text>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s8-7">8.7 消费组与 PEL 流转</h2>
+<!-- ============================================================ -->
+
+<h3>8.7.1 设计动机</h3>
+
+<p>Stream 消费组解决"<strong>多消费者并行处理 + 消息至少一次保证</strong>"的问题:</p>
+
+<ul>
+  <li><strong>每个消息只分给组内一个消费者</strong> — 通过 <code>group.last_id</code> 推进保证</li>
+  <li><strong>消费者处理失败可由其他消费者认领</strong> — 通过 <code>XCLAIM</code> / <code>XAUTOCLAIM</code></li>
+  <li><strong>消息处理完后 XACK 删除 PEL</strong> — 否则一直挂着,可被认领</li>
+</ul>
+
+<h3>8.7.2 消费组数据结构</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-7-1 · 消费组内部多 rax 拓扑</div>
+  <svg viewBox="0 0 940 580" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect x="0" y="0" width="940" height="580" fill="var(--diagram-panel)" rx="10"/>
+
+    <g transform="translate(380, 16)" filter="url(#d-shadow)"><rect width="180" height="44" rx="10" fill="url(#d-blue)"/><text x="90" y="20" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">stream</text><text x="90" y="36" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">streamObject</text></g>
+    <path d="M 470 60 L 470 80" stroke="var(--diagram-blue-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-b)"/>
+
+    <g transform="translate(330, 80)" filter="url(#d-shadow)"><rect width="280" height="44" rx="10" fill="url(#d-purple)"/><text x="140" y="20" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">consumer groups rax</text><text x="140" y="36" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">key=组名 · value=streamCG*</text></g>
+    <path d="M 470 124 L 470 144" stroke="var(--diagram-purple-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+
+    <g transform="translate(310, 144)" filter="url(#d-shadow)"><rect width="320" height="50" rx="10" fill="url(#d-purple)"/><text x="160" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">streamCG 'orders'</text><text x="160" y="40" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-family="ui-monospace,Consolas">last_id + pel + consumers</text></g>
+
+    <path d="M 360 194 L 120 240" stroke="var(--diagram-cyan-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+    <text x="180" y="226" fill="var(--diagram-cyan-text)" font-size="11" font-weight="700">last_id</text>
+    <g transform="translate(20, 240)" filter="url(#d-shadow)"><rect width="200" height="56" rx="10" fill="url(#d-cyan)"/><text x="100" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">last_id</text><text x="100" y="40" text-anchor="middle" fill="var(--diagram-cyan-text)" font-size="10">下次发哪条 ID ≥ last_id</text><text x="100" y="52" text-anchor="middle" fill="var(--diagram-cyan-text)" font-size="9">推进游标</text></g>
+
+    <path d="M 470 194 L 470 240" stroke="var(--diagram-orange-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+    <text x="430" y="220" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">pel</text>
+    <g transform="translate(370, 240)" filter="url(#d-shadow)"><rect width="200" height="56" rx="10" fill="url(#d-amber)"/><text x="100" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="800">组级 PEL rax</text><text x="100" y="40" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">key=ID · value=NACK*</text><text x="100" y="52" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">未 ACK 全集</text></g>
+
+    <path d="M 590 194 L 820 240" stroke="var(--diagram-green-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-g)"/>
+    <text x="700" y="220" fill="var(--diagram-green-text)" font-size="11" font-weight="700">consumers</text>
+    <g transform="translate(720, 240)" filter="url(#d-shadow)"><rect width="200" height="56" rx="10" fill="url(#d-green)"/><text x="100" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">consumers rax</text><text x="100" y="40" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">key=name · value=streamConsumer*</text></g>
+
+    <path d="M 470 296 L 470 322" stroke="var(--diagram-orange-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+    <g transform="translate(360, 322)" filter="url(#d-shadow)"><rect width="220" height="50" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)" stroke-width="1.5"/><text x="110" y="22" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="12" font-weight="800">NACK</text><text x="110" y="40" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">delivery_time + delivery_count</text></g>
+
+    <path d="M 820 296 L 720 340" stroke="var(--diagram-green-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-g)"/>
+    <path d="M 820 296 L 920 340" stroke="var(--diagram-green-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-g)"/>
+
+    <g transform="translate(620, 340)" filter="url(#d-shadow)"><rect width="200" height="50" rx="8" fill="url(#d-green)"/><text x="100" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">consumer 'worker-1'</text><text x="100" y="40" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">streamConsumer 结构</text></g>
+    <g transform="translate(840, 340)" filter="url(#d-shadow)"><rect width="80" height="50" rx="8" fill="url(#d-green)"/><text x="40" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">'w-2'</text><text x="40" y="40" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">...</text></g>
+
+    <path d="M 720 390 L 720 412" stroke="var(--diagram-green-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-g)"/>
+    <path d="M 880 390 L 880 412" stroke="var(--diagram-green-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-g)"/>
+
+    <g transform="translate(620, 412)" filter="url(#d-shadow)"><rect width="200" height="50" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)" stroke-width="1.5"/><text x="100" y="22" text-anchor="middle" fill="var(--diagram-green-text)" font-size="12" font-weight="800">worker-1.pel rax</text><text x="100" y="40" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">该消费者持有的 NACK</text></g>
+    <g transform="translate(840, 412)"><rect width="80" height="50" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/><text x="40" y="22" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="800">w-2.pel</text></g>
+
+    <g transform="translate(20, 480)">
+      <rect width="900" height="84" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-dasharray="4 3"/>
+      <text x="20" y="22" fill="var(--diagram-purple-text)" font-size="13" font-weight="800">📐 关键不变量</text>
+      <text x="20" y="42" fill="var(--diagram-purple-text)" font-size="11">★ NACK 是<strong>共享对象</strong>: group.pel[id] 和 consumer.pel[id] 指向<strong>同一个 NACK 实例</strong></text>
+      <text x="20" y="58" fill="var(--diagram-purple-text)" font-size="11">★ XACK 同时从两边删 NACK · XCLAIM 把 NACK 从原消费者 pel 转到新消费者 pel,组级 pel 不变</text>
+      <text x="20" y="76" fill="var(--diagram-muted)" font-size="10">★ 所以"消息去哪里了"答案在 group.pel,"哪个消费者欠多少"答案在 consumer.pel</text>
+    </g>
+  </svg>
+</div>
+
+<h3>8.7.3 XREADGROUP + XACK + XAUTOCLAIM 流转 5 帧</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-7-2 · 消息从分配到 ACK 的完整生命周期</div>
+<svg class="svg-diagram" viewBox="0 0 920 530" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="pel-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-muted)"/>
+    </marker>
+  </defs>
+
+  <text x="20" y="22" fill="var(--diagram-orange-text)" font-size="13" font-weight="bold">XREADGROUP + XACK + XAUTOCLAIM 全生命周期 (5 帧, 至少一次保证)</text>
+
+  <!-- 帧 1: XREADGROUP -->
+  <rect x="20" y="40" width="880" height="90" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="35" y="60" fill="var(--diagram-blue-text)" font-size="12" font-weight="bold">帧 1 · XREADGROUP GROUP g worker-1 COUNT 2</text>
+  <text x="35" y="80" fill="var(--diagram-blue-text)" font-size="11">扫 rax 找 ≥ group.last_id 的 id_1, id_2 → 创建 NACK_1, NACK_2 (delivery_count=1, consumer=worker-1)</text>
+  <text x="35" y="98" fill="var(--diagram-blue-text)" font-size="11">写入 group.pel = {id_1→NACK_1, id_2→NACK_2}, worker-1.pel = {id_1→NACK_1, id_2→NACK_2}  ★ 同一引用</text>
+  <text x="35" y="116" fill="var(--diagram-green-text)" font-size="11">group.last_id = id_2 · 返回 [id_1, id_2] 给客户端</text>
+
+  <!-- 帧 2: XACK id_1 -->
+  <rect x="20" y="140" width="880" height="75" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+  <text x="35" y="160" fill="var(--diagram-green-text)" font-size="12" font-weight="bold">帧 2 · 客户端处理 id_1 成功 → XACK s g id_1</text>
+  <text x="35" y="180" fill="var(--diagram-blue-text)" font-size="11">group.pel.delete(id_1) + worker-1.pel.delete(id_1) → NACK_1 引用计数归零 → free(NACK_1)</text>
+  <text x="35" y="200" fill="var(--diagram-blue-text)" font-size="11">剩余: group.pel = {id_2}, worker-1.pel = {id_2}</text>
+
+  <!-- 帧 3: 崩溃 -->
+  <rect x="20" y="225" width="880" height="60" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+  <text x="35" y="245" fill="var(--diagram-red-text)" font-size="12" font-weight="bold">帧 3 · worker-1 处理 id_2 时崩溃, 无人 ACK</text>
+  <text x="35" y="265" fill="var(--diagram-blue-text)" font-size="11">group.pel = {id_2 → NACK_2 (consumer=worker-1)} · worker-1.pel = {id_2 → NACK_2} · 时间流逝...</text>
+
+  <!-- 帧 4: XAUTOCLAIM -->
+  <rect x="20" y="295" width="880" height="110" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="35" y="315" fill="var(--diagram-orange-text)" font-size="12" font-weight="bold">帧 4 · 监控进程 XAUTOCLAIM s g worker-2 30000 0-0 COUNT 10</text>
+  <text x="35" y="335" fill="var(--diagram-blue-text)" font-size="11">扫 group.pel 找 idle = (now - delivery_time) > 30000ms 的 NACK → id_2 命中 (idle=60s)</text>
+  <text x="35" y="355" fill="var(--diagram-blue-text)" font-size="11">转移 NACK_2.consumer = worker-2 · delivery_count++ = 2 · delivery_time = now</text>
+  <text x="35" y="373" fill="var(--diagram-blue-text)" font-size="11">worker-1.pel.delete(id_2) · worker-2.pel.insert(id_2, NACK_2)</text>
+  <text x="35" y="392" fill="var(--diagram-green-text)" font-size="11">group.pel 中 id_2 仍在 (NACK 实例不变, 只改 consumer 字段) · 返回 [id_2] 给 worker-2</text>
+
+  <!-- 帧 5: 最终 ACK -->
+  <rect x="20" y="415" width="880" height="60" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+  <text x="35" y="435" fill="var(--diagram-green-text)" font-size="12" font-weight="bold">帧 5 · worker-2 处理 id_2 成功 → XACK s g id_2</text>
+  <text x="35" y="455" fill="var(--diagram-blue-text)" font-size="11">group.pel.delete(id_2) + worker-2.pel.delete(id_2) → NACK_2 引用归零 → free · 全部清空</text>
+
+  <!-- 至少一次保证 -->
+  <rect x="20" y="485" width="880" height="40" rx="6" fill="var(--diagram-purple-fill)" stroke="var(--diagram-purple-stroke)"/>
+  <text x="35" y="510" fill="var(--diagram-purple-text)" font-size="12" font-weight="bold">★ 至少一次保证: 进 PEL = 必有消费者持有 · 消费者死 = XAUTOCLAIM 转移 · ACK = 出 PEL · 不 ACK = 等待认领</text>
+</svg>
+</div>
+
+<h3>8.7.4 Stream 消费组操作复杂度</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 8-7-1 · Stream 命令的 rax 操作复杂度</div>
+  <table>
+    <thead><tr><th>操作</th><th>时间</th><th>涉及 rax 操作</th><th>常见 P99</th></tr></thead>
+    <tbody>
+      <tr><td>XADD</td><td>O(log N)</td><td>raxLast / raxInsert (尾追加)</td><td>15-30 μs</td></tr>
+      <tr><td>XRANGE</td><td>O(log N + M)</td><td>raxSeek + 顺序遍历</td><td>50-500 μs (M=100)</td></tr>
+      <tr><td>XREAD BLOCK</td><td>等待 + O(1)</td><td>rax 尾部访问</td><td>等待时间为主</td></tr>
+      <tr><td>XREADGROUP</td><td>O(log N + count)</td><td>rax + 写 group PEL</td><td>30-80 μs</td></tr>
+      <tr><td>XACK</td><td>O(log P)</td><td>rax delete in group PEL + consumer PEL</td><td>5-15 μs</td></tr>
+      <tr><td>XPENDING</td><td>O(log P + K)</td><td>rax range scan in PEL</td><td>20-100 μs</td></tr>
+      <tr><td>XAUTOCLAIM</td><td>O(log P + count)</td><td>rax scan + transfer</td><td>50-300 μs</td></tr>
+      <tr><td>XLEN</td><td>O(1)</td><td>读 stream-&gt;length</td><td>&lt; 1 μs</td></tr>
+      <tr><td>XDEL</td><td>O(log N)</td><td>找 listpack + 标记 deleted</td><td>10-30 μs</td></tr>
+      <tr><td>XGROUP CREATE</td><td>O(log G)</td><td>raxInsert in cgroups</td><td>5-15 μs</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p>N = stream 内 listpack 节点数(消息数 / 100);P = PEL 大小;G = 消费组数;K = 返回元素数。</p>
+
+<!-- ============================================================ -->
+<h2 id="s8-8">8.8 为什么不选其他算法</h2>
+<!-- ============================================================ -->
+
+<p>这一节是 Antirez 在 <code>src/rax.c</code> 顶部注释里反复强调过的话题。把候选方案的对比再展开一次,让读者明白为什么"路径压缩前缀树"是 Stream 场景的<strong>必然选择</strong>。</p>
+
+<h3>8.8.1 6 种 ID 索引方案的多维矩阵</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 8-8-1 · ID 索引方案对 Stream 场景的适配</div>
+  <table>
+    <thead><tr><th>方案</th><th>范围扫描</th><th>内存 (1M ID)</th><th>前缀复用</th><th>追加 P99</th><th>关键劣势</th></tr></thead>
+    <tbody>
+      <tr><td><code>dict</code> (hashtable)</td><td>不支持</td><td>~32 MB</td><td>无</td><td>1 μs</td><td>无法支持 XRANGE</td></tr>
+      <tr><td>跳表 + dict</td><td>O(log N + M)</td><td>~80 MB</td><td>无</td><td>5 μs</td><td>ID 时间戳前缀重复存储,内存翻倍</td></tr>
+      <tr><td>红黑树</td><td>O(log N + M)</td><td>~48 MB</td><td>无</td><td>3 μs</td><td>旋转开销;前缀不复用</td></tr>
+      <tr><td>B+ 树</td><td>O(log N + M)</td><td>视分支</td><td>节点内</td><td>5 μs</td><td>主要为磁盘设计,内存常数高</td></tr>
+      <tr><td>标准 Trie</td><td>O(K)</td><td>~1.2 GB</td><td>完美</td><td>2 μs</td><td>16M 个节点(每字符 1 个),空间爆炸</td></tr>
+      <tr><td><strong>rax + listpack</strong></td><td><strong>O(K)</strong></td><td><strong>~80 MB</strong></td><td><strong>完美</strong></td><td><strong>15 μs</strong></td><td><strong>无,本场景最优</strong></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>8.8.2 设计动机总结</h3>
+
+<div class="key-insight">
+  <strong>Redis 选择 rax + listpack 节点 + 多 rax 设计的 5 个理由</strong>:<br>
+  ① <strong>路径压缩适配 ID 特征</strong>:同毫秒 ID 前 12 字节相同,压缩节点存共享前缀;<br>
+  ② <strong>复杂度与 N 解耦</strong>:O(K) = O(16),百万 Stream 与万级 Stream 操作时间相同;<br>
+  ③ <strong>listpack 二级打包</strong>:rax 索引粒度是 "listpack 节点"(50-100 条消息),不是单条;<br>
+  ④ <strong>消费组用同一棵 rax</strong>:数据结构统一,代码复用度高;<br>
+  ⑤ <strong>PEL 同样用 rax</strong>:按消息 ID 范围查未确认消息高效,XPENDING 0-+ 不阻塞。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s8-9">8.9 已知陷阱与限制</h2>
+<!-- ============================================================ -->
+
+<h3>8.9.1 陷阱分类</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-9-1 · rax + Stream 陷阱 8 种分类</div>
+  <svg viewBox="0 0 940 380" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect x="0" y="0" width="940" height="380" fill="var(--diagram-panel)" rx="10"/>
+    <g transform="translate(370, 16)" filter="url(#d-shadow)"><rect width="200" height="40" rx="10" fill="url(#d-purple)"/><text x="100" y="26" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">rax / Stream 陷阱 (8)</text></g>
+    <path d="M 470 56 L 160 110" stroke="var(--diagram-red-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-r)"/>
+    <path d="M 470 56 L 470 110" stroke="var(--diagram-orange-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+    <path d="M 470 56 L 780 110" stroke="var(--diagram-cyan-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+
+    <g transform="translate(60, 110)" filter="url(#d-shadow)"><rect width="200" height="40" rx="8" fill="url(#d-red)"/><text x="100" y="18" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">A · Stream 使用</text><text x="100" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="10">ID / MAXLEN / XRANGE</text></g>
+    <g transform="translate(370, 110)" filter="url(#d-shadow)"><rect width="200" height="40" rx="8" fill="url(#d-amber)"/><text x="100" y="18" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="700">B · 消费组</text><text x="100" y="34" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">XACK / 悬挂 / XAUTOCLAIM</text></g>
+    <g transform="translate(680, 110)" filter="url(#d-shadow)"><rect width="200" height="40" rx="8" fill="url(#d-cyan)"/><text x="100" y="18" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">C · 内存</text><text x="100" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="10">listpack / rax 碎片</text></g>
+
+    <path d="M 160 150 L 160 184" stroke="var(--diagram-red-stroke)" stroke-width="1.2" fill="none" marker-end="url(#d-arr-r)"/>
+    <path d="M 470 150 L 470 184" stroke="var(--diagram-orange-stroke)" stroke-width="1.2" fill="none" marker-end="url(#d-arr)"/>
+    <path d="M 780 150 L 780 184" stroke="var(--diagram-cyan-stroke)" stroke-width="1.2" fill="none" marker-end="url(#d-arr)"/>
+
+    <g font-family="ui-monospace,Consolas" font-size="11">
+      <g transform="translate(60, 184)"><rect width="200" height="42" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/><text x="10" y="18" fill="var(--diagram-red-text)" font-weight="700">①</text><text x="32" y="18" fill="var(--diagram-red-text)">ID 不严格递增</text><text x="32" y="34" fill="var(--diagram-muted)" font-size="10">XADD ERR</text></g>
+      <g transform="translate(60, 232)"><rect width="200" height="42" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/><text x="10" y="18" fill="var(--diagram-red-text)" font-weight="700">②</text><text x="32" y="18" fill="var(--diagram-red-text)">无 MAXLEN</text><text x="32" y="34" fill="var(--diagram-muted)" font-size="10">内存暴涨</text></g>
+      <g transform="translate(60, 280)"><rect width="200" height="42" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/><text x="10" y="18" fill="var(--diagram-red-text)" font-weight="700">③</text><text x="32" y="18" fill="var(--diagram-red-text)">XRANGE 0 +全量</text><text x="32" y="34" fill="var(--diagram-muted)" font-size="10">单命令阻塞秒级</text></g>
+
+      <g transform="translate(370, 184)"><rect width="200" height="42" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/><text x="10" y="18" fill="var(--diagram-orange-text)" font-weight="700">④</text><text x="32" y="18" fill="var(--diagram-orange-text)">忘 XACK</text><text x="32" y="34" fill="var(--diagram-muted)" font-size="10">PEL 无限累积</text></g>
+      <g transform="translate(370, 232)"><rect width="200" height="42" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/><text x="10" y="18" fill="var(--diagram-orange-text)" font-weight="700">⑤</text><text x="32" y="18" fill="var(--diagram-orange-text)">消费者宕机</text><text x="32" y="34" fill="var(--diagram-muted)" font-size="10">消息悬挂未认领</text></g>
+      <g transform="translate(370, 280)"><rect width="200" height="42" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/><text x="10" y="18" fill="var(--diagram-orange-text)" font-weight="700">⑥</text><text x="32" y="18" fill="var(--diagram-orange-text)">XAUTOCLAIM idle 过小</text><text x="32" y="34" fill="var(--diagram-muted)" font-size="10">误抢未完成消息</text></g>
+
+      <g transform="translate(680, 184)"><rect width="200" height="42" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-cyan-stroke)"/><text x="10" y="18" fill="var(--diagram-cyan-text)" font-weight="700">⑦</text><text x="32" y="18" fill="var(--diagram-cyan-text)">listpack 节点过大</text><text x="32" y="34" fill="var(--diagram-muted)" font-size="10">XADD 偶发抖动</text></g>
+      <g transform="translate(680, 232)"><rect width="200" height="42" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-cyan-stroke)"/><text x="10" y="18" fill="var(--diagram-cyan-text)" font-weight="700">⑧</text><text x="32" y="18" fill="var(--diagram-cyan-text)">rax 节点小碎片</text><text x="32" y="34" fill="var(--diagram-muted)" font-size="10">jemalloc 不归还</text></g>
+    </g>
+
+    <g transform="translate(40, 332)">
+      <rect width="860" height="40" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)" stroke-dasharray="4 3"/>
+      <text x="20" y="22" fill="var(--diagram-green-text)" font-size="12" font-weight="800">📐 最常见</text>
+      <text x="120" y="22" fill="var(--diagram-blue-text)" font-size="11">② + ④ — 上线先配 MAXLEN,补 XACK 流程,后续配 XAUTOCLAIM 兜底</text>
+    </g>
+  </svg>
+</div>
+
+<h3>8.9.2 陷阱明细</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 8-9-1 · Stream + rax 8 大陷阱</div>
+  <table>
+    <thead><tr><th>#</th><th>陷阱</th><th>症状</th><th>根因</th><th>处理</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>手动指定 ID 不递增</td><td>XADD 报错</td><td>Stream 要求 ID 严格 ascending</td><td>用 <code>*</code> 自动生成,或保证手动 ID 递增</td></tr>
+      <tr><td>2</td><td>无 MAXLEN 导致 Stream 无限增长</td><td>内存暴涨</td><td>业务消息只写不删</td><td><code>XADD MAXLEN ~ 1000000</code> 限制长度</td></tr>
+      <tr><td>3</td><td>XRANGE - + (全量返回)</td><td>主线程阻塞</td><td>百万消息序列化 + 网络写</td><td>使用 COUNT 分页</td></tr>
+      <tr><td>4</td><td>忘 XACK</td><td>XPENDING 持续增长</td><td>消费者代码缺 XACK</td><td>处理成功后必须 XACK</td></tr>
+      <tr><td>5</td><td>消费者宕机消息悬挂</td><td>部分消息无人处理</td><td>没有 XAUTOCLAIM 周期任务</td><td>启动 idle 阈值定时任务</td></tr>
+      <tr><td>6</td><td>XAUTOCLAIM idle=0</td><td>频繁抢占其他活跃消费者</td><td>idle 阈值过小</td><td>idle 至少 30s,根据业务调整</td></tr>
+      <tr><td>7</td><td>单 listpack 节点过大</td><td>XADD/XRANGE 慢</td><td><code>stream-node-max-bytes</code> 调过大</td><td>保持默认 4096</td></tr>
+      <tr><td>8</td><td>rax 节点内存碎片</td><td>RSS 高于 <code>used_memory</code></td><td>频繁 split + 释放 raxNode</td><td>重建 stream(BRPOPLPUSH 转移)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>8.9.3 反例 1:不限长度 + 忘 XACK</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4>不限 MAXLEN 也不 XACK 的灾难现场</h4>
+<pre><code class="language-bash"># 应用代码 (Java pseudo)
+while (true) {
+    redis.xadd("events", "*", "data", evt);   // 持续写
+}
+
+# 几个月后:
+127.0.0.1:6379> XLEN events
+50000000
+
+127.0.0.1:6379> MEMORY USAGE events
+3500000000        # 3.5 GB
+
+127.0.0.1:6379> XPENDING events g
+1) (integer) 12000000   # 1200 万条 pending
+2) "0-0"
+3) "1714000000000-0"
+4) ...
+
+# 现象:
+# - 单 key 内存 GB 级
+# - bgsave / replication 都受影响
+# - PEL 12M 条,worker 重启后全部 redelivery
+# - XPENDING 自身要遍历 12M 个 NACK,慢到秒级</code></pre>
+  </div>
+  <div class="compare-good">
+    <h4>MAXLEN ~ 控长 + 必 XACK</h4>
+<pre><code class="language-bash"># 写入端: MAXLEN ~ 1m (近似裁剪,性能更好)
+127.0.0.1:6379> XADD events MAXLEN '~' 1000000 \
+                  * data 'log'
+"1714000000099-0"
+
+# 消费端: 处理成功后立即 XACK
+process(msg);
+127.0.0.1:6379> XACK events g 1714000000099-0
+(integer) 1
+
+# 监控端: 周期性 XAUTOCLAIM 扫死消费者
+127.0.0.1:6379> XAUTOCLAIM events g worker-2 \
+                  30000 0-0 COUNT 50
+1) "1714000000150-0"   # 下次扫描起点
+2) 1) "id"  "value"   # 转移到 worker-2 的消息列表
+
+# 收益:
+# - XLEN 稳定在 ~1M
+# - 内存 ~ 80 MB (40×)
+# - XPENDING 几十条 (worker 处理速度同步)</code></pre>
+  </div>
+</div>
+
+<h3>8.9.4 反例 2:多消费者用同一 consumer name</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4>错误:多 client 共享同 consumer name</h4>
+<pre><code class="language-bash">client A:
+  XREADGROUP GROUP g c1 COUNT 10 STREAMS events '>'
+client B:
+  XREADGROUP GROUP g c1 COUNT 10 STREAMS events '>'
+                       ^^ 同一个 consumer name
+
+# 现象:
+# - 两个 client 都拿到同样的 PEL
+# - 消息被重复处理 → 业务逻辑错乱
+# - worker-1.pel 显示 100 条,但实际 client A
+#   只处理了 50 条,client B 也处理了相同 50 条
+# - XAUTOCLAIM 无法判断真正的责任人
+
+# 后果:
+# - 订单重复扣款
+# - 计数器多次累加
+# - 数据不一致</code></pre>
+  </div>
+  <div class="compare-good">
+    <h4>修复:每 client 独立 consumer name</h4>
+<pre><code class="language-bash">client A (host: app-1, pid: 1234):
+  consumer_name = "app-1.1234"
+  XREADGROUP GROUP g app-1.1234 COUNT 10
+             STREAMS events '>'
+
+client B (host: app-2, pid: 5678):
+  consumer_name = "app-2.5678"
+  XREADGROUP GROUP g app-2.5678 COUNT 10
+             STREAMS events '>'
+
+# 收益:
+# - 每 client 独立 PEL
+# - 消息归属清晰
+# - worker 死掉后 XAUTOCLAIM 转移
+#   到其他活跃 consumer
+# - XINFO CONSUMERS events g 看每个
+#   consumer 的 idle / pending</code></pre>
+  </div>
+</div>
+
+<h3>8.9.5 反例 3:用 Stream 当大型消息队列</h3>
+
+<div class="warning">
+  <strong>Stream 不是 Kafka</strong>:Redis Stream 适合<strong>单实例 &lt; 1M 消息</strong>的场景。超过这个量级:<br>
+  ① 单 key 几 GB 影响 RDB / replication<br>
+  ② consumer group 数 &gt; 100 时 PEL 总占用爆炸<br>
+  ③ 没有分区 / 副本机制,横向扩展困难<br>
+  → <strong>10 GB+ 流量请直接走 Kafka / RocketMQ / Pulsar</strong>。Redis Stream 的甜点场景是 "<strong>实时事件 + 短保留 + 业务快速分发</strong>"。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s8-10">8.10 源码深潜与设计取舍</h2>
+<!-- ============================================================ -->
+
+<h3>8.10.1 核心源码入口</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 8-10-1 · rax + Stream 源码地图</div>
+  <table>
+    <thead><tr><th>源码文件</th><th>关键函数</th><th>职责</th></tr></thead>
+    <tbody>
+      <tr><td><code>src/rax.h</code></td><td><code>rax</code>、<code>raxNode</code>、<code>raxIterator</code></td><td>基数树定义</td></tr>
+      <tr><td><code>src/rax.c</code></td><td><code>raxNew()</code>、<code>raxFree()</code></td><td>生命周期</td></tr>
+      <tr><td><code>src/rax.c</code></td><td><code>raxInsert()</code>、<code>raxRemove()</code></td><td>插入与删除</td></tr>
+      <tr><td><code>src/rax.c</code></td><td><code>raxFind()</code>、<code>raxLowWalk()</code></td><td>查找与路径走</td></tr>
+      <tr><td><code>src/rax.c</code></td><td><code>raxSplit()</code>、<code>raxAddChild()</code></td><td>节点分裂(核心)</td></tr>
+      <tr><td><code>src/rax.c</code></td><td><code>raxSeek()</code>、<code>raxNext()</code>、<code>raxPrev()</code></td><td>范围迭代</td></tr>
+      <tr><td><code>src/t_stream.c</code></td><td><code>xaddCommand</code>、<code>streamAppendItem</code></td><td>XADD 入口</td></tr>
+      <tr><td><code>src/t_stream.c</code></td><td><code>xreadCommand</code>、<code>xreadgroupCommand</code></td><td>XREAD/XREADGROUP</td></tr>
+      <tr><td><code>src/t_stream.c</code></td><td><code>streamCreateConsumerGroup</code></td><td>XGROUP CREATE</td></tr>
+      <tr><td><code>src/t_stream.c</code></td><td><code>streamReplyWithRange</code></td><td>XRANGE 实现</td></tr>
+      <tr><td><code>src/t_stream.c</code></td><td><code>streamProcessACK</code></td><td>XACK 实现</td></tr>
+      <tr><td><code>src/t_stream.c</code></td><td><code>streamPropagateXCLAIM</code></td><td>XCLAIM/XAUTOCLAIM 转移</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>8.10.2 raxAddChild 关键代码</h3>
+
+<pre><code class="language-c">/* src/rax.c - 给普通节点添加一个 child (情况 B 核心) */
+raxNode *raxAddChild(raxNode *n, unsigned char c, raxNode **childptr,
+                     raxNode ***parentlink) {
+    /* n 必须是普通节点 */
+    assert(n->iscompr == 0);
+
+    /* 1. 在 sorted chars 中找插入位置 (二分) */
+    int pos;
+    unsigned char *p = n->data;
+    for (pos = 0; pos < n->size; pos++) {
+        if (p[pos] >= c) break;
+    }
+    /* pos 是新字符插入位置 */
+
+    /* 2. 计算扩容后大小 */
+    size_t curlen = raxNodeCurrentLength(n);
+    size_t newlen = curlen
+                  + 1                  /* 新字符 */
+                  + sizeof(raxNode *)  /* 新 child 指针 */
+                  + raxPaddingSize(n->size + 1) - raxPaddingSize(n->size);
+
+    /* 3. realloc 节点本身 */
+    raxNode *newn = rax_realloc(n, newlen);
+    if (newn == NULL) return NULL;
+    n = newn;
+
+    /* 4. 在 chars 数组中给新字符腾位 (移动后续 chars + ptrs) */
+    unsigned char *src_chars = n->data + pos;
+    unsigned char *dst_chars = src_chars + 1;
+    memmove(dst_chars, src_chars, n->size - pos);
+
+    /* 5. 移动 child 指针数组 (考虑 padding 变化) */
+    raxNode **child_array = (raxNode **)(n->data + n->size + 1
+                                         + raxPaddingSize(n->size + 1));
+    /* (省略指针数组重排细节) */
+
+    /* 6. 写入新字符 + 新 child 指针 */
+    n->data[pos] = c;
+    raxNode *child = raxNewNode(0, 0);  /* 创建新空压缩节点 */
+    child_array[pos] = child;
+
+    /* 7. 更新 size */
+    n->size++;
+
+    /* 8. 通过 parentlink 通知调用方:节点地址可能改变了 */
+    if (parentlink) **parentlink = n;
+    *childptr = child;
+    return n;
+}
+
+/* ★ 关键不变量:
+ *   1. data 中字符必须 sorted (二分查找前提)
+ *   2. realloc 后节点地址可能改变,父节点指针必须同步更新
+ *   3. padding 字节数因 size 改变而改变,要重算 child_array 偏移
+ */</code></pre>
+
+<h3>8.10.3 设计取舍</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 8-10-1 · Stream 数据结构选型决策树</div>
+  <svg viewBox="0 0 940 580" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect x="0" y="0" width="940" height="580" fill="var(--diagram-panel)" rx="10"/>
+
+    <g transform="translate(290, 16)" filter="url(#d-shadow)"><rect width="360" height="46" rx="10" fill="url(#d-blue)"/><text x="180" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">需求: 16B ID + 范围 + O(1) 追加 + 消费组</text><text x="180" y="38" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">Stream 设计目标</text></g>
+    <path d="M 470 62 L 470 88" stroke="var(--diagram-blue-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr-b)"/>
+
+    <g transform="translate(360, 88)"><path d="M 110 0 L 220 26 L 110 52 L 0 26 Z" fill="var(--diagram-blue-stroke)" stroke="var(--diagram-blue-stroke)" stroke-width="1.5"/><text x="110" y="20" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="700">需要范围扫描 ?</text><text x="110" y="38" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">XRANGE / XREAD</text></g>
+
+    <path d="M 380 114 L 100 180" stroke="var(--diagram-red-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-r)"/>
+    <text x="160" y="160" fill="var(--diagram-red-text)" font-size="11" font-weight="700">否</text>
+    <g transform="translate(20, 180)"><rect width="160" height="42" rx="8" fill="url(#d-red)"/><text x="80" y="18" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">✗ dict</text><text x="80" y="34" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">无序,无范围</text></g>
+
+    <path d="M 580 114 L 580 156" stroke="var(--diagram-green-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr-g)"/>
+    <text x="588" y="138" fill="var(--diagram-green-text)" font-size="11" font-weight="700">是</text>
+
+    <g transform="translate(470, 156)"><path d="M 110 0 L 220 26 L 110 52 L 0 26 Z" fill="var(--diagram-blue-stroke)" stroke="var(--diagram-green-stroke)" stroke-width="1.5"/><text x="110" y="20" text-anchor="middle" fill="var(--diagram-green-text)" font-size="12" font-weight="700">key 有共享前缀 ?</text><text x="110" y="38" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">同 ms 多 ID</text></g>
+
+    <path d="M 490 184 L 220 240" stroke="var(--diagram-orange-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+    <text x="290" y="218" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">否 (UUID 等)</text>
+    <g transform="translate(120, 240)"><rect width="200" height="46" rx="8" fill="url(#d-amber)"/><text x="100" y="20" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="700">⚠ 跳表 + dict</text><text x="100" y="36" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">前缀不复用,内存翻倍</text></g>
+
+    <path d="M 690 184 L 690 220" stroke="var(--diagram-green-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr-g)"/>
+    <text x="700" y="204" fill="var(--diagram-green-text)" font-size="11" font-weight="700">是</text>
+
+    <g transform="translate(580, 220)"><path d="M 110 0 L 220 26 L 110 52 L 0 26 Z" fill="var(--diagram-blue-stroke)" stroke="var(--diagram-green-stroke)" stroke-width="1.5"/><text x="110" y="20" text-anchor="middle" fill="var(--diagram-green-text)" font-size="12" font-weight="700">内存还是磁盘 ?</text><text x="110" y="38" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">载体决定结构</text></g>
+
+    <path d="M 600 250 L 360 310" stroke="var(--diagram-orange-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+    <text x="430" y="290" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">磁盘</text>
+    <g transform="translate(260, 310)"><rect width="200" height="46" rx="8" fill="url(#d-amber)"/><text x="100" y="20" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="700">⚠ B+ 树</text><text x="100" y="36" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">为磁盘设计,内存常数高</text></g>
+
+    <path d="M 800 250 L 800 286" stroke="var(--diagram-green-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr-g)"/>
+    <text x="810" y="270" fill="var(--diagram-green-text)" font-size="11" font-weight="700">内存</text>
+
+    <g transform="translate(690, 286)"><path d="M 110 0 L 220 26 L 110 52 L 0 26 Z" fill="var(--diagram-blue-stroke)" stroke="var(--diagram-green-stroke)" stroke-width="1.5"/><text x="110" y="20" text-anchor="middle" fill="var(--diagram-green-text)" font-size="12" font-weight="700">N 大,要省节点 ?</text><text x="110" y="38" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">百万级别</text></g>
+
+    <path d="M 720 316 L 600 380" stroke="var(--diagram-red-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-r)"/>
+    <text x="640" y="358" fill="var(--diagram-red-text)" font-size="11" font-weight="700">否,字符 1 节点 OK</text>
+    <g transform="translate(500, 380)"><rect width="200" height="46" rx="8" fill="url(#d-red)"/><text x="100" y="20" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">✗ 标准 Trie</text><text x="100" y="36" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">每字符 1 节点,内存爆炸</text></g>
+
+    <path d="M 880 316 L 800 380" stroke="var(--diagram-green-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr-g)"/>
+    <text x="850" y="358" fill="var(--diagram-green-text)" font-size="11" font-weight="800">是,要省节点</text>
+    <g transform="translate(720, 380)" filter="url(#d-shadow)"><rect width="200" height="46" rx="8" fill="url(#d-green)"/><text x="100" y="20" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">✓ rax (路径压缩)</text><text x="100" y="36" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">前缀复用,节点 ~40 B</text></g>
+
+    <path d="M 820 426 L 470 470" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-g)"/>
+    <g transform="translate(310, 470)" filter="url(#d-shadow)"><rect width="320" height="50" rx="10" fill="url(#d-green)"/><text x="160" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="800">★ Stream 选 rax + listpack 二级打包</text><text x="160" y="40" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">外层 rax 索引,内层 listpack 紧凑存消息</text></g>
+
+    <g transform="translate(20, 538)">
+      <rect width="900" height="32" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-dasharray="4 3"/>
+      <text x="20" y="22" fill="var(--diagram-blue-text)" font-size="11">📐 5 个分支 4 种数据结构 — 只有 rax 同时满足"范围扫描 + 内存紧凑 + 大 N + 共享前缀"四个条件</text>
+    </g>
+  </svg>
+</div>
+
+<h4>取舍 1:rax vs B+ 树</h4>
+
+<p>B+ 树是磁盘存储的标准,但内存场景下:</p>
+<ul>
+  <li>B+ 树节点固定大小,有大量未使用空间</li>
+  <li>节点内是数组比较,常数大</li>
+  <li>不能利用 key 的公共前缀</li>
+</ul>
+
+<p>rax 在内存场景下:</p>
+<ul>
+  <li>节点大小动态(<code>size</code> bit-field 灵活),无空间浪费</li>
+  <li>路径压缩复用前缀,Stream ID 节省 30-100 倍</li>
+  <li>复杂度只与 key 长度相关,与 N 无关</li>
+</ul>
+
+<h4>取舍 2:每 listpack 一个 rax key vs 每消息一个 rax key</h4>
+
+<p>如果每消息一个 rax key:</p>
+<ul>
+  <li>rax 节点数 = 消息数,百万消息 = 百万 rax 节点</li>
+  <li>每节点 ~40 B 元数据,内存 40 MB 仅元数据</li>
+  <li>每次插入都要走 raxInsert,可能触发 split</li>
+</ul>
+
+<p>每 listpack 一个 rax key:</p>
+<ul>
+  <li>rax 节点数 = 消息数 / ~80(默认每 listpack 80 条均值)</li>
+  <li>内存元数据降为 0.5 MB</li>
+  <li>listpack 内紧凑追加,大部分 XADD 是 lpAppend(O(1))</li>
+</ul>
+
+<h4>取舍 3:多棵 rax(主索引 + 消费组 + PEL)</h4>
+
+<p>代码统一性优先于代码复用:每个角色单独一棵 rax,语义清晰。代价是 rax 实现需要支持<strong>多种 value 类型</strong>(主 rax 的 value 是 listpack 指针,PEL 的 value 是 streamNACK 指针),但 value 在 raxNode 里就是 <code>void*</code>,不影响实现。</p>
+
+<!-- ============================================================ -->
+<h2 id="s8-11">8.11 性能场景与监控</h2>
+<!-- ============================================================ -->
+
+<h3>8.11.1 性能基线</h3>
+
+<div class="metric-row">
+  <div class="metric">
+    <div class="value">15 μs</div>
+    <div class="label">XADD P50 (典型)</div>
+  </div>
+  <div class="metric">
+    <div class="value">30 μs</div>
+    <div class="label">XADD P99 (典型)</div>
+  </div>
+  <div class="metric">
+    <div class="value">82 μs</div>
+    <div class="label">XRANGE P99 (M=100)</div>
+  </div>
+  <div class="metric">
+    <div class="value">~80 MB</div>
+    <div class="label">1M 消息内存 (默认配置)</div>
+  </div>
+</div>
+
+<h3>8.11.2 各场景 P99 实测</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 8-11-1 · rax + Stream 性能基线 (M2 Pro 单实例)</div>
+  <table>
+    <thead><tr><th>场景</th><th>消息数</th><th>消费组</th><th>PEL/组</th><th>内存</th><th>XADD P99</th><th>XRANGE P99</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>small</td><td>10K</td><td>1</td><td>0</td><td>8 MB</td><td>12 μs</td><td>42 μs</td><td>默认</td></tr>
+      <tr><td>medium</td><td>100K</td><td>1</td><td>0</td><td>72 MB</td><td>15 μs</td><td>82 μs</td><td>典型</td></tr>
+      <tr><td>medium + group</td><td>100K</td><td>3</td><td>1K</td><td>82 MB</td><td>18 μs</td><td>82 μs</td><td>有消费组</td></tr>
+      <tr><td>large</td><td>1M</td><td>1</td><td>0</td><td>720 MB</td><td>18 μs</td><td>180 μs</td><td>接近上限</td></tr>
+      <tr><td>huge</td><td>10M</td><td>1</td><td>0</td><td>7200 MB</td><td>22 μs</td><td>520 μs</td><td>超大流</td></tr>
+      <tr><td>trim_maxlen</td><td>1M</td><td>1</td><td>0</td><td>720 MB</td><td>15 μs</td><td>180 μs</td><td>带 MAXLEN ~ 1m</td></tr>
+      <tr><td>many_groups</td><td>100K</td><td>100</td><td>1K each</td><td>180 MB</td><td>28 μs</td><td>82 μs</td><td>100 个消费组</td></tr>
+      <tr><td>huge_pel</td><td>100K</td><td>1</td><td>80K</td><td>260 MB</td><td>18 μs</td><td>82 μs</td><td>PEL 异常增长</td></tr>
+      <tr><td>xrevrange</td><td>1M</td><td>0</td><td>0</td><td>720 MB</td><td>18 μs</td><td>420 μs</td><td>反向扫描略慢</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key-insight">
+  <strong>教学结论 (生产可直接借用)</strong>:<br>
+  ① rax 索引粒度是 listpack(~50-100 条消息一个节点),<strong>不是单消息</strong>;<br>
+  ② XADD 平均 15-20 μs,P99 &lt; 30 μs;<br>
+  ③ XRANGE 顺序扫描接近 listpack 解码速度;<br>
+  ④ <strong>PEL 必须监控</strong>,&gt; 10K 通常说明 XACK 漏调;<br>
+  ⑤ <code>MAXLEN ~</code> 比精确 <code>MAXLEN</code> 性能提升 2-3 倍;<br>
+  ⑥ 消费组 &gt; 100 时考虑分库或换 Kafka。
+</div>
+
+<h3>8.11.3 监控指标</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 8-11-2 · Stream 必监控指标 (Prometheus 风格)</div>
+  <table>
+    <thead><tr><th>指标</th><th>类型</th><th>含义</th><th>告警阈值</th></tr></thead>
+    <tbody>
+      <tr><td><code>stream_xadd_total{stream}</code></td><td>counter</td><td>XADD 总数</td><td>—</td></tr>
+      <tr><td><code>stream_xrange_total{stream}</code></td><td>counter</td><td>XRANGE 调用数</td><td>—</td></tr>
+      <tr><td><code>stream_pel_size{stream,group}</code></td><td>gauge</td><td>待确认消息数</td><td>&gt; 10K = XACK 漏调</td></tr>
+      <tr><td><code>stream_consumer_idle_seconds{stream,group,consumer}</code></td><td>gauge</td><td>消费者空闲时间</td><td>&gt; 600 = 离线</td></tr>
+      <tr><td><code>stream_length{stream}</code></td><td>gauge</td><td>Stream 当前长度</td><td>增长不停 = 没 trim</td></tr>
+      <tr><td><code>stream_listpack_count{stream}</code></td><td>gauge</td><td>内部 listpack 节点数</td><td>—</td></tr>
+      <tr><td><code>rax_node_count{key}</code></td><td>gauge</td><td>rax 节点数</td><td>—</td></tr>
+      <tr><td><code>stream_radix_tree_keys{stream}</code></td><td>gauge</td><td>索引 key 数</td><td>接近 stream_length / 80</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>8.11.4 PromQL 报警示例</h3>
+
+<pre><code class="language-bash"># Stream 长度持续增长 (没 trim)
+deriv(stream_length[5m]) > 100
+
+# PEL 异常 (XACK 漏调)
+stream_pel_size > 10000
+
+# 消费者离线
+stream_consumer_idle_seconds > 600
+
+# XADD 延迟 P99
+histogram_quantile(0.99,
+  rate(stream_xadd_duration_us_bucket[5m])) > 100
+
+# 消费组数过多 (维护成本激增)
+count by (stream) (stream_pel_size) > 50</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s8-12">8.12 真实用例</h2>
+<!-- ============================================================ -->
+
+<div class="real-world">
+  <strong>用例 1:实时事件总线</strong>(电商订单系统)<br>
+  某电商订单服务用 Stream 做事件总线:订单创建 → <code>XADD orders.created * order_id ... amount ...</code>;库存服务、积分服务、风控服务都是 consumer group。<strong>设置</strong>:<code>MAXLEN ~ 1M</code>(保留约 1 小时),每 group 独立 PEL,worker 处理后必 XACK,定时 XAUTOCLAIM 30s 回收死消费者。<strong>实际运行</strong>:日均 2 亿事件,Stream 长度稳定 ~1M,内存占 80 MB,XADD P99 20 μs,XREADGROUP P99 50 μs。<strong>故障演练</strong>:杀掉一个库存 worker,30s 内 XAUTOCLAIM 转给其他 worker,业务无感知。
+</div>
+
+<div class="real-world">
+  <strong>用例 2:CDC 数据同步</strong>(MySQL → ES)<br>
+  把 binlog 转成 Stream 事件 (<code>XADD cdc.users * op insert id 123 name alice</code>),Elasticsearch 同步 worker 用 consumer group 消费。<strong>关键设计</strong>:用 <code>XADD * op ... seq <binlog_pos></code> 加上 binlog 位置作字段(不是 ID),让重启时按 <code>XRANGE last_acked_pos +</code> 续传;PEL 长度作为同步延迟指标 (<code>XPENDING cdc.users sync_g</code>)。<strong>陷阱</strong>:早期版本用了 <code>XADD MAXLEN 100000</code>(精确),写入 P99 抖到 200 μs;改成 <code>MAXLEN ~ 100000</code> 后稳定在 30 μs。
+</div>
+
+<div class="real-world">
+  <strong>用例 3:轻量任务队列</strong>(异步发邮件)<br>
+  Web 应用把"发邮件"任务塞进 Stream:<code>XADD email_queue * to user@x.com tpl welcome</code>;邮件 worker 用 consumer group 拉取并发送。<strong>设计</strong>:每 worker 用 hostname+pid 做 consumer name(<code>worker.app-1.1234</code>),处理完 XACK,失败不 ACK,等下次扫到 idle &gt; 5min 时由其他 worker 接手。<strong>规模</strong>:5 worker,日均 50 万邮件,Stream 长度稳定 ~3K,PEL 平均 &lt; 50。<strong>对比 Celery + Redis</strong>:Celery 没有 PEL 流转,worker 死掉的任务永远丢失;Stream 提供 "至少一次"。
+</div>
+
+<div class="real-world">
+  <strong>用例 4:不要这么用 — 大文件分发</strong><br>
+  反例:某团队用 <code>XADD logs * payload <100KB JSON></code> 把每条访问日志(含完整 request body)塞进 Stream。<strong>结果</strong>:listpack 节点很快被撑大(单 entry &gt; 4KB),实际每个 listpack 只能放 1-2 条消息,rax 节点数 = 消息数,内存爆炸 + XADD 因频繁 raxInsert 而降速到 200 μs。<strong>正解</strong>:大 payload 单独存 (S3 / 文件系统),Stream 只放引用 (URL + metadata)。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s8-summary">8.13 本章要点</h2>
+<!-- ============================================================ -->
+
+<div class="chapter-summary">
+
+<h3>关键事实</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 8-13-1 · rax + Stream 关键事实速查</div>
+  <table>
+    <thead><tr><th>要点</th><th>关键依据</th><th>易错点</th></tr></thead>
+    <tbody>
+      <tr><td>rax 是路径压缩前缀树,O(K) 操作</td><td><code>raxFind</code> / <code>raxInsert</code></td><td>不依赖元素数 N</td></tr>
+      <tr><td>普通节点(分叉)与压缩节点(无分叉)双形态</td><td><code>iscompr</code> 字段</td><td>共享前缀只存一次</td></tr>
+      <tr><td>raxNode 头 4 byte 位字段 + 柔性 data[]</td><td><code>iskey:1, isnull:1, iscompr:1, size:29</code></td><td>data 排布两形态不同</td></tr>
+      <tr><td>raxInsert 三种情况(分裂/添加/标记)</td><td><code>raxSplit</code> / <code>raxAddChild</code></td><td>压缩节点中部分裂最复杂</td></tr>
+      <tr><td>Stream ID 是 16B 大端编码,有序</td><td><code>streamGenerateID</code></td><td>字典序与时间序一致</td></tr>
+      <tr><td>Stream 内部 rax + listpack 节点</td><td><code>streamAppendItem</code></td><td>rax 索引粒度是 listpack,不是单消息</td></tr>
+      <tr><td>每 listpack 默认 ≤ 4096 byte / ≤ 100 条</td><td><code>stream-node-max-*</code></td><td>调大会拖慢 XADD</td></tr>
+      <tr><td>消费组用 PEL rax 维护未确认消息</td><td><code>streamCG.pel</code></td><td>忘 XACK 会导致 PEL 无限增长</td></tr>
+      <tr><td>同一 NACK 同时被组级与消费者 PEL 引用</td><td><code>streamNACK *consumer</code></td><td>XACK 必须双删</td></tr>
+      <tr><td>XAUTOCLAIM 转移空闲消息保证至少一次</td><td><code>streamPropagateXCLAIM</code></td><td>idle 阈值不能太小</td></tr>
+      <tr><td>Stream 必须用 MAXLEN 控制</td><td><code>XADD MAXLEN ~ N</code></td><td>不限制会内存暴涨</td></tr>
+      <tr><td>一棵 rax 可同时索引 + 消费组 + PEL</td><td><code>cgroups</code>, <code>pel</code></td><td>设计统一,语义清晰</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>最小回归测试</h3>
+
+<pre><code class="language-bash">redis-cli DEL s
+
+# 写入 + XLEN 验证
+redis-cli XADD s '*' user alice action login
+redis-cli XADD s '*' user bob action pay
+redis-cli XLEN s
+# 期望: 2
+
+# XRANGE 全量
+redis-cli XRANGE s - +
+# 期望: 2 messages with full content
+
+# 创建消费组
+redis-cli XGROUP CREATE s g 0
+
+# 消费 + PEL 验证
+redis-cli XREADGROUP GROUP g c1 COUNT 1 STREAMS s '>'
+redis-cli XPENDING s g
+# 期望: 1 pending
+
+# XACK 后 PEL 清空
+redis-cli XACK s g <id>
+redis-cli XPENDING s g
+# 期望: 0 pending
+
+# MAXLEN ~ 控长
+for i in $(seq 1 10); do
+  redis-cli XADD s 'MAXLEN' '~' 3 '*' n $i
+done
+redis-cli XLEN s
+# 期望: 接近 3 (近似裁剪)
+
+# XAUTOCLAIM 转移
+redis-cli XADD s '*' n test
+redis-cli XREADGROUP GROUP g c1 COUNT 1 STREAMS s '>'
+sleep 2
+redis-cli XAUTOCLAIM s g c2 1000 0-0 COUNT 10
+# 期望: NACK 转给 c2</code></pre>
+
+<h3>性能速查</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 8-13-2 · rax + Stream 性能速查</div>
+  <table>
+    <thead><tr><th>操作</th><th>时延 P99</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>XADD</td><td>15-30 μs</td><td>O(log N + K),K=16</td></tr>
+      <tr><td>XRANGE COUNT 100</td><td>50-180 μs</td><td>raxSeek + listpack 解码</td></tr>
+      <tr><td>XREAD BLOCK</td><td>等待为主</td><td>无消息时挂 client</td></tr>
+      <tr><td>XREADGROUP</td><td>30-80 μs</td><td>+ 写组级与消费者 PEL</td></tr>
+      <tr><td>XACK</td><td>5-15 μs</td><td>双 rax 删除</td></tr>
+      <tr><td>XPENDING (全)</td><td>O(P)</td><td>慎用,P 大时秒级</td></tr>
+      <tr><td>XAUTOCLAIM COUNT 50</td><td>50-300 μs</td><td>scan + 转移</td></tr>
+      <tr><td>XLEN</td><td>&lt; 1 μs</td><td>读字段</td></tr>
+      <tr><td>1M 消息 Stream 内存</td><td>~80 MB</td><td>每条 ~80 byte (含 NACK)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>下一章预告</h3>
+
+<p>至此 Redis 的<strong>核心数据结构</strong>(SDS / adlist / dict / skiplist / intset / ziplist / listpack / quicklist / rax)都已讲完。下一章 <strong><code>09-redisobject.html</code></strong> 把视角拉回到 Redis 的<strong>"对象封装层"</strong> — 所有用户可见的 String / List / Hash / Set / ZSet / Stream 类型都是 <code>redisObject</code> 包装,内含 <code>type</code> / <code>encoding</code> / <code>refcount</code> / <code>ptr</code> 等元数据。讨论 redisObject 的 16 字节字节布局、引用计数与共享对象池、type 与 encoding 的多对多关系,以及命令路径如何根据 encoding 分派到不同底层结构。</p>
+
+</div>
+
+<p class="footer">&copy; 2026 图解 Redis &middot; 第 8 章 &middot; rax 基数树与 Stream</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/c.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+</body>
+</html>

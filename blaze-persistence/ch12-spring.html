@@ -1,0 +1,1022 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-book="blaze">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 12 章 · Spring Data 集成 — 图解 Blaze-Persistence</title>
+<link rel="stylesheet" href="books.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="topnav">
+  <a class="brand" href="index.html">📖 图解 Blaze-Persistence</a>
+  <span class="sep">|</span>
+  <a href="ch11-dml.html">← 第 11 章 · 批量 DML</a>
+  <span class="sep">|</span>
+  <a href="ch13-bestpractice.html">第 13 章 · 性能调优 →</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s12-1">12.1 Spring Boot Starter 配置</a>
+  <a href="#s12-2">12.2 EntityViewRepository</a>
+  <a href="#s12-3">12.3 方法名查询派生</a>
+  <a href="#s12-4">12.4 EntityViewSpecification</a>
+  <a href="#s12-5">12.5 分页与排序集成</a>
+  <a href="#s12-6">12.6 事务管理</a>
+  <a href="#s12-7">12.7 测试策略</a>
+  <a href="#s12-8">12.8 陷阱与限制</a>
+</aside>
+
+<article class="article">
+
+<h1>第 12 章 · Spring Data 集成</h1>
+<p class="subtitle">EntityViewRepository · Auto-configuration · Specification · 事务 · 测试</p>
+
+<!-- ===== chapter-intro ===== -->
+<div class="chapter-intro">
+  <p class="lead">
+    Blaze-Persistence 提供了一等公民级别的 Spring Data 集成模块，让你在 Spring Boot 项目中以声明式仓库接口直接操作 Entity View —— 无需手写 <code>CriteriaBuilder</code> 查询即可获得类型安全投影、Keyset 分页和动态过滤。
+  </p>
+  <ul class="will-learn">
+    <li>Spring Boot Starter 自动装配的 Bean 注册流程</li>
+    <li>EntityViewRepository 接口继承体系与 CRUD 语义</li>
+    <li>方法名查询派生机制及其与 CriteriaBuilder 的映射</li>
+    <li>EntityViewSpecification 动态查询模式</li>
+    <li>Keyset 分页与 Spring Data Pageable 的桥接</li>
+    <li>事务管理与可更新视图的协同</li>
+    <li>@DataJpaTest 集成测试配置策略</li>
+  </ul>
+  <p class="prereq">
+    前置知识：<a href="ch02-setup.html">第 2 章 项目搭建</a> ·
+    <a href="ch04-entityview.html">第 4 章 Entity View 基础</a> ·
+    <a href="ch06-updatable.html">第 6 章 可更新视图</a>
+  </p>
+</div>
+
+<!-- ================================================================ -->
+<!-- 12.1 Spring Boot Starter 配置                                    -->
+<!-- ================================================================ -->
+<h2 id="s12-1">12.1 Spring Boot Starter 配置</h2>
+
+<p>Blaze-Persistence 为 Spring Boot 2.x 和 3.x 各提供了独立的集成 Starter，只需一个 Maven/Gradle 依赖即可完成全部 Bean 的自动注册。</p>
+
+<div class="diagram">
+<div class="diagram-title">Spring Boot 自动装配全景流程</div>
+<div class="mermaid">
+flowchart TD
+    DEP["pom.xml / build.gradle<br/>添加 blaze-persistence-integration-spring-data-3.x"]
+    AC["Spring Boot AutoConfiguration<br/>BlazeJpaAutoConfiguration"]
+    EMF["EntityManagerFactory<br/>(Hibernate 提供)"]
+    CBF["CriteriaBuilderFactory"]
+    EVC["EntityViewConfiguration<br/>扫描 @EntityView"]
+    EVM["EntityViewManager"]
+    REPO["EntityViewRepository<br/>Bean 代理"]
+    APP["应用代码 @Autowired"]
+
+    DEP --> AC
+    AC --> EMF
+    EMF --> CBF
+    AC --> EVC
+    EVC --> EVM
+    CBF --> EVM
+    EVM --> REPO
+    CBF --> REPO
+    REPO --> APP
+
+    style DEP fill:#1e3a5f,stroke:#2563eb
+    style AC fill:#2d1f4e,stroke:#7c3aed
+    style CBF fill:#1a3a2a,stroke:#22c55e
+    style EVM fill:#1a3a2a,stroke:#22c55e
+    style REPO fill:#3a2a1a,stroke:#d97706
+    style APP fill:#1a2a3a,stroke:#06b6d4
+</div>
+</div>
+
+<h3>Maven 依赖配置</h3>
+
+<p>根据 Spring Boot 版本选择对应 Starter：</p>
+
+<div class="compare-grid">
+<div class="compare-bad" style="--label:'Spring Boot 2.x';">
+<pre><code>&lt;!-- Spring Boot 2.x --&gt;
+&lt;dependency&gt;
+  &lt;groupId&gt;com.blazebit&lt;/groupId&gt;
+  &lt;artifactId&gt;blaze-persistence-integration-spring-data-2.x&lt;/artifactId&gt;
+  &lt;version&gt;${blaze.version}&lt;/version&gt;
+&lt;/dependency&gt;</code></pre>
+</div>
+<div class="compare-good" style="--label:'Spring Boot 3.x (推荐)';">
+<pre><code>&lt;!-- Spring Boot 3.x (Jakarta EE) --&gt;
+&lt;dependency&gt;
+  &lt;groupId&gt;com.blazebit&lt;/groupId&gt;
+  &lt;artifactId&gt;blaze-persistence-integration-spring-data-3.x&lt;/artifactId&gt;
+  &lt;version&gt;${blaze.version}&lt;/version&gt;
+&lt;/dependency&gt;</code></pre>
+</div>
+</div>
+
+<h3>自动注册的 Bean 清单</h3>
+
+<table>
+<thead><tr><th>Bean 类型</th><th>作用</th><th>注册条件</th></tr></thead>
+<tbody>
+  <tr><td><code>CriteriaBuilderFactory</code></td><td>查询引擎入口</td><td>检测到 <code>EntityManagerFactory</code></td></tr>
+  <tr><td><code>EntityViewManager</code></td><td>视图管理器</td><td>检测到 <code>CriteriaBuilderFactory</code> + <code>@EntityView</code> 类</td></tr>
+  <tr><td><code>EntityViewAwareRepositoryFactory</code></td><td>Repository 工厂替换</td><td>检测到 <code>EntityViewManager</code></td></tr>
+  <tr><td><code>EntityViewConfiguration</code></td><td>视图类注册表</td><td>classpath 扫描 <code>@EntityView</code></td></tr>
+</tbody>
+</table>
+
+<h3>application.yml 常用配置</h3>
+
+<pre><code>blaze:
+  persistence:
+    view:
+      entity-view-package: com.example.views
+    default-batch-size: 20
+    compatible-mode: false
+
+spring:
+  jpa:
+    properties:
+      hibernate.ejb.entitymanager_factory_name: default</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">Starter 版本选择决策树</div>
+<div class="mermaid">
+flowchart TD
+    Q1{"Spring Boot 版本?"}
+    Q2{"javax 还是 jakarta?"}
+    SB2["spring-data-2.x<br/>Starter"]
+    SB3["spring-data-3.x<br/>Starter"]
+    ERR["不支持<br/>请升级 Spring Boot"]
+
+    Q1 -->|"2.x"| SB2
+    Q1 -->|"3.x"| Q2
+    Q1 -->|"1.x"| ERR
+    Q2 -->|"jakarta (默认)"| SB3
+    Q2 -->|"javax (兼容)"| SB2
+
+    style SB2 fill:#3a2a1a,stroke:#d97706
+    style SB3 fill:#1a3a2a,stroke:#22c55e
+    style ERR fill:#3a1a1a,stroke:#f85149
+</div>
+</div>
+
+<!-- ================================================================ -->
+<!-- 12.2 EntityViewRepository                                        -->
+<!-- ================================================================ -->
+<h2 id="s12-2">12.2 EntityViewRepository</h2>
+
+<p>
+  <code>EntityViewRepository&lt;V, ID&gt;</code> 是 Blaze-Persistence 对 Spring Data <code>JpaRepository</code> 的等价替换。
+  它不操作实体类 (Entity)，而是直接以 Entity View 作为投影载体进行 CRUD，从而确保所有查询只 SELECT 视图声明的字段。
+</p>
+
+<div class="diagram">
+<div class="diagram-title">EntityViewRepository 继承体系</div>
+<div class="mermaid">
+classDiagram
+    class Repository~T, ID~ {
+        &lt;&lt;interface&gt;&gt;
+    }
+    class CrudRepository~T, ID~ {
+        &lt;&lt;interface&gt;&gt;
+        +save(entity) T
+        +findById(id) Optional~T~
+        +findAll() Iterable~T~
+        +deleteById(id) void
+    }
+    class PagingAndSortingRepository~T, ID~ {
+        &lt;&lt;interface&gt;&gt;
+        +findAll(pageable) Page~T~
+        +findAll(sort) Iterable~T~
+    }
+    class EntityViewRepository~V, ID~ {
+        &lt;&lt;interface&gt;&gt;
+        +findOne(id) V
+        +findAll(spec) List~V~
+        +findAll(spec, pageable) Page~V~
+    }
+    class EntityViewSpecificationExecutor~V~ {
+        &lt;&lt;interface&gt;&gt;
+        +findAll(spec) List~V~
+        +findOne(spec) Optional~V~
+        +count(spec) long
+    }
+    class UserViewRepository {
+        &lt;&lt;interface&gt;&gt;
+        +findByNameContaining(name) List
+        +findByStatus(status) List
+    }
+
+    Repository <|-- CrudRepository
+    CrudRepository <|-- PagingAndSortingRepository
+    PagingAndSortingRepository <|-- EntityViewRepository
+    EntityViewRepository <|-- UserViewRepository
+    EntityViewSpecificationExecutor <|.. UserViewRepository
+</div>
+</div>
+
+<h3>定义 Repository 接口</h3>
+
+<pre><code>@EntityView(User.class)
+public interface UserView {
+    @IdMapping
+    Long getId();
+    String getName();
+    String getEmail();
+}
+
+public interface UserViewRepository
+        extends EntityViewRepository&lt;UserView, Long&gt;,
+                EntityViewSpecificationExecutor&lt;UserView&gt; {
+    // 方法名查询 —— 下一节详解
+    List&lt;UserView&gt; findByNameContaining(String fragment);
+}</code></pre>
+
+<h3>CRUD 操作语义对比</h3>
+
+<div class="diagram">
+<div class="diagram-title">EntityViewRepository 与 JpaRepository 操作对比</div>
+<div class="mermaid">
+flowchart LR
+    subgraph JPA["JpaRepository"]
+        J1["findAll()"] -->|"SELECT *"| J2["全字段加载"]
+        J3["save(entity)"] -->|"merge/persist"| J4["实体脏检查"]
+    end
+    subgraph BZ["EntityViewRepository"]
+        B1["findAll()"] -->|"SELECT id,name,email"| B2["仅视图字段"]
+        B3["save(view)"] -->|"FlushOperationBuilder"| B4["视图脏检查"]
+    end
+
+    style JPA fill:#3a1a1a,stroke:#f85149
+    style BZ fill:#1a3a2a,stroke:#22c55e
+</div>
+</div>
+
+<table>
+<thead><tr><th>操作</th><th>JpaRepository</th><th>EntityViewRepository</th></tr></thead>
+<tbody>
+  <tr><td><code>findById()</code></td><td>加载完整实体</td><td>仅投影视图字段，SQL 自动优化</td></tr>
+  <tr><td><code>findAll()</code></td><td><code>SELECT * FROM user</code></td><td><code>SELECT id, name, email FROM user</code></td></tr>
+  <tr><td><code>save()</code></td><td>EntityManager.merge()</td><td>FlushOperationBuilder + 视图脏检查</td></tr>
+  <tr><td><code>delete()</code></td><td>EntityManager.remove()</td><td>基于 ID 删除，无需加载实体</td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<!-- 12.3 方法名查询派生                                              -->
+<!-- ================================================================ -->
+<h2 id="s12-3">12.3 方法名查询派生</h2>
+
+<p>
+  Spring Data 的方法名约定（Query Derivation）在 Blaze-Persistence 集成中同样有效。框架会将方法名解析为等价的 <code>CriteriaBuilder</code> 查询，而非原生 JPQL，从而享受类型安全和视图投影优化。
+</p>
+
+<div class="diagram">
+<div class="diagram-title">方法名 → CriteriaBuilder 查询派生管线</div>
+<div class="mermaid">
+flowchart LR
+    MN["方法名<br/>findByNameContaining"]
+    PARSE["Spring Data<br/>PartTree 解析器"]
+    PARTS["Subject: find<br/>Predicate: Name + Containing"]
+    CB["CriteriaBuilder<br/>.where('name').like().value('%x%')"]
+    JPQL["JPQL 生成<br/>SELECT ... WHERE name LIKE ?"]
+    SQL["数据库执行"]
+
+    MN --> PARSE --> PARTS --> CB --> JPQL --> SQL
+
+    style MN fill:#1e3a5f,stroke:#2563eb
+    style PARSE fill:#2d1f4e,stroke:#7c3aed
+    style CB fill:#1a3a2a,stroke:#22c55e
+    style JPQL fill:#3a2a1a,stroke:#d97706
+    style SQL fill:#1a2a3a,stroke:#06b6d4
+</div>
+</div>
+
+<h3>常用派生关键词</h3>
+
+<table>
+<thead><tr><th>方法名片段</th><th>CriteriaBuilder 等价</th><th>SQL 片段</th></tr></thead>
+<tbody>
+  <tr><td><code>findByName</code></td><td><code>.where("name").eq()</code></td><td><code>WHERE name = ?</code></td></tr>
+  <tr><td><code>findByNameContaining</code></td><td><code>.where("name").like().value("%?%")</code></td><td><code>WHERE name LIKE '%?%'</code></td></tr>
+  <tr><td><code>findByStatusIn</code></td><td><code>.where("status").in()</code></td><td><code>WHERE status IN (?,...)</code></td></tr>
+  <tr><td><code>findByAgeGreaterThan</code></td><td><code>.where("age").gt()</code></td><td><code>WHERE age > ?</code></td></tr>
+  <tr><td><code>findByActiveTrue</code></td><td><code>.where("active").eq(true)</code></td><td><code>WHERE active = true</code></td></tr>
+  <tr><td><code>findByCreatedAtBetween</code></td><td><code>.where("createdAt").between()</code></td><td><code>WHERE created_at BETWEEN ? AND ?</code></td></tr>
+  <tr><td><code>countByStatus</code></td><td><code>.where("status").eq()  // + count</code></td><td><code>SELECT COUNT(*) ... WHERE status = ?</code></td></tr>
+</tbody>
+</table>
+
+<h3>代码示例</h3>
+
+<pre><code>public interface OrderViewRepository
+        extends EntityViewRepository&lt;OrderSummaryView, Long&gt; {
+
+    List&lt;OrderSummaryView&gt; findByStatusIn(Collection&lt;OrderStatus&gt; statuses);
+
+    List&lt;OrderSummaryView&gt; findByCustomerNameContainingIgnoreCase(String name);
+
+    List&lt;OrderSummaryView&gt; findByTotalAmountGreaterThanEqual(BigDecimal min);
+
+    long countByStatus(OrderStatus status);
+
+    List&lt;OrderSummaryView&gt; findByCreatedAtBetweenOrderByCreatedAtDesc(
+            LocalDateTime from, LocalDateTime to);
+}</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">派生查询方法名解析结构</div>
+<div class="mermaid">
+flowchart TD
+    M["findByCustomerNameContainingIgnoreCaseOrderByCreatedAtDesc"]
+    S["Subject: find"]
+    P1["Predicate: Customer.Name"]
+    OP["Operator: Containing + IgnoreCase"]
+    ORD["OrderBy: CreatedAt Desc"]
+    CB["CriteriaBuilder 链式调用"]
+
+    M --> S
+    M --> P1
+    M --> OP
+    M --> ORD
+    S --> CB
+    P1 --> CB
+    OP --> CB
+    ORD --> CB
+
+    style M fill:#1e3a5f,stroke:#2563eb
+    style CB fill:#1a3a2a,stroke:#22c55e
+</div>
+</div>
+
+<div class="key-insight">
+  <strong>💡 关键洞察：</strong>与原生 Spring Data JPA 不同，Blaze-Persistence 的查询派生通过 <code>CriteriaBuilder</code> 构建查询，而非直接拼接 JPQL 字符串。这意味着在多表关联场景中，JOIN 策略由框架自动优化，不会产生不必要的 CROSS JOIN。
+</div>
+
+<!-- ================================================================ -->
+<!-- 12.4 EntityViewSpecification                                     -->
+<!-- ================================================================ -->
+<h2 id="s12-4">12.4 EntityViewSpecification</h2>
+
+<p>
+  当查询条件是运行时动态组合的（例如后台管理界面的多条件筛选），方法名派生就力不从心了。<code>EntityViewSpecificationExecutor</code> 提供了 Specification 模式，将过滤逻辑封装为可组合的谓词对象。
+</p>
+
+<div class="diagram">
+<div class="diagram-title">Specification 动态查询组合流程</div>
+<div class="mermaid">
+flowchart TD
+    REQ["HTTP Request<br/>?name=alice&status=ACTIVE&minAge=18"]
+    CTRL["Controller<br/>解析查询参数"]
+    SP1["Spec: nameLike('alice')"]
+    SP2["Spec: statusEq(ACTIVE)"]
+    SP3["Spec: ageGte(18)"]
+    AND["Specification.and()<br/>组合谓词"]
+    EXEC["EntityViewSpecificationExecutor<br/>.findAll(combinedSpec)"]
+    CB["CriteriaBuilder<br/>.where(...).where(...)"]
+    SQL["SELECT id, name, email<br/>FROM user<br/>WHERE name LIKE '%alice%'<br/>  AND status = 'ACTIVE'<br/>  AND age >= 18"]
+
+    REQ --> CTRL
+    CTRL --> SP1
+    CTRL --> SP2
+    CTRL --> SP3
+    SP1 --> AND
+    SP2 --> AND
+    SP3 --> AND
+    AND --> EXEC --> CB --> SQL
+
+    style REQ fill:#1e3a5f,stroke:#2563eb
+    style AND fill:#2d1f4e,stroke:#7c3aed
+    style CB fill:#1a3a2a,stroke:#22c55e
+    style SQL fill:#3a2a1a,stroke:#d97706
+</div>
+</div>
+
+<h3>定义 Specification</h3>
+
+<pre><code>public class UserViewSpecs {
+
+    public static EntityViewSpecification&lt;UserView&gt; nameLike(String fragment) {
+        return (root, cb) -&gt;
+            cb.where(root.get("name")).like().value("%" + fragment + "%");
+    }
+
+    public static EntityViewSpecification&lt;UserView&gt; statusEq(UserStatus status) {
+        return (root, cb) -&gt;
+            cb.where(root.get("status")).eq(status);
+    }
+
+    public static EntityViewSpecification&lt;UserView&gt; ageGreaterThanOrEqual(int min) {
+        return (root, cb) -&gt;
+            cb.where(root.get("age")).ge(min);
+    }
+}</code></pre>
+
+<h3>在 Controller 中组合 Specification</h3>
+
+<pre><code>@GetMapping("/users")
+public Page&lt;UserView&gt; searchUsers(
+        @RequestParam(required = false) String name,
+        @RequestParam(required = false) UserStatus status,
+        @RequestParam(required = false) Integer minAge,
+        Pageable pageable) {
+
+    EntityViewSpecification&lt;UserView&gt; spec = EntityViewSpecification.where(null);
+
+    if (name != null)   spec = spec.and(UserViewSpecs.nameLike(name));
+    if (status != null) spec = spec.and(UserViewSpecs.statusEq(status));
+    if (minAge != null) spec = spec.and(UserViewSpecs.ageGreaterThanOrEqual(minAge));
+
+    return userViewRepository.findAll(spec, pageable);
+}</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">Specification 组合模式类图</div>
+<div class="mermaid">
+classDiagram
+    class EntityViewSpecification~V~ {
+        &lt;&lt;FunctionalInterface&gt;&gt;
+        +toPredicate(root, cb) void
+        +and(other) EntityViewSpecification
+        +or(other) EntityViewSpecification
+        +negate() EntityViewSpecification
+    }
+    class NameLikeSpec {
+        -fragment: String
+        +toPredicate(root, cb) void
+    }
+    class StatusEqSpec {
+        -status: UserStatus
+        +toPredicate(root, cb) void
+    }
+    class CompositeSpec {
+        -left: EntityViewSpecification
+        -right: EntityViewSpecification
+        -operator: AND / OR
+        +toPredicate(root, cb) void
+    }
+
+    EntityViewSpecification <|.. NameLikeSpec
+    EntityViewSpecification <|.. StatusEqSpec
+    EntityViewSpecification <|.. CompositeSpec
+    CompositeSpec o-- EntityViewSpecification : left
+    CompositeSpec o-- EntityViewSpecification : right
+</div>
+</div>
+
+<!-- ================================================================ -->
+<!-- 12.5 分页与排序集成                                              -->
+<!-- ================================================================ -->
+<h2 id="s12-5">12.5 分页与排序集成</h2>
+
+<p>
+  Blaze-Persistence 最强大的分页能力是 Keyset 分页（见<a href="ch10-pagination.html">第 10 章</a>）。在 Spring Data 集成中，你可以透明地将 <code>Pageable</code> / <code>Sort</code> 与 Keyset 分页结合，获得 O(1) 分页性能的同时保留 Spring 生态的兼容性。
+</p>
+
+<div class="diagram">
+<div class="diagram-title">REST → Keyset 分页完整请求链路</div>
+<div class="mermaid">
+sequenceDiagram
+    participant Client as 前端 Client
+    participant Ctrl as Controller
+    participant Repo as EntityViewRepository
+    participant CB as CriteriaBuilder
+    participant DB as 数据库
+
+    Client->>Ctrl: GET /orders?page=0&size=20&sort=createdAt,desc
+    Ctrl->>Ctrl: 构建 KeysetPageable
+    Ctrl->>Repo: findAll(spec, keysetPageable)
+    Repo->>CB: applySetting(keysetPageable)
+    CB->>DB: SELECT ... WHERE (createdAt, id) < (?, ?)<br/>ORDER BY createdAt DESC, id DESC<br/>LIMIT 21
+    DB-->>CB: 21 rows (20 + 1 探测行)
+    CB-->>Repo: KeysetAwarePage&lt;OrderView&gt;
+    Repo-->>Ctrl: KeysetAwarePage
+    Ctrl-->>Client: { content: [...], keyset: { lowest: {...}, highest: {...} } }
+
+    Note over Client, DB: 下一页请求携带 keyset 令牌，无需 OFFSET
+</div>
+</div>
+
+<h3>Controller 分页代码</h3>
+
+<pre><code>@RestController
+@RequestMapping("/api/orders")
+public class OrderController {
+
+    private final OrderViewRepository repository;
+
+    @GetMapping
+    public KeysetAwarePage&lt;OrderSummaryView&gt; list(
+            @RequestParam(required = false) String status,
+            @KeysetConfig(keysetClass = OrderSummaryView.class)
+            KeysetPageable pageable) {
+
+        EntityViewSpecification&lt;OrderSummaryView&gt; spec =
+            status != null ? OrderViewSpecs.statusEq(status) : null;
+
+        return repository.findAll(spec, pageable);
+    }
+}</code></pre>
+
+<h3>Offset 分页 vs Keyset 分页性能对比</h3>
+
+<div class="diagram">
+<div class="diagram-title">分页策略性能曲线（概念图）</div>
+<div class="mermaid">
+flowchart LR
+    subgraph OFFSET["Offset 分页"]
+        O1["第 1 页: 扫描 20 行"] --> O2["第 100 页: 扫描 2000 行"]
+        O2 --> O3["第 N 页: 扫描 N×20 行"]
+    end
+    subgraph KEYSET["Keyset 分页"]
+        K1["第 1 页: 扫描 20 行"] --> K2["第 100 页: 扫描 20 行"]
+        K2 --> K3["第 N 页: 扫描 20 行"]
+    end
+
+    style OFFSET fill:#3a1a1a,stroke:#f85149
+    style KEYSET fill:#1a3a2a,stroke:#22c55e
+</div>
+</div>
+
+<h3>KeysetAwarePage 响应结构</h3>
+
+<table>
+<thead><tr><th>字段</th><th>类型</th><th>说明</th></tr></thead>
+<tbody>
+  <tr><td><code>content</code></td><td><code>List&lt;V&gt;</code></td><td>当前页数据</td></tr>
+  <tr><td><code>keysetPage.lowest</code></td><td><code>Keyset</code></td><td>当前页最小 keyset 值，用于向前翻页</td></tr>
+  <tr><td><code>keysetPage.highest</code></td><td><code>Keyset</code></td><td>当前页最大 keyset 值，用于向后翻页</td></tr>
+  <tr><td><code>totalElements</code></td><td><code>long</code></td><td>满足条件的总记录数</td></tr>
+  <tr><td><code>totalPages</code></td><td><code>int</code></td><td>总页数</td></tr>
+</tbody>
+</table>
+
+<!-- ================================================================ -->
+<!-- 12.6 事务管理                                                    -->
+<!-- ================================================================ -->
+<h2 id="s12-6">12.6 事务管理</h2>
+
+<p>
+  Entity View 的保存操作（<code>save()</code>、<code>saveFull()</code>）会触发底层 <code>EntityManager</code> 的 flush，因此必须运行在活跃事务中。Spring 的 <code>@Transactional</code> 注解与 Entity View CRUD 天然协同。
+</p>
+
+<div class="diagram">
+<div class="diagram-title">事务边界与 Entity View 保存操作时序</div>
+<div class="mermaid">
+sequenceDiagram
+    participant Svc as @Service
+    participant TX as TransactionManager
+    participant Repo as EntityViewRepository
+    participant EVM as EntityViewManager
+    participant EM as EntityManager
+    participant DB as 数据库
+
+    Svc->>TX: @Transactional 开始
+    TX->>TX: 开启事务 BEGIN
+
+    Svc->>Repo: save(updatableView)
+    Repo->>EVM: FlushOperationBuilder
+    EVM->>EVM: 视图脏检查<br/>对比快照
+    EVM->>EM: merge() / persist()
+    EM->>DB: INSERT / UPDATE SQL
+
+    Svc->>Repo: findById(id)
+    Repo->>EVM: applySetting(CriteriaBuilder)
+    EVM->>DB: SELECT 视图字段
+
+    TX->>DB: COMMIT
+    TX-->>Svc: 事务完成
+</div>
+</div>
+
+<h3>Service 层事务示例</h3>
+
+<pre><code>@Service
+@Transactional
+public class UserService {
+
+    private final UserViewRepository viewRepo;
+    private final EntityViewManager evm;
+
+    public UserService(UserViewRepository viewRepo, EntityViewManager evm) {
+        this.viewRepo = viewRepo;
+        this.evm = evm;
+    }
+
+    public void updateUserName(Long userId, String newName) {
+        UpdatableUserView user = viewRepo.findById(userId)
+                .orElseThrow(() -&gt; new NotFoundException(userId));
+        user.setName(newName);
+        viewRepo.save(user);
+    }
+
+    @Transactional(readOnly = true)
+    public List&lt;UserView&gt; listActiveUsers() {
+        return viewRepo.findByActiveTrue();
+    }
+
+    public UpdatableUserView createUser(String name, String email) {
+        UpdatableUserView user = evm.create(UpdatableUserView.class);
+        user.setName(name);
+        user.setEmail(email);
+        return viewRepo.save(user);
+    }
+}</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">只读事务 vs 读写事务选择决策</div>
+<div class="mermaid">
+flowchart TD
+    Q{"操作类型?"}
+    RO["@Transactional(readOnly = true)<br/>只读事务"]
+    RW["@Transactional<br/>读写事务"]
+    ROB["✓ 跳过脏检查<br/>✓ 跳过 flush<br/>✓ 数据库只读优化<br/>✓ 适合纯查询"]
+    RWB["✓ 视图脏检查<br/>✓ 自动 flush<br/>✓ INSERT/UPDATE/DELETE<br/>✓ 适合 CUD 操作"]
+
+    Q -->|"查询 / 列表 / 导出"| RO --> ROB
+    Q -->|"创建 / 更新 / 删除"| RW --> RWB
+
+    style RO fill:#1a3a2a,stroke:#22c55e
+    style RW fill:#3a2a1a,stroke:#d97706
+</div>
+</div>
+
+<div class="warning">
+  <strong>⚠ 注意：</strong>在 <code>readOnly = true</code> 事务中调用 <code>save()</code> 不会抛出异常，但 Hibernate 会静默跳过 flush，导致数据丢失。务必为写操作使用读写事务。
+</div>
+
+<!-- ================================================================ -->
+<!-- 12.7 测试策略                                                    -->
+<!-- ================================================================ -->
+<h2 id="s12-7">12.7 测试策略</h2>
+
+<p>
+  在 Spring Boot 测试中使用 Blaze-Persistence 需要额外配置 <code>CriteriaBuilderFactory</code> 和 <code>EntityViewManager</code> Bean。
+  <code>@DataJpaTest</code> 默认只加载 JPA 相关的切片，不包含 Blaze-Persistence 的自动装配。
+</p>
+
+<div class="diagram">
+<div class="diagram-title">测试配置加载管线</div>
+<div class="mermaid">
+flowchart TD
+    TEST["@DataJpaTest<br/>+ @Import(BlazeConfig.class)"]
+    SLICE["JPA 切片<br/>Entity + Repository"]
+    BLAZE["BlazeConfig<br/>手动注册 CBF + EVM"]
+    EMF["嵌入式 H2<br/>EntityManagerFactory"]
+    CBF["CriteriaBuilderFactory"]
+    EVM["EntityViewManager"]
+    REPO["EntityViewRepository<br/>代理 Bean"]
+    EXEC["测试方法执行"]
+
+    TEST --> SLICE
+    TEST --> BLAZE
+    SLICE --> EMF
+    BLAZE --> EMF
+    EMF --> CBF
+    CBF --> EVM
+    EVM --> REPO
+    REPO --> EXEC
+
+    style TEST fill:#1e3a5f,stroke:#2563eb
+    style BLAZE fill:#2d1f4e,stroke:#7c3aed
+    style EMF fill:#1a3a2a,stroke:#22c55e
+    style EXEC fill:#1a2a3a,stroke:#06b6d4
+</div>
+</div>
+
+<h3>测试配置类</h3>
+
+<pre><code>@TestConfiguration
+public class BlazePersistenceTestConfig {
+
+    @Bean
+    @Scope(ConfigurableBeanFactory.SCOPE_SINGLETON)
+    @Lazy(false)
+    public CriteriaBuilderFactory criteriaBuilderFactory(EntityManagerFactory emf) {
+        CriteriaBuilderConfiguration config = Criteria.getDefault();
+        return config.createCriteriaBuilderFactory(emf);
+    }
+
+    @Bean
+    @Scope(ConfigurableBeanFactory.SCOPE_SINGLETON)
+    @Lazy(false)
+    public EntityViewManager entityViewManager(
+            CriteriaBuilderFactory cbf,
+            EntityViewConfiguration evc) {
+        return evc.createEntityViewManager(cbf);
+    }
+
+    @Bean
+    public EntityViewConfiguration entityViewConfiguration() {
+        EntityViewConfiguration cfg = EntityViews.createDefaultConfiguration();
+        cfg.addEntityView(UserView.class);
+        cfg.addEntityView(UpdatableUserView.class);
+        cfg.addEntityView(OrderSummaryView.class);
+        return cfg;
+    }
+}</code></pre>
+
+<h3>集成测试示例</h3>
+
+<pre><code>@DataJpaTest
+@Import(BlazePersistenceTestConfig.class)
+@AutoConfigureTestDatabase(replace = Replace.NONE)
+class UserViewRepositoryTest {
+
+    @Autowired
+    private UserViewRepository repository;
+
+    @Autowired
+    private TestEntityManager tem;
+
+    @Test
+    void shouldFindByNameContaining() {
+        tem.persist(new User("Alice", "alice@test.com", UserStatus.ACTIVE));
+        tem.persist(new User("Bob", "bob@test.com", UserStatus.ACTIVE));
+        tem.persist(new User("Alicia", "alicia@test.com", UserStatus.INACTIVE));
+        tem.flush();
+
+        List&lt;UserView&gt; results = repository.findByNameContaining("Ali");
+
+        assertThat(results).hasSize(2);
+        assertThat(results).extracting(UserView::getName)
+                           .containsExactlyInAnyOrder("Alice", "Alicia");
+    }
+
+    @Test
+    void shouldSupportSpecification() {
+        tem.persist(new User("Charlie", "charlie@test.com", UserStatus.ACTIVE));
+        tem.flush();
+
+        var spec = UserViewSpecs.statusEq(UserStatus.ACTIVE)
+                   .and(UserViewSpecs.nameLike("Char"));
+
+        List&lt;UserView&gt; results = repository.findAll(spec);
+
+        assertThat(results).hasSize(1);
+        assertThat(results.get(0).getName()).isEqualTo("Charlie");
+    }
+}</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">测试数据库选择决策</div>
+<div class="mermaid">
+flowchart TD
+    Q{"测试场景?"}
+    UNIT["单元测试 / CI"]
+    INTEG["集成测试 / 全特性"]
+    H2["H2 内存数据库<br/>快速启动 ~200ms"]
+    TC["Testcontainers<br/>真实数据库容器"]
+    H2W["⚠ 不支持 CTE<br/>⚠ 不支持窗口函数<br/>✓ 基本 CRUD 测试"]
+    TCW["✓ 完整 SQL 兼容<br/>✓ CTE + 窗口函数<br/>✓ 接近生产环境"]
+
+    Q -->|"快速反馈"| UNIT --> H2 --> H2W
+    Q -->|"全功能验证"| INTEG --> TC --> TCW
+
+    style H2 fill:#3a2a1a,stroke:#d97706
+    style TC fill:#1a3a2a,stroke:#22c55e
+</div>
+</div>
+
+<div class="os-note">
+  <strong>🔧 提示：</strong>H2 数据库不支持 Blaze-Persistence 的 CTE 和窗口函数特性。如果你的查询使用了这些高级功能，请使用 Testcontainers 启动真实的 PostgreSQL / MySQL 容器进行测试。
+</div>
+
+<!-- ================================================================ -->
+<!-- 12.8 陷阱与限制                                                  -->
+<!-- ================================================================ -->
+<h2 id="s12-8">12.8 陷阱与限制</h2>
+
+<p>
+  Spring Data 集成虽然便捷，但存在一些需要留意的边界条件和已知限制。
+</p>
+
+<div class="diagram">
+<div class="diagram-title">常见陷阱地图</div>
+<div class="mermaid">
+flowchart TD
+    T1["❌ @Query 注解<br/>不支持直接使用"]
+    T2["❌ LazyInitializationException<br/>View 序列化超出事务"]
+    T3["⚠ 版本兼容性<br/>Starter 与 Spring Boot 必须匹配"]
+    T4["⚠ Specification 嵌套<br/>深层 OR/AND 可能生成次优 SQL"]
+    T5["⚠ 测试上下文缓存<br/>CBF/EVM 未正确缓存导致慢测试"]
+
+    T1 --> FIX1["使用方法名派生<br/>或 Specification 替代"]
+    T2 --> FIX2["在事务内完成序列化<br/>或使用 DTO 投影"]
+    T3 --> FIX3["查阅官方兼容矩阵<br/>锁定版本号"]
+    T4 --> FIX4["拆分复杂 Spec<br/>或用 CriteriaBuilder 手写"]
+    T5 --> FIX5["CBF/EVM 设为 Singleton<br/>+ @Lazy(false)"]
+
+    style T1 fill:#3a1a1a,stroke:#f85149
+    style T2 fill:#3a1a1a,stroke:#f85149
+    style T3 fill:#3a2a1a,stroke:#d97706
+    style T4 fill:#3a2a1a,stroke:#d97706
+    style T5 fill:#3a2a1a,stroke:#d97706
+</div>
+</div>
+
+<h3>版本兼容矩阵</h3>
+
+<table>
+<thead><tr><th>Spring Boot</th><th>Spring Data JPA</th><th>Blaze Starter</th><th>Java</th></tr></thead>
+<tbody>
+  <tr><td>2.7.x</td><td>2.7.x</td><td><code>spring-data-2.x</code></td><td>11 / 17</td></tr>
+  <tr><td>3.0.x</td><td>3.0.x</td><td><code>spring-data-3.x</code></td><td>17+</td></tr>
+  <tr><td>3.1.x</td><td>3.1.x</td><td><code>spring-data-3.x</code></td><td>17+</td></tr>
+  <tr><td>3.2.x</td><td>3.2.x</td><td><code>spring-data-3.x</code></td><td>17+</td></tr>
+  <tr><td>3.3.x+</td><td>3.3.x+</td><td><code>spring-data-3.x</code></td><td>17+</td></tr>
+</tbody>
+</table>
+
+<h3>陷阱 1：@Query 注解不可用</h3>
+
+<p><code>EntityViewRepository</code> 不支持 Spring Data 的 <code>@Query</code> 注解。JPQL 字符串绕过了 Blaze-Persistence 的查询引擎，无法与 Entity View 投影协同。</p>
+
+<div class="compare-grid">
+<div class="compare-bad">
+<pre><code>// ❌ 不生效 — @Query 绕过 Entity View
+@Query("SELECT u FROM User u WHERE u.name = :name")
+List&lt;UserView&gt; findByNameCustom(@Param("name") String n);</code></pre>
+</div>
+<div class="compare-good">
+<pre><code>// ✅ 使用方法名派生
+List&lt;UserView&gt; findByName(String name);
+
+// ✅ 或使用 Specification
+List&lt;UserView&gt; findAll(
+    EntityViewSpecification&lt;UserView&gt; spec);</code></pre>
+</div>
+</div>
+
+<h3>陷阱 2：LazyInitializationException</h3>
+
+<div class="diagram">
+<div class="diagram-title">LazyInitializationException 触发场景</div>
+<div class="mermaid">
+sequenceDiagram
+    participant Ctrl as Controller
+    participant Svc as Service
+    participant TX as Transaction
+    participant View as Entity View
+    participant JSON as Jackson Serializer
+
+    Ctrl->>Svc: getUser(id)
+    Svc->>TX: @Transactional 开始
+    TX->>View: findById → 构建 View
+    TX->>TX: COMMIT (事务结束)
+    TX-->>Svc: 返回 View
+    Svc-->>Ctrl: 返回 View
+
+    Ctrl->>JSON: 序列化 View → JSON
+    JSON->>View: 访问延迟加载属性
+    View--xJSON: LazyInitializationException ❌
+
+    Note over JSON, View: 解决：在事务内完成序列化<br/>或确保 View 不包含延迟属性
+</div>
+</div>
+
+<p>解决方案：</p>
+<ul>
+  <li>确保 Entity View 中所有属性都是 eager 加载的（Entity View 默认即 eager）</li>
+  <li>避免在 View 中映射未声明的关联属性</li>
+  <li>如果使用子视图，确保关联在查询时已经被 JOIN FETCH</li>
+</ul>
+
+<h3>陷阱 3：测试上下文缓存</h3>
+
+<pre><code>// ❌ 每个测试类创建新的 CBF/EVM → 测试变慢
+@Bean
+public CriteriaBuilderFactory cbf(EntityManagerFactory emf) {
+    return Criteria.getDefault().createCriteriaBuilderFactory(emf);
+}
+
+// ✅ 正确做法：Singleton + @Lazy(false) 确保缓存复用
+@Bean
+@Scope(ConfigurableBeanFactory.SCOPE_SINGLETON)
+@Lazy(false)
+public CriteriaBuilderFactory cbf(EntityManagerFactory emf) {
+    return Criteria.getDefault().createCriteriaBuilderFactory(emf);
+}</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">Spring Data + Blaze-Persistence 集成全景总结</div>
+<div class="mermaid">
+flowchart TD
+    subgraph SPRING["Spring Boot 应用"]
+        CTRL["REST Controller"]
+        SVC["@Service 事务层"]
+        REPO["EntityViewRepository"]
+        SPEC["EntityViewSpecification"]
+    end
+
+    subgraph BLAZE["Blaze-Persistence 引擎"]
+        EVM["EntityViewManager"]
+        CBF["CriteriaBuilderFactory"]
+        FLUSH["FlushOperationBuilder<br/>脏检查 + 写入"]
+    end
+
+    subgraph JPA["JPA 层"]
+        EM["EntityManager"]
+        DB[("数据库")]
+    end
+
+    CTRL --> SVC
+    SVC --> REPO
+    REPO --> SPEC
+    REPO --> EVM
+    EVM --> CBF
+    CBF --> EM
+    REPO --> FLUSH
+    FLUSH --> EM
+    EM --> DB
+
+    style SPRING fill:#1e3a5f,stroke:#2563eb
+    style BLAZE fill:#1a3a2a,stroke:#22c55e
+    style JPA fill:#2d1f4e,stroke:#7c3aed
+</div>
+</div>
+
+<!-- ===== chapter-summary ===== -->
+<div class="chapter-summary">
+  <h2>本章小结</h2>
+  <ul>
+    <li><strong>Spring Boot Starter</strong> 自动装配 <code>CriteriaBuilderFactory</code>、<code>EntityViewManager</code> 和 Repository 工厂，零配置即可启动</li>
+    <li><strong>EntityViewRepository</strong> 替代 <code>JpaRepository</code>，所有查询自动投影为 Entity View，只 SELECT 需要的字段</li>
+    <li><strong>方法名查询派生</strong>通过 <code>CriteriaBuilder</code> 执行，继承 Blaze-Persistence 的 JOIN 优化能力</li>
+    <li><strong>EntityViewSpecification</strong> 提供动态查询组合模式，适用于多条件筛选场景</li>
+    <li><strong>Keyset 分页</strong>与 Spring Data <code>Pageable</code> 无缝桥接，O(1) 性能优于 OFFSET 分页</li>
+    <li><strong>事务管理</strong>：写操作必须在 <code>@Transactional</code> 中执行，只读查询使用 <code>readOnly = true</code> 获得性能提升</li>
+    <li><strong>测试配置</strong>：<code>@DataJpaTest</code> 需要额外导入 Blaze 配置类，<code>CBF</code>/<code>EVM</code> 应设为 Singleton 避免重复创建</li>
+    <li><strong>已知限制</strong>：<code>@Query</code> 注解不可用、注意版本兼容矩阵、避免延迟加载跨事务访问</li>
+  </ul>
+  <p class="next-hint">
+    下一章 → <a href="ch13-bestpractice.html">第 13 章 · 性能调优、陷阱与最佳实践</a>：将本书所有知识整合为生产级最佳实践清单，涵盖 N+1 诊断、查询缓存、Entity View 反模式和 JPA Criteria 迁移路径。
+  </p>
+</div>
+
+<!-- ===== chapter-nav ===== -->
+<div class="chapter-nav">
+  <a href="ch11-dml.html">← 第 11 章 · 批量 DML</a>
+  <a href="ch13-bestpractice.html">第 13 章 · 性能调优 →</a>
+</div>
+
+<p class="footer">&copy; 2026 图解 Blaze-Persistence &middot; 第 12 章 · Spring Data 集成</p>
+
+</article>
+</div><!-- /container -->
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+mermaid.initialize({
+  startOnLoad:true,
+  theme:'dark',
+  themeVariables:{
+    primaryColor:'#58a6ff',primaryTextColor:'#e6edf3',primaryBorderColor:'#30363d',
+    lineColor:'#8b949e',secondaryColor:'#161b22',tertiaryColor:'#0d1117',
+    background:'#161b22',mainBkg:'#161b22',nodeBorder:'#30363d',
+    clusterBkg:'rgba(22,27,34,.5)',clusterBorder:'#30363d',titleColor:'#e6edf3',
+    edgeLabelBackground:'#161b22',
+    fontSize:'13px',
+  },
+  flowchart:{curve:'basis',padding:8,nodeSpacing:20,rankSpacing:30,useMaxWidth:true,htmlLabels:true},
+  sequence:{useMaxWidth:true,actorMargin:30},
+  state:{useMaxWidth:true},
+});
+document.querySelectorAll('.mermaid svg').forEach(function(svg){
+  var vb=svg.getAttribute('viewBox');
+  if(vb){
+    var p=vb.split(/[\s,]+/).map(Number);
+    if(p[3]>600&&p[2]<p[3]){
+      svg.style.maxHeight='500px';
+      svg.style.width='100%';
+    }
+  }
+});
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script>
+hljs.configure({ignoreUnescapedHTML: true});
+hljs.highlightAll();
+document.querySelectorAll('pre code[class*="language-"]').forEach(el => {
+  var lang = el.className.match(/language-(\w+)/);
+  if (lang) {
+    var label = document.createElement('span');
+    label.className = 'lang-label';
+    label.textContent = lang[1];
+    el.closest('pre').appendChild(label);
+  }
+});
+</script>
+</body>
+</html>

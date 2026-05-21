@@ -1,0 +1,1614 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 14 章 · 事务与连接管理 — 图解 jOOQ</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 jOOQ</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="ch13-listener.html">上一章 ch13-listener</a>
+  <a href="ch15-spring.html">下一章 ch15-spring</a>
+</nav>
+
+<aside class="toc">
+<a href="#14.0-章首速览">14.0 章首速览</a>
+<a href="#14.1-transactionprovider-spi">14.1 TransactionProvider SPI</a>
+<a href="#14.2-事务生命周期">14.2 事务生命周期</a>
+<a href="#14.3-嵌套事务与-savepoint">14.3 嵌套事务与 Savepoint</a>
+<a href="#14.4-spring-集成">14.4 Spring 集成</a>
+<a href="#14.5-连接池集成">14.5 连接池集成</a>
+<a href="#14.6-陷阱与限制">14.6 陷阱与限制</a>
+<a href="#14.7-生产守卫">14.7 生产守卫</a>
+<a href="#14.8-测试护栏">14.8 测试护栏</a>
+<a href="#14.9-源码深潜">14.9 源码深潜</a>
+<a href="#14.10-本章要点">14.10 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 14 章 · 事务与连接管理</h1>
+<p class="subtitle">v7 图解版 · 自动从 v6 markdown 生成 · Mermaid 图原样保留</p>
+<div class="chapter-intro"><p>一条 SQL 能执行成功只是起点;多条 SQL 要么全部成功、要么全部回滚 — 这才是生产级代码的底线。jOOQ 没有重新发明事务轮子,而是通过 <code>TransactionProvider</code> SPI 将事务控制委托给底层实现 — 可以是 JDBC 原生事务,也可以是 Spring <code>PlatformTransactionManager</code>。</p>
+<p>本章按"SPI → 生命周期 → 嵌套与 Savepoint → Spring 集成 → 连接池 → 陷阱 → 守护 → 源码深潜"展开。事务的核心理念是"派生 <code>Configuration</code>":事务内 <code>DSL.using(configuration)</code> 创建的 <code>DSLContext</code> 绑定同一连接、同一 <code>TransactionProvider</code> 状态,通过 <code>TransactionListener</code> 暴露生命周期。</p>
+</div>
+<h2 id="14.0-章首速览">14.0 章首速览</h2>
+<h3>图 14-0:事务全景</h3>
+<div class="diagram">
+  <div class="diagram-title">图 14-0 · 事务全景 — 7 大主题</div>
+  <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#240d38"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0d0d"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="340" y="20" width="240" height="56" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="460" y="46" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">事务与连接管理</text>
+    <text x="460" y="64" text-anchor="middle" fill="#8b949e" font-size="11">SPI 委派 + 派生 Configuration</text>
+
+    <rect x="20"  y="120" width="200" height="42" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="120" y="146" text-anchor="middle" fill="#c9d1d9" font-size="11">§14.1 TransactionProvider SPI</text>
+
+    <rect x="240" y="120" width="200" height="42" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="340" y="146" text-anchor="middle" fill="#c9d1d9" font-size="11">§14.2 事务生命周期</text>
+
+    <rect x="460" y="120" width="200" height="42" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="560" y="146" text-anchor="middle" fill="#c9d1d9" font-size="11">§14.3 嵌套 + Savepoint</text>
+
+    <rect x="680" y="120" width="220" height="42" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="790" y="146" text-anchor="middle" fill="#c9d1d9" font-size="11">§14.4 Spring 集成</text>
+
+    <rect x="20"  y="195" width="200" height="42" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="120" y="221" text-anchor="middle" fill="#c9d1d9" font-size="11">§14.5 连接池(HikariCP)</text>
+
+    <rect x="240" y="195" width="200" height="42" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="340" y="221" text-anchor="middle" fill="#c9d1d9" font-size="11">§14.6 陷阱与限制</text>
+
+    <rect x="460" y="195" width="440" height="42" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="680" y="221" text-anchor="middle" fill="#c9d1d9" font-size="11">§14.7-14.10 守护 / 测试 / 源码</text>
+
+    <path d="M 460 76 L 120 120" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 76 L 340 120" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 76 L 560 120" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 76 L 790 120" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 76 L 120 195" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 76 L 340 195" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 76 L 680 195" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="20"  y="290" width="200" height="36" rx="6" fill="#161b22" stroke="#bc8cff"/>
+    <text x="120" y="313" text-anchor="middle" fill="#c9d1d9" font-size="11">begin / commit / rollback</text>
+    <path d="M 120 162 L 120 290" stroke="#bc8cff" stroke-width="1" fill="none" stroke-dasharray="3 3"/>
+
+    <rect x="460" y="290" width="200" height="36" rx="6" fill="#161b22" stroke="#d29922"/>
+    <text x="560" y="313" text-anchor="middle" fill="#c9d1d9" font-size="11">内层 Savepoint</text>
+    <path d="M 560 162 L 560 290" stroke="#d29922" stroke-width="1" fill="none" stroke-dasharray="3 3"/>
+
+    <rect x="680" y="290" width="220" height="36" rx="6" fill="#161b22" stroke="#bc8cff"/>
+    <text x="790" y="313" text-anchor="middle" fill="#c9d1d9" font-size="11">@Transactional + Spring TX</text>
+    <path d="M 790 162 L 790 290" stroke="#bc8cff" stroke-width="1" fill="none" stroke-dasharray="3 3"/>
+
+    <rect x="20"  y="345" width="200" height="36" rx="6" fill="#161b22" stroke="#3fb950"/>
+    <text x="120" y="368" text-anchor="middle" fill="#c9d1d9" font-size="11">HikariCP 配置 + 池大小</text>
+    <path d="M 120 237 L 120 345" stroke="#3fb950" stroke-width="1" fill="none" stroke-dasharray="3 3"/>
+
+    <rect x="40" y="410" width="840" height="36" rx="8" fill="#0d1117" stroke="#30363d"/>
+    <text x="460" y="433" text-anchor="middle" fill="#8b949e" font-size="11">关键设计:派生 Configuration · 事务内 DSL.using(cfg) 绑定同一连接 · TransactionListener 暴露生命周期</text>
+  </svg>
+</div>
+<h3>图 14-0a:事务运行时</h3>
+<div class="diagram">
+  <div class="diagram-title">图 14-0a · 事务运行时主线 — Lambda → begin → SQL → commit/rollback → release</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0d0d"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20"  y="40" width="140" height="50" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="90"  y="64" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">业务 Lambda</text>
+    <text x="90"  y="80" text-anchor="middle" fill="#8b949e" font-size="11">Service 方法</text>
+
+    <rect x="200" y="40" width="180" height="50" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="290" y="64" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">dsl.transaction</text>
+    <text x="290" y="80" text-anchor="middle" fill="#8b949e" font-size="11">(cfg -&gt; ...)</text>
+
+    <rect x="420" y="40" width="180" height="50" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="510" y="64" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">TP.begin()</text>
+    <text x="510" y="80" text-anchor="middle" fill="#8b949e" font-size="11">TransactionProvider</text>
+
+    <rect x="640" y="40" width="160" height="50" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="720" y="64" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">CP.acquire()</text>
+    <text x="720" y="80" text-anchor="middle" fill="#8b949e" font-size="11">ConnectionProvider</text>
+
+    <path d="M 160 65 L 200 65" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 380 65 L 420 65" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 600 65 L 640 65" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="280" y="130" width="320" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="440" y="156" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Connection · setAutoCommit(false)</text>
+    <text x="440" y="174" text-anchor="middle" fill="#8b949e" font-size="11">BEGIN — 事务内所有 SQL 共享同一连接</text>
+
+    <path d="M 720 90 L 440 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="280" y="210" width="320" height="40" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="440" y="236" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">DSL.using(cfg).insert / update / select</text>
+    <path d="M 440 190 L 440 210" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <polygon points="440,270 580,310 440,350 300,310" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="440" y="306" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Lambda 正常?</text>
+    <text x="440" y="326" text-anchor="middle" fill="#8b949e" font-size="11">无异常抛出</text>
+
+    <path d="M 440 250 L 440 270" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <path d="M 300 310 L 180 310" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="240" y="302" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">是</text>
+
+    <rect x="20"  y="290" width="160" height="40" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="100" y="316" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">TP.commit()</text>
+
+    <path d="M 580 310 L 720 310" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="650" y="302" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">否(抛异常)</text>
+
+    <rect x="720" y="290" width="160" height="40" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="800" y="316" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">TP.rollback()</text>
+
+    <text x="460" y="370" text-anchor="middle" fill="#8b949e" font-size="11">无论 commit / rollback 都调用 CP.release() 将连接归还池 — 异常重新抛回业务层</text>
+  </svg>
+</div>
+<h2 id="14.1-transactionprovider-spi">14.1 TransactionProvider SPI</h2>
+<h3>14.1.1 接口与实现</h3>
+<div class="diagram">
+  <div class="diagram-title">图 14-1-1 · TransactionProvider 接口与三个实现</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#240d38"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><polygon points="0,0 10,6 0,12" fill="none" stroke="#58a6ff" stroke-width="1.5"/></marker>
+    </defs>
+
+    <rect x="320" y="20" width="280" height="100" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="46" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">&lt;&lt;interface&gt;&gt;</text>
+    <text x="460" y="64" text-anchor="middle" fill="#c9d1d9" font-size="14" font-weight="bold">TransactionProvider</text>
+    <line x1="330" y1="74" x2="590" y2="74" stroke="#bc8cff" stroke-width="1"/>
+    <text x="340" y="92" fill="#c9d1d9" font-size="11">+ begin(TransactionContext)</text>
+    <text x="340" y="108" fill="#c9d1d9" font-size="11">+ commit(TransactionContext)</text>
+    <text x="340" y="124" fill="#8b949e" font-size="11">+ rollback(TransactionContext)</text>
+
+    <path d="M 460 250 L 460 150 L 130 150 L 130 200" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 250 L 460 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 250 L 460 150 L 790 150 L 790 200" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="20"  y="200" width="220" height="120" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="130" y="226" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">DefaultTransactionProvider</text>
+    <line x1="30" y1="236" x2="230" y2="236" stroke="#58a6ff" stroke-width="1"/>
+    <text x="40" y="254" fill="#c9d1d9" font-size="11">- nested : boolean</text>
+    <text x="40" y="272" fill="#8b949e" font-size="11">+ JDBC + Savepoint 实现</text>
+    <text x="40" y="290" fill="#8b949e" font-size="11">+ 适用:独立应用</text>
+    <text x="40" y="308" fill="#8b949e" font-size="11">+ 默认</text>
+
+    <rect x="260" y="200" width="240" height="120" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="380" y="226" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">ThreadLocalTransaction</text>
+    <text x="380" y="240" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">Provider</text>
+    <line x1="270" y1="250" x2="490" y2="250" stroke="#3fb950" stroke-width="1"/>
+    <text x="280" y="268" fill="#c9d1d9" font-size="11">- ThreadLocal&lt;Connection&gt;</text>
+    <text x="280" y="286" fill="#8b949e" font-size="11">+ 同线程共享连接</text>
+    <text x="280" y="304" fill="#8b949e" font-size="11">+ 适用:事务外需同连接</text>
+
+    <rect x="520" y="200" width="280" height="120" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="660" y="226" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">SpringTransactionProvider</text>
+    <line x1="530" y1="236" x2="790" y2="236" stroke="#d29922" stroke-width="1"/>
+    <text x="540" y="254" fill="#c9d1d9" font-size="11">- PlatformTransactionManager</text>
+    <text x="540" y="272" fill="#8b949e" font-size="11">+ 委托 Spring TX</text>
+    <text x="540" y="290" fill="#8b949e" font-size="11">+ 支持 @Transactional</text>
+    <text x="540" y="308" fill="#8b949e" font-size="11">+ 适用:Spring / Boot</text>
+
+    <text x="460" y="170" text-anchor="middle" fill="#8b949e" font-size="11">三种实现 · 选一即可 · 接口共用</text>
+    <text x="460" y="360" text-anchor="middle" fill="#8b949e" font-size="11">注册:cfg.set(new XxxTransactionProvider(...)) — Configuration SPI 切换实现</text>
+  </svg>
+</div>
+<h3>表 14-1:实现类对照</h3>
+<table>
+<thead>
+<tr>
+<th>实现</th>
+<th>连接管理</th>
+<th>嵌套支持</th>
+<th>适用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DefaultTransactionProvider</code></td>
+<td>从 ConnectionProvider 获取</td>
+<td>Savepoint(<code>nested=true</code>)</td>
+<td>独立应用</td>
+</tr>
+<tr>
+<td><code>ThreadLocalTransactionProvider</code></td>
+<td>ThreadLocal 复用</td>
+<td>Savepoint</td>
+<td>事务外需同连接</td>
+</tr>
+<tr>
+<td><code>SpringTransactionProvider</code></td>
+<td>委托 Spring TX</td>
+<td>Spring NESTED 传播</td>
+<td>Spring / Boot</td>
+</tr>
+</tbody>
+</table>
+<h3>14.1.2 Lambda 事务 API</h3>
+<pre><code class="language-java">dsl.transaction(configuration -&gt; {
+    DSLContext tx = DSL.using(configuration);
+
+    Long orderId = tx.insertInto(ORDERS)
+        .set(ORDERS.CUSTOMER_ID, customerId)
+        .set(ORDERS.AMOUNT, amount)
+        .returning(ORDERS.ID)
+        .fetchOne(ORDERS.ID);
+
+    tx.insertInto(ORDER_ITEMS, ORDER_ITEMS.ORDER_ID, ORDER_ITEMS.PRODUCT_ID)
+      .values(orderId, productId)
+      .execute();
+});
+
+Long newOrderId = dsl.transactionResult(configuration -&gt; {
+    DSLContext tx = DSL.using(configuration);
+    return tx.insertInto(ORDERS)
+             .set(ORDERS.CUSTOMER_ID, customerId)
+             .set(ORDERS.AMOUNT, amount)
+             .returning(ORDERS.ID)
+             .fetchOne(ORDERS.ID);
+});
+</code></pre>
+<p>PostgreSQL 输出:</p>
+<pre><code class="language-sql">begin;
+insert into orders (customer_id, amount) values (?, ?) returning orders.id;
+insert into order_items (order_id, product_id) values (?, ?);
+commit;
+</code></pre>
+<div class="warning"><p>Lambda 内必须用 <code>DSL.using(configuration)</code> 创建事务专属 <code>DSLContext</code>,该实例绑定事务连接。直接使用外部 <code>dsl</code> 会在不同连接上执行,脱离事务范围。</p></div>
+<h3>表 14-1a:返回与异常</h3>
+<table>
+<thead>
+<tr>
+<th>API</th>
+<th>返回</th>
+<th>异常</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>transaction(TransactionalRunnable)</code></td>
+<td>void</td>
+<td>checked 包装为 <code>DataAccessException</code></td>
+</tr>
+<tr>
+<td><code>transactionResult(TransactionalCallable)</code></td>
+<td>T</td>
+<td>同上</td>
+</tr>
+<tr>
+<td><code>transactionAsync</code></td>
+<td><code>CompletionStage</code></td>
+<td>异步异常</td>
+</tr>
+</tbody>
+</table>
+<h2 id="14.2-事务生命周期">14.2 事务生命周期</h2>
+<h3>14.2.1 完整时序</h3>
+<div class="diagram">
+  <div class="diagram-title">图 14-2-1 · 事务完整时序 — begin → SQL → commit/rollback → release</div>
+  <svg viewBox="0 0 920 720" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#240d38"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0d0d"/></linearGradient>
+      <marker id="arr"  markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+      <marker id="arrG" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#3fb950"/></marker>
+      <marker id="arrR" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#f85149"/></marker>
+    </defs>
+
+    <rect x="20"  y="20" width="100" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="70"  y="46" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">App</text>
+
+    <rect x="160" y="20" width="120" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="220" y="46" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">DSLContext</text>
+
+    <rect x="320" y="20" width="140" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="390" y="46" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">TransactionProvider</text>
+
+    <rect x="500" y="20" width="140" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="570" y="46" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">ConnectionProvider</text>
+
+    <rect x="680" y="20" width="100" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="730" y="46" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Connection</text>
+
+    <rect x="820" y="20" width="80" height="40" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="860" y="46" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">DB</text>
+
+    <path d="M 70 60 L 70 690"   stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+    <path d="M 220 60 L 220 690" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+    <path d="M 390 60 L 390 690" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+    <path d="M 570 60 L 570 690" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+    <path d="M 730 60 L 730 690" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+    <path d="M 860 60 L 860 690" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+
+    <path d="M 70 90 L 220 90"   stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="145" y="84" text-anchor="middle" fill="#c9d1d9" font-size="11">① transaction(cfg -&gt; ...)</text>
+
+    <path d="M 220 120 L 390 120" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="305" y="114" text-anchor="middle" fill="#c9d1d9" font-size="11">② begin(txCtx)</text>
+
+    <path d="M 390 150 L 570 150" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="480" y="144" text-anchor="middle" fill="#c9d1d9" font-size="11">③ acquire()</text>
+
+    <path d="M 570 180 L 390 180" stroke="#3fb950" stroke-width="1.5" fill="none" stroke-dasharray="4 2" marker-end="url(#arrG)"/>
+    <text x="480" y="174" text-anchor="middle" fill="#3fb950" font-size="11">④ Connection</text>
+
+    <path d="M 390 210 L 730 210" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="560" y="204" text-anchor="middle" fill="#c9d1d9" font-size="11">⑤ setAutoCommit(false)</text>
+
+    <rect x="180" y="235" width="690" height="160" rx="10" fill="#0d1117" stroke="#bc8cff" stroke-dasharray="6 3"/>
+    <text x="200" y="258" fill="#bc8cff" font-size="12" font-weight="bold">Lambda 内 — 所有 SQL 共享同一连接</text>
+
+    <path d="M 220 285 L 730 285" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="475" y="279" text-anchor="middle" fill="#c9d1d9" font-size="11">⑥ SQL #1</text>
+
+    <path d="M 730 315 L 860 315" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="795" y="309" text-anchor="middle" fill="#c9d1d9" font-size="11">⑦ INSERT 执行</text>
+
+    <path d="M 220 345 L 730 345" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="475" y="339" text-anchor="middle" fill="#c9d1d9" font-size="11">⑧ SQL #2</text>
+
+    <path d="M 730 375 L 860 375" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="795" y="369" text-anchor="middle" fill="#c9d1d9" font-size="11">⑨ INSERT 执行</text>
+
+    <rect x="40" y="420" width="840" height="170" rx="10" fill="#0d1117" stroke="#3fb950" stroke-dasharray="6 3"/>
+    <text x="60" y="444" fill="#3fb950" font-size="12" font-weight="bold">alt — 正常返回 / 抛异常 二选一</text>
+
+    <path d="M 220 470 L 390 470" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arrG)"/>
+    <text x="305" y="464" text-anchor="middle" fill="#3fb950" font-size="11">⑩a 正常 · commit</text>
+
+    <path d="M 390 495 L 730 495" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arrG)"/>
+    <text x="560" y="489" text-anchor="middle" fill="#3fb950" font-size="11">⑪a TP → Conn.commit</text>
+
+    <path d="M 730 520 L 860 520" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arrG)"/>
+    <text x="795" y="514" text-anchor="middle" fill="#3fb950" font-size="11">⑫a COMMIT 写盘</text>
+
+    <path d="M 220 550 L 390 550" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arrR)"/>
+    <text x="305" y="544" text-anchor="middle" fill="#f85149" font-size="11">⑩b 抛异常 · rollback</text>
+
+    <path d="M 390 575 L 730 575" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arrR)"/>
+    <text x="560" y="569" text-anchor="middle" fill="#f85149" font-size="11">⑪b TP → Conn.rollback</text>
+
+    <path d="M 390 600 L 70 600" stroke="#f85149" stroke-width="1.5" fill="none" stroke-dasharray="4 2" marker-end="url(#arrR)"/>
+    <text x="230" y="594" text-anchor="middle" fill="#f85149" font-size="11">⑫b 重新抛出异常</text>
+
+    <path d="M 390 645 L 730 645" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="560" y="639" text-anchor="middle" fill="#c9d1d9" font-size="11">⑬ setAutoCommit(true) · 复位</text>
+
+    <path d="M 390 680 L 570 680" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="480" y="674" text-anchor="middle" fill="#c9d1d9" font-size="11">⑭ release · 归还连接池</text>
+  </svg>
+</div>
+<h3>14.2.2 auto-commit vs 显式事务</h3>
+<pre><code class="language-java">// 反例:auto-commit 无原子性
+dsl.insertInto(ORDERS).set(ORDERS.AMOUNT, amount).execute();   // 自动 COMMIT
+dsl.insertInto(ORDER_ITEMS).set(...).execute();               // 失败则订单已提交
+
+// 正例:显式事务保证原子性
+dsl.transaction(configuration -&gt; {
+    DSLContext tx = DSL.using(configuration);
+    tx.insertInto(ORDERS).set(ORDERS.AMOUNT, amount).execute();
+    tx.insertInto(ORDER_ITEMS).set(...).execute();
+});
+</code></pre>
+<h3>14.2.3 连接独占</h3>
+<div class="diagram">
+  <div class="diagram-title">图 14-2-3 · 连接独占对比 — auto-commit 散单 vs 显式事务包租</div>
+  <svg viewBox="0 0 920 540" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <marker id="arr"  markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+      <marker id="arrG" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#3fb950"/></marker>
+    </defs>
+
+    <rect x="180" y="20" width="120" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="240" y="46" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">连接池</text>
+    <rect x="500" y="20" width="120" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="560" y="46" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">应用</text>
+    <path d="M 240 60 L 240 510" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+    <path d="M 560 60 L 560 510" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+
+    <rect x="30" y="80" width="860" height="200" rx="10" fill="#0d1117" stroke="#d29922" stroke-dasharray="6 3"/>
+    <text x="50" y="104" fill="#d29922" font-size="12" font-weight="bold">A · auto-commit 模式 — 每条 SQL 独立 acquire / release(高频)</text>
+
+    <path d="M 560 130 L 240 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="400" y="124" text-anchor="middle" fill="#c9d1d9" font-size="11">① acquire</text>
+    <path d="M 240 155 L 560 155" stroke="#3fb950" stroke-width="1.5" fill="none" stroke-dasharray="4 2" marker-end="url(#arrG)"/>
+    <text x="400" y="149" text-anchor="middle" fill="#3fb950" font-size="11">② Conn A</text>
+    <text x="640" y="173" fill="#c9d1d9" font-size="11">③ SQL #1 执行</text>
+    <path d="M 560 195 L 240 195" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="400" y="189" text-anchor="middle" fill="#c9d1d9" font-size="11">④ release(立刻归还)</text>
+    <path d="M 560 225 L 240 225" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="400" y="219" text-anchor="middle" fill="#c9d1d9" font-size="11">⑤ acquire</text>
+    <path d="M 240 250 L 560 250" stroke="#3fb950" stroke-width="1.5" fill="none" stroke-dasharray="4 2" marker-end="url(#arrG)"/>
+    <text x="400" y="244" text-anchor="middle" fill="#3fb950" font-size="11">⑥ Conn B(可能不同)</text>
+    <text x="640" y="268" fill="#c9d1d9" font-size="11">⑦ SQL #2 → release</text>
+
+    <rect x="30" y="310" width="860" height="200" rx="10" fill="#0d1117" stroke="#3fb950" stroke-dasharray="6 3"/>
+    <text x="50" y="334" fill="#3fb950" font-size="12" font-weight="bold">B · 显式事务 — Lambda 内独占一条 Conn A 直到 release(低频)</text>
+
+    <path d="M 560 360 L 240 360" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="400" y="354" text-anchor="middle" fill="#c9d1d9" font-size="11">① acquire</text>
+    <path d="M 240 385 L 560 385" stroke="#3fb950" stroke-width="1.5" fill="none" stroke-dasharray="4 2" marker-end="url(#arrG)"/>
+    <text x="400" y="379" text-anchor="middle" fill="#3fb950" font-size="11">② Conn A · autoCommit=false</text>
+
+    <rect x="430" y="400" width="260" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="560" y="421" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">SQL #1 / #2 / #3 全部走 Conn A</text>
+    <text x="560" y="438" text-anchor="middle" fill="#c9d1d9" font-size="11">Lambda 期间连接被独占</text>
+
+    <path d="M 560 480 L 240 480" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="400" y="474" text-anchor="middle" fill="#c9d1d9" font-size="11">③ commit + release(事务结束)</text>
+  </svg>
+</div>
+<div class="key-insight"><p>事务期间连接被独占,长事务直接挤占连接池。事务越短,连接复用率越高。</p></div>
+<h2 id="14.3-嵌套事务与-savepoint">14.3 嵌套事务与 Savepoint</h2>
+<h3>图 14-3:嵌套状态机</h3>
+<div class="diagram">
+  <div class="diagram-title">图 14-3 · 嵌套事务状态机 — Savepoint 实现部分回滚</div>
+  <svg viewBox="0 0 920 540" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#240d38"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0d0d"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+
+    <circle cx="80" cy="50" r="14" fill="#c9d1d9" stroke="#58a6ff" stroke-width="2"/>
+    <text x="80" y="55" text-anchor="middle" fill="#0d1117" font-size="11" font-weight="bold">●</text>
+
+    <rect x="40" y="100" width="200" height="50" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="140" y="120" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">OuterBegin</text>
+    <text x="140" y="138" text-anchor="middle" fill="#8b949e" font-size="11">setAutoCommit(false)</text>
+
+    <rect x="40" y="190" width="200" height="50" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="140" y="210" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">OuterSQL1</text>
+    <text x="140" y="228" text-anchor="middle" fill="#8b949e" font-size="11">INSERT orders ...</text>
+
+    <rect x="340" y="190" width="200" height="50" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="440" y="210" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">SP · 内层入口</text>
+    <text x="440" y="228" text-anchor="middle" fill="#8b949e" font-size="11">SAVEPOINT sp_1</text>
+
+    <rect x="340" y="280" width="200" height="50" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="440" y="300" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">InnerSQL · 内层执行</text>
+    <text x="440" y="318" text-anchor="middle" fill="#8b949e" font-size="11">INSERT order_items ...</text>
+
+    <rect x="290" y="370" width="300" height="50" rx="25" fill="#161b22" stroke="#d29922" stroke-width="2"/>
+    <text x="440" y="395" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">⟨InnerCheck⟩ Lambda 是否抛异常 ?</text>
+
+    <rect x="620" y="320" width="240" height="50" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="740" y="340" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">SP_Release · 内层成功</text>
+    <text x="740" y="358" text-anchor="middle" fill="#8b949e" font-size="11">RELEASE SAVEPOINT sp_1</text>
+
+    <rect x="620" y="430" width="240" height="50" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="740" y="450" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">SP_Rollback · 内层失败</text>
+    <text x="740" y="468" text-anchor="middle" fill="#8b949e" font-size="11">ROLLBACK TO sp_1(外层 SQL 保留)</text>
+
+    <rect x="40" y="430" width="200" height="50" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="140" y="450" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">OuterContinue</text>
+    <text x="140" y="468" text-anchor="middle" fill="#8b949e" font-size="11">外层继续运行</text>
+
+    <rect x="40" y="500" width="200" height="34" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="140" y="522" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Committed · COMMIT 全部</text>
+
+    <path d="M 80 64 L 80 80 L 140 80 L 140 100" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 140 150 L 140 190" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="160" y="174" fill="#8b949e" font-size="11">BEGIN</text>
+
+    <path d="M 240 215 L 340 215" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="290" y="208" text-anchor="middle" fill="#8b949e" font-size="11">内层 transaction()</text>
+
+    <path d="M 440 240 L 440 280" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 440 330 L 440 370" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="460" y="356" fill="#8b949e" font-size="11">Lambda 结束</text>
+
+    <path d="M 590 385 L 740 385 L 740 320" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="668" y="375" fill="#3fb950" font-size="11">正常</text>
+
+    <path d="M 590 410 L 740 410 L 740 430" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="668" y="425" fill="#f85149" font-size="11">异常 + catch</text>
+
+    <path d="M 620 345 L 240 345 L 240 430" stroke="#58a6ff" stroke-width="1.5" fill="none" stroke-dasharray="4 2" marker-end="url(#arr)"/>
+    <path d="M 620 455 L 240 455" stroke="#58a6ff" stroke-width="1.5" fill="none" stroke-dasharray="4 2" marker-end="url(#arr)"/>
+
+    <path d="M 140 480 L 140 500" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="160" y="494" fill="#8b949e" font-size="11">外层结束</text>
+
+    <text x="460" y="510" fill="#8b949e" font-size="11">不 catch 内层异常 = 外层一起 ROLLBACK</text>
+  </svg>
+</div>
+<h3>14.3.1 部分回滚示例</h3>
+<pre><code class="language-java">dsl.transaction(outerConfig -&gt; {
+    DSLContext otx = DSL.using(outerConfig);
+
+    Long orderId = otx.insertInto(ORDERS)
+       .set(ORDERS.CUSTOMER_ID, 1001L)
+       .set(ORDERS.AMOUNT, new BigDecimal(&quot;199.99&quot;))
+       .returning(ORDERS.ID)
+       .fetchOne(ORDERS.ID);
+
+    try {
+        otx.transaction(innerConfig -&gt; {
+            DSLContext itx = DSL.using(innerConfig);
+            itx.insertInto(ORDER_ITEMS)
+               .set(ORDER_ITEMS.ORDER_ID, orderId)
+               .set(ORDER_ITEMS.PRODUCT_ID, 99999L)  // 不存在
+               .execute();
+        });
+    } catch (DataAccessException e) {
+        log.warn(&quot;明细插入失败,改写默认条目&quot;, e);
+
+        otx.insertInto(ORDER_ITEMS)
+           .set(ORDER_ITEMS.ORDER_ID, orderId)
+           .set(ORDER_ITEMS.PRODUCT_ID, DEFAULT_PRODUCT_ID)
+           .execute();
+    }
+});
+</code></pre>
+<p>PostgreSQL 输出:</p>
+<pre><code class="language-sql">begin;
+insert into orders (customer_id, amount) values (1001, 199.99);
+savepoint jooq_savepoint_1;
+insert into order_items (order_id, product_id) values (10042, 99999);
+rollback to savepoint jooq_savepoint_1;
+insert into order_items (order_id, product_id) values (10042, 1);
+commit;
+</code></pre>
+<h3>14.3.2 三种结果</h3>
+<div class="diagram">
+  <div class="diagram-title">图 14-3-2 · 嵌套事务三种结果 — 成功 / 部分回滚 / 全部回滚</div>
+  <svg viewBox="0 0 920 620" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#240d38"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0d0d"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="360" y="20"  width="200" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="460" y="48" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">外层 transaction</text>
+
+    <rect x="360" y="100" width="200" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="460" y="128" text-anchor="middle" fill="#c9d1d9" font-size="12">SQL-A · INSERT orders</text>
+
+    <rect x="360" y="180" width="200" height="44" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="208" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">内层 transaction</text>
+
+    <rect x="360" y="260" width="200" height="44" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="288" text-anchor="middle" fill="#c9d1d9" font-size="12">SQL-B · INSERT items</text>
+
+    <polygon points="460,340 600,390 460,440 320,390" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="460" y="385" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">内层结果?</text>
+    <text x="460" y="402" text-anchor="middle" fill="#c9d1d9" font-size="11">try / catch</text>
+
+    <path d="M 460 64  L 460 100" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 144 L 460 180" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 224 L 460 260" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 304 L 460 340" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="30"  y="460" width="220" height="44" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="140" y="488" text-anchor="middle" fill="#c9d1d9" font-size="12">RELEASE SAVEPOINT</text>
+
+    <rect x="30"  y="520" width="220" height="44" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="140" y="546" text-anchor="middle" fill="#c9d1d9" font-size="12">SQL-C · UPDATE stock</text>
+
+    <rect x="30"  y="580" width="220" height="32" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="140" y="600" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">COMMIT 全部</text>
+
+    <rect x="350" y="460" width="220" height="44" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="460" y="488" text-anchor="middle" fill="#c9d1d9" font-size="12">ROLLBACK TO SAVEPOINT</text>
+
+    <rect x="350" y="520" width="220" height="44" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="460" y="542" text-anchor="middle" fill="#c9d1d9" font-size="11">SQL-A 保留 · SQL-B 撤销</text>
+
+    <rect x="350" y="580" width="220" height="32" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="460" y="600" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">继续外层 → COMMIT</text>
+
+    <rect x="670" y="460" width="220" height="44" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="780" y="488" text-anchor="middle" fill="#c9d1d9" font-size="12">异常传播</text>
+
+    <rect x="670" y="520" width="220" height="32" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="780" y="540" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">ROLLBACK 全部</text>
+
+    <path d="M 380 410 L 140 410 L 140 460" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="240" y="402" fill="#3fb950" font-size="11">全部成功</text>
+
+    <path d="M 460 440 L 460 460" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="480" y="455" fill="#d29922" font-size="11">内层失败 + catch</text>
+
+    <path d="M 540 410 L 780 410 L 780 460" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="680" y="402" fill="#f85149" font-size="11">内层失败 + 未 catch</text>
+
+    <path d="M 140 504 L 140 520" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 140 564 L 140 580" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 504 L 460 520" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 564 L 460 580" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 780 504 L 780 520" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+<h3>表 14-3:嵌套层与回滚范围</h3>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>JDBC 操作</th>
+<th>回滚范围</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>第 1 层(外层)</td>
+<td><code>setAutoCommit(false)</code></td>
+<td>全部 SQL</td>
+</tr>
+<tr>
+<td>第 2 层</td>
+<td><code>setSavepoint("sp_1")</code></td>
+<td>sp_1 之后</td>
+</tr>
+<tr>
+<td>第 3 层</td>
+<td><code>setSavepoint("sp_2")</code></td>
+<td>sp_2 之后</td>
+</tr>
+<tr>
+<td>第 N 层</td>
+<td><code>setSavepoint("sp_(N-1)")</code></td>
+<td>sp_(N-1) 之后</td>
+</tr>
+</tbody>
+</table>
+<div class="key-insight"><p>不 catch 内层异常 = 整体回滚。Savepoint 只是事务内的检查点,RELEASE SAVEPOINT 不等于 COMMIT。</p></div>
+<h3>14.3.3 nested 标志</h3>
+<pre><code class="language-java">new DefaultTransactionProvider(connectionProvider, true);   // 嵌套用 Savepoint
+new DefaultTransactionProvider(connectionProvider, false);  // 内层加入外层事务
+</code></pre>
+<p><code>nested=false</code> 时内层 <code>transaction()</code> 不创建 Savepoint,行为类似 Spring <code>REQUIRED</code> 传播。</p>
+<h2 id="14.4-spring-集成">14.4 Spring 集成</h2>
+<h3>图 14-4:全链路</h3>
+<div class="diagram">
+  <div class="diagram-title">图 14-4 · Spring 集成全链路 — @Transactional 与 jOOQ 共享 Connection</div>
+  <svg viewBox="0 0 920 660" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#240d38"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0d0d"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="280" y="20"  width="360" height="44" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="48" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">@Transactional Service 方法</text>
+
+    <rect x="280" y="90"  width="360" height="44" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="118" text-anchor="middle" fill="#c9d1d9" font-size="13">Spring AOP Proxy</text>
+
+    <rect x="280" y="160" width="360" height="44" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="460" y="188" text-anchor="middle" fill="#c9d1d9" font-size="13">PlatformTransactionManager.getTransaction</text>
+
+    <rect x="280" y="230" width="360" height="44" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="460" y="258" text-anchor="middle" fill="#c9d1d9" font-size="13">DataSourceTransactionManager</text>
+
+    <rect x="280" y="300" width="360" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="460" y="328" text-anchor="middle" fill="#c9d1d9" font-size="13">DataSource.getConnection → autoCommit=false</text>
+
+    <rect x="280" y="370" width="360" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="460" y="398" text-anchor="middle" fill="#c9d1d9" font-size="13">DSLContext 执行 SQL</text>
+
+    <rect x="280" y="440" width="360" height="44" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="460" y="468" text-anchor="middle" fill="#c9d1d9" font-size="13">DataSourceConnectionProvider</text>
+
+    <rect x="240" y="510" width="440" height="44" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="460" y="538" text-anchor="middle" fill="#c9d1d9" font-size="13">TransactionSynchronizationManager 返回同一 Connection</text>
+
+    <polygon points="460,580 600,615 460,650 320,615" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="460" y="620" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">方法正常?</text>
+
+    <rect x="40"  y="595" width="180" height="40" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="130" y="620" text-anchor="middle" fill="#c9d1d9" font-size="12">Spring commit → release</text>
+
+    <rect x="700" y="595" width="180" height="40" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="790" y="620" text-anchor="middle" fill="#c9d1d9" font-size="12">Spring rollback → release</text>
+
+    <path d="M 460 64  L 460 90"  stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 134 L 460 160" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 204 L 460 230" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 274 L 460 300" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 344 L 460 370" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 414 L 460 440" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 484 L 460 510" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 554 L 460 580" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <path d="M 320 615 L 220 615" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="270" y="608" text-anchor="middle" fill="#3fb950" font-size="11">是</text>
+
+    <path d="M 600 615 L 700 615" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="650" y="608" text-anchor="middle" fill="#f85149" font-size="11">否</text>
+
+    <text x="660" y="490" fill="#bc8cff" font-size="11">关键:走 TransactionSync 拿到同一 Conn,Spring 提交 = jOOQ 提交</text>
+  </svg>
+</div>
+<h3>14.4.1 配置</h3>
+<pre><code class="language-java">@Configuration
+public class JooqConfig {
+
+    @Bean
+    public DefaultDSLContext dslContext(DataSource ds, PlatformTransactionManager tx) {
+        DefaultConfiguration cfg = new DefaultConfiguration();
+        cfg.set(SQLDialect.POSTGRES);
+        cfg.set(new DataSourceConnectionProvider(
+            new TransactionAwareDataSourceProxy(ds)));
+        cfg.set(new SpringTransactionProvider(tx));
+        return new DefaultDSLContext(cfg);
+    }
+}
+
+@Service
+public class OrderService {
+    @Autowired private DSLContext dsl;
+
+    @Transactional
+    public void createOrder(Long customerId, List&lt;OrderItemDTO&gt; items) {
+        OrdersRecord order = dsl.newRecord(ORDERS);
+        order.setCustomerId(customerId);
+        order.store();
+
+        for (OrderItemDTO item : items) {
+            dsl.insertInto(ORDER_ITEMS)
+               .set(ORDER_ITEMS.ORDER_ID, order.getId())
+               .set(ORDER_ITEMS.PRODUCT_ID, item.productId())
+               .execute();
+        }
+    }
+}
+</code></pre>
+<h3>表 14-4:Spring vs jOOQ 原生</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>Spring?</th>
+<th>@Transactional?</th>
+<th>推荐</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>无框架</td>
+<td>否</td>
+<td>-</td>
+<td><code>dsl.transaction()</code> + <code>DefaultTransactionProvider</code></td>
+</tr>
+<tr>
+<td>Spring 声明式</td>
+<td>是</td>
+<td>是</td>
+<td><code>@Transactional</code> + <code>SpringTransactionProvider</code></td>
+</tr>
+<tr>
+<td>Spring 编程式</td>
+<td>是</td>
+<td>否</td>
+<td><code>dsl.transaction()</code> + <code>SpringTransactionProvider</code></td>
+</tr>
+</tbody>
+</table>
+<h3>14.4.2 TransactionAwareDataSourceProxy</h3>
+<p>该 Spring 代理类确保 <code>DataSource.getConnection()</code> 返回 Spring 事务管理器绑定到当前线程的连接,而非从池新借。缺失会让 jOOQ 在事务外的连接上执行 SQL,直接破坏事务原子性。</p>
+<h2 id="14.5-连接池集成">14.5 连接池集成</h2>
+<h3>图 14-5:HikariCP 集成全景</h3>
+<div class="diagram">
+  <div class="diagram-title">图 14-5 · HikariCP 集成全景 — 五层调用链</div>
+  <svg viewBox="0 0 920 180" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#240d38"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20"  y="60" width="160" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="100" y="86" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">DSLContext</text>
+    <text x="100" y="104" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">.transaction(...)</text>
+
+    <rect x="200" y="60" width="160" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="280" y="86" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Transaction</text>
+    <text x="280" y="104" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Provider</text>
+
+    <rect x="380" y="60" width="180" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="470" y="86" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">DataSourceConnection</text>
+    <text x="470" y="104" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Provider</text>
+
+    <rect x="580" y="60" width="180" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="670" y="86" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">HikariDataSource</text>
+    <text x="670" y="104" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">HikariPool</text>
+
+    <rect x="780" y="60" width="120" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="840" y="96" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">数据库</text>
+
+    <path d="M 180 90 L 200 90" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 360 90 L 380 90" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 560 90 L 580 90" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 760 90 L 780 90" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <text x="460" y="160" text-anchor="middle" fill="#8b949e" font-size="11">jOOQ 不实现连接池 — 通过 ConnectionProvider 桥接到 HikariCP / Tomcat-JDBC / 任意 DataSource</text>
+  </svg>
+</div>
+<h3>14.5.1 配置</h3>
+<pre><code class="language-java">HikariConfig hikari = new HikariConfig();
+hikari.setJdbcUrl(&quot;jdbc:postgresql://localhost:5432/mydb&quot;);
+hikari.setUsername(&quot;app&quot;);
+hikari.setPassword(&quot;secret&quot;);
+hikari.setMaximumPoolSize(20);
+hikari.setMinimumIdle(5);
+hikari.setConnectionTimeout(30_000);
+hikari.setLeakDetectionThreshold(60_000);
+
+HikariDataSource ds = new HikariDataSource(hikari);
+ConnectionProvider cp = new DataSourceConnectionProvider(ds);
+
+DSLContext dsl = DSL.using(new DefaultConfiguration()
+    .set(SQLDialect.POSTGRES)
+    .set(cp)
+    .set(new DefaultTransactionProvider(cp, true)));
+</code></pre>
+<h3>表 14-5:Hikari 关键参数</h3>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>推荐</th>
+<th>与事务关系</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>maximumPoolSize</code></td>
+<td>10–20</td>
+<td>并发事务上限</td>
+</tr>
+<tr>
+<td><code>connectionTimeout</code></td>
+<td>30 s</td>
+<td>池耗尽时新请求等待</td>
+</tr>
+<tr>
+<td><code>idleTimeout</code></td>
+<td>600 s</td>
+<td>空闲超时</td>
+</tr>
+<tr>
+<td><code>maxLifetime</code></td>
+<td>1800 s</td>
+<td>应小于 DB <code>wait_timeout</code></td>
+</tr>
+<tr>
+<td><code>leakDetectionThreshold</code></td>
+<td>60 s</td>
+<td>连接泄漏告警</td>
+</tr>
+</tbody>
+</table>
+<h3>14.5.2 池大小公式</h3>
+<p><code>poolSize = (core_count × 2) + effective_spindle_count</code></p>
+<p>SSD 环境典型 8 核 → 16 连接。过大反而因上下文切换降低吞吐。</p>
+<h3>14.5.3 事务连接生命周期</h3>
+<div class="diagram">
+  <div class="diagram-title">图 14-5-3 · 事务连接生命周期 — idle → active → idle</div>
+  <svg viewBox="0 0 920 580" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#240d38"/></linearGradient>
+      <marker id="arr"  markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+      <marker id="arrG" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#3fb950"/></marker>
+    </defs>
+
+    <rect x="20"  y="20" width="120" height="40" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="2"/>
+    <text x="80"  y="46" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Service</text>
+    <rect x="180" y="20" width="160" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="260" y="46" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">TransactionProvider</text>
+    <rect x="380" y="20" width="160" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="46" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">ConnectionProvider</text>
+    <rect x="580" y="20" width="160" height="40" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="2"/>
+    <text x="660" y="46" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">HikariPool</text>
+    <rect x="780" y="20" width="120" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="840" y="46" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Connection</text>
+
+    <path d="M 80  60 L 80  560" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+    <path d="M 260 60 L 260 560" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+    <path d="M 460 60 L 460 560" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+    <path d="M 660 60 L 660 560" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+    <path d="M 840 60 L 840 560" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+
+    <path d="M 80 90 L 260 90"   stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="170" y="84" text-anchor="middle" fill="#c9d1d9" font-size="11">① begin</text>
+
+    <path d="M 260 120 L 460 120" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="360" y="114" text-anchor="middle" fill="#c9d1d9" font-size="11">② acquire</text>
+
+    <path d="M 460 150 L 660 150" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="560" y="144" text-anchor="middle" fill="#c9d1d9" font-size="11">③ getConnection</text>
+
+    <path d="M 660 180 L 460 180" stroke="#3fb950" stroke-width="1.5" fill="none" stroke-dasharray="4 2" marker-end="url(#arrG)"/>
+    <text x="560" y="174" text-anchor="middle" fill="#3fb950" font-size="11">④ Conn #7 · idle → active</text>
+
+    <path d="M 460 210 L 260 210" stroke="#3fb950" stroke-width="1.5" fill="none" stroke-dasharray="4 2" marker-end="url(#arrG)"/>
+    <text x="360" y="204" text-anchor="middle" fill="#3fb950" font-size="11">⑤ Conn #7</text>
+
+    <path d="M 260 240 L 840 240" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="550" y="234" text-anchor="middle" fill="#c9d1d9" font-size="11">⑥ setAutoCommit(false)</text>
+
+    <rect x="30" y="265" width="860" height="120" rx="10" fill="#0d1117" stroke="#bc8cff" stroke-dasharray="6 3"/>
+    <text x="50" y="288" fill="#bc8cff" font-size="12" font-weight="bold">事务期间 — Conn #7 被独占 · 池中 active 计数 +1</text>
+
+    <path d="M 80 320 L 840 320" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="460" y="314" text-anchor="middle" fill="#c9d1d9" font-size="11">⑦ INSERT / UPDATE / SELECT</text>
+
+    <path d="M 80 360 L 260 360" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arrG)"/>
+    <text x="170" y="354" text-anchor="middle" fill="#3fb950" font-size="11">⑧ commit</text>
+
+    <path d="M 260 410 L 840 410" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arrG)"/>
+    <text x="550" y="404" text-anchor="middle" fill="#3fb950" font-size="11">⑨ Conn.commit</text>
+
+    <path d="M 260 445 L 840 445" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="550" y="439" text-anchor="middle" fill="#c9d1d9" font-size="11">⑩ setAutoCommit(true) · 复位</text>
+
+    <path d="M 260 485 L 460 485" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="360" y="479" text-anchor="middle" fill="#c9d1d9" font-size="11">⑪ release</text>
+
+    <path d="M 460 520 L 660 520" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="560" y="514" text-anchor="middle" fill="#c9d1d9" font-size="11">⑫ close → 归还池</text>
+
+    <path d="M 660 555 L 720 555" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arrG)"/>
+    <text x="800" y="549" text-anchor="middle" fill="#3fb950" font-size="11">⑬ Conn #7 · active → idle</text>
+  </svg>
+</div>
+<h2 id="14.6-陷阱与限制">14.6 陷阱与限制</h2>
+<h3>图 14-6:陷阱分类</h3>
+<div class="diagram">
+  <div class="diagram-title">图 14-6 · 事务陷阱分类 — 5 大类 / 9 个具体陷阱</div>
+  <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#240d38"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0d0d"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="380" y="20" width="160" height="48" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="460" y="50" text-anchor="middle" fill="#c9d1d9" font-size="14" font-weight="bold">事务陷阱</text>
+
+    <rect x="20"  y="110" width="160" height="40" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="100" y="135" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">A · 连接泄漏</text>
+
+    <rect x="200" y="110" width="160" height="40" rx="10" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="2"/>
+    <text x="280" y="135" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">B · 隔离级别差异</text>
+
+    <rect x="380" y="110" width="160" height="40" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="135" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">C · 嵌套回滚误解</text>
+
+    <rect x="560" y="110" width="160" height="40" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="640" y="135" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">D · 长事务</text>
+
+    <rect x="740" y="110" width="160" height="40" rx="10" fill="url(#g-red)"    stroke="#f85149" stroke-width="2"/>
+    <text x="820" y="135" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">E · 两套管理混用</text>
+
+    <path d="M 460 68  L 460 90 L 100 90 L 100 110" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 90 L 280 90 L 280 110" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 68 L 460 110" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 90 L 640 90 L 640 110" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 90 L 820 90 L 820 110" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="20"  y="200" width="160" height="40" rx="8" fill="#0d1117" stroke="#d29922"/>
+    <text x="100" y="225" text-anchor="middle" fill="#c9d1d9" font-size="11">1. Conn 未关闭</text>
+    <rect x="20"  y="250" width="160" height="40" rx="8" fill="#0d1117" stroke="#d29922"/>
+    <text x="100" y="275" text-anchor="middle" fill="#c9d1d9" font-size="11">2. Cursor 未关闭</text>
+
+    <rect x="200" y="200" width="160" height="40" rx="8" fill="#0d1117" stroke="#58a6ff"/>
+    <text x="280" y="225" text-anchor="middle" fill="#c9d1d9" font-size="11">3. PG SERIALIZABLE</text>
+    <rect x="200" y="250" width="160" height="40" rx="8" fill="#0d1117" stroke="#58a6ff"/>
+    <text x="280" y="275" text-anchor="middle" fill="#c9d1d9" font-size="11">4. MySQL Gap Lock</text>
+
+    <rect x="380" y="200" width="160" height="40" rx="8" fill="#0d1117" stroke="#bc8cff"/>
+    <text x="460" y="220" text-anchor="middle" fill="#c9d1d9" font-size="11">5. RELEASE ≠</text>
+    <text x="460" y="235" text-anchor="middle" fill="#c9d1d9" font-size="11">COMMIT</text>
+    <rect x="380" y="250" width="160" height="40" rx="8" fill="#0d1117" stroke="#bc8cff"/>
+    <text x="460" y="270" text-anchor="middle" fill="#c9d1d9" font-size="11">6. 未 catch</text>
+    <text x="460" y="285" text-anchor="middle" fill="#c9d1d9" font-size="11">内层异常</text>
+
+    <rect x="560" y="200" width="160" height="40" rx="8" fill="#0d1117" stroke="#d29922"/>
+    <text x="640" y="225" text-anchor="middle" fill="#c9d1d9" font-size="11">7. 事务内 HTTP 调用</text>
+    <rect x="560" y="250" width="160" height="40" rx="8" fill="#0d1117" stroke="#d29922"/>
+    <text x="640" y="275" text-anchor="middle" fill="#c9d1d9" font-size="11">8. 大批量未分批</text>
+
+    <rect x="740" y="200" width="160" height="40" rx="8" fill="#0d1117" stroke="#f85149"/>
+    <text x="820" y="220" text-anchor="middle" fill="#c9d1d9" font-size="11">9. Spring + dsl</text>
+    <text x="820" y="235" text-anchor="middle" fill="#c9d1d9" font-size="11">.transaction 混用</text>
+
+    <path d="M 100 150 L 100 200" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 100 240 L 100 250" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 280 150 L 280 200" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 280 240 L 280 250" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 150 L 460 200" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 240 L 460 250" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 640 150 L 640 200" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 640 240 L 640 250" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 820 150 L 820 200" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="60" y="340" width="800" height="100" rx="10" fill="#0d1117" stroke="#bc8cff" stroke-dasharray="6 3"/>
+    <text x="80" y="364" fill="#bc8cff" font-size="12" font-weight="bold">最常见 = 1 + 7 — 池耗尽根因都是连接独占太久 → 短事务 + 先 I/O 再事务</text>
+    <text x="80" y="388" fill="#c9d1d9" font-size="11">隔离级别(3/4) — 不是 bug,是隔离语义,需要应用层重试 / 业务建模配合</text>
+    <text x="80" y="408" fill="#c9d1d9" font-size="11">语义陷阱(5/6/9) — 与文档冲突 → 必须 code review + 集成测试覆盖</text>
+    <text x="80" y="428" fill="#c9d1d9" font-size="11">规模陷阱(8) — 大事务撤销日志膨胀 → 分批 + 多事务 + 幂等</text>
+  </svg>
+</div>
+<h3>表 14-6:陷阱明细</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">#</th>
+<th>陷阱</th>
+<th>现象</th>
+<th>根因</th>
+<th>修复</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">1</td>
+<td>Conn 未关闭</td>
+<td>池耗尽</td>
+<td>手动 acquire 未 release</td>
+<td>try-with-resources</td>
+</tr>
+<tr>
+<td style="text-align: right;">2</td>
+<td>Cursor 未关闭</td>
+<td>池耗尽</td>
+<td>提前 break</td>
+<td>try-with-resources</td>
+</tr>
+<tr>
+<td style="text-align: right;">3</td>
+<td>PG SERIALIZABLE 冲突</td>
+<td>ERROR 40001</td>
+<td>SSI 冲突</td>
+<td>重试</td>
+</tr>
+<tr>
+<td style="text-align: right;">4</td>
+<td>MySQL Gap Lock</td>
+<td>死锁</td>
+<td>InnoDB 默认 RR</td>
+<td>隔离级别评估</td>
+</tr>
+<tr>
+<td style="text-align: right;">5</td>
+<td>RELEASE ≠ COMMIT</td>
+<td>数据丢失</td>
+<td>误解 Savepoint</td>
+<td>关键审计用独立事务</td>
+</tr>
+<tr>
+<td style="text-align: right;">6</td>
+<td>未 catch 内层异常</td>
+<td>全部回滚</td>
+<td>Savepoint 形同虚设</td>
+<td>主动 try-catch</td>
+</tr>
+<tr>
+<td style="text-align: right;">7</td>
+<td>事务内 HTTP</td>
+<td>池耗尽</td>
+<td>长事务</td>
+<td>先 I/O 再事务</td>
+</tr>
+<tr>
+<td style="text-align: right;">8</td>
+<td>大批量未分批</td>
+<td>锁等待 / 撤销日志膨胀</td>
+<td>全量一次</td>
+<td>分批 + 多事务</td>
+</tr>
+<tr>
+<td style="text-align: right;">9</td>
+<td>Spring + dsl 混用</td>
+<td>嵌套语义</td>
+<td>双 TX 管理</td>
+<td>选一种风格</td>
+</tr>
+</tbody>
+</table>
+<h3>14.6.1 隔离级别速查</h3>
+<table>
+<thead>
+<tr>
+<th>数据库</th>
+<th>默认隔离</th>
+<th>高级语义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PostgreSQL</td>
+<td>READ COMMITTED</td>
+<td>REPEATABLE READ 快照 / SERIALIZABLE SSI</td>
+</tr>
+<tr>
+<td>MySQL InnoDB</td>
+<td>REPEATABLE READ</td>
+<td>Gap Lock 阻止幻读</td>
+</tr>
+<tr>
+<td>Oracle</td>
+<td>READ COMMITTED</td>
+<td>SERIALIZABLE 冲突 ORA-08177</td>
+</tr>
+<tr>
+<td>SQL Server</td>
+<td>READ COMMITTED</td>
+<td>SNAPSHOT 可选</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>RC</th>
+<th>RR</th>
+<th>SER</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>脏读</td>
+<td>阻止</td>
+<td>阻止</td>
+<td>阻止</td>
+</tr>
+<tr>
+<td>不可重复读</td>
+<td>可能</td>
+<td>阻止</td>
+<td>阻止</td>
+</tr>
+<tr>
+<td>幻读</td>
+<td>可能</td>
+<td>数据库依赖</td>
+<td>阻止</td>
+</tr>
+<tr>
+<td>写偏斜</td>
+<td>可能</td>
+<td>可能</td>
+<td>阻止(PG SSI)</td>
+</tr>
+</tbody>
+</table>
+<h3>14.6.2 长事务反例</h3>
+<pre><code class="language-java">// 反例:事务内 HTTP
+dsl.transaction(cfg -&gt; {
+    DSLContext tx = DSL.using(cfg);
+    tx.insertInto(ORDERS).set(...).execute();
+    HttpResponse resp = httpClient.send(req, ...);  // 5 s+
+    tx.update(ORDERS).set(ORDERS.PAYMENT_STATUS, resp.body()).execute();
+});
+
+// 正例:先 I/O 再事务
+HttpResponse resp = httpClient.send(req, ...);
+dsl.transaction(cfg -&gt; {
+    DSLContext tx = DSL.using(cfg);
+    tx.insertInto(ORDERS).set(...).execute();
+    tx.update(ORDERS).set(ORDERS.PAYMENT_STATUS, resp.body()).execute();
+});
+</code></pre>
+<div class="key-insight"><p>事务黄金法则:目标持续时间 &lt; 100 ms。</p></div>
+<h2 id="14.7-生产守卫">14.7 生产守卫</h2>
+<h3>14.7.1 上线检查</h3>
+<table>
+<thead>
+<tr>
+<th>检查项</th>
+<th>验证</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TransactionProvider 类型</td>
+<td>启动断言</td>
+</tr>
+<tr>
+<td><code>nested</code> 标志</td>
+<td>显式声明</td>
+</tr>
+<tr>
+<td>Spring 集成</td>
+<td><code>TransactionAwareDataSourceProxy</code></td>
+</tr>
+<tr>
+<td>Hikari <code>leakDetectionThreshold</code></td>
+<td>配置</td>
+</tr>
+<tr>
+<td>池大小</td>
+<td>CPU × 2 量级</td>
+</tr>
+<tr>
+<td>隔离级别声明</td>
+<td>入口统一</td>
+</tr>
+<tr>
+<td>事务内禁 I/O</td>
+<td>静态扫描</td>
+</tr>
+<tr>
+<td>大批量分批</td>
+<td><code>commitAfter</code></td>
+</tr>
+</tbody>
+</table>
+<h3>14.7.2 启动校验</h3>
+<pre><code class="language-java">@PostConstruct
+void verifyTransactionProvider() {
+    TransactionProvider tp = config.transactionProvider();
+    if (tp instanceof NoTransactionProvider) {
+        throw new IllegalStateException(
+            &quot;NoTransactionProvider not allowed in production&quot;);
+    }
+    log.info(&quot;jOOQ transactionProvider={}&quot;, tp.getClass().getSimpleName());
+}
+</code></pre>
+<h3>14.7.3 隔离级别统一声明</h3>
+<pre><code class="language-java">// 推荐:Spring @Transactional 入口声明
+@Transactional(isolation = Isolation.SERIALIZABLE)
+public void transferMoney(Long from, Long to, BigDecimal amount) {
+    // ...
+}
+
+// 编程式
+TransactionTemplate tpl = new TransactionTemplate(txManager);
+tpl.setIsolationLevel(TransactionDefinition.ISOLATION_SERIALIZABLE);
+tpl.execute(status -&gt; { /* ... */ });
+</code></pre>
+<p>避免在事务中途改连接状态:</p>
+<pre><code class="language-java">// 反例
+dsl.transaction(cfg -&gt; {
+    DSLContext tx = DSL.using(cfg);
+    tx.connection(c -&gt; c.setTransactionIsolation(
+        Connection.TRANSACTION_SERIALIZABLE));  // 第一条 SQL 之前才能设
+    // ...
+});
+</code></pre>
+<h2 id="14.8-测试护栏">14.8 测试护栏</h2>
+<h3>14.8.1 提交与回滚断言</h3>
+<pre><code class="language-java">@Test
+void transaction_commits_on_success() {
+    dsl.transaction(cfg -&gt; {
+        DSL.using(cfg).insertInto(ORDERS)
+           .set(ORDERS.ID, 1001L).set(ORDERS.AMOUNT, BigDecimal.TEN)
+           .execute();
+    });
+
+    assertThat(dsl.fetchExists(ORDERS, ORDERS.ID.eq(1001L))).isTrue();
+}
+
+@Test
+void transaction_rolls_back_on_exception() {
+    assertThatThrownBy(() -&gt; dsl.transaction(cfg -&gt; {
+        DSL.using(cfg).insertInto(ORDERS)
+           .set(ORDERS.ID, 1002L).set(ORDERS.AMOUNT, BigDecimal.TEN)
+           .execute();
+        throw new RuntimeException(&quot;rollback me&quot;);
+    })).isInstanceOf(RuntimeException.class)
+       .hasMessage(&quot;rollback me&quot;);
+
+    assertThat(dsl.fetchExists(ORDERS, ORDERS.ID.eq(1002L))).isFalse();
+}
+</code></pre>
+<h3>14.8.2 嵌套部分回滚</h3>
+<pre><code class="language-java">@Test
+void nested_savepoint_partially_rolls_back() {
+    dsl.transaction(outer -&gt; {
+        DSLContext otx = DSL.using(outer);
+        otx.insertInto(LOG).set(LOG.MSG, &quot;step1&quot;).execute();
+
+        try {
+            otx.transaction(inner -&gt; {
+                DSL.using(inner).insertInto(LOG).set(LOG.MSG, &quot;step2-bad&quot;).execute();
+                throw new RuntimeException(&quot;inner fail&quot;);
+            });
+        } catch (RuntimeException ignored) {
+        }
+
+        otx.insertInto(LOG).set(LOG.MSG, &quot;step3&quot;).execute();
+    });
+
+    List&lt;String&gt; msgs = dsl.select(LOG.MSG).from(LOG).fetch(LOG.MSG);
+    assertThat(msgs).containsExactly(&quot;step1&quot;, &quot;step3&quot;);
+}
+</code></pre>
+<h3>14.8.3 长事务时长断言</h3>
+<pre><code class="language-java">@Test
+@Timeout(value = 200, unit = TimeUnit.MILLISECONDS)
+void transaction_completes_under_threshold() {
+    long start = System.currentTimeMillis();
+    dsl.transaction(cfg -&gt; {
+        DSLContext tx = DSL.using(cfg);
+        tx.insertInto(ORDERS).set(ORDERS.ID, 1003L)
+          .set(ORDERS.AMOUNT, BigDecimal.TEN).execute();
+    });
+    assertThat(System.currentTimeMillis() - start).isLessThan(200);
+}
+</code></pre>
+<h2 id="14.9-源码深潜">14.9 源码深潜</h2>
+<h3>图 14-9:事务调用链</h3>
+<div class="diagram">
+  <div class="diagram-title">图 14-9 · 核心调用链 — 应用 → DSL → TP → CP → 派生 Configuration → SQL</div>
+  <svg viewBox="0 0 920 600" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#240d38"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0d0d"/></linearGradient>
+      <marker id="arr"  markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+      <marker id="arrG" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#3fb950"/></marker>
+      <marker id="arrR" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#f85149"/></marker>
+    </defs>
+
+    <rect x="20"  y="20" width="100" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="70"  y="46" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">App</text>
+
+    <rect x="160" y="20" width="160" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="240" y="40" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">DSLContext</text>
+    <text x="240" y="54" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">.transaction</text>
+
+    <rect x="360" y="20" width="140" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="430" y="46" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">TransactionProvider</text>
+
+    <rect x="540" y="20" width="140" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="610" y="46" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">ConnectionProvider</text>
+
+    <rect x="720" y="20" width="160" height="40" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="800" y="40" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">派生 Configuration</text>
+    <text x="800" y="54" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">+ Query.execute</text>
+
+    <path d="M 70  60 L 70  580" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+    <path d="M 240 60 L 240 580" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+    <path d="M 430 60 L 430 580" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+    <path d="M 610 60 L 610 580" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+    <path d="M 800 60 L 800 580" stroke="#30363d" stroke-width="1" stroke-dasharray="4 3"/>
+
+    <path d="M 70 100 L 240 100"  stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="155" y="94" text-anchor="middle" fill="#c9d1d9" font-size="11">① transaction(cfg -&gt; ...)</text>
+
+    <path d="M 240 135 L 430 135" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="335" y="129" text-anchor="middle" fill="#c9d1d9" font-size="11">② begin(TxContext)</text>
+
+    <path d="M 430 170 L 610 170" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="520" y="164" text-anchor="middle" fill="#c9d1d9" font-size="11">③ acquire</text>
+
+    <path d="M 430 210 L 800 210" stroke="#3fb950" stroke-width="1.5" fill="none" stroke-dasharray="4 2" marker-end="url(#arrG)"/>
+    <text x="615" y="204" text-anchor="middle" fill="#3fb950" font-size="11">④ 绑定事务连接到派生 Configuration</text>
+
+    <rect x="40" y="240" width="850" height="150" rx="10" fill="#0d1117" stroke="#bc8cff" stroke-dasharray="6 3"/>
+    <text x="60" y="263" fill="#bc8cff" font-size="12" font-weight="bold">Lambda 内 — 用户 DSL 操作走派生 Configuration · 共享同一连接</text>
+
+    <path d="M 70 295 L 800 295" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="435" y="289" text-anchor="middle" fill="#c9d1d9" font-size="11">⑤ DSL.using(configuration).insert / select / update</text>
+
+    <path d="M 800 335 L 800 360 L 240 360 L 240 380" stroke="#3fb950" stroke-width="1.5" fill="none" stroke-dasharray="4 2" marker-end="url(#arrG)"/>
+    <text x="500" y="354" text-anchor="middle" fill="#3fb950" font-size="11">⑥ 复用 TxContext 中的连接(同一物理 Connection)</text>
+
+    <rect x="40" y="410" width="850" height="120" rx="10" fill="#0d1117" stroke="#3fb950" stroke-dasharray="6 3"/>
+    <text x="60" y="434" fill="#3fb950" font-size="12" font-weight="bold">alt — 正常 / 异常 二选一</text>
+
+    <path d="M 240 460 L 430 460" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arrG)"/>
+    <text x="335" y="454" text-anchor="middle" fill="#3fb950" font-size="11">⑦a Lambda 正常 → commit</text>
+
+    <path d="M 240 495 L 430 495" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arrR)"/>
+    <text x="335" y="489" text-anchor="middle" fill="#f85149" font-size="11">⑦b 抛异常 → rollback</text>
+
+    <path d="M 430 555 L 610 555" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="520" y="549" text-anchor="middle" fill="#c9d1d9" font-size="11">⑧ release · 归还连接池</text>
+  </svg>
+</div>
+<h3>表 14-9:核心源码入口</h3>
+<table>
+<thead>
+<tr>
+<th>入口</th>
+<th>包 / 类</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>入口 API</td>
+<td><code>org.jooq.DSLContext.transaction</code></td>
+<td>Lambda 包裹</td>
+</tr>
+<tr>
+<td>SPI</td>
+<td><code>org.jooq.TransactionProvider</code></td>
+<td>begin / commit / rollback</td>
+</tr>
+<tr>
+<td>上下文</td>
+<td><code>org.jooq.TransactionContext</code></td>
+<td>configuration / cause</td>
+</tr>
+<tr>
+<td>默认实现</td>
+<td><code>org.jooq.impl.DefaultTransactionProvider</code></td>
+<td>JDBC + Savepoint</td>
+</tr>
+<tr>
+<td>默认 ctx</td>
+<td><code>org.jooq.impl.DefaultTransactionContext</code></td>
+<td>状态管理</td>
+</tr>
+<tr>
+<td>监听器</td>
+<td><code>org.jooq.TransactionListener</code></td>
+<td>生命周期观察</td>
+</tr>
+<tr>
+<td>派生 cfg</td>
+<td><code>org.jooq.Configuration.derive</code></td>
+<td>事务专属副本</td>
+</tr>
+<tr>
+<td>连接 SPI</td>
+<td><code>org.jooq.ConnectionProvider</code></td>
+<td>acquire / release</td>
+</tr>
+<tr>
+<td>Spring 适配</td>
+<td><code>SpringTransactionProvider</code> (Spring Boot 提供或项目桥接)</td>
+<td>PlatformTransactionManager</td>
+</tr>
+</tbody>
+</table>
+<h3>设计取舍</h3>
+<p><strong>取舍 1:<code>TransactionProvider</code> SPI 而非内置事务</strong></p>
+<p>不绑定 Spring / JTA / JDBC 任一模型,业务可按部署形态选择实现。代价是自研 provider 必须严格保证 begin / commit / rollback 对称性,否则连接泄漏。</p>
+<p><strong>取舍 2:派生 <code>Configuration</code> 而非线程绑定</strong></p>
+<p>Lambda 内传入派生 <code>Configuration</code>,与外部上下文隔离。该设计支持并发事务(同线程内多个事务、异步事务),代价是业务必须自觉使用 <code>DSL.using(configuration)</code> 而非外层 <code>dsl</code>。</p>
+<p><strong>取舍 3:嵌套映射 Savepoint 而非独立事务</strong></p>
+<p>JDBC 不支持真正的嵌套事务,SQL Server / PG / MySQL 都用 Savepoint。jOOQ 的内层 <code>transaction()</code> 自然映射 Savepoint;若需独立事务边界,使用 Spring <code>REQUIRES_NEW</code> 或 outbox 模式。</p>
+<p><strong>取舍 4:事务不托管外部 I/O</strong></p>
+<p>事务 lambda 可执行任意代码,但 jOOQ 不强制限制 I/O。设计假定开发者了解长事务危害;生产应通过静态扫描或代码审查禁止事务内 HTTP / 文件 / 消息操作。</p>
+<p><strong>取舍 5:<code>TransactionListener</code> 用于观察而非改写</strong></p>
+<p>Listener 只能观察 begin / commit / rollback 事件,无法改变结果。该约束保证事务语义的可预测性;改写需求应在更上层(<code>TransactionProvider</code> 实现 / Spring TX Manager)解决。</p>
+<div class="chapter-summary">
+<h2>14.10 本章要点</h2>
+
+<table>
+<thead>
+<tr>
+<th>要点</th>
+<th>验证依据</th>
+<th>易错点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TransactionProvider 三方法</td>
+<td>实现类继承</td>
+<td>自研未对称</td>
+</tr>
+<tr>
+<td>Lambda 自动 commit / rollback</td>
+<td>提交 / 回滚测试</td>
+<td>checked 异常未处理</td>
+</tr>
+<tr>
+<td>必须 <code>DSL.using(configuration)</code></td>
+<td>测试同连接</td>
+<td>用外层 dsl</td>
+</tr>
+<tr>
+<td>嵌套 = Savepoint</td>
+<td>嵌套测试</td>
+<td>期望独立事务</td>
+</tr>
+<tr>
+<td>Spring 集成需 <code>TransactionAwareDataSourceProxy</code></td>
+<td>配置检查</td>
+<td>缺代理</td>
+</tr>
+<tr>
+<td>长事务 = 池耗尽</td>
+<td>时长断言</td>
+<td>事务内 HTTP</td>
+</tr>
+<tr>
+<td>隔离级别入口声明</td>
+<td><code>@Transactional(isolation=)</code></td>
+<td>中途改连接</td>
+</tr>
+<tr>
+<td>HikariCP <code>leakDetectionThreshold</code></td>
+<td>启动配置</td>
+<td>默认关闭</td>
+</tr>
+<tr>
+<td>部分回滚需 catch</td>
+<td>嵌套测试</td>
+<td>未 catch 全回滚</td>
+</tr>
+</tbody>
+</table>
+<p>最小回归:</p>
+<pre><code class="language-text">mvn -q test -Dtest=Transaction*Test
+</code></pre>
+<pre><code class="language-log">[INFO] Tests run: 14, Failures: 0
+</code></pre>
+<hr>
+<p>下一章讨论 jOOQ 与 Spring / Spring Boot 的深度集成:自动配置、<code>DSLContext</code> 注入、与 Spring Data 协作、测试事务回滚策略。</p>
+</div>
+
+
+<div class="chapter-nav">
+  <a href="ch13-listener.html">&larr; ch13-listener · 第 13 章 · ExecuteListener 与性能调优</a>
+  <a href="ch15-spring.html">ch15-spring · 第 15 章 · Spring Boot 集成 &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 jOOQ &middot; 第 14 章 · 事务与连接管理</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){setTimeout(function(){document.querySelectorAll('.mermaid svg,.diagram svg').forEach(function(svg){var h=parseInt(svg.getAttribute('height')||svg.getBoundingClientRect().height);if(h>500){svg.style.maxHeight='500px';svg.style.width='auto';var p=svg.closest('.diagram');if(p)p.style.overflowX='auto';}});},1500);});</script>
+</body>
+</html>

@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.20 Spring Data JPA 核心 — 图解 JPA &amp; Hibernate</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📘 图解 JPA &amp; Hibernate</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="19-connection-pool.html">上一章</a>
+  <a href="21-specification.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s20-0">20.0 全链路</a>
+  <a href="#s20-1">20.1 启动代理</a>
+  <a href="#s20-2">20.2 派生查询</a>
+  <a href="#s20-3">20.3 @Query 注解</a>
+  <a href="#s20-4">20.4 Projection 投影</a>
+  <a href="#s20-5">20.5 分页 Pageable</a>
+  <a href="#s20-6">20.6 自定义 Fragment</a>
+  <a href="#s20-7">20.7 性能场景</a>
+  <a href="#s20-8">20.8 陷阱</a>
+  <a href="#s20-summary">20.9 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 20 章 · Spring Data JPA 核心</h1>
+<p class="subtitle">Repository 抽象 · 代理生成 · 方法名 DSL · @Query · Projection · Pageable · Custom Fragment</p>
+
+<div class="chapter-intro">
+  <p class="lead">Spring Data JPA 在 JPA 规范之上构建了一层 <strong>Repository 抽象</strong>。开发者声明接口,Spring 启动时自动生成代理实现,大幅减少模板代码。</p>
+  <p>本章从接口层次、代理生成、方法名查询、@Query、Projection 投影到自定义 Fragment 全链路展开,并在每条路径上给出 SQL 行为与吞吐量化。验收标准是:<strong>看到接口方法,能预测分派路径、SQL 数量、是否额外 SELECT、P95 延迟数量级</strong>。</p>
+  <ul class="will-learn">
+    <li>5 层 Repository 接口层次:Repository → CrudRepository → ListCrud → PagingAndSorting → JpaRepository</li>
+    <li>JpaRepositoryFactoryBean 启动代理生成 + JDK 动态代理 + QueryLookup 路径分派</li>
+    <li>方法名 DSL(PartTree)解析:findBy / Top / OrderBy / Containing / IgnoreCase 等关键字</li>
+    <li>@Query 三种模式:JPQL / Native SQL / @NamedQuery,以及 SpEL 支持</li>
+    <li>3 种 Projection:DTO 构造投影 / Interface-based 接口投影 / 动态 ResultClass</li>
+    <li>Pageable 分页的 2 条 SQL(主查 + count)与 Sort 推断</li>
+    <li>Custom Fragment + 自定义实现类的命名约定(<code>RepoCustomImpl</code>)</li>
+    <li>派生查询 vs @Query vs Specification 三者的取舍</li>
+    <li>常见陷阱:派生查询参数过多、@Query 缺 countQuery、Projection 返回懒加载</li>
+    <li>Spring Data JPA 与 Hibernate 的协作边界:Spring 管 Repository 代理,Hibernate 管 SQL 生成</li>
+  </ul>
+  <p class="prereq">前置知识:JPA EntityManager API;Spring AOP / 动态代理;JPQL 基础;第 17 章 Hibernate 架构;第 18 章 SQL 生成。</p>
+</div>
+
+<h2 id="s20-0">20.0 Repository 全链路</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 20-0-1 · 接口 → 代理 → 4 类查询执行器 → EM</div>
+  <svg viewBox="0 0 920 370" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1f4f8b"/><stop offset="100%" stop-color="#0d2c4d"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a0e"/><stop offset="100%" stop-color="#3a230a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="20"  y="20" width="180" height="50" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="110" y="50" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">Repository 接口</text>
+
+    <rect x="240" y="20" width="220" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="350" y="42" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">启动扫描</text>
+    <text x="350" y="60" text-anchor="middle" fill="#c9d1d9" font-size="11">RepositoryFactoryBean</text>
+
+    <rect x="500" y="20" width="220" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="610" y="42" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">JpaRepositoryFactory</text>
+    <text x="610" y="60" text-anchor="middle" fill="#c9d1d9" font-size="11">创建 JDK 动态代理</text>
+
+    <rect x="760" y="20" width="140" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="830" y="50" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">QueryLookup</text>
+
+    <rect x="20"  y="140" width="200" height="60" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="120" y="166" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">SimpleJpaRepository</text>
+    <text x="120" y="184" text-anchor="middle" fill="#c9d1d9" font-size="11">CRUD 默认实现</text>
+
+    <rect x="240" y="140" width="200" height="60" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="340" y="166" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">PartTreeJpaQuery</text>
+    <text x="340" y="184" text-anchor="middle" fill="#c9d1d9" font-size="11">方法名 DSL</text>
+
+    <rect x="460" y="140" width="200" height="60" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="560" y="166" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">StringBasedJpaQuery</text>
+    <text x="560" y="184" text-anchor="middle" fill="#c9d1d9" font-size="11">@Query 解析</text>
+
+    <rect x="680" y="140" width="220" height="60" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="790" y="166" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">CustomImpl Fragment</text>
+    <text x="790" y="184" text-anchor="middle" fill="#c9d1d9" font-size="11">自定义实现类</text>
+
+    <rect x="280" y="250" width="360" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="460" y="280" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">EntityManager</text>
+
+    <rect x="280" y="320" width="360" height="44" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="460" y="346" text-anchor="middle" fill="#f85149" font-size="13" font-weight="bold">Hibernate → SQL → DB</text>
+
+    <path d="M200,46 L240,46" stroke="#bc8cff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,46 L500,46" stroke="#58a6ff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M720,46 L760,46" stroke="#58a6ff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M830,70 L120,140" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M830,70 L340,140" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M830,70 L560,140" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M830,70 L790,140" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M120,200 L460,250" stroke="#3fb950" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M340,200 L460,250" stroke="#3fb950" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M560,200 L460,250" stroke="#3fb950" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M790,200 L460,250" stroke="#3fb950" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,300 L460,320" stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<table>
+<thead><tr><th>接口</th><th>提供方法</th><th>用途</th></tr></thead>
+<tbody>
+<tr><td>Repository</td><td>标记接口</td><td>元数据</td></tr>
+<tr><td>CrudRepository</td><td>save, findById, delete, count</td><td>基础 CRUD</td></tr>
+<tr><td>ListCrudRepository</td><td>findAll(List 返回)</td><td>List 风格</td></tr>
+<tr><td>PagingAndSortingRepository</td><td>findAll(Pageable), findAll(Sort)</td><td>分页排序</td></tr>
+<tr><td>JpaRepository</td><td>flush, saveAndFlush, deleteInBatch</td><td>JPA 完整</td></tr>
+</tbody>
+</table>
+
+<h2 id="s20-1">20.1 Repository 启动代理</h2>
+
+<pre><code class="language-java">public interface CustomerRepository extends JpaRepository&lt;Customer, Long&gt; {
+    Optional&lt;Customer&gt; findByEmail(String email);
+}
+
+@Component
+class RepositoryProbe implements ApplicationRunner {
+
+    private final CustomerRepository customers;
+
+    @Override
+    public void run(ApplicationArguments args) {
+        log.info("Repository class: {}", customers.getClass().getName());
+    }
+}</code></pre>
+
+<pre><code>Repository class: jdk.proxy2.$Proxy124
+INFO  - JpaRepositoryFactoryBean started for CustomerRepository</code></pre>
+
+<table>
+<thead><tr><th>启动错误</th><th>根因</th><th>修复</th></tr></thead>
+<tbody>
+<tr><td>No property xxx found</td><td>方法名属性拼写错</td><td>核对实体字段</td></tr>
+<tr><td>Could not create query for findBy...</td><td>方法名超复杂</td><td>改用 @Query</td></tr>
+<tr><td>No matching bean of type Repository</td><td>未启用 @EnableJpaRepositories</td><td>添加注解 / 包扫描</td></tr>
+<tr><td>Failed to convert from type</td><td>参数类型与字段不符</td><td>统一类型</td></tr>
+</tbody>
+</table>
+
+<h2 id="s20-2">20.2 派生查询(Method Name DSL)</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 20-2-1 · PartTree 解析 — 方法名转 JPQL</div>
+  <svg viewBox="0 0 920 190" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1f4f8b"/><stop offset="100%" stop-color="#0d2c4d"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a0e"/><stop offset="100%" stop-color="#3a230a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="20"  y="60" width="220" height="70" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="130" y="90" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">方法名</text>
+    <text x="130" y="110" text-anchor="middle" fill="#c9d1d9" font-size="11">findTop10ByStatusAndRegion...</text>
+
+    <rect x="280" y="60" width="200" height="70" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="380" y="90" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">PartTree</text>
+    <text x="380" y="110" text-anchor="middle" fill="#c9d1d9" font-size="11">Subject + Predicate</text>
+
+    <rect x="520" y="60" width="200" height="70" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="620" y="90" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">JPQL 拼接</text>
+    <text x="620" y="110" text-anchor="middle" fill="#c9d1d9" font-size="11">where + order + limit</text>
+
+    <rect x="760" y="60" width="140" height="70" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="830" y="90" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">SQL</text>
+    <text x="830" y="110" text-anchor="middle" fill="#c9d1d9" font-size="11">PartTreeJpaQuery</text>
+
+    <path d="M240,95 L280,95" stroke="#bc8cff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M480,95 L520,95" stroke="#58a6ff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M720,95 L760,95" stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<table>
+<thead><tr><th>关键字</th><th>JPQL</th><th>示例方法</th></tr></thead>
+<tbody>
+<tr><td>findBy / readBy / queryBy</td><td>select</td><td>findByEmail</td></tr>
+<tr><td>Top / First</td><td>limit N</td><td>findTop10ByStatus</td></tr>
+<tr><td>And / Or</td><td>and / or</td><td>findByStatusAndRegion</td></tr>
+<tr><td>Between</td><td>between</td><td>findByCreatedAtBetween</td></tr>
+<tr><td>Containing / Like</td><td>like %?%</td><td>findByNameContaining</td></tr>
+<tr><td>IgnoreCase</td><td>lower(...) = lower(?)</td><td>findByEmailIgnoreCase</td></tr>
+<tr><td>OrderBy</td><td>order by</td><td>findByStatusOrderByCreatedAtDesc</td></tr>
+<tr><td>In / NotIn</td><td>in / not in</td><td>findByStatusIn</td></tr>
+<tr><td>IsNull / IsNotNull</td><td>is null / is not null</td><td>findByCancelledAtIsNull</td></tr>
+<tr><td>countBy / deleteBy</td><td>count / delete</td><td>countByStatus / deleteByRegion</td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-java">public interface OrderRepository extends JpaRepository&lt;Order, Long&gt; {
+
+    Optional&lt;Order&gt; findByOrderNo(String orderNo);
+
+    List&lt;Order&gt; findTop10ByStatusOrderByCreatedAtDesc(OrderStatus status);
+
+    List&lt;Order&gt; findByCustomerIdAndStatusIn(Long customerId, Collection&lt;OrderStatus&gt; statuses);
+
+    long countByStatusAndCreatedAtAfter(OrderStatus status, Instant since);
+
+    @Modifying
+    @Transactional
+    int deleteByStatusAndCreatedAtBefore(OrderStatus status, Instant before);
+}</code></pre>
+
+<pre><code class="language-sql">-- findTop10ByStatusOrderByCreatedAtDesc
+select o1_0.id, o1_0.order_no, o1_0.customer_id, o1_0.status,
+       o1_0.amount, o1_0.created_at, o1_0.version
+from orders o1_0
+where o1_0.status = ?
+order by o1_0.created_at desc
+fetch first 10 rows only;</code></pre>
+
+<div class="warning"><p><strong>派生查询的边界</strong>:超过 3 个 AND 条件、含 join、含子查询的方法名应改用 <code>@Query</code>。一句 <code>findByCustomerStatusAndOrderStatusAndCreatedAtBetweenAndRegionInOrderByCreatedAtDesc</code> 无法保证可读性,且属性变更时编译期无法发现。</p></div>
+
+<h2 id="s20-3">20.3 @Query 注解</h2>
+
+<pre><code class="language-java">public interface OrderRepository extends JpaRepository&lt;Order, Long&gt; {
+
+    @Query("""
+        select o from Order o
+        join fetch o.customer c
+        where o.status = :status
+          and c.region = :region
+        order by o.createdAt desc
+        """)
+    List&lt;Order&gt; findRecentPaidOrders(@Param("status") OrderStatus status,
+                                       @Param("region") String region,
+                                       Pageable page);
+
+    @Query(value = """
+        select o.* from orders o
+        where o.status = :status
+          and o.created_at &gt;= :since
+        order by o.created_at desc
+        """,
+        countQuery = """
+        select count(*) from orders o
+        where o.status = :status
+          and o.created_at &gt;= :since
+        """,
+        nativeQuery = true)
+    Page&lt;Order&gt; findByStatusSince(@Param("status") String status,
+                                    @Param("since") Instant since,
+                                    Pageable page);
+
+    @Modifying
+    @Transactional
+    @Query("update Order o set o.status = :newStatus where o.id = :id and o.status = :oldStatus")
+    int transitionStatus(@Param("id") Long id,
+                          @Param("oldStatus") OrderStatus oldStatus,
+                          @Param("newStatus") OrderStatus newStatus);
+}</code></pre>
+
+<table>
+<thead><tr><th>模式</th><th>语法</th><th>适用</th></tr></thead>
+<tbody>
+<tr><td>JPQL</td><td>实体路径 + named param</td><td>大多数业务查询</td></tr>
+<tr><td>Native SQL</td><td><code>nativeQuery=true</code></td><td>方言特性 / 复杂 join</td></tr>
+<tr><td>@NamedQuery</td><td>实体上 + name 引用</td><td>共享查询定义</td></tr>
+<tr><td>SpEL</td><td><code>?#{#param}</code></td><td>动态拼条件</td></tr>
+<tr><td>countQuery</td><td>分页时单独 SQL</td><td>Native + Pageable</td></tr>
+</tbody>
+</table>
+
+<div class="key-insight"><p><strong>Native + Pageable 必须配 countQuery</strong>。JPQL 模式 Spring Data 能从 select 自动派生 count;Native 模式无法解析,需要显式 <code>countQuery</code>,否则抛 <code>InvalidJpaQueryMethodException</code>。</p></div>
+
+<h2 id="s20-4">20.4 Projection 投影</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 20-4-1 · 3 种 Projection — DTO / Interface / Dynamic</div>
+  <svg viewBox="0 0 920 220" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1f4f8b"/><stop offset="100%" stop-color="#0d2c4d"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a0e"/><stop offset="100%" stop-color="#3a230a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="20"  y="60" width="200" height="100" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="120" y="92" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">DTO Constructor</text>
+    <text x="120" y="116" text-anchor="middle" fill="#c9d1d9" font-size="11">select new com.x.OrderDto</text>
+    <text x="120" y="136" text-anchor="middle" fill="#c9d1d9" font-size="11">(o.id, c.name)</text>
+
+    <rect x="240" y="60" width="220" height="100" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="350" y="92" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">Interface-based</text>
+    <text x="350" y="116" text-anchor="middle" fill="#c9d1d9" font-size="11">interface OrderSummary {</text>
+    <text x="350" y="136" text-anchor="middle" fill="#c9d1d9" font-size="11">Long getId(); String getName(); }</text>
+
+    <rect x="480" y="60" width="220" height="100" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="590" y="92" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">Dynamic</text>
+    <text x="590" y="116" text-anchor="middle" fill="#c9d1d9" font-size="11">&lt;T&gt; List&lt;T&gt; findBy...(</text>
+    <text x="590" y="136" text-anchor="middle" fill="#c9d1d9" font-size="11">  status, Class&lt;T&gt; type)</text>
+
+    <rect x="720" y="60" width="180" height="100" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="810" y="92" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">SpEL Open</text>
+    <text x="810" y="116" text-anchor="middle" fill="#c9d1d9" font-size="11">@Value("#{...}")</text>
+    <text x="810" y="136" text-anchor="middle" fill="#c9d1d9" font-size="11">计算字段</text>
+  </svg>
+</div>
+
+<pre><code class="language-java">// 1. DTO Constructor
+public record OrderSummaryDto(Long id, String customerName, BigDecimal amount) {}
+
+@Query("""
+    select new com.acme.OrderSummaryDto(o.id, c.name, o.amount)
+    from Order o join o.customer c
+    where o.status = :status
+    """)
+List&lt;OrderSummaryDto&gt; findSummaryByStatus(@Param("status") OrderStatus status);
+
+// 2. Interface-based (Closed Projection)
+public interface OrderSummary {
+    Long getId();
+    String getOrderNo();
+    BigDecimal getAmount();
+    @Value("#{target.customer.name}")
+    String getCustomerName();
+}
+List&lt;OrderSummary&gt; findByStatus(OrderStatus status);
+
+// 3. Dynamic Projection
+&lt;T&gt; List&lt;T&gt; findByStatus(OrderStatus status, Class&lt;T&gt; type);
+// 调用: repo.findByStatus(PAID, OrderSummaryDto.class)
+// 或:   repo.findByStatus(PAID, OrderSummary.class)
+// 或:   repo.findByStatus(PAID, Order.class)</code></pre>
+
+<table>
+<thead><tr><th>类型</th><th>SQL 影响</th><th>懒加载</th><th>序列化</th></tr></thead>
+<tbody>
+<tr><td>DTO Constructor</td><td>仅 select 必要列</td><td>无</td><td>JSON 友好</td></tr>
+<tr><td>Closed Interface</td><td>仅 select 必要列</td><td>无</td><td>需 Jackson 配置</td></tr>
+<tr><td>Open Interface (SpEL)</td><td>select 全部列(加载实体)</td><td>有</td><td>需注意懒加载</td></tr>
+<tr><td>Dynamic</td><td>按 type 决定</td><td>按 type</td><td>灵活</td></tr>
+</tbody>
+</table>
+
+<h2 id="s20-5">20.5 分页 Pageable</h2>
+
+<pre><code class="language-java">@GetMapping("/orders")
+public Page&lt;Order&gt; list(
+        @RequestParam OrderStatus status,
+        @PageableDefault(size = 20, sort = "createdAt", direction = DESC) Pageable page) {
+    return repo.findByStatus(status, page);
+}
+
+// 接口: Page<Order> findByStatus(OrderStatus status, Pageable page);</code></pre>
+
+<pre><code class="language-sql">-- 主查询
+select o1_0.id, o1_0.order_no, ... from orders o1_0
+where o1_0.status = ?
+order by o1_0.created_at desc
+offset ? rows fetch first ? rows only;
+-- bind: PAID, 0, 20
+
+-- count 查询(Page 必有,Slice 没有)
+select count(o1_0.id) from orders o1_0
+where o1_0.status = ?;</code></pre>
+
+<table>
+<thead><tr><th>返回类型</th><th>SQL 数</th><th>含义</th></tr></thead>
+<tbody>
+<tr><td>Page&lt;T&gt;</td><td>主查 + count = 2</td><td>有总数,可分页</td></tr>
+<tr><td>Slice&lt;T&gt;</td><td>主查 + 1(查 N+1 条)</td><td>无总数,只判 hasNext</td></tr>
+<tr><td>List&lt;T&gt;</td><td>主查 1</td><td>无元数据</td></tr>
+<tr><td>Window&lt;T&gt; (3.1+)</td><td>主查 + keyset</td><td>游标分页,无 offset</td></tr>
+</tbody>
+</table>
+
+<h2 id="s20-6">20.6 自定义 Fragment</h2>
+
+<pre><code class="language-java">// 1. Fragment 接口
+public interface OrderRepositoryCustom {
+    List&lt;Order&gt; findByDynamicFilter(OrderFilter filter);
+}
+
+// 2. Custom 实现类(类名必须 = Fragment 接口名 + Impl)
+@Repository
+public class OrderRepositoryCustomImpl implements OrderRepositoryCustom {
+
+    @PersistenceContext
+    private EntityManager em;
+
+    @Override
+    public List&lt;Order&gt; findByDynamicFilter(OrderFilter filter) {
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        CriteriaQuery&lt;Order&gt; cq = cb.createQuery(Order.class);
+        Root&lt;Order&gt; o = cq.from(Order.class);
+
+        List&lt;Predicate&gt; predicates = new ArrayList&lt;&gt;();
+        if (filter.status() != null)
+            predicates.add(cb.equal(o.get("status"), filter.status()));
+        if (filter.since() != null)
+            predicates.add(cb.greaterThanOrEqualTo(o.get("createdAt"), filter.since()));
+
+        cq.where(predicates.toArray(new Predicate[0]));
+        return em.createQuery(cq).getResultList();
+    }
+}
+
+// 3. Repository 继承 Fragment
+public interface OrderRepository extends JpaRepository&lt;Order, Long&gt;,
+                                          OrderRepositoryCustom {
+}</code></pre>
+
+<table>
+<thead><tr><th>组件</th><th>命名约定</th><th>职责</th></tr></thead>
+<tbody>
+<tr><td>Fragment 接口</td><td>RepoCustom</td><td>自定义方法签名</td></tr>
+<tr><td>实现类</td><td>RepoCustomImpl(必须)</td><td>Spring 自动注入</td></tr>
+<tr><td>主 Repository</td><td>extends 多个 Fragment</td><td>组合而非继承</td></tr>
+</tbody>
+</table>
+
+<h2 id="s20-7">20.7 性能场景</h2>
+
+<table>
+<thead><tr><th>场景</th><th>反例</th><th>修复</th><th>收益</th></tr></thead>
+<tbody>
+<tr><td>派生查询参数爆炸</td><td>findByAAndBAndCAndD(超长方法名)</td><td>@Query + Specification</td><td>可读性 + 索引可控</td></tr>
+<tr><td>@Query Native + Pageable 缺 countQuery</td><td>分页计数错</td><td>显式 countQuery</td><td>正确分页</td></tr>
+<tr><td>Open Projection 触发懒加载</td><td>SpEL 访问关联</td><td>用 Closed Projection 或 DTO</td><td>无 N+1</td></tr>
+<tr><td>Page 序列化包含全部实体字段</td><td>API 暴露过多</td><td>DTO 投影 + ResponseEntity</td><td>载荷减半</td></tr>
+<tr><td>findAll() 全表扫描</td><td>无分页直接全量</td><td>必须 Pageable / Stream / Slice</td><td>避免 OOM</td></tr>
+</tbody>
+</table>
+
+<h2 id="s20-8">20.8 陷阱与限制</h2>
+
+<table>
+<thead><tr><th>#</th><th>陷阱</th><th>现象</th><th>修复</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>派生查询属性拼写错</td><td>启动失败 NoSuchProperty</td><td>启动期检查</td></tr>
+<tr><td>2</td><td>Native + Pageable 无 countQuery</td><td>启动失败</td><td>显式 countQuery</td></tr>
+<tr><td>3</td><td>@Modifying 缺 @Transactional</td><td>TransactionRequired</td><td>添加 @Transactional</td></tr>
+<tr><td>4</td><td>@Modifying 后 PC 未清</td><td>读到旧值</td><td>clearAutomatically=true</td></tr>
+<tr><td>5</td><td>findAll() 全表</td><td>OOM</td><td>用 Pageable</td></tr>
+<tr><td>6</td><td>Open Projection N+1</td><td>SpEL 触发懒加载</td><td>用 Closed Projection</td></tr>
+<tr><td>7</td><td>Custom Impl 命名错</td><td>方法未注入</td><td>必须 ...Impl</td></tr>
+<tr><td>8</td><td>同名 Repository 包冲突</td><td>Bean 冲突</td><td>@EnableJpaRepositories basePackages</td></tr>
+</tbody>
+</table>
+
+<h2 id="s20-summary">20.9 本章要点</h2>
+
+<div class="chapter-summary">
+<table>
+<thead><tr><th>要点</th><th>API / 配置</th><th>易错点</th></tr></thead>
+<tbody>
+<tr><td>JpaRepository 五层接口</td><td>JpaRepository&lt;T,ID&gt;</td><td>误用 CrudRepository</td></tr>
+<tr><td>启动期代理生成</td><td>JpaRepositoryFactoryBean</td><td>错误推迟到运行期</td></tr>
+<tr><td>方法名 DSL 优于 @Query</td><td>PartTreeJpaQuery</td><td>过长方法名</td></tr>
+<tr><td>Projection 减少列</td><td>DTO / Closed Interface</td><td>Open Projection 懒加载</td></tr>
+<tr><td>Page 双查 / Slice 单查</td><td>Page&lt;T&gt; vs Slice&lt;T&gt;</td><td>不必要 count</td></tr>
+<tr><td>@Modifying + @Transactional</td><td>clearAutomatically</td><td>PC 不一致</td></tr>
+<tr><td>Custom Impl 命名约定</td><td>RepoCustomImpl</td><td>错名导致不注入</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>下一章讨论 Specification 动态查询。本章覆盖 Repository 基础抽象,下一章进入用 Criteria API 构建可组合的动态查询条件。</p>
+
+<div class="chapter-nav">
+  <a href="19-connection-pool.html">&larr; 第 19 章 &middot; 连接池</a>
+  <a href="21-specification.html">第 21 章 &middot; Specification &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 JPA &amp; Hibernate &middot; 第 20 章 &middot; Spring Data JPA 核心</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

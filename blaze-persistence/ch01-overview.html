@@ -1,0 +1,921 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-book="blaze">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.01 全景概览 — 图解 Blaze-Persistence</title>
+<link rel="stylesheet" href="books.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Blaze-Persistence</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <span class="sep">|</span>
+  <a href="ch00-quickstart.html">← 上一章: Quick Start</a>
+  <span class="sep">|</span>
+  <a href="ch02-setup.html">下一章 →</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s1-1">1.1 JPA 的困境与诞生</a>
+  <a href="#s1-2">1.2 架构分层</a>
+  <a href="#s1-3">1.3 核心概念速览</a>
+  <a href="#s1-4">1.4 与同类框架对比</a>
+  <a href="#s1-5">1.5 JPQL 生成管线</a>
+  <a href="#s1-6">1.6 陷阱与限制</a>
+  <a href="#summary">本章小结</a>
+</aside>
+
+<div class="article">
+
+  <h1>第 1 章 · 全景概览</h1>
+  <p class="subtitle">JPA 增强 · 类型安全 · Entity View · CriteriaBuilder · 框架对比</p>
+
+  <div class="chapter-intro">
+    <p class="lead">
+      JPA 是 Java 持久化的标准，但当查询复杂度上升——子查询嵌套、CTE、窗口函数、DTO 投影——标准 Criteria API 就变得力不从心。
+      Blaze-Persistence 正是为填补这一空白而生的开源框架：它在 JPA 之上构建了一套<strong>类型安全、表达力极强</strong>的查询 DSL，
+      同时通过 <em>Entity View</em> 将 DTO 映射提升到声明式水平。本章带你从全局视角了解 Blaze-Persistence 的定位、架构与核心概念。
+    </p>
+    <ul class="will-learn">
+      <li>理解 JPA Criteria API 的局限性以及 Blaze-Persistence 的解决思路</li>
+      <li>掌握 Core / Entity View / 集成层 的三层架构</li>
+      <li>认识 <code>CriteriaBuilderFactory</code>、<code>EntityViewManager</code> 等核心接口</li>
+      <li>在 JPA Criteria、QueryDSL、jOOQ 之间做出合理技术选型</li>
+      <li>了解 JPQL 生成管线的完整流程</li>
+      <li>提前知晓常见陷阱与限制</li>
+    </ul>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- 1.1 JPA 的困境与 Blaze-Persistence 的诞生 -->
+  <!-- ================================================================== -->
+  <h2 id="s1-1">1.1 JPA 的困境与 Blaze-Persistence 的诞生</h2>
+
+  <p>
+    JPA（Java Persistence API）通过 <code>EntityManager</code> 和 JPQL 为 Java 应用提供了统一的 ORM 层。
+    对于简单的 CRUD 操作，JPA 工作得很好。但一旦需求演变为：
+  </p>
+  <ul>
+    <li>多层嵌套子查询与关联过滤</li>
+    <li>CTE（公用表表达式）递归查询</li>
+    <li>窗口函数（<code>ROW_NUMBER</code>、<code>RANK</code>）</li>
+    <li>批量 UPDATE / DELETE 的 DML 语句</li>
+    <li>高效 DTO 投影（避免 N+1 和全字段加载）</li>
+  </ul>
+  <p>
+    标准 JPA Criteria API 就暴露出冗长、类型不安全、SQL 功能覆盖不足等问题。
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">▸ JPA 困境与 Blaze-Persistence 的定位</div>
+    <div class="mermaid">
+flowchart LR
+    A["🗄️ 业务需求<br/>复杂查询"]
+    B["📜 JPA Criteria API"]
+    C["⚠️ 冗长的代码"]
+    D["⚠️ 缺少 CTE / 窗口函数"]
+    E["⚠️ DTO 投影困难"]
+    F["🚀 Blaze-Persistence"]
+    G["✅ 类型安全 DSL"]
+    H["✅ CTE + 窗口函数"]
+    I["✅ Entity View 投影"]
+
+    A --> B
+    B --> C
+    B --> D
+    B --> E
+    A --> F
+    F --> G
+    F --> H
+    F --> I
+
+    style A fill:#1c2129,stroke:#58a6ff,color:#e6edf3
+    style B fill:#1c2129,stroke:#f85149,color:#e6edf3
+    style C fill:#1c2129,stroke:#d29922,color:#e6edf3
+    style D fill:#1c2129,stroke:#d29922,color:#e6edf3
+    style E fill:#1c2129,stroke:#d29922,color:#e6edf3
+    style F fill:#1c2129,stroke:#3fb950,color:#e6edf3
+    style G fill:#1c2129,stroke:#3fb950,color:#e6edf3
+    style H fill:#1c2129,stroke:#3fb950,color:#e6edf3
+    style I fill:#1c2129,stroke:#3fb950,color:#e6edf3
+    </div>
+  </div>
+
+  <h3>代码对比：同一查询的两种写法</h3>
+  <p>
+    假设我们需要查询"年龄大于 18 且姓名以 'J' 开头的用户，并按注册时间降序排列"。
+    来看看 JPA Criteria API 和 Blaze-Persistence CriteriaBuilder 的差异。
+  </p>
+
+  <div class="compare-grid">
+    <div class="compare-bad">
+<pre><code>CriteriaBuilder cb = em.getCriteriaBuilder();
+CriteriaQuery&lt;User&gt; cq = cb.createQuery(User.class);
+Root&lt;User&gt; root = cq.from(User.class);
+
+Predicate agePred = cb.greaterThan(
+    root.get("age"), 18);
+Predicate namePred = cb.like(
+    root.get("name"), "J%");
+
+cq.where(cb.and(agePred, namePred));
+cq.orderBy(cb.desc(
+    root.get("registeredAt")));
+
+List&lt;User&gt; users = em
+    .createQuery(cq)
+    .getResultList();</code></pre>
+    </div>
+    <div class="compare-good">
+<pre><code>CriteriaBuilder&lt;User&gt; cb = cbf
+    .create(em, User.class);
+
+List&lt;User&gt; users = cb
+    .where("age").gt(18)
+    .where("name").like().value("J%")
+    .orderByDesc("registeredAt")
+    .getResultList();</code></pre>
+    </div>
+  </div>
+
+  <div class="key-insight">
+    <strong>💡 关键洞察</strong><br>
+    Blaze-Persistence 的 CriteriaBuilder 通过流式 API（Fluent API）将查询构建代码量减少 60%–70%，
+    同时保留完整的类型安全。每一个方法调用对应一个 SQL 子句，阅读和维护成本大幅降低。
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">▸ JPA Criteria vs Blaze-Persistence 代码行数对比</div>
+    <div style="display:flex;flex-wrap:wrap;gap:20px;justify-content:center;padding:16px 0;">
+      <div style="flex:1;min-width:240px;max-width:380px;border:1px solid #f85149;border-radius:10px;padding:18px;background:rgba(248,81,73,.06);">
+        <div style="font-weight:bold;color:#f85149;margin-bottom:10px;font-size:15px;">❌ JPA Criteria API — 6 步</div>
+        <div style="display:flex;flex-direction:column;gap:6px;">
+          <div style="background:rgba(248,81,73,.08);border-radius:6px;padding:6px 10px;color:#e6edf3;font-size:13px;">1. CriteriaBuilder 获取</div>
+          <div style="color:#8b949e;text-align:center;">↓</div>
+          <div style="background:rgba(248,81,73,.08);border-radius:6px;padding:6px 10px;color:#e6edf3;font-size:13px;">2. CriteriaQuery 创建</div>
+          <div style="color:#8b949e;text-align:center;">↓</div>
+          <div style="background:rgba(248,81,73,.08);border-radius:6px;padding:6px 10px;color:#e6edf3;font-size:13px;">3. Root 定义</div>
+          <div style="color:#8b949e;text-align:center;">↓</div>
+          <div style="background:rgba(248,81,73,.08);border-radius:6px;padding:6px 10px;color:#e6edf3;font-size:13px;">4. Predicate 逐个构建</div>
+          <div style="color:#8b949e;text-align:center;">↓</div>
+          <div style="background:rgba(248,81,73,.08);border-radius:6px;padding:6px 10px;color:#e6edf3;font-size:13px;">5. 组合 where / orderBy</div>
+          <div style="color:#8b949e;text-align:center;">↓</div>
+          <div style="background:rgba(248,81,73,.08);border-radius:6px;padding:6px 10px;color:#e6edf3;font-size:13px;">6. 执行查询</div>
+        </div>
+      </div>
+      <div style="flex:1;min-width:240px;max-width:380px;border:1px solid #3fb950;border-radius:10px;padding:18px;background:rgba(63,185,80,.06);">
+        <div style="font-weight:bold;color:#3fb950;margin-bottom:10px;font-size:15px;">✅ Blaze-Persistence — 4 步</div>
+        <div style="display:flex;flex-direction:column;gap:6px;">
+          <div style="background:rgba(63,185,80,.08);border-radius:6px;padding:6px 10px;color:#e6edf3;font-size:13px;">1. cbf.create()</div>
+          <div style="color:#8b949e;text-align:center;">↓</div>
+          <div style="background:rgba(63,185,80,.08);border-radius:6px;padding:6px 10px;color:#e6edf3;font-size:13px;">2. .where().gt() / .like()</div>
+          <div style="color:#8b949e;text-align:center;">↓</div>
+          <div style="background:rgba(63,185,80,.08);border-radius:6px;padding:6px 10px;color:#e6edf3;font-size:13px;">3. .orderByDesc()</div>
+          <div style="color:#8b949e;text-align:center;">↓</div>
+          <div style="background:rgba(63,185,80,.08);border-radius:6px;padding:6px 10px;color:#e6edf3;font-size:13px;">4. .getResultList()</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- 1.2 架构分层 -->
+  <!-- ================================================================== -->
+  <h2 id="s1-2">1.2 架构分层：Core + Entity View + 集成层</h2>
+
+  <p>
+    Blaze-Persistence 的设计采用清晰的分层架构。每一层只依赖下方的层，上层可以选择性使用。
+    理解这个分层是掌握框架的第一步。
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">▸ Blaze-Persistence 四层架构</div>
+    <div style="display:flex;flex-direction:column;gap:8px;max-width:700px;margin:0 auto;padding:16px 0;">
+      <div style="border:1px solid #bc8cff;border-radius:8px;padding:14px 16px;background:rgba(188,140,255,.08);">
+        <div style="font-weight:bold;color:#bc8cff;margin-bottom:8px;font-size:13px;text-align:center;">🔗 集成层 Integration</div>
+        <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
+          <span style="background:rgba(188,140,255,.12);border:1px solid rgba(188,140,255,.3);border-radius:6px;padding:6px 14px;color:#e6edf3;font-size:12px;">Spring Data</span>
+          <span style="background:rgba(188,140,255,.12);border:1px solid rgba(188,140,255,.3);border-radius:6px;padding:6px 14px;color:#e6edf3;font-size:12px;">DeltaSpike</span>
+          <span style="background:rgba(188,140,255,.12);border:1px solid rgba(188,140,255,.3);border-radius:6px;padding:6px 14px;color:#e6edf3;font-size:12px;">JAX-RS</span>
+          <span style="background:rgba(188,140,255,.12);border:1px solid rgba(188,140,255,.3);border-radius:6px;padding:6px 14px;color:#e6edf3;font-size:12px;">GraphQL</span>
+        </div>
+      </div>
+      <div style="text-align:center;color:#8b949e;font-size:14px;">▼</div>
+      <div style="border:1px solid #58a6ff;border-radius:8px;padding:14px 16px;background:rgba(88,166,255,.08);">
+        <div style="font-weight:bold;color:#58a6ff;margin-bottom:8px;font-size:13px;text-align:center;">📐 Entity View</div>
+        <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
+          <span style="background:rgba(88,166,255,.12);border:1px solid rgba(88,166,255,.3);border-radius:6px;padding:6px 14px;color:#e6edf3;font-size:12px;">DTO 投影</span>
+          <span style="background:rgba(88,166,255,.12);border:1px solid rgba(88,166,255,.3);border-radius:6px;padding:6px 14px;color:#e6edf3;font-size:12px;">Updatable Views</span>
+          <span style="background:rgba(88,166,255,.12);border:1px solid rgba(88,166,255,.3);border-radius:6px;padding:6px 14px;color:#e6edf3;font-size:12px;">Creatable Views</span>
+        </div>
+      </div>
+      <div style="text-align:center;color:#8b949e;font-size:14px;">▼</div>
+      <div style="border:1px solid #3fb950;border-radius:8px;padding:14px 16px;background:rgba(63,185,80,.08);">
+        <div style="font-weight:bold;color:#3fb950;margin-bottom:8px;font-size:13px;text-align:center;">⚙️ Blaze-Persistence Core</div>
+        <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
+          <span style="background:rgba(63,185,80,.12);border:1px solid rgba(63,185,80,.3);border-radius:6px;padding:6px 14px;color:#e6edf3;font-size:12px;">CriteriaBuilder</span>
+          <span style="background:rgba(63,185,80,.12);border:1px solid rgba(63,185,80,.3);border-radius:6px;padding:6px 14px;color:#e6edf3;font-size:12px;">CTE 支持</span>
+          <span style="background:rgba(63,185,80,.12);border:1px solid rgba(63,185,80,.3);border-radius:6px;padding:6px 14px;color:#e6edf3;font-size:12px;">窗口函数</span>
+          <span style="background:rgba(63,185,80,.12);border:1px solid rgba(63,185,80,.3);border-radius:6px;padding:6px 14px;color:#e6edf3;font-size:12px;">批量 DML</span>
+        </div>
+      </div>
+      <div style="text-align:center;color:#8b949e;font-size:14px;">▼</div>
+      <div style="border:1px solid #d29922;border-radius:8px;padding:14px 16px;background:rgba(210,153,34,.08);">
+        <div style="font-weight:bold;color:#d29922;margin-bottom:8px;font-size:13px;text-align:center;">🏗️ JPA Provider</div>
+        <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
+          <span style="background:rgba(210,153,34,.12);border:1px solid rgba(210,153,34,.3);border-radius:6px;padding:6px 14px;color:#e6edf3;font-size:12px;">Hibernate</span>
+          <span style="background:rgba(210,153,34,.12);border:1px solid rgba(210,153,34,.3);border-radius:6px;padding:6px 14px;color:#e6edf3;font-size:12px;">EclipseLink</span>
+          <span style="background:rgba(210,153,34,.12);border:1px solid rgba(210,153,34,.3);border-radius:6px;padding:6px 14px;color:#e6edf3;font-size:12px;">DataNucleus</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <h3>各层职责</h3>
+
+  <table>
+    <thead>
+      <tr><th>层级</th><th>模块</th><th>核心职责</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>JPA Provider</strong></td>
+        <td><code>javax.persistence</code> / <code>jakarta.persistence</code></td>
+        <td>提供底层 ORM 实现，将 JPQL 翻译为原生 SQL 并管理实体生命周期</td>
+      </tr>
+      <tr>
+        <td><strong>Core</strong></td>
+        <td><code>blaze-persistence-core</code></td>
+        <td>类型安全的 CriteriaBuilder API，扩展 JPA 不支持的 SQL 特性（CTE、窗口函数、集合操作、批量 DML）</td>
+      </tr>
+      <tr>
+        <td><strong>Entity View</strong></td>
+        <td><code>blaze-persistence-entity-view</code></td>
+        <td>声明式 DTO 投影框架，通过注解定义视图接口，自动生成优化的 JPQL <code>SELECT</code> 子句</td>
+      </tr>
+      <tr>
+        <td><strong>集成层</strong></td>
+        <td><code>blaze-persistence-integration-*</code></td>
+        <td>与 Spring Data、DeltaSpike Data、JAX-RS、GraphQL 等上层框架集成，提供 Repository 抽象和自动分页</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="os-note">
+    <strong>📌 按需引入</strong><br>
+    如果你只需要增强的 CriteriaBuilder，只引入 Core 即可。Entity View 和集成层是可选的，按需添加 Maven/Gradle 依赖。
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">▸ 模块依赖关系</div>
+    <div class="mermaid">
+flowchart TD
+    APP["📱 你的应用"]
+    SI["spring-data-integration"]
+    EV["entity-view-impl"]
+    CORE["core-impl"]
+    SPI["core-api / SPI"]
+    HIB["hibernate-integration"]
+    JPA["JPA Provider"]
+
+    APP --> SI
+    APP --> EV
+    SI --> EV
+    EV --> CORE
+    CORE --> SPI
+    CORE --> HIB
+    HIB --> JPA
+
+    style APP fill:#1c2129,stroke:#58a6ff,color:#e6edf3
+    style SI fill:#1c2129,stroke:#bc8cff,color:#e6edf3
+    style EV fill:#1c2129,stroke:#58a6ff,color:#e6edf3
+    style CORE fill:#1c2129,stroke:#3fb950,color:#e6edf3
+    style SPI fill:#1c2129,stroke:#3fb950,color:#e6edf3
+    style HIB fill:#1c2129,stroke:#d29922,color:#e6edf3
+    style JPA fill:#1c2129,stroke:#d29922,color:#e6edf3
+    </div>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- 1.3 核心概念速览 -->
+  <!-- ================================================================== -->
+  <h2 id="s1-3">1.3 核心概念速览</h2>
+
+  <p>
+    在深入各模块之前，先建立对核心接口和注解的整体认知。Blaze-Persistence 的 API 围绕两个工厂展开：
+  </p>
+  <ul>
+    <li><strong><code>CriteriaBuilderFactory</code></strong>（CBF）— 创建查询构建器，是 Core 层的入口</li>
+    <li><strong><code>EntityViewManager</code></strong>（EVM）— 管理 Entity View 的注册与实例化，是 Entity View 层的入口</li>
+  </ul>
+
+  <div class="diagram">
+    <div class="diagram-title">▸ 核心接口关系类图</div>
+    <div class="mermaid">
+classDiagram
+    class CriteriaBuilderFactory {
+        +create(EntityManager, Class) CriteriaBuilder
+        +startSet(EntityManager, Class) SetOperationBuilder
+    }
+
+    class CriteriaBuilder~T~ {
+        +where(String) WhereBuilder
+        +orderByAsc(String) CriteriaBuilder
+        +orderByDesc(String) CriteriaBuilder
+        +page(int, int) PaginatedCriteriaBuilder
+        +getResultList() List~T~
+    }
+
+    class PaginatedCriteriaBuilder~T~ {
+        +withKeysetExtraction(boolean)
+        +getPageResultList() PagedList~T~
+    }
+
+    class EntityViewManager {
+        +find(EntityManager, Class, Object) T
+        +applySetting(EntityViewSetting, CriteriaBuilder) CriteriaBuilder
+        +save(EntityManager, Object) void
+    }
+
+    class EntityViewSetting~T~ {
+        +create(Class) EntityViewSetting
+        +addAttributeFilter(String, Object)
+        +addAttributeSorter(String, Sorter)
+    }
+
+    CriteriaBuilderFactory --> CriteriaBuilder : creates
+    CriteriaBuilder --> PaginatedCriteriaBuilder : .page()
+    EntityViewManager --> EntityViewSetting : applies
+    EntityViewSetting --> CriteriaBuilder : enhances
+    </div>
+  </div>
+
+  <h3>核心注解一览</h3>
+  <p>
+    Entity View 通过 Java 接口 + 注解实现声明式 DTO 定义。以下是最常用的注解：
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>注解</th><th>位置</th><th>用途</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>@EntityView</code></td>
+        <td>接口/抽象类</td>
+        <td>标记该类型为某个实体的视图（DTO 定义的入口）</td>
+      </tr>
+      <tr>
+        <td><code>@IdMapping</code></td>
+        <td>getter 方法</td>
+        <td>映射实体的主键字段</td>
+      </tr>
+      <tr>
+        <td><code>@Mapping("expr")</code></td>
+        <td>getter 方法</td>
+        <td>映射任意 JPQL 表达式到视图属性</td>
+      </tr>
+      <tr>
+        <td><code>@UpdatableEntityView</code></td>
+        <td>接口/抽象类</td>
+        <td>允许通过视图执行 UPDATE 操作</td>
+      </tr>
+      <tr>
+        <td><code>@CreatableEntityView</code></td>
+        <td>接口/抽象类</td>
+        <td>允许通过视图创建新实体</td>
+      </tr>
+      <tr>
+        <td><code>@MappingSubquery</code></td>
+        <td>getter 方法</td>
+        <td>将子查询结果映射为视图属性</td>
+      </tr>
+      <tr>
+        <td><code>@MappingCorrelated</code></td>
+        <td>getter 方法</td>
+        <td>关联查询映射，支持自定义关联策略</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Entity View 示例</h3>
+<pre><code>@EntityView(User.class)
+public interface UserSummaryView {
+
+    @IdMapping
+    Long getId();
+
+    String getName();
+
+    @Mapping("SIZE(orders)")
+    long getOrderCount();
+
+    @Mapping("TREAT(address AS DomesticAddress).city")
+    String getCity();
+}
+
+// 使用
+CriteriaBuilder&lt;User&gt; cb = cbf.create(em, User.class);
+List&lt;UserSummaryView&gt; views = evm
+    .applySetting(EntityViewSetting.create(UserSummaryView.class), cb)
+    .getResultList();</code></pre>
+
+  <div class="key-insight">
+    <strong>💡 关键洞察</strong><br>
+    Entity View 的核心优势在于<strong>只 SELECT 视图中声明的字段</strong>。上例生成的 JPQL 不会加载 User 的所有列，
+    而是精确投影 <code>id</code>、<code>name</code>、<code>SIZE(orders)</code>、<code>address.city</code>，
+    从根本上避免了全字段加载的性能浪费。
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">▸ Entity View 工作流</div>
+    <div class="mermaid">
+sequenceDiagram
+    participant App as 应用代码
+    participant EVM as EntityViewManager
+    participant CB as CriteriaBuilder
+    participant JPA as JPA Provider
+    participant DB as 数据库
+
+    App->>EVM: applySetting(ViewClass, cb)
+    EVM->>CB: 注入 SELECT / JOIN 子句
+    CB->>CB: 构建完整 JPQL
+    App->>CB: getResultList()
+    CB->>JPA: 提交 JPQL
+    JPA->>DB: 执行 Native SQL
+    DB-->>JPA: ResultSet
+    JPA-->>CB: 原始结果
+    CB-->>EVM: 实例化 View 对象
+    EVM-->>App: List&lt;ViewClass&gt;
+    </div>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- 1.4 与同类框架对比 -->
+  <!-- ================================================================== -->
+  <h2 id="s1-4">1.4 与同类框架对比</h2>
+
+  <p>
+    Java 生态中，处理复杂查询的框架不止 Blaze-Persistence。以下从多个维度进行横向比较，
+    帮助你在技术选型时做出明智决策。
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">▸ 四大查询框架能力雷达</div>
+    <div style="max-width:600px;margin:0 auto;padding:16px 0;">
+      <div style="display:flex;align-items:center;margin-bottom:4px;">
+        <div style="width:28px;"></div>
+        <div style="flex:1;text-align:center;color:#8b949e;font-size:12px;font-weight:bold;">高 JPA 集成 ↑</div>
+      </div>
+      <div style="display:flex;">
+        <div style="width:28px;display:flex;align-items:center;justify-content:center;">
+          <span style="writing-mode:vertical-lr;transform:rotate(180deg);color:#8b949e;font-size:11px;">低 SQL 覆盖 ← → 高 SQL 覆盖</span>
+        </div>
+        <div style="flex:1;display:grid;grid-template-columns:1fr 1fr;gap:2px;">
+          <div style="background:rgba(210,153,34,.08);border:1px solid #d29922;border-radius:8px 0 0 0;padding:24px 16px;text-align:center;position:relative;">
+            <div style="color:#d29922;font-size:11px;margin-bottom:14px;font-weight:bold;">JPA 友好但 SQL 受限</div>
+            <div style="display:inline-block;background:rgba(248,81,73,.15);border:1px solid #f85149;border-radius:20px;padding:5px 14px;">
+              <span style="color:#f85149;font-size:12px;font-weight:bold;">JPA Criteria</span>
+            </div>
+          </div>
+          <div style="background:rgba(63,185,80,.08);border:1px solid #3fb950;border-radius:0 8px 0 0;padding:24px 16px;text-align:center;position:relative;">
+            <div style="color:#3fb950;font-size:11px;margin-bottom:14px;font-weight:bold;">JPA 友好 + SQL 强大</div>
+            <div style="display:inline-block;background:rgba(63,185,80,.2);border:1px solid #3fb950;border-radius:20px;padding:5px 14px;">
+              <span style="color:#3fb950;font-size:12px;font-weight:bold;">★ Blaze-Persistence</span>
+            </div>
+            <div style="display:inline-block;background:rgba(88,166,255,.12);border:1px solid #58a6ff;border-radius:20px;padding:5px 14px;margin-top:8px;">
+              <span style="color:#58a6ff;font-size:12px;font-weight:bold;">QueryDSL</span>
+            </div>
+          </div>
+          <div style="background:rgba(139,148,158,.06);border:1px solid #30363d;border-radius:0 0 0 8px;padding:24px 16px;text-align:center;">
+            <div style="color:#8b949e;font-size:11px;margin-bottom:14px;font-weight:bold;">脱离 JPA + SQL 受限</div>
+            <div style="color:#484f58;font-size:12px;font-style:italic;">（无代表框架）</div>
+          </div>
+          <div style="background:rgba(88,166,255,.06);border:1px solid #58a6ff;border-radius:0 0 8px 0;padding:24px 16px;text-align:center;">
+            <div style="color:#58a6ff;font-size:11px;margin-bottom:14px;font-weight:bold;">脱离 JPA + SQL 强大</div>
+            <div style="display:inline-block;background:rgba(210,153,34,.15);border:1px solid #d29922;border-radius:20px;padding:5px 14px;">
+              <span style="color:#d29922;font-size:12px;font-weight:bold;">jOOQ</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>维度</th>
+        <th>JPA Criteria</th>
+        <th>QueryDSL</th>
+        <th>jOOQ</th>
+        <th>Blaze-Persistence</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>类型安全</strong></td>
+        <td>部分（Metamodel 生成）</td>
+        <td>✅ 强（Q 类生成）</td>
+        <td>✅ 强（代码生成）</td>
+        <td>✅ 强（流式 API）</td>
+      </tr>
+      <tr>
+        <td><strong>SQL 功能覆盖</strong></td>
+        <td>❌ 有限（无 CTE / 窗口函数）</td>
+        <td>⚠️ 中等</td>
+        <td>✅ 完整（原生 SQL）</td>
+        <td>✅ 广泛（CTE / 窗口 / 集合操作）</td>
+      </tr>
+      <tr>
+        <td><strong>DTO 投影</strong></td>
+        <td>⚠️ 手动构造</td>
+        <td>⚠️ Projection 半自动</td>
+        <td>⚠️ Record Mapper</td>
+        <td>✅ Entity View 声明式</td>
+      </tr>
+      <tr>
+        <td><strong>JPA 集成</strong></td>
+        <td>✅ 原生</td>
+        <td>✅ JPA 模块</td>
+        <td>❌ 独立于 JPA</td>
+        <td>✅ 构建于 JPA 之上</td>
+      </tr>
+      <tr>
+        <td><strong>Keyset 分页</strong></td>
+        <td>❌</td>
+        <td>❌</td>
+        <td>⚠️ 手动实现</td>
+        <td>✅ 内置支持</td>
+      </tr>
+      <tr>
+        <td><strong>学习曲线</strong></td>
+        <td>中等</td>
+        <td>低</td>
+        <td>中等</td>
+        <td>中等偏高</td>
+      </tr>
+      <tr>
+        <td><strong>社区活跃度</strong></td>
+        <td>JPA 标准，无独立社区</td>
+        <td>⚠️ 维护放缓</td>
+        <td>✅ 商业支持</td>
+        <td>⚠️ 中等（Blazebit 团队）</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>何时选择 Blaze-Persistence？</h3>
+
+  <div class="diagram">
+    <div class="diagram-title">▸ 技术选型决策树</div>
+    <div class="mermaid">
+flowchart TD
+    Q1{"需要 JPA 集成？"}
+    Q2{"需要 CTE / 窗口函数？"}
+    Q3{"需要声明式<br/>DTO 投影？"}
+    Q4{"现有 QueryDSL<br/>能满足需求？"}
+    R1["✅ 选择<br/>Blaze-Persistence"]
+    R2["推荐 jOOQ"]
+    R3["可继续使用<br/>QueryDSL"]
+    R4["JPA Criteria<br/>或 QueryDSL"]
+
+    Q1 -- "否" --> R2
+    Q1 -- "是" --> Q2
+    Q2 -- "是" --> R1
+    Q2 -- "否" --> Q3
+    Q3 -- "是" --> R1
+    Q3 -- "否" --> Q4
+    Q4 -- "是" --> R3
+    Q4 -- "否" --> R4
+
+    style Q1 fill:#1c2129,stroke:#58a6ff,color:#e6edf3
+    style Q2 fill:#1c2129,stroke:#58a6ff,color:#e6edf3
+    style Q3 fill:#1c2129,stroke:#58a6ff,color:#e6edf3
+    style Q4 fill:#1c2129,stroke:#58a6ff,color:#e6edf3
+    style R1 fill:#1c2129,stroke:#3fb950,color:#e6edf3
+    style R2 fill:#1c2129,stroke:#d29922,color:#e6edf3
+    style R3 fill:#1c2129,stroke:#d29922,color:#e6edf3
+    style R4 fill:#1c2129,stroke:#8b949e,color:#e6edf3
+    </div>
+  </div>
+
+  <div class="os-note">
+    <strong>📌 选型建议</strong><br>
+    如果你的项目已经深度依赖 JPA/Hibernate，且面临复杂查询和高效 DTO 投影的双重需求，
+    Blaze-Persistence 是目前最优解。如果你不需要 JPA（例如纯 JDBC 项目），jOOQ 是更好的选择。
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- 1.5 JPQL 生成管线 -->
+  <!-- ================================================================== -->
+  <h2 id="s1-5">1.5 JPQL 生成管线</h2>
+
+  <p>
+    Blaze-Persistence 不直接生成原生 SQL，而是先生成增强的 JPQL（兼容 HQL），再委托给 JPA Provider 翻译为具体数据库的 SQL。
+    理解这条管线有助于排查性能问题和理解框架行为。
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">▸ JPQL 生成管线全流程</div>
+    <div class="mermaid">
+flowchart LR
+    A["🧑‍💻 应用代码<br/>CriteriaBuilder API"]
+    B["🌳 表达式树<br/>ExpressionTree"]
+    C["📝 JPQL 渲染器<br/>JpqlRenderer"]
+    D["🔌 JPA Provider<br/>Hibernate / EclipseLink"]
+    E["🗃️ 原生 SQL<br/>PostgreSQL / MySQL / ..."]
+    F["📊 数据库<br/>执行查询"]
+
+    A -->|"构建"| B
+    B -->|"遍历渲染"| C
+    C -->|"提交 JPQL"| D
+    D -->|"翻译"| E
+    E -->|"发送"| F
+
+    style A fill:#1c2129,stroke:#58a6ff,color:#e6edf3
+    style B fill:#1c2129,stroke:#bc8cff,color:#e6edf3
+    style C fill:#1c2129,stroke:#3fb950,color:#e6edf3
+    style D fill:#1c2129,stroke:#d29922,color:#e6edf3
+    style E fill:#1c2129,stroke:#f85149,color:#e6edf3
+    style F fill:#1c2129,stroke:#39d2c0,color:#e6edf3
+    </div>
+  </div>
+
+  <h3>管线各阶段详解</h3>
+
+  <div class="steps">
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-body">
+        <h4>API 调用 → 表达式树</h4>
+        <p>
+          每一次 <code>.where()</code>、<code>.orderBy()</code>、<code>.select()</code> 调用，
+          都会在内部构建一棵<strong>表达式树</strong>（AST）。树的节点包括：谓词节点、路径表达式、函数调用、子查询引用等。
+        </p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-body">
+        <h4>表达式树优化</h4>
+        <p>
+          框架在渲染前会对表达式树做优化：合并冗余 JOIN、提取公共子表达式、决定是否使用子查询或 EXISTS 改写。
+        </p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-body">
+        <h4>JPQL 渲染</h4>
+        <p>
+          <code>JpqlRenderer</code> 遍历表达式树，生成标准 JPQL 字符串。对于 JPA 不支持的特性（CTE、窗口函数），
+          框架会生成<strong>扩展 JPQL</strong>或直接注入原生 SQL 片段。
+        </p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">4</div>
+      <div class="step-body">
+        <h4>JPA Provider 翻译</h4>
+        <p>
+          Hibernate 或 EclipseLink 接收 JPQL，经过其内部解析器和方言（Dialect）转换为目标数据库的原生 SQL。
+        </p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">5</div>
+      <div class="step-body">
+        <h4>数据库执行</h4>
+        <p>原生 SQL 被发送到数据库，返回 ResultSet，再经由 JPA Provider 映射回 Java 对象。</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="diagram">
+    <div class="diagram-title">▸ 表达式树示例（WHERE age &gt; 18 AND name LIKE 'J%'）</div>
+    <div class="mermaid">
+flowchart TD
+    ROOT["AND"]
+    LEFT["GT"]
+    RIGHT["LIKE"]
+    P1["PathExpr<br/>user.age"]
+    L1["Literal<br/>18"]
+    P2["PathExpr<br/>user.name"]
+    L2["Literal<br/>'J%'"]
+
+    ROOT --> LEFT
+    ROOT --> RIGHT
+    LEFT --> P1
+    LEFT --> L1
+    RIGHT --> P2
+    RIGHT --> L2
+
+    style ROOT fill:#1c2129,stroke:#58a6ff,color:#e6edf3
+    style LEFT fill:#1c2129,stroke:#3fb950,color:#e6edf3
+    style RIGHT fill:#1c2129,stroke:#3fb950,color:#e6edf3
+    style P1 fill:#1c2129,stroke:#bc8cff,color:#e6edf3
+    style L1 fill:#1c2129,stroke:#d29922,color:#e6edf3
+    style P2 fill:#1c2129,stroke:#bc8cff,color:#e6edf3
+    style L2 fill:#1c2129,stroke:#d29922,color:#e6edf3
+    </div>
+  </div>
+
+  <div class="real-world">
+    <h5>调试技巧：查看生成的 JPQL</h5>
+    <p>在开发阶段，可以通过以下方式查看 Blaze-Persistence 生成的 JPQL：</p>
+<pre><code>CriteriaBuilder&lt;User&gt; cb = cbf.create(em, User.class)
+    .where("age").gt(18);
+
+// 获取生成的 JPQL 字符串
+String jpql = cb.getQueryString();
+System.out.println(jpql);
+// 输出: SELECT user FROM User user WHERE user.age > :param_0</code></pre>
+    <p>配合 Hibernate 的 <code>hibernate.show_sql=true</code> 可以同时看到最终的原生 SQL。</p>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- 1.6 陷阱与限制 -->
+  <!-- ================================================================== -->
+  <h2 id="s1-6">1.6 陷阱与限制</h2>
+
+  <p>
+    任何框架都有边界。提前了解 Blaze-Persistence 的限制，可以避免在项目后期踩坑。
+  </p>
+
+  <div class="diagram">
+    <div class="diagram-title">▸ 陷阱全景图</div>
+    <div class="mermaid">
+mindmap
+  root(("⚠️ 陷阱与限制"))
+    JPA Provider 依赖
+      Hibernate 支持最完整
+      EclipseLink 部分功能受限
+      DataNucleus 实验性支持
+    SQL 特性覆盖
+      CTE 支持因数据库而异
+      窗口函数需数据库原生支持
+      某些方言生成的 SQL 不够优化
+    Entity View
+      注解学习曲线较陡
+      复杂映射调试困难
+      循环引用需特殊处理
+    运行时
+      JPQL 解析有额外开销
+      首次查询需预热
+      升级 Hibernate 版本需验证兼容性
+    </div>
+  </div>
+
+  <h3>1.6.1 JPA Provider 兼容性</h3>
+  <p>
+    Blaze-Persistence 虽然基于 JPA 标准，但内部大量使用了 Provider 特定的扩展能力。
+    各 Provider 的支持程度不同：
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>特性</th>
+        <th><span class="provider-badge hibernate">Hibernate</span></th>
+        <th><span class="provider-badge eclipselink">EclipseLink</span></th>
+        <th><span class="provider-badge datanucleus">DataNucleus</span></th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>CriteriaBuilder 基础</td><td>✅ 完整</td><td>✅ 完整</td><td>⚠️ 基本</td></tr>
+      <tr><td>CTE（WITH 子句）</td><td>✅</td><td>❌</td><td>❌</td></tr>
+      <tr><td>窗口函数</td><td>✅</td><td>⚠️ 部分</td><td>❌</td></tr>
+      <tr><td>LATERAL JOIN</td><td>✅</td><td>❌</td><td>❌</td></tr>
+      <tr><td>Entity View</td><td>✅ 完整</td><td>✅ 完整</td><td>⚠️ 基本</td></tr>
+      <tr><td>批量 DML（INSERT / UPDATE）</td><td>✅</td><td>⚠️ 部分</td><td>❌</td></tr>
+      <tr><td>集合操作（UNION / INTERSECT）</td><td>✅</td><td>⚠️ 部分</td><td>❌</td></tr>
+    </tbody>
+  </table>
+
+  <div class="warning">
+    <strong>⚠️ 警告</strong><br>
+    如果你的项目不使用 Hibernate，请在选型前仔细评估目标 Provider 对所需特性的支持程度。
+    EclipseLink 用户在使用 CTE 和窗口函数时会遇到不可绕过的限制。
+  </div>
+
+  <h3>1.6.2 数据库方言差异</h3>
+
+  <div class="diagram">
+    <div class="diagram-title">▸ 各数据库对高级 SQL 特性的支持</div>
+    <div style="display:flex;flex-wrap:wrap;gap:16px;justify-content:center;padding:16px 0;">
+      <div style="border:1px solid #3fb950;border-radius:8px;padding:14px 18px;min-width:180px;max-width:240px;background:rgba(63,185,80,.06);text-align:center;">
+        <div style="font-weight:bold;color:#3fb950;margin-bottom:8px;">✅ 完整支持</div>
+        <div style="color:#e6edf3;font-size:13px;line-height:1.7;">PostgreSQL<br>SQL Server<br>Oracle</div>
+      </div>
+      <div style="border:1px solid #d29922;border-radius:8px;padding:14px 18px;min-width:180px;max-width:240px;background:rgba(210,153,34,.06);text-align:center;">
+        <div style="font-weight:bold;color:#d29922;margin-bottom:8px;">⚠️ 部分支持</div>
+        <div style="color:#e6edf3;font-size:13px;line-height:1.7;">MySQL 8+<br>MariaDB 10.2+</div>
+        <div style="color:#8b949e;font-size:12px;margin-top:4px;">CTE 可用，递归受限</div>
+      </div>
+      <div style="border:1px solid #f85149;border-radius:8px;padding:14px 18px;min-width:180px;max-width:240px;background:rgba(248,81,73,.06);text-align:center;">
+        <div style="font-weight:bold;color:#f85149;margin-bottom:8px;">❌ 受限</div>
+        <div style="color:#e6edf3;font-size:13px;line-height:1.7;">H2<br>HSQLDB</div>
+        <div style="color:#8b949e;font-size:12px;margin-top:4px;">不支持递归 CTE</div>
+      </div>
+    </div>
+  </div>
+
+  <h3>1.6.3 Entity View 常见陷阱</h3>
+  <ul>
+    <li><strong>循环引用</strong>：A View 引用 B View，B View 又引用 A View → 需要用 <code>@MappingCorrelated</code> 或拆分子视图打破循环</li>
+    <li><strong>延迟加载误区</strong>：Entity View 默认即时加载所有声明的属性，不存在 JPA 实体的 LAZY 语义</li>
+    <li><strong>集合映射性能</strong>：在 View 中映射 <code>Set&lt;SubView&gt;</code> 时，如果数据量大，要配合分页或限制条数</li>
+    <li><strong>更新冲突</strong>：<code>@UpdatableEntityView</code> 使用乐观锁，需要实体定义 <code>@Version</code> 字段</li>
+  </ul>
+
+  <div class="key-insight">
+    <strong>💡 最佳实践</strong><br>
+    在项目初期使用 <code>cb.getQueryString()</code> 配合 SQL 日志验证每一个关键查询的生成结果。
+    不要等到上线才发现生成的 SQL 不符合预期。第 2 章将详细介绍如何配置日志级别以便调试。
+  </div>
+
+  <h3>1.6.4 性能注意事项</h3>
+
+  <div class="diagram">
+    <div class="diagram-title">▸ 性能影响因素与应对策略</div>
+    <div class="mermaid">
+flowchart TD
+    P["性能关注点"]
+    P1["JPQL 解析开销"]
+    P2["首次查询预热"]
+    P3["Entity View 实例化"]
+    P4["生成 SQL 质量"]
+
+    S1["🛡️ 启用查询缓存"]
+    S2["🛡️ 应用启动时预热"]
+    S3["🛡️ 使用接口而非抽象类"]
+    S4["🛡️ 检查执行计划"]
+
+    P --> P1 --> S1
+    P --> P2 --> S2
+    P --> P3 --> S3
+    P --> P4 --> S4
+
+    style P fill:#1c2129,stroke:#f85149,color:#e6edf3
+    style P1 fill:#1c2129,stroke:#d29922,color:#e6edf3
+    style P2 fill:#1c2129,stroke:#d29922,color:#e6edf3
+    style P3 fill:#1c2129,stroke:#d29922,color:#e6edf3
+    style P4 fill:#1c2129,stroke:#d29922,color:#e6edf3
+    style S1 fill:#1c2129,stroke:#3fb950,color:#e6edf3
+    style S2 fill:#1c2129,stroke:#3fb950,color:#e6edf3
+    style S3 fill:#1c2129,stroke:#3fb950,color:#e6edf3
+    style S4 fill:#1c2129,stroke:#3fb950,color:#e6edf3
+    </div>
+  </div>
+
+  <!-- ================================================================== -->
+  <!-- 本章小结 -->
+  <!-- ================================================================== -->
+  <div class="chapter-summary" id="summary">
+    <h2>本章小结</h2>
+    <ul>
+      <li>JPA Criteria API 在复杂查询场景下存在冗长、类型安全不足、SQL 功能覆盖有限等问题</li>
+      <li>Blaze-Persistence 通过 <strong>Core（CriteriaBuilder）</strong>和 <strong>Entity View</strong> 两大模块分别解决了查询构建和 DTO 投影的痛点</li>
+      <li>框架采用四层架构：JPA Provider → Core → Entity View → 集成层，各层职责清晰、按需引入</li>
+      <li><code>CriteriaBuilderFactory</code> 和 <code>EntityViewManager</code> 是框架的两大入口</li>
+      <li>与 QueryDSL、jOOQ 相比，Blaze-Persistence 在"JPA 集成 + 高级 SQL 特性"这一象限具有独特优势</li>
+      <li>JPQL 生成管线经历：API 调用 → 表达式树 → JPQL 渲染 → JPA Provider 翻译 → 原生 SQL</li>
+      <li>Hibernate 是最佳 JPA Provider；使用 EclipseLink 或 DataNucleus 时需评估特性支持</li>
+    </ul>
+    <p class="next-hint">下一章 <a href="ch02-setup.html">第 2 章 · 项目搭建</a> 将介绍如何从零搭建 Blaze-Persistence 项目，初始化 CriteriaBuilderFactory 与 EntityViewManager。</p>
+  </div>
+
+</div>
+
+<div class="chapter-nav">
+  <a href="index.html">&larr; 返回目录</a>
+  <a href="ch02-setup.html">第 2 章 · 项目搭建 &rarr;</a>
+</div>
+
+<p class="footer">&copy; 2026 图解 Blaze-Persistence · 第 1 章 · 全景概览</p>
+
+</div>
+
+<!-- Mermaid -->
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+mermaid.initialize({
+  theme: 'dark',
+  themeVariables: {
+    primaryColor: '#58a6ff', primaryTextColor: '#e6edf3', primaryBorderColor: '#30363d',
+    lineColor: '#8b949e', secondaryColor: '#161b22', tertiaryColor: '#0d1117',
+    background: '#161b22', mainBkg: '#161b22', nodeBorder: '#30363d',
+    clusterBkg: 'rgba(22,27,34,.5)', clusterBorder: '#30363d', titleColor: '#e6edf3',
+    edgeLabelBackground: '#161b22',
+  },
+  flowchart: { curve: 'basis', padding: 15 },
+  sequence: { actorMargin: 50, messageMargin: 30 },
+});
+</script>
+</body>
+</html>

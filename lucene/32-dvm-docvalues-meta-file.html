@@ -1,0 +1,1860 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lucene 图解 - 第 32 章 · .dvm DocValues 元信息文件</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="g-blue" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1f6feb"/><stop offset="100%" stop-color="#0d419d"/>
+    </linearGradient>
+    <linearGradient id="g-green" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#238636"/><stop offset="100%" stop-color="#1a6028"/>
+    </linearGradient>
+    <linearGradient id="g-orange" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#bd561d"/><stop offset="100%" stop-color="#9e4416"/>
+    </linearGradient>
+    <linearGradient id="g-red" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#a40e26"/><stop offset="100%" stop-color="#7d0a1d"/>
+    </linearGradient>
+    <linearGradient id="g-purple" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6f42c1"/><stop offset="100%" stop-color="#553098"/>
+    </linearGradient>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#58a6ff"/>
+    </marker>
+    <marker id="arr-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3fb950"/>
+    </marker>
+    <marker id="arr-o" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#f0883e"/>
+    </marker>
+    <marker id="arr-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#f85149"/>
+    </marker>
+    <marker id="arr-p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#a371f7"/>
+    </marker>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Lucene</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="31-dvd-docvalues-data-file.html">上一章</a>
+  <a href="33-dim-points-data-file.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s32-0">32.0 章首速览</a>
+  <a href="#s32-1">32.1 文件用途与触发时机</a>
+  <a href="#s32-2">32.2 整体字节布局</a>
+  <a href="#s32-3">32.3 字段记录通用框架</a>
+  <a href="#s32-4">32.4 NUMERIC 字段 metadata</a>
+  <a href="#s32-5">32.5 BINARY 字段 metadata</a>
+  <a href="#s32-6">32.6 SORTED 字段 metadata</a>
+  <a href="#s32-7">32.7 SORTED_SET / SORTED_NUMERIC metadata</a>
+  <a href="#s32-8">32.8 写入路径</a>
+  <a href="#s32-9">32.9 读取路径</a>
+  <a href="#s32-10">32.10 性能基线</a>
+  <a href="#s32-11">32.11 版本演进与兼容性</a>
+  <a href="#s32-12">32.12 陷阱与限制</a>
+  <a href="#s32-13">32.13 本章要点</a>
+  <a href="#s32-summary">本章小结</a>
+</aside>
+
+<div class="article">
+
+<h1>第 32 章 · .dvm DocValues 元信息文件</h1>
+<p class="subtitle">.dvm DocValues Meta · 字段表 · NUMERIC/BINARY/SORTED/SORTED_NUMERIC/SORTED_SET · 编码模式选择 · valuesOffset · DENSE/SPARSE DISI · ord_addresses</p>
+
+<div class="chapter-intro">
+  <p class="lead"><code>.dvm</code>(DocValues Meta)是 DocValues 列存通道的<strong>字段表</strong> + <strong>编码描述</strong>:它逐字段记录"该列是 NUMERIC / BINARY / SORTED / SORTED_NUMERIC / SORTED_SET 中的哪种"、"用了哪种编码模式(DELTA / GCD / TABLE / MONOTONIC / BLOCK_PFOR)"、"在 <code>.dvd</code> 中的起始偏移与长度"、以及"docsWithField 的稠密/稀疏选择(DENSE / SPARSE / ALL)"。</p>
+  <p><code>.dvm</code> 与 <code>.dvd</code> 是 1:1 配对的双文件:<code>.dvd</code> 是<strong>数据本体</strong>(几 MB-几 GB),<code>.dvm</code> 是<strong>读取它的目录</strong>(几 KB-几 MB,字段越多越大)。reader 打开 segment 时一次性把 <code>.dvm</code> 全部加载到内存,缓存为 <code>Map&lt;String, FieldEntry&gt;</code>;之后任何 <code>getNumericDocValues(field)</code> 调用都先查这张表,拿到 valuesOffset → seek 到 <code>.dvd</code> → block 解码。本章按"角色 → 字节布局 → 5 种 DocValuesType 的 FieldEntry → 编码模式选择 → 写入读取路径 → 合并 → 性能"组织,逐节拆解 <code>.dvm</code>。</p>
+  <ul class="will-learn">
+    <li>.dvm 文件大小特征:每字段 60-300 byte,1000 个字段约 100-300 KB</li>
+    <li>字节布局:Header(<code>Lucene90DocValuesMetadata</code>) + 字段表(numFields × FieldEntry) + IndexHeader 偏移 + Footer</li>
+    <li>FieldEntry 结构:fieldNumber + DocValuesType(1 byte) + 类型相关元信息(20-200 byte)</li>
+    <li>5 种 DocValuesType 各自的 FieldEntry:NUMERIC(min/max/gcd/numericFormat)、BINARY(addressesOffset/length)、SORTED(ordsOffset/dictOffset)、SORTED_NUMERIC(addressesOffset)、SORTED_SET(ordsOffset/ordAddressesOffset/dictOffset)</li>
+    <li>NUMERIC 6 种编码模式:CONST / TABLE / GCD / DELTA / MONOTONIC / BLOCK_PFOR,writer 根据 min/max/gcd/uniqueCount 自动选择</li>
+    <li>DENSE / SPARSE / ALL 三种 docsWithField 编码:依据 cardinality 自动选择,DENSE 用 bitset,SPARSE 用 docID 列表</li>
+    <li>valuesOffset 的作用:reader 在 <code>.dvd</code> 中 O(1) seek 到该字段数据起点</li>
+    <li>字典 dict + termAddr 表:SORTED / SORTED_SET 的字典字节与字典内偏移表均在 <code>.dvd</code>,但<strong>偏移指针</strong>在 <code>.dvm</code></li>
+    <li>ord_addresses:仅 SORTED_SET 有,记录每 doc 的多 ord 子序列起止</li>
+    <li>写入路径:<code>Lucene90DocValuesConsumer</code> 在 finish() 时把所有字段元信息一次性写到 <code>.dvm</code></li>
+    <li>读取路径:<code>Lucene90DocValuesProducer</code> 打开时全量加载 <code>.dvm</code> → 缓存 fieldEntries</li>
+    <li>合并行为:.dvm 重建,字段顺序按合并后的 fieldInfos 排序</li>
+  </ul>
+  <p class="prereq">前置:第 31 章 <code>.dvd</code>(本章的对偶,DocValues 数据本体);第 22 章 <code>.fnm</code>(FieldInfos,字段表的来源);第 13 章 PackedInts / MONOTONIC(.dvm 中的偏移表与 .dvd 中的列编码都用 PackedInts);第 18 章 IndexedDISI(DENSE / SPARSE 编码);第 03 章 segment merge(.dvm 在 merge 时重建)。</p>
+</div>
+
+
+<p>
+<code>.dvm</code> 是 <code>.dvd</code> 的字段目录。它告诉 reader:每个 DocValues 字段的类型(NUMERIC/BINARY/SORTED/SORTED_SET/SORTED_NUMERIC)、编码模式(DELTA/GCD/TABLE/MONOTONIC/BLOCK_PFOR)、在 <code>.dvd</code> 中的偏移与长度、统计信息(min/max/gcd/uniqueCount)、以及解码所需的辅助参数(bitsPerValue/blockShift/jumpTableOffset)。
+</p>
+<p>
+<code>.dvm</code> 是 reader 启动时全量加载到内存的一类小文件,典型大小 KB 到几 MB,加载后字段元信息常驻 <code>Lucene90DocValuesProducer</code> 内部 map,后续 <code>getNumeric / getSorted</code> 调用直接命中。
+</p>
+<p>
+本章拆解 <code>.dvm</code> 字段记录的字节布局、五种类型的 metadata 字段差异、写入读取流程、与 <code>.dvd</code> 的偏移配对、以及版本演进与生产陷阱。
+</p>
+<!-- ============================================================ -->
+<h2 id="s32-0">32.0 章首速览</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 32-0-1:.dvm 在 DocValues 体系中的角色</div>
+<svg viewBox="0 0 1200 480" width="100%" style="max-width:1200px;display:block;margin:0 auto" font-family="-apple-system,Segoe UI,sans-serif" font-size="11">
+  <rect x="450" y="20" width="300" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="600" y="45" text-anchor="middle" fill="#fff" font-weight="700">.dvm 元信息文件</text>
+  <text x="600" y="65" text-anchor="middle" fill="#a5d6ff" font-size="11">DocValues 字段表 + 编码描述</text>
+
+  <g font-size="11">
+    <rect x="20" y="160" width="180" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="110" y="183" text-anchor="middle" fill="#fff" font-weight="700">§32.1</text>
+    <text x="110" y="200" text-anchor="middle" fill="#d2f4d8">角色与触发</text>
+
+    <rect x="220" y="160" width="180" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="310" y="183" text-anchor="middle" fill="#fff" font-weight="700">§32.2-32.3</text>
+    <text x="310" y="200" text-anchor="middle" fill="#d2f4d8">字节布局</text>
+
+    <rect x="420" y="160" width="180" height="50" rx="8" fill="url(#g-orange)" stroke="#f0883e"/>
+    <text x="510" y="183" text-anchor="middle" fill="#fff" font-weight="700">§32.4-32.7</text>
+    <text x="510" y="200" text-anchor="middle" fill="#fff3e0">五类型 metadata</text>
+
+    <rect x="620" y="160" width="180" height="50" rx="8" fill="url(#g-purple)" stroke="#a371f7"/>
+    <text x="710" y="183" text-anchor="middle" fill="#fff" font-weight="700">§32.8-32.9</text>
+    <text x="710" y="200" text-anchor="middle" fill="#d8c5ff">写入 / 读取</text>
+
+    <rect x="820" y="160" width="180" height="50" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="910" y="183" text-anchor="middle" fill="#fff" font-weight="700">§32.10-32.12</text>
+    <text x="910" y="200" text-anchor="middle" fill="#fbd9d8">性能 / 演进 / 陷阱</text>
+
+    <rect x="1020" y="160" width="160" height="50" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="1100" y="183" text-anchor="middle" fill="#fff" font-weight="700">§32.13</text>
+    <text x="1100" y="200" text-anchor="middle" fill="#a5d6ff">本章要点</text>
+  </g>
+
+  <g stroke-width="1.2">
+    <line x1="490" y1="80" x2="110" y2="158" stroke="#3fb950" marker-end="url(#arr-g)"/>
+    <line x1="520" y1="80" x2="310" y2="158" stroke="#3fb950" marker-end="url(#arr-g)"/>
+    <line x1="560" y1="80" x2="510" y2="158" stroke="#f0883e" marker-end="url(#arr-o)"/>
+    <line x1="640" y1="80" x2="710" y2="158" stroke="#a371f7" marker-end="url(#arr-p)"/>
+    <line x1="680" y1="80" x2="910" y2="158" stroke="#f85149" marker-end="url(#arr-r)"/>
+    <line x1="710" y1="80" x2="1100" y2="158" stroke="#58a6ff" marker-end="url(#arr)"/>
+  </g>
+
+  <g font-size="10">
+    <rect x="120" y="290" width="200" height="50" rx="6" fill="#161b22" stroke="#f0883e"/>
+    <text x="220" y="320" text-anchor="middle" fill="#f0883e" font-weight="700">NUMERIC metadata</text>
+    <rect x="350" y="290" width="200" height="50" rx="6" fill="#161b22" stroke="#f0883e"/>
+    <text x="450" y="320" text-anchor="middle" fill="#f0883e" font-weight="700">BINARY metadata</text>
+    <rect x="580" y="290" width="200" height="50" rx="6" fill="#161b22" stroke="#f0883e"/>
+    <text x="680" y="320" text-anchor="middle" fill="#f0883e" font-weight="700">SORTED metadata</text>
+    <rect x="810" y="290" width="280" height="50" rx="6" fill="#161b22" stroke="#f0883e"/>
+    <text x="950" y="320" text-anchor="middle" fill="#f0883e" font-weight="700">SORTED_SET / SORTED_NUMERIC</text>
+  </g>
+
+  <g stroke-width="1" stroke="#f0883e">
+    <line x1="510" y1="210" x2="220" y2="288" marker-end="url(#arr-o)"/>
+    <line x1="510" y1="210" x2="450" y2="288" marker-end="url(#arr-o)"/>
+    <line x1="510" y1="210" x2="680" y2="288" marker-end="url(#arr-o)"/>
+    <line x1="510" y1="210" x2="950" y2="288" marker-end="url(#arr-o)"/>
+  </g>
+
+  <text x="600" y="410" text-anchor="middle" fill="#79c0ff" font-weight="700" font-size="13">本章组织:角色 → 布局 → 5 种 FieldEntry → 路径 → 性能 → 陷阱</text>
+  <text x="600" y="435" text-anchor="middle" fill="#c9d1d9" font-size="11">.dvm 是 .dvd 的字段目录,reader 启动时一次性全量加载</text>
+</svg>
+</div>
+<p>
+§32.1 解释 <code>.dvm</code> 角色;§32.2-32.3 给出文件总体布局与字段记录通用结构;§32.4-32.7 拆解五种 DocValues 类型在 <code>.dvm</code> 中的 metadata 字段;§32.8-32.9 讨论写入读取路径;§32.10-32.12 给出性能、版本演进与生产陷阱;§32.13 给出本章要点。
+</p>
+<!-- ============================================================ -->
+<h2 id="s32-1">32.1 文件用途与触发时机</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 32-1-1:.dvm 与 .dvd 的协作</div>
+<svg viewBox="0 0 1200 600" width="100%" style="max-width:1200px;display:block;margin:0 auto" font-family="-apple-system,Segoe UI,sans-serif" font-size="11">
+  <g font-weight="600" font-size="12">
+    <rect x="20" y="20" width="80" height="32" rx="6" fill="url(#g-blue)"/>
+    <text x="60" y="41" text-anchor="middle" fill="#fff">App</text>
+    <rect x="180" y="20" width="280" height="32" rx="6" fill="url(#g-orange)"/>
+    <text x="320" y="41" text-anchor="middle" fill="#fff">Lucene90DocValuesProducer</text>
+    <rect x="540" y="20" width="100" height="32" rx="6" fill="url(#g-red)"/>
+    <text x="590" y="41" text-anchor="middle" fill="#fff">.dvm</text>
+    <rect x="700" y="20" width="100" height="32" rx="6" fill="url(#g-red)"/>
+    <text x="750" y="41" text-anchor="middle" fill="#fff">.dvd</text>
+  </g>
+
+  <g stroke="#30363d" stroke-dasharray="4 4">
+    <line x1="60" y1="55" x2="60" y2="590"/>
+    <line x1="320" y1="55" x2="320" y2="590"/>
+    <line x1="590" y1="55" x2="590" y2="590"/>
+    <line x1="750" y1="55" x2="750" y2="590"/>
+  </g>
+
+  <rect x="50" y="70" width="800" height="32" rx="6" fill="rgba(31,111,235,0.06)" stroke="#58a6ff" stroke-dasharray="4 3"/>
+  <text x="450" y="91" text-anchor="middle" fill="#79c0ff" font-weight="600">segment 打开阶段(一次)</text>
+
+  <g font-size="11" fill="#c9d1d9">
+    <line x1="60" y1="125" x2="320" y2="125" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="190" y="119" text-anchor="middle" fill="#79c0ff">1: open(directory, segmentInfo)</text>
+
+    <line x1="320" y1="160" x2="590" y2="160" stroke="#f0883e" stroke-width="1.5" marker-end="url(#arr-o)"/>
+    <text x="455" y="154" text-anchor="middle" fill="#f0883e">2: 全量读 .dvm</text>
+
+    <line x1="590" y1="195" x2="320" y2="195" stroke="#f0883e" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#arr-o)"/>
+    <text x="455" y="189" text-anchor="middle" fill="#f0883e">3: fieldName → FieldEntry map</text>
+
+    <line x1="320" y1="225" x2="320" y2="245" stroke="#f0883e" stroke-width="1.5"/>
+    <rect x="305" y="225" width="30" height="20" fill="url(#g-orange)" rx="4"/>
+    <text x="380" y="239" fill="#f0883e">4: 缓存所有字段 metadata</text>
+
+    <line x1="320" y1="275" x2="750" y2="275" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    <text x="535" y="269" text-anchor="middle" fill="#f85149">5: 仅打开 IndexInput,不预读</text>
+  </g>
+
+  <rect x="50" y="320" width="800" height="32" rx="6" fill="rgba(63,185,80,0.06)" stroke="#3fb950" stroke-dasharray="4 3"/>
+  <text x="450" y="341" text-anchor="middle" fill="#56d364" font-weight="600">查询阶段(多次)</text>
+
+  <g font-size="11" fill="#c9d1d9">
+    <line x1="60" y1="375" x2="320" y2="375" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="190" y="369" text-anchor="middle" fill="#79c0ff">6: getNumeric("price")</text>
+
+    <line x1="320" y1="410" x2="320" y2="430" stroke="#f0883e" stroke-width="1.5"/>
+    <rect x="305" y="410" width="30" height="20" fill="url(#g-orange)" rx="4"/>
+    <text x="380" y="424" fill="#f0883e">7: 查 fieldEntries.priceMetadata</text>
+
+    <line x1="320" y1="460" x2="750" y2="460" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    <text x="535" y="454" text-anchor="middle" fill="#f85149">8: seek(valuesOffset) + 解码</text>
+
+    <line x1="750" y1="495" x2="320" y2="495" stroke="#f85149" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#arr-r)"/>
+    <text x="535" y="489" text-anchor="middle" fill="#f85149">9: long values</text>
+
+    <line x1="320" y1="535" x2="60" y2="535" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#arr-g)"/>
+    <text x="190" y="529" text-anchor="middle" fill="#56d364">10: NumericDocValues handle</text>
+  </g>
+</svg>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 32-1-1:.dvm 与 .dvd 的对照</div>
+<table>
+<thead><tr>
+<th>维度</th>
+<th>.dvm</th>
+<th>.dvd</th>
+</tr></thead><tbody>
+<tr>
+<td>角色</td>
+<td>字段目录 + metadata</td>
+<td>真实数据</td>
+</tr>
+<tr>
+<td>大小</td>
+<td>KB-MB</td>
+<td>MB-GB</td>
+</tr>
+<tr>
+<td>加载</td>
+<td>启动时全量</td>
+<td>懒加载,按 block</td>
+</tr>
+<tr>
+<td>内存占用</td>
+<td>常驻 heap</td>
+<td>LRU cache + page cache</td>
+</tr>
+<tr>
+<td>读取频率</td>
+<td>每字段 1 次缓存</td>
+<td>按 doc/字段访问</td>
+</tr>
+<tr>
+<td>reader 入口</td>
+<td>open() 全量解析</td>
+<td>seek + decode</td>
+</tr>
+</tbody></table>
+</div>
+<div class="diagram">
+<div class="diagram-title">图 32-1-2:.dvm 生命周期</div>
+<pre><code class="language-text">.dvm 生命周期:
+
+  [写入阶段]
+    Lucene90DocValuesConsumer.finish() 调用前
+      → 各字段写完 .dvd 时已积累 metadata
+    finish 阶段:
+      writeFieldEntry(field) 把 metadata 写入 .dvm
+      所有字段写完后写 footer
+      .dvm 与 .dvd 同时 close
+
+  [打开阶段]
+    DirectoryReader.open(directory)
+      → SegmentReader 创建
+      → Lucene90DocValuesProducer 构造
+      → readMeta() 读 .dvm 全文 (一次性 O(N_fields))
+      → 构建 fieldName -&gt; FieldEntry map
+      → 校验 .dvd objectID 与 .dvm 一致
+
+  [查询阶段]
+    LeafReader.getNumericDocValues("price")
+      → producer.fields.get("price")
+      → 拿到 FieldEntry,含 valuesOffset/length 等
+      → 创建 NumericDocValues 实现,内部持有 indexInput slice
+
+  [merge 阶段]
+    新 .dvm 由 SegmentMerger 重新生成
+    各字段 metadata 重新计算(min/max/gcd 可能变化)</code></pre>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 32-1-2:.dvm 何时被读写</div>
+<table>
+<thead><tr>
+<th>事件</th>
+<th>操作</th>
+<th>触发者</th>
+<th>频率</th>
+</tr></thead><tbody>
+<tr>
+<td>segment flush</td>
+<td>写入</td>
+<td>DocValuesConsumer.finish</td>
+<td>每次 commit/flush</td>
+</tr>
+<tr>
+<td>segment merge</td>
+<td>写入</td>
+<td>SegmentMerger</td>
+<td>每次 merge</td>
+</tr>
+<tr>
+<td>DirectoryReader.open</td>
+<td>全量读</td>
+<td>DocValuesProducer.&lt;init&gt;</td>
+<td>每次打开 reader</td>
+</tr>
+<tr>
+<td>getNumericDocValues</td>
+<td>查 cache</td>
+<td>DocValuesProducer</td>
+<td>每查询</td>
+</tr>
+</tbody></table>
+</div>
+<!-- ============================================================ -->
+<h2 id="s32-2">32.2 整体字节布局</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 32-2-1:.dvm 文件总览</div>
+<pre><code class="language-text">.dvm 文件结构(自顶向下):
+
+  ┌──────────────────────────────────────────────────┐
+  │ Header                                           │
+  │   magic        : 4 byte (0x3FD76C17)              │
+  │   codecName    : "Lucene90DocValuesMetadata"      │
+  │   version      : VInt (0)                         │
+  │   objectId     : 16 byte                          │
+  │   suffix       : string                           │
+  ├──────────────────────────────────────────────────┤
+  │ Field Entries (按字段编号顺序)                       │
+  │   Field 0: NUMERIC                              │
+  │   Field 1: SORTED                               │
+  │   Field 2: SORTED_SET                           │
+  │   ...                                           │
+  │   Field N: BINARY                               │
+  │                                                   │
+  │   终止标记: -1 (VInt)                              │
+  ├──────────────────────────────────────────────────┤
+  │ Footer                                            │
+  │   magic     : 4 byte (0xC02893E8)                 │
+  │   algorithmID : 4 byte (0)                        │
+  │   checksum    : 8 byte (CRC32)                    │
+  └──────────────────────────────────────────────────┘</code></pre>
+</div>
+<div class="diagram">
+<div class="diagram-title">图 32-2-2:.dvm Header 字节网格</div>
+<pre><code class="language-text">.dvm Header 字节网格:
+
+偏移   0    1    2    3    4    5    6    7    8    9    a    b    c    d    e    f
+0x000 | 3F | D7 | 6C | 17 | 1B | 4C | 75 | 63 | 65 | 6E | 65 | 39 | 30 | 44 | 6F | 63 |
+      | magic 0x3FD76C17  |strLn=27|  L     u    c    e    n    e    9    0    D    o    c |
+0x010 | 56 | 61 | 6C | 75 | 65 | 73 | 4D | 65 | 74 | 61 | 64 | 61 | 74 | 61 | 00 | A8 |
+      |  V    a    l    u    e    s    M    e    t    a    d    a    t    a |ver=0| objId|
+0x020 | 1F | 73 | 32 | 4B | F7 | 22 | 91 | C0 | DD | 4F | 1A | 5C | 88 | 36 | 03 | 00 |
+      | objectID (16 byte) ...                                                | suffLen=0 |
+0x030 | xx | xx | xx | xx | xx | xx | xx | xx | xx | xx | xx | xx | xx | xx | xx | xx |
+      | Field Entry 0 起点                                                                |
+
+Header 字段:
+  magic     : 0x3FD76C17 (CodecUtil 公共)
+  codecName : "Lucene90DocValuesMetadata" (27 byte)
+  version   : 0
+  objectID  : 16 byte (与 .dvd 一致)
+  suffix    : 0 byte (length 0)
+
+Header 总长 48 byte</code></pre>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 32-2-1:.dvm 各部分占比(典型 10 字段索引)</div>
+<table>
+<thead><tr>
+<th>部分</th>
+<th>字节</th>
+<th>占比</th>
+</tr></thead><tbody>
+<tr>
+<td>Header</td>
+<td>48</td>
+<td>4%</td>
+</tr>
+<tr>
+<td>Field Entries</td>
+<td>1000-1500</td>
+<td>90%</td>
+</tr>
+<tr>
+<td>终止标记 -1</td>
+<td>1</td>
+<td>&lt; 1%</td>
+</tr>
+<tr>
+<td>Footer</td>
+<td>16</td>
+<td>1%</td>
+</tr>
+<tr>
+<td>合计</td>
+<td>~ 1.2 KB</td>
+<td>100%</td>
+</tr>
+</tbody></table>
+</div>
+<!-- ============================================================ -->
+<h2 id="s32-3">32.3 字段记录通用框架</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 32-3-1:每字段记录通用前缀</div>
+<pre><code class="language-text">每 Field Entry 前缀(共用 5 个字段):
+
+  ┌──────────────────────────────────────────┐
+  │ fieldNumber       : VInt                  │
+  │   字段编号(&gt;= 0)                            │
+  │   值 -1 表示文件结束                          │
+  ├──────────────────────────────────────────┤
+  │ fieldType         : 1 byte                │
+  │   0 = NUMERIC                             │
+  │   1 = BINARY                              │
+  │   2 = SORTED                              │
+  │   3 = SORTED_SET                          │
+  │   4 = SORTED_NUMERIC                      │
+  ├──────────────────────────────────────────┤
+  │ docsWithFieldOffset : VLong                │
+  │   .dvd 中 IndexedDISI 的偏移                │
+  │   -1 = ALL (DENSE),-2 = NONE              │
+  ├──────────────────────────────────────────┤
+  │ docsWithFieldLength : VLong                │
+  │   IndexedDISI 字节数                       │
+  ├──────────────────────────────────────────┤
+  │ jumpTableEntryCount : 1 byte 或 VInt       │
+  │   IndexedDISI block 数(对 SPARSE/DENSE 有效) │
+  ├──────────────────────────────────────────┤
+  │ denseRankPower      : 1 byte               │
+  │   IndexedDISI 内部跳表层级                    │
+  ├──────────────────────────────────────────┤
+  │ numValues           : VLong                │
+  │   字段 doc 数                                │
+  ├──────────────────────────────────────────┤
+  │ ── 类型相关 metadata ──                    │
+  └──────────────────────────────────────────┘</code></pre>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 32-3-1:fieldType 取值表</div>
+<table>
+<thead><tr>
+<th>数值</th>
+<th>类型</th>
+<th>API 类</th>
+<th>备注</th>
+</tr></thead><tbody>
+<tr>
+<td>0</td>
+<td>NUMERIC</td>
+<td>NumericDocValues</td>
+<td>单值 long</td>
+</tr>
+<tr>
+<td>1</td>
+<td>BINARY</td>
+<td>BinaryDocValues</td>
+<td>单值 byte[]</td>
+</tr>
+<tr>
+<td>2</td>
+<td>SORTED</td>
+<td>SortedDocValues</td>
+<td>单值 ord</td>
+</tr>
+<tr>
+<td>3</td>
+<td>SORTED_SET</td>
+<td>SortedSetDocValues</td>
+<td>多值 ord</td>
+</tr>
+<tr>
+<td>4</td>
+<td>SORTED_NUMERIC</td>
+<td>SortedNumericDocValues</td>
+<td>多值 long</td>
+</tr>
+</tbody></table>
+</div>
+<div class="diagram">
+<div class="diagram-title">图 32-3-2:字段记录序列示例</div>
+<svg viewBox="0 0 1200 220" width="100%" style="max-width:1200px;display:block;margin:0 auto" font-family="-apple-system,Segoe UI,sans-serif" font-size="11">
+  <g>
+    <rect x="20" y="80" width="120" height="80" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="80" y="110" text-anchor="middle" fill="#fff" font-weight="700">Header</text>
+    <text x="80" y="130" text-anchor="middle" fill="#a5d6ff" font-size="10">codecName</text>
+    <text x="80" y="146" text-anchor="middle" fill="#a5d6ff" font-size="10">+ objectID</text>
+
+    <rect x="160" y="80" width="180" height="80" rx="8" fill="url(#g-orange)" stroke="#f0883e"/>
+    <text x="250" y="105" text-anchor="middle" fill="#fff" font-weight="700">Field 0</text>
+    <text x="250" y="125" text-anchor="middle" fill="#fff3e0" font-size="10">fieldNum=2 (price)</text>
+    <text x="250" y="143" text-anchor="middle" fill="#fff3e0" font-size="10">type=NUMERIC</text>
+
+    <rect x="360" y="80" width="180" height="80" rx="8" fill="url(#g-orange)" stroke="#f0883e"/>
+    <text x="450" y="105" text-anchor="middle" fill="#fff" font-weight="700">Field 1</text>
+    <text x="450" y="125" text-anchor="middle" fill="#fff3e0" font-size="10">fieldNum=5 (brand)</text>
+    <text x="450" y="143" text-anchor="middle" fill="#fff3e0" font-size="10">type=SORTED</text>
+
+    <rect x="560" y="80" width="180" height="80" rx="8" fill="url(#g-orange)" stroke="#f0883e"/>
+    <text x="650" y="105" text-anchor="middle" fill="#fff" font-weight="700">Field 2</text>
+    <text x="650" y="125" text-anchor="middle" fill="#fff3e0" font-size="10">fieldNum=7 (tags)</text>
+    <text x="650" y="143" text-anchor="middle" fill="#fff3e0" font-size="10">type=SORTED_SET</text>
+
+    <rect x="760" y="80" width="180" height="80" rx="8" fill="url(#g-orange)" stroke="#f0883e"/>
+    <text x="850" y="105" text-anchor="middle" fill="#fff" font-weight="700">Field 3</text>
+    <text x="850" y="125" text-anchor="middle" fill="#fff3e0" font-size="10">fieldNum=9 (vec)</text>
+    <text x="850" y="143" text-anchor="middle" fill="#fff3e0" font-size="10">type=BINARY</text>
+
+    <rect x="960" y="80" width="100" height="80" rx="8" fill="url(#g-purple)" stroke="#a371f7"/>
+    <text x="1010" y="110" text-anchor="middle" fill="#fff" font-weight="700">END</text>
+    <text x="1010" y="130" text-anchor="middle" fill="#d8c5ff" font-size="10">fieldNum=-1</text>
+    <text x="1010" y="146" text-anchor="middle" fill="#d8c5ff" font-size="10">(终止哨兵)</text>
+
+    <rect x="1080" y="80" width="100" height="80" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="1130" y="110" text-anchor="middle" fill="#fff" font-weight="700">Footer</text>
+    <text x="1130" y="130" text-anchor="middle" fill="#fbd9d8" font-size="10">+ CRC32</text>
+  </g>
+
+  <g stroke-width="1.5">
+    <line x1="140" y1="120" x2="160" y2="120" stroke="#58a6ff" marker-end="url(#arr)"/>
+    <line x1="340" y1="120" x2="360" y2="120" stroke="#f0883e" marker-end="url(#arr-o)"/>
+    <line x1="540" y1="120" x2="560" y2="120" stroke="#f0883e" marker-end="url(#arr-o)"/>
+    <line x1="740" y1="120" x2="760" y2="120" stroke="#f0883e" marker-end="url(#arr-o)"/>
+    <line x1="940" y1="120" x2="960" y2="120" stroke="#a371f7" marker-end="url(#arr-p)"/>
+    <line x1="1060" y1="120" x2="1080" y2="120" stroke="#f85149" marker-end="url(#arr-r)"/>
+  </g>
+
+  <text x="600" y="40" text-anchor="middle" fill="#79c0ff" font-weight="700" font-size="13">字段记录顺序写入,以 fieldNum=-1 为终止哨兵</text>
+</svg>
+</div>
+<!-- ============================================================ -->
+<h2 id="s32-4">32.4 NUMERIC 字段 metadata</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 32-4-1:NUMERIC 字段记录</div>
+<pre><code class="language-text">NUMERIC 字段 metadata 字段表:
+
+  ┌──────────────────────────────────────────┐
+  │ fieldNumber       : VInt (e.g. 2)          │
+  │ fieldType         : 1 byte (=0)            │
+  │ docsWithFieldOffset : VLong                 │
+  │ docsWithFieldLength : VLong                 │
+  │ jumpTableEntryCount : (omitted if dense)    │
+  │ denseRankPower      : 1 byte                │
+  │ numValues           : VLong (e.g. 1000000)  │
+  ├──────────────────────────────────────────┤
+  │ tableLength    : 1 byte                   │
+  │   0..255 (TABLE 模式才有)                    │
+  ├──────────────────────────────────────────┤
+  │ table          : tableLength * 8 byte      │
+  │   only if tableLength &gt; 0                  │
+  ├──────────────────────────────────────────┤
+  │ minValue       : VLong                    │
+  │   GCD/DELTA 的基线值                         │
+  ├──────────────────────────────────────────┤
+  │ gcd            : VLong                    │
+  │   GCD_COMPRESSED 的公约数                    │
+  │   = 1 表示无 GCD 优化                        │
+  ├──────────────────────────────────────────┤
+  │ blockShift     : 1 byte                   │
+  │   = 14 (block size = 16384) 或 0(单 block)  │
+  ├──────────────────────────────────────────┤
+  │ valuesOffset   : VLong                    │
+  │   .dvd 中 values 数据起点                    │
+  ├──────────────────────────────────────────┤
+  │ valuesLength   : VLong                    │
+  │   values 字节数                              │
+  ├──────────────────────────────────────────┤
+  │ jumpTableOffset : VLong                   │
+  │   .dvd 中 jump table 起点                    │
+  └──────────────────────────────────────────┘</code></pre>
+</div>
+<div class="diagram">
+<div class="diagram-title">图 32-4-2:NUMERIC 模式判定</div>
+<svg viewBox="0 0 1100 560" width="100%" style="max-width:1100px;display:block;margin:0 auto" font-family="-apple-system,Segoe UI,sans-serif" font-size="11">
+  <rect x="430" y="20" width="240" height="50" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="550" y="50" text-anchor="middle" fill="#fff" font-weight="700">读 NUMERIC metadata</text>
+
+  <polygon points="550,110 720,150 550,190 380,150" fill="url(#g-orange)" stroke="#f0883e"/>
+  <text x="550" y="155" text-anchor="middle" fill="#fff" font-weight="700">tableLength &gt; 0 ?</text>
+  <line x1="550" y1="70" x2="550" y2="108" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/>
+
+  <rect x="40" y="130" width="240" height="60" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="160" y="155" text-anchor="middle" fill="#fff" font-weight="700">TABLE_COMPRESSED</text>
+  <text x="160" y="175" text-anchor="middle" fill="#d2f4d8" font-size="11">用 table[ord]</text>
+  <line x1="380" y1="150" x2="280" y2="155" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+  <text x="320" y="142" fill="#3fb950" font-size="10">是</text>
+
+  <polygon points="550,230 720,270 550,310 380,270" fill="url(#g-orange)" stroke="#f0883e"/>
+  <text x="550" y="275" text-anchor="middle" fill="#fff" font-weight="700">gcd &gt; 1 ?</text>
+  <line x1="550" y1="190" x2="550" y2="228" stroke="#f0883e" stroke-width="2" marker-end="url(#arr-o)"/>
+  <text x="560" y="215" fill="#f0883e" font-size="10">否</text>
+
+  <rect x="820" y="250" width="240" height="60" rx="8" fill="url(#g-purple)" stroke="#a371f7"/>
+  <text x="940" y="275" text-anchor="middle" fill="#fff" font-weight="700">GCD_COMPRESSED</text>
+  <text x="940" y="295" text-anchor="middle" fill="#d8c5ff" font-size="11">v = min + raw · gcd</text>
+  <line x1="720" y1="270" x2="820" y2="275" stroke="#a371f7" stroke-width="1.5" marker-end="url(#arr-p)"/>
+  <text x="765" y="262" fill="#bc8cff" font-size="10">是</text>
+
+  <polygon points="550,350 720,390 550,430 380,390" fill="url(#g-orange)" stroke="#f0883e"/>
+  <text x="550" y="395" text-anchor="middle" fill="#fff" font-weight="700">blockShift == 0 ?</text>
+  <line x1="550" y1="310" x2="550" y2="348" stroke="#f0883e" stroke-width="2" marker-end="url(#arr-o)"/>
+  <text x="560" y="335" fill="#f0883e" font-size="10">否</text>
+
+  <rect x="40" y="370" width="240" height="60" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="160" y="395" text-anchor="middle" fill="#fff" font-weight="700">CONST</text>
+  <text x="160" y="415" text-anchor="middle" fill="#d2f4d8" font-size="11">或 单 block DELTA</text>
+  <line x1="380" y1="390" x2="280" y2="395" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+  <text x="320" y="382" fill="#3fb950" font-size="10">是</text>
+
+  <rect x="430" y="470" width="240" height="60" rx="10" fill="url(#g-red)" stroke="#f85149"/>
+  <text x="550" y="495" text-anchor="middle" fill="#fff" font-weight="700">BLOCK_PFOR + DELTA</text>
+  <text x="550" y="515" text-anchor="middle" fill="#fbd9d8" font-size="11">通用 fallback</text>
+  <line x1="550" y1="430" x2="550" y2="468" stroke="#f85149" stroke-width="2" marker-end="url(#arr-r)"/>
+  <text x="560" y="455" fill="#f85149" font-size="10">否</text>
+</svg>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 32-4-1:NUMERIC metadata 字段大小</div>
+<table>
+<thead><tr>
+<th>模式</th>
+<th>tableLen</th>
+<th>minValue</th>
+<th>gcd</th>
+<th>blockShift</th>
+<th>values 占 .dvm</th>
+</tr></thead><tbody>
+<tr>
+<td>CONST</td>
+<td>0</td>
+<td>1</td>
+<td>0</td>
+<td>0</td>
+<td>0 byte</td>
+</tr>
+<tr>
+<td>TABLE</td>
+<td>6</td>
+<td>0</td>
+<td>0</td>
+<td>0</td>
+<td>48 byte</td>
+</tr>
+<tr>
+<td>GCD</td>
+<td>0</td>
+<td>8</td>
+<td>8</td>
+<td>14</td>
+<td>0 byte</td>
+</tr>
+<tr>
+<td>DELTA</td>
+<td>0</td>
+<td>8</td>
+<td>0</td>
+<td>14</td>
+<td>0 byte</td>
+</tr>
+<tr>
+<td>BLOCK_PFOR</td>
+<td>0</td>
+<td>0</td>
+<td>0</td>
+<td>14</td>
+<td>0 byte</td>
+</tr>
+</tbody></table>
+</div>
+<!-- ============================================================ -->
+<h2 id="s32-5">32.5 BINARY 字段 metadata</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 32-5-1:BINARY 字段记录</div>
+<pre><code class="language-text">BINARY 字段 metadata:
+
+  ┌──────────────────────────────────────────┐
+  │ ── 通用前缀 ──                            │
+  │ fieldNumber, type=1, docsWithField...     │
+  ├──────────────────────────────────────────┤
+  │ minLength      : VInt                     │
+  │   最短 byte 序列长度                          │
+  ├──────────────────────────────────────────┤
+  │ maxLength      : VInt                     │
+  │   最长 byte 序列长度                          │
+  │   minLength == maxLength → 固定长度           │
+  ├──────────────────────────────────────────┤
+  │ dataOffset     : VLong                    │
+  │   .dvd 中 data bytes 起点                    │
+  ├──────────────────────────────────────────┤
+  │ dataLength     : VLong                    │
+  │   data bytes 总字节数                         │
+  ├──────────────────────────────────────────┤
+  │ -- 仅变长才有 ─                             │
+  │ addressesOffset : VLong                   │
+  │   addresses (MonotonicBlockPackedWriter)  │
+  ├──────────────────────────────────────────┤
+  │ addressesLength : VLong                   │
+  ├──────────────────────────────────────────┤
+  │ blockShift      : 1 byte                  │
+  │   addresses 的 block size                   │
+  ├──────────────────────────────────────────┤
+  │ jumpTableOffset : VLong                   │
+  │ jumpTableLength : VLong                   │
+  └──────────────────────────────────────────┘</code></pre>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 32-5-1:BINARY 字段 metadata 大小对比</div>
+<table>
+<thead><tr>
+<th>类型</th>
+<th>minLen</th>
+<th>maxLen</th>
+<th>metadata 字节</th>
+<th>备注</th>
+</tr></thead><tbody>
+<tr>
+<td>固定长度 16 byte</td>
+<td>16</td>
+<td>16</td>
+<td>24</td>
+<td>无 addresses</td>
+</tr>
+<tr>
+<td>变长 1-1024 byte</td>
+<td>1</td>
+<td>1024</td>
+<td>48</td>
+<td>含 addresses</td>
+</tr>
+<tr>
+<td>极长 1 KB-100 KB</td>
+<td>1024</td>
+<td>102400</td>
+<td>48</td>
+<td>含 addresses</td>
+</tr>
+</tbody></table>
+</div>
+<div class="diagram">
+<div class="diagram-title">图 32-5-2:固定 vs 变长解码路径</div>
+<svg viewBox="0 0 1100 320" width="100%" style="max-width:1100px;display:block;margin:0 auto" font-family="-apple-system,Segoe UI,sans-serif" font-size="11">
+  <rect x="430" y="20" width="240" height="50" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="550" y="50" text-anchor="middle" fill="#fff" font-weight="700">读 BINARY metadata</text>
+
+  <polygon points="550,110 770,150 550,190 330,150" fill="url(#g-orange)" stroke="#f0883e"/>
+  <text x="550" y="155" text-anchor="middle" fill="#fff" font-weight="700">minLength == maxLength ?</text>
+  <line x1="550" y1="70" x2="550" y2="108" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/>
+
+  <rect x="20" y="220" width="500" height="80" rx="10" fill="url(#g-green)" stroke="#3fb950"/>
+  <text x="270" y="245" text-anchor="middle" fill="#fff" font-weight="700">固定长度</text>
+  <text x="270" y="265" text-anchor="middle" fill="#d2f4d8">offset = dataOffset + docID · length</text>
+  <text x="270" y="283" text-anchor="middle" fill="#d2f4d8">无 addresses 表(O(1) 直接计算)</text>
+  <line x1="330" y1="150" x2="270" y2="218" stroke="#3fb950" stroke-width="2" marker-end="url(#arr-g)"/>
+  <text x="280" y="195" fill="#3fb950" font-size="10">是</text>
+
+  <rect x="580" y="220" width="500" height="80" rx="10" fill="url(#g-red)" stroke="#f85149"/>
+  <text x="830" y="241" text-anchor="middle" fill="#fff" font-weight="700">变长</text>
+  <text x="830" y="259" text-anchor="middle" fill="#fbd9d8">start = readMonotonic(addresses, docID)</text>
+  <text x="830" y="275" text-anchor="middle" fill="#fbd9d8">end   = readMonotonic(addresses, docID+1)</text>
+  <text x="830" y="291" text-anchor="middle" fill="#fbd9d8">bytes = data[start .. end]</text>
+  <line x1="770" y1="150" x2="830" y2="218" stroke="#f85149" stroke-width="2" marker-end="url(#arr-r)"/>
+  <text x="810" y="195" fill="#f85149" font-size="10">否</text>
+</svg>
+</div>
+<!-- ============================================================ -->
+<h2 id="s32-6">32.6 SORTED 字段 metadata</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 32-6-1:SORTED 字段记录</div>
+<pre><code class="language-text">SORTED 字段 metadata:
+
+  ┌──────────────────────────────────────────┐
+  │ ── 通用前缀 ──                            │
+  ├──────────────────────────────────────────┤
+  │ ── ord 数据(类似 NUMERIC) ──                │
+  │ ordValuesOffset    : VLong                │
+  │ ordValuesLength    : VLong                │
+  │ ordBlockShift      : 1 byte               │
+  │ jumpTableOffset    : VLong                │
+  ├──────────────────────────────────────────┤
+  │ ── terms dictionary ──                    │
+  │ termsDictSize      : VLong                │
+  │   unique term 总数                          │
+  ├──────────────────────────────────────────┤
+  │ termsDictBlockShift  : 1 byte             │
+  │   每 dict block 的 term 数 = 1 &lt;&lt; shift     │
+  │   典型 4 (16 term/block)                    │
+  ├──────────────────────────────────────────┤
+  │ termsDictDataOffset  : VLong              │
+  │ termsDictDataLength  : VLong              │
+  ├──────────────────────────────────────────┤
+  │ termsIndexOffset     : VLong              │
+  │ termsIndexLength     : VLong              │
+  │   block 起点的 term 索引                      │
+  ├──────────────────────────────────────────┤
+  │ ── reverse index 可选 ──                   │
+  │ reverseIndexOffset   : VLong (可 -1)        │
+  │ reverseIndexLength   : VLong              │
+  │   bytes -&gt; ord 反向索引(SortedSetField 才有) │
+  └──────────────────────────────────────────┘</code></pre>
+</div>
+<div class="diagram">
+<div class="diagram-title">图 32-6-2:SORTED 字典分块结构</div>
+<pre><code class="language-text">Sorted 字典分块结构(termsDictBlockShift = 4 → 16 term/block):
+
+  block 0 (term 0..15):
+    block header:    blockOffset, blockLength
+    sharedPrefixLen: 0
+    term 0:           "Adidas\0"           (full)
+    term 1:           share=2, suffix="ddas\0"  (delta)
+    term 2:           share=1, suffix="merican Eagle\0"
+    ...
+    term 15:          share=3, suffix="ung\0"
+
+  block 1 (term 16..31):
+    sharedPrefixLen: 4 ("Sams" prefix)
+    term 16:          "Samsung\0"
+    term 17:          "Sandisk\0"
+    ...
+
+  termsIndex:
+    block 0 起 -&gt; blockOffset 0
+    block 1 起 -&gt; blockOffset 0x140
+    block 2 起 -&gt; blockOffset 0x280
+    ...
+
+读取 term ord = 23:
+  blockIdx = 23 &gt;&gt; 4 = 1
+  blockOffset = readMonotonic(termsIndex, 1) = 0x140
+  seek to 0x140
+  解码 block 1 直到 inBlockIdx = 23 &amp; 15 = 7
+  返回前缀 + suffix 拼接的完整 term</code></pre>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 32-6-1:SORTED metadata 字段大小</div>
+<table>
+<thead><tr>
+<th>维度</th>
+<th>1K unique</th>
+<th>100K unique</th>
+<th>1M unique</th>
+</tr></thead><tbody>
+<tr>
+<td>ord 部分 metadata</td>
+<td>~ 30 byte</td>
+<td>~ 30 byte</td>
+<td>~ 35 byte</td>
+</tr>
+<tr>
+<td>dict 部分 metadata</td>
+<td>~ 50 byte</td>
+<td>~ 60 byte</td>
+<td>~ 70 byte</td>
+</tr>
+<tr>
+<td>合计字段 metadata</td>
+<td>~ 100 byte</td>
+<td>~ 110 byte</td>
+<td>~ 120 byte</td>
+</tr>
+<tr>
+<td>在 .dvd 实际数据</td>
+<td>50 KB</td>
+<td>5 MB</td>
+<td>50 MB</td>
+</tr>
+</tbody></table>
+</div>
+<!-- ============================================================ -->
+<h2 id="s32-7">32.7 SORTED_SET / SORTED_NUMERIC metadata</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 32-7-1:SORTED_SET 字段记录</div>
+<pre><code class="language-text">SORTED_SET 字段 metadata 关键扩展:
+
+  ┌──────────────────────────────────────────┐
+  │ ── 通用前缀 ──                            │
+  ├──────────────────────────────────────────┤
+  │ ── 单值 vs 多值判定 ──                      │
+  │ uniqueValueCount  : VLong                 │
+  │   = 1 → 退化为单值,后续仅 NumericValue       │
+  │   &gt; 1 → 多值字段,需要 ord_addresses          │
+  ├──────────────────────────────────────────┤
+  │ ── ord 数据(同 SORTED) ──                  │
+  ├──────────────────────────────────────────┤
+  │ ── ord_addresses ──                       │
+  │ ordAddressesOffset    : VLong              │
+  │ ordAddressesLength    : VLong              │
+  │ ordAddressesBlockShift : 1 byte            │
+  ├──────────────────────────────────────────┤
+  │ ── terms dictionary(同 SORTED) ──         │
+  └──────────────────────────────────────────┘</code></pre>
+</div>
+<div class="diagram">
+<div class="diagram-title">图 32-7-2:SORTED_NUMERIC 字段记录</div>
+<pre><code class="language-text">SORTED_NUMERIC 字段 metadata:
+
+  ┌──────────────────────────────────────────┐
+  │ ── 通用前缀 ──                            │
+  ├──────────────────────────────────────────┤
+  │ uniqueValueCount  : VLong                 │
+  │   = 1 → 退化为 NUMERIC                       │
+  │   &gt; 1 → 多值                                 │
+  ├──────────────────────────────────────────┤
+  │ ── numeric values 编码同 NUMERIC ──         │
+  │ tableLength, table, minValue, gcd, ...    │
+  │ valuesOffset, valuesLength, ...           │
+  ├──────────────────────────────────────────┤
+  │ ── ord_addresses(per-doc 起止索引) ──       │
+  │ ordAddressesOffset    : VLong              │
+  │ ordAddressesLength    : VLong              │
+  │ ordAddressesBlockShift : 1 byte            │
+  │   ord_addresses[doc] = 该 doc 的 value 起点  │
+  └──────────────────────────────────────────┘</code></pre>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 32-7-1:多值字段 metadata 大小</div>
+<table>
+<thead><tr>
+<th>类型</th>
+<th>单值退化</th>
+<th>多值完整</th>
+<th>多值额外开销</th>
+</tr></thead><tbody>
+<tr>
+<td>SORTED_SET</td>
+<td>100 B</td>
+<td>130 B (+ 30 B addr)</td>
+<td>ord_addresses</td>
+</tr>
+<tr>
+<td>SORTED_NUMERIC</td>
+<td>60 B</td>
+<td>90 B (+ 30 B addr)</td>
+<td>ord_addresses</td>
+</tr>
+</tbody></table>
+</div>
+<!-- ============================================================ -->
+<h2 id="s32-8">32.8 写入路径</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 32-8-1:.dvm 写入调用链</div>
+<svg viewBox="0 0 1200 600" width="100%" style="max-width:1200px;display:block;margin:0 auto" font-family="-apple-system,Segoe UI,sans-serif" font-size="11">
+  <g font-weight="600" font-size="12">
+    <rect x="20" y="20" width="280" height="32" rx="6" fill="url(#g-orange)"/>
+    <text x="160" y="41" text-anchor="middle" fill="#fff">Lucene90DocValuesConsumer</text>
+    <rect x="380" y="20" width="100" height="32" rx="6" fill="url(#g-red)"/>
+    <text x="430" y="41" text-anchor="middle" fill="#fff">.dvd</text>
+    <rect x="560" y="20" width="240" height="32" rx="6" fill="url(#g-purple)"/>
+    <text x="680" y="41" text-anchor="middle" fill="#fff">临时 fieldEntries[]</text>
+    <rect x="880" y="20" width="100" height="32" rx="6" fill="url(#g-red)"/>
+    <text x="930" y="41" text-anchor="middle" fill="#fff">.dvm</text>
+  </g>
+
+  <g stroke="#30363d" stroke-dasharray="4 4">
+    <line x1="160" y1="55" x2="160" y2="590"/>
+    <line x1="430" y1="55" x2="430" y2="590"/>
+    <line x1="680" y1="55" x2="680" y2="590"/>
+    <line x1="930" y1="55" x2="930" y2="590"/>
+  </g>
+
+  <rect x="50" y="80" width="950" height="200" rx="6" fill="rgba(63,185,80,0.05)" stroke="#3fb950" stroke-dasharray="4 3"/>
+  <text x="70" y="100" fill="#3fb950" font-weight="700">loop 每字段</text>
+
+  <g font-size="11" fill="#c9d1d9">
+    <line x1="160" y1="130" x2="430" y2="130" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    <text x="295" y="124" text-anchor="middle" fill="#f85149">1: 写字段数据 (.dvd)</text>
+
+    <line x1="160" y1="170" x2="160" y2="190" stroke="#f0883e" stroke-width="1.5"/>
+    <rect x="145" y="170" width="30" height="20" fill="url(#g-orange)" rx="4"/>
+    <text x="240" y="184" fill="#f0883e">2: 收集 offsets/lengths/stats</text>
+
+    <line x1="160" y1="220" x2="680" y2="220" stroke="#a371f7" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    <text x="420" y="214" text-anchor="middle" fill="#bc8cff">3: 暂存 FieldEntry 对象</text>
+  </g>
+
+  <rect x="50" y="310" width="950" height="32" rx="6" fill="rgba(31,111,235,0.06)" stroke="#58a6ff" stroke-dasharray="4 3"/>
+  <text x="525" y="331" text-anchor="middle" fill="#79c0ff" font-weight="600">所有字段处理完</text>
+
+  <g font-size="11" fill="#c9d1d9">
+    <line x1="160" y1="365" x2="160" y2="385" stroke="#f0883e" stroke-width="1.5"/>
+    <rect x="145" y="365" width="30" height="20" fill="url(#g-orange)" rx="4"/>
+    <text x="220" y="379" fill="#f0883e">4: finish()</text>
+
+    <line x1="160" y1="410" x2="930" y2="410" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    <text x="545" y="404" text-anchor="middle" fill="#f85149">5: writeHeader (codec + objectID)</text>
+
+    <rect x="140" y="430" width="800" height="100" rx="6" fill="rgba(63,185,80,0.05)" stroke="#3fb950" stroke-dasharray="4 3"/>
+    <text x="160" y="450" fill="#3fb950" font-weight="700">loop 每 fieldEntry</text>
+
+    <line x1="160" y1="480" x2="930" y2="480" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    <text x="545" y="474" text-anchor="middle" fill="#f85149">6: writeFieldEntry(按 type 分支)</text>
+
+    <line x1="160" y1="555" x2="930" y2="555" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    <text x="545" y="549" text-anchor="middle" fill="#f85149">7: writeVInt(-1) 终止 + writeFooter (CRC32)</text>
+  </g>
+</svg>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 32-8-1:写入字段顺序</div>
+<table>
+<thead><tr>
+<th>阶段</th>
+<th>字段顺序</th>
+<th>备注</th>
+</tr></thead><tbody>
+<tr>
+<td>.dvd 数据写入</td>
+<td>按 fieldNumber 升序</td>
+<td>顺序写入,记录 offset</td>
+</tr>
+<tr>
+<td>.dvm metadata 写</td>
+<td>按 fieldNumber 升序</td>
+<td>与 .dvd 顺序一致</td>
+</tr>
+<tr>
+<td>reader 加载顺序</td>
+<td>按 .dvm 出现顺序</td>
+<td>不依赖字段名 hash,稳定遍历</td>
+</tr>
+</tbody></table>
+</div>
+<div class="diagram">
+<div class="diagram-title">图 32-8-2:writeFieldEntry 分支</div>
+<svg viewBox="0 0 1200 380" width="100%" style="max-width:1200px;display:block;margin:0 auto" font-family="-apple-system,Segoe UI,sans-serif" font-size="11">
+  <rect x="500" y="20" width="200" height="50" rx="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="600" y="50" text-anchor="middle" fill="#fff" font-weight="700">writeFieldEntry</text>
+
+  <polygon points="600,110 760,150 600,190 440,150" fill="url(#g-orange)" stroke="#f0883e"/>
+  <text x="600" y="155" text-anchor="middle" fill="#fff" font-weight="700">fieldType</text>
+  <line x1="600" y1="70" x2="600" y2="108" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/>
+
+  <g font-size="10">
+    <rect x="20" y="240" width="220" height="80" rx="8" fill="url(#g-purple)" stroke="#a371f7"/>
+    <text x="130" y="262" text-anchor="middle" fill="#fff" font-weight="700">writeNumericMeta</text>
+    <text x="130" y="282" text-anchor="middle" fill="#d8c5ff">tableLen / min / gcd /</text>
+    <text x="130" y="298" text-anchor="middle" fill="#d8c5ff">blockShift / values...</text>
+
+    <rect x="260" y="240" width="220" height="80" rx="8" fill="url(#g-purple)" stroke="#a371f7"/>
+    <text x="370" y="262" text-anchor="middle" fill="#fff" font-weight="700">writeBinaryMeta</text>
+    <text x="370" y="282" text-anchor="middle" fill="#d8c5ff">minLen / maxLen /</text>
+    <text x="370" y="298" text-anchor="middle" fill="#d8c5ff">data / addresses</text>
+
+    <rect x="500" y="240" width="220" height="80" rx="8" fill="url(#g-purple)" stroke="#a371f7"/>
+    <text x="610" y="262" text-anchor="middle" fill="#fff" font-weight="700">writeSortedMeta</text>
+    <text x="610" y="282" text-anchor="middle" fill="#d8c5ff">ord + dict +</text>
+    <text x="610" y="298" text-anchor="middle" fill="#d8c5ff">termsIndex</text>
+
+    <rect x="740" y="240" width="220" height="80" rx="8" fill="url(#g-purple)" stroke="#a371f7"/>
+    <text x="850" y="262" text-anchor="middle" fill="#fff" font-weight="700">writeSortedSetMeta</text>
+    <text x="850" y="282" text-anchor="middle" fill="#d8c5ff">ord + ordAddrs +</text>
+    <text x="850" y="298" text-anchor="middle" fill="#d8c5ff">dict</text>
+
+    <rect x="980" y="240" width="220" height="80" rx="8" fill="url(#g-purple)" stroke="#a371f7"/>
+    <text x="1090" y="262" text-anchor="middle" fill="#fff" font-weight="700">writeSortedNumericMeta</text>
+    <text x="1090" y="282" text-anchor="middle" fill="#d8c5ff">numericValues +</text>
+    <text x="1090" y="298" text-anchor="middle" fill="#d8c5ff">ordAddrs</text>
+  </g>
+
+  <g stroke-width="1.2">
+    <line x1="490" y1="180" x2="130" y2="238" stroke="#a371f7" marker-end="url(#arr-p)"/>
+    <text x="280" y="215" fill="#bc8cff" font-size="10">NUMERIC</text>
+    <line x1="530" y1="190" x2="370" y2="238" stroke="#a371f7" marker-end="url(#arr-p)"/>
+    <text x="430" y="220" fill="#bc8cff" font-size="10">BINARY</text>
+    <line x1="600" y1="190" x2="610" y2="238" stroke="#a371f7" marker-end="url(#arr-p)"/>
+    <text x="615" y="220" fill="#bc8cff" font-size="10">SORTED</text>
+    <line x1="670" y1="190" x2="850" y2="238" stroke="#a371f7" marker-end="url(#arr-p)"/>
+    <text x="780" y="220" fill="#bc8cff" font-size="10">SORTED_SET</text>
+    <line x1="710" y1="180" x2="1090" y2="238" stroke="#a371f7" marker-end="url(#arr-p)"/>
+    <text x="950" y="215" fill="#bc8cff" font-size="10">SORTED_NUMERIC</text>
+  </g>
+</svg>
+</div>
+<!-- ============================================================ -->
+<h2 id="s32-9">32.9 读取路径</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 32-9-1:Producer 初始化</div>
+<svg viewBox="0 0 1200 700" width="100%" style="max-width:1200px;display:block;margin:0 auto" font-family="-apple-system,Segoe UI,sans-serif" font-size="11">
+  <g font-weight="600" font-size="12">
+    <rect x="20" y="20" width="160" height="32" rx="6" fill="url(#g-blue)"/>
+    <text x="100" y="41" text-anchor="middle" fill="#fff">SegmentReader</text>
+    <rect x="280" y="20" width="280" height="32" rx="6" fill="url(#g-orange)"/>
+    <text x="420" y="41" text-anchor="middle" fill="#fff">Lucene90DocValuesProducer</text>
+    <rect x="660" y="20" width="100" height="32" rx="6" fill="url(#g-red)"/>
+    <text x="710" y="41" text-anchor="middle" fill="#fff">.dvm</text>
+  </g>
+
+  <g stroke="#30363d" stroke-dasharray="4 4">
+    <line x1="100" y1="55" x2="100" y2="690"/>
+    <line x1="420" y1="55" x2="420" y2="690"/>
+    <line x1="710" y1="55" x2="710" y2="690"/>
+  </g>
+
+  <g font-size="11" fill="#c9d1d9">
+    <line x1="100" y1="85" x2="420" y2="85" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="260" y="79" text-anchor="middle" fill="#79c0ff">1: new(state, dataCodec, dataExt, metaCodec, metaExt)</text>
+
+    <line x1="420" y1="115" x2="710" y2="115" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    <text x="565" y="109" text-anchor="middle" fill="#f85149">2: openInput(.dvm)</text>
+
+    <line x1="420" y1="145" x2="710" y2="145" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    <text x="565" y="139" text-anchor="middle" fill="#f85149">3: readHeader (校验 codec / objectID)</text>
+
+    <rect x="80" y="170" width="700" height="380" rx="6" fill="rgba(63,185,80,0.05)" stroke="#3fb950" stroke-dasharray="4 3"/>
+    <text x="100" y="190" fill="#3fb950" font-weight="700">loop 直到 fieldNumber == -1</text>
+
+    <line x1="420" y1="215" x2="710" y2="215" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    <text x="565" y="209" text-anchor="middle" fill="#f85149">4: readVInt fieldNumber</text>
+
+    <line x1="420" y1="245" x2="710" y2="245" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    <text x="565" y="239" text-anchor="middle" fill="#f85149">5: readByte fieldType</text>
+
+    <rect x="280" y="265" width="500" height="220" rx="6" fill="rgba(248,81,73,0.05)" stroke="#f85149" stroke-dasharray="4 3"/>
+    <text x="300" y="285" fill="#f85149" font-weight="700">alt 按 fieldType 分支</text>
+
+    <line x1="420" y1="305" x2="710" y2="305" stroke="#f85149" stroke-width="1.2" marker-end="url(#arr-r)"/>
+    <text x="565" y="299" text-anchor="middle" fill="#f85149">6: NUMERIC → readNumericMeta</text>
+
+    <line x1="420" y1="335" x2="710" y2="335" stroke="#f85149" stroke-width="1.2" marker-end="url(#arr-r)"/>
+    <text x="565" y="329" text-anchor="middle" fill="#f85149">7: BINARY → readBinaryMeta</text>
+
+    <line x1="420" y1="365" x2="710" y2="365" stroke="#f85149" stroke-width="1.2" marker-end="url(#arr-r)"/>
+    <text x="565" y="359" text-anchor="middle" fill="#f85149">8: SORTED → readSortedMeta</text>
+
+    <line x1="420" y1="395" x2="710" y2="395" stroke="#f85149" stroke-width="1.2" marker-end="url(#arr-r)"/>
+    <text x="565" y="389" text-anchor="middle" fill="#f85149">9: SORTED_SET → readSortedSetMeta</text>
+
+    <line x1="420" y1="425" x2="710" y2="425" stroke="#f85149" stroke-width="1.2" marker-end="url(#arr-r)"/>
+    <text x="565" y="419" text-anchor="middle" fill="#f85149">10: SORTED_NUMERIC → readSortedNumericMeta</text>
+
+    <line x1="420" y1="510" x2="420" y2="530" stroke="#f0883e" stroke-width="1.5"/>
+    <rect x="405" y="510" width="30" height="20" fill="url(#g-orange)" rx="4"/>
+    <text x="510" y="524" fill="#f0883e">11: fields.put(fieldName, FieldEntry)</text>
+
+    <line x1="420" y1="585" x2="710" y2="585" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    <text x="565" y="579" text-anchor="middle" fill="#f85149">12: checkFooter (CRC32)</text>
+
+    <line x1="420" y1="630" x2="420" y2="650" stroke="#f0883e" stroke-width="1.5"/>
+    <rect x="405" y="630" width="30" height="20" fill="url(#g-orange)" rx="4"/>
+    <text x="510" y="644" fill="#f0883e">13: openDataInput(.dvd) (校验 objectID 一致)</text>
+  </g>
+</svg>
+</div>
+<div class="diagram">
+<div class="diagram-title">图 32-9-2:查询时的字段访问</div>
+<svg viewBox="0 0 1200 480" width="100%" style="max-width:1200px;display:block;margin:0 auto" font-family="-apple-system,Segoe UI,sans-serif" font-size="11">
+  <g font-weight="600" font-size="12">
+    <rect x="20" y="20" width="80" height="32" rx="6" fill="url(#g-blue)"/>
+    <text x="60" y="41" text-anchor="middle" fill="#fff">App</text>
+    <rect x="180" y="20" width="160" height="32" rx="6" fill="url(#g-green)"/>
+    <text x="260" y="41" text-anchor="middle" fill="#fff">LeafReader</text>
+    <rect x="420" y="20" width="240" height="32" rx="6" fill="url(#g-orange)"/>
+    <text x="540" y="41" text-anchor="middle" fill="#fff">DocValuesProducer</text>
+    <rect x="740" y="20" width="100" height="32" rx="6" fill="url(#g-red)"/>
+    <text x="790" y="41" text-anchor="middle" fill="#fff">.dvd</text>
+  </g>
+
+  <g stroke="#30363d" stroke-dasharray="4 4">
+    <line x1="60" y1="55" x2="60" y2="470"/>
+    <line x1="260" y1="55" x2="260" y2="470"/>
+    <line x1="540" y1="55" x2="540" y2="470"/>
+    <line x1="790" y1="55" x2="790" y2="470"/>
+  </g>
+
+  <g font-size="11" fill="#c9d1d9">
+    <line x1="60" y1="85" x2="260" y2="85" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+    <text x="160" y="79" text-anchor="middle" fill="#79c0ff">1: getNumericDocValues("price")</text>
+
+    <line x1="260" y1="115" x2="540" y2="115" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+    <text x="400" y="109" text-anchor="middle" fill="#56d364">2: getNumeric("price")</text>
+
+    <line x1="540" y1="145" x2="540" y2="165" stroke="#f0883e" stroke-width="1.5"/>
+    <rect x="525" y="145" width="30" height="20" fill="url(#g-orange)" rx="4"/>
+    <text x="630" y="159" fill="#f0883e">3: fields.get("price") → FieldEntry</text>
+
+    <rect x="580" y="180" width="600" height="50" rx="6" fill="rgba(31,111,235,0.06)" stroke="#58a6ff" stroke-dasharray="4 3"/>
+    <text x="880" y="200" text-anchor="middle" fill="#79c0ff" font-weight="600">FieldEntry 含</text>
+    <text x="880" y="218" text-anchor="middle" fill="#c9d1d9" font-size="10">valuesOffset / length / blockShift / min / gcd</text>
+
+    <line x1="540" y1="260" x2="790" y2="260" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    <text x="665" y="254" text-anchor="middle" fill="#f85149">4: dvdInput.slice(valuesOffset, valuesLength)</text>
+
+    <line x1="540" y1="295" x2="540" y2="315" stroke="#f0883e" stroke-width="1.5"/>
+    <rect x="525" y="295" width="30" height="20" fill="url(#g-orange)" rx="4"/>
+    <text x="630" y="309" fill="#f0883e">5: 构造 NumericDocValues 实例</text>
+
+    <line x1="540" y1="345" x2="260" y2="345" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#arr-g)"/>
+    <text x="400" y="339" text-anchor="middle" fill="#56d364">6: NumericDocValues</text>
+
+    <line x1="260" y1="380" x2="60" y2="380" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="4 2" marker-end="url(#arr-g)"/>
+    <text x="160" y="374" text-anchor="middle" fill="#56d364">7: handle</text>
+
+    <line x1="60" y1="430" x2="60" y2="450" stroke="#58a6ff" stroke-width="1.5"/>
+    <rect x="45" y="430" width="30" height="20" fill="url(#g-blue)" rx="4"/>
+    <text x="135" y="444" fill="#79c0ff">8: numeric.advance(docID) → readBlock + decode</text>
+  </g>
+</svg>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 32-9-1:Producer 缓存策略</div>
+<table>
+<thead><tr>
+<th>缓存项</th>
+<th>范围</th>
+<th>大小</th>
+</tr></thead><tbody>
+<tr>
+<td>FieldEntry map</td>
+<td>全字段 metadata</td>
+<td>KB-MB</td>
+</tr>
+<tr>
+<td>jumpTable cache</td>
+<td>per-field jump table</td>
+<td>KB</td>
+</tr>
+<tr>
+<td>terms dict block cache</td>
+<td>per-field LRU</td>
+<td>64 MB 默认</td>
+</tr>
+<tr>
+<td>values block cache</td>
+<td>per-field LRU</td>
+<td>64 MB 默认</td>
+</tr>
+</tbody></table>
+</div>
+<!-- ============================================================ -->
+<h2 id="s32-10">32.10 性能基线</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">表 32-10-1:.dvm 操作性能</div>
+<table>
+<thead><tr>
+<th>操作</th>
+<th>典型时延</th>
+<th>备注</th>
+</tr></thead><tbody>
+<tr>
+<td>open .dvm + readMeta</td>
+<td>0.5 ms</td>
+<td>10 字段</td>
+</tr>
+<tr>
+<td>open .dvm + readMeta</td>
+<td>5 ms</td>
+<td>100 字段</td>
+</tr>
+<tr>
+<td>open .dvm + readMeta</td>
+<td>50 ms</td>
+<td>1000 字段</td>
+</tr>
+<tr>
+<td>单字段 metadata 解析</td>
+<td>50 μs</td>
+<td>-</td>
+</tr>
+<tr>
+<td>getNumericDocValues 命中缓存</td>
+<td>10 ns</td>
+<td>map 查找</td>
+</tr>
+</tbody></table>
+</div>
+<div class="diagram">
+<div class="diagram-title">图 32-10-1:.dvm 加载时间分解</div>
+<pre><code class="language-text">.dvm 加载分解(10 字段索引):
+
+  Header 读取        : 50 μs    (1 KB I/O)
+  Field 0 (NUMERIC)  : 30 μs    (read VInts)
+  Field 1 (SORTED)   : 60 μs    (含 dict 部分)
+  Field 2 (SORTED_SET): 80 μs   (+ ord_addresses)
+  Field 3 (BINARY)   : 40 μs
+  Field 4-9          : 200 μs
+  Footer + CRC32     : 50 μs
+  ----
+  合计               : 510 μs
+
+  对千段索引(10 segment * 0.5 ms):
+    总 .dvm 加载 = 5 ms
+    占 reader 启动 &lt; 1%</code></pre>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 32-10-2:.dvm 大小估算</div>
+<table>
+<thead><tr>
+<th>字段数</th>
+<th>类型分布</th>
+<th>典型 .dvm 大小</th>
+</tr></thead><tbody>
+<tr>
+<td>5</td>
+<td>3 NUMERIC + 2 SORTED</td>
+<td>600 byte</td>
+</tr>
+<tr>
+<td>20</td>
+<td>12 NUMERIC + 5 SORTED + 3 SORTED_SET</td>
+<td>2.5 KB</td>
+</tr>
+<tr>
+<td>100</td>
+<td>80 NUMERIC + 15 SORTED + 5 BINARY</td>
+<td>12 KB</td>
+</tr>
+<tr>
+<td>1000</td>
+<td>复杂混合</td>
+<td>120 KB</td>
+</tr>
+</tbody></table>
+</div>
+<!-- ============================================================ -->
+<h2 id="s32-11">32.11 版本演进与兼容性</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 32-11-1:.dvm Codec 演进</div>
+<svg viewBox="0 0 1200 280" width="100%" style="max-width:1200px;display:block;margin:0 auto" font-family="-apple-system,Segoe UI,sans-serif" font-size="11">
+  <line x1="80" y1="140" x2="1120" y2="140" stroke="#30363d" stroke-width="2"/>
+
+  <g>
+    <circle cx="120" cy="140" r="10" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <rect x="20" y="170" width="200" height="60" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="120" y="190" text-anchor="middle" fill="#fff" font-weight="700">Lucene 4.0</text>
+    <text x="120" y="208" text-anchor="middle" fill="#a5d6ff" font-size="10">引入 .dvm</text>
+    <text x="120" y="222" text-anchor="middle" fill="#a5d6ff" font-size="10">基本字段表</text>
+  </g>
+
+  <g>
+    <circle cx="320" cy="140" r="10" fill="url(#g-green)" stroke="#3fb950"/>
+    <rect x="220" y="50" width="200" height="60" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="320" y="70" text-anchor="middle" fill="#fff" font-weight="700">Lucene 4.2</text>
+    <text x="320" y="88" text-anchor="middle" fill="#d2f4d8" font-size="10">多种 numeric 编码</text>
+    <text x="320" y="102" text-anchor="middle" fill="#d2f4d8" font-size="10">metadata</text>
+  </g>
+
+  <g>
+    <circle cx="520" cy="140" r="10" fill="url(#g-orange)" stroke="#f0883e"/>
+    <rect x="420" y="170" width="200" height="60" rx="8" fill="url(#g-orange)" stroke="#f0883e"/>
+    <text x="520" y="190" text-anchor="middle" fill="#fff" font-weight="700">Lucene 6.0</text>
+    <text x="520" y="208" text-anchor="middle" fill="#fff3e0" font-size="10">BLOCK_PFOR</text>
+    <text x="520" y="222" text-anchor="middle" fill="#fff3e0" font-size="10">jumpTable</text>
+  </g>
+
+  <g>
+    <circle cx="720" cy="140" r="10" fill="url(#g-purple)" stroke="#a371f7"/>
+    <rect x="620" y="50" width="200" height="60" rx="8" fill="url(#g-purple)" stroke="#a371f7"/>
+    <text x="720" y="70" text-anchor="middle" fill="#fff" font-weight="700">Lucene 7.0</text>
+    <text x="720" y="88" text-anchor="middle" fill="#d8c5ff" font-size="10">IndexedDISI</text>
+    <text x="720" y="102" text-anchor="middle" fill="#d8c5ff" font-size="10">metadata</text>
+  </g>
+
+  <g>
+    <circle cx="920" cy="140" r="10" fill="url(#g-red)" stroke="#f85149"/>
+    <rect x="820" y="170" width="200" height="60" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="920" y="190" text-anchor="middle" fill="#fff" font-weight="700">Lucene 8.0</text>
+    <text x="920" y="208" text-anchor="middle" fill="#fbd9d8" font-size="10">iterator API</text>
+    <text x="920" y="222" text-anchor="middle" fill="#fbd9d8" font-size="10">denseRankPower</text>
+  </g>
+
+  <g>
+    <circle cx="1080" cy="140" r="10" fill="url(#g-green)" stroke="#3fb950"/>
+    <rect x="980" y="50" width="200" height="60" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="1080" y="70" text-anchor="middle" fill="#fff" font-weight="700">Lucene 9.0</text>
+    <text x="1080" y="88" text-anchor="middle" fill="#d2f4d8" font-size="10">Lucene90DocValuesMetadata</text>
+    <text x="1080" y="102" text-anchor="middle" fill="#d2f4d8" font-size="10">字典 blockShift</text>
+  </g>
+</svg>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 32-11-1:版本字段对照</div>
+<table>
+<thead><tr>
+<th>版本</th>
+<th>字段</th>
+<th>用途</th>
+</tr></thead><tbody>
+<tr>
+<td>4.0</td>
+<td>fieldType</td>
+<td>类型标识</td>
+</tr>
+<tr>
+<td>4.2</td>
+<td>tableLength</td>
+<td>TABLE 模式启用</td>
+</tr>
+<tr>
+<td>6.0</td>
+<td>jumpTableOffset</td>
+<td>BLOCK_PFOR 跳块</td>
+</tr>
+<tr>
+<td>7.0</td>
+<td>docsWithFieldOffset</td>
+<td>IndexedDISI 稀疏支持</td>
+</tr>
+<tr>
+<td>8.0</td>
+<td>denseRankPower</td>
+<td>DISI 内部跳表</td>
+</tr>
+<tr>
+<td>9.0</td>
+<td>termsDictBlockShift</td>
+<td>字典分块 shift</td>
+</tr>
+</tbody></table>
+</div>
+<div class="diagram">
+<div class="diagram-title">图 32-11-2:8.x → 9.x 升级</div>
+<pre><code class="language-text">.dvm 升级路径(8.x → 9.x):
+
+  8.x 索引:
+    _0_Lucene80_0.dvd
+    _0_Lucene80_0.dvm
+
+  IndexUpgrader 后:
+    _0_Lucene90_0.dvd  (重写)
+    _0_Lucene90_0.dvm  (重写)
+
+  关键变化:
+    - 字典 block size 默认调整
+    - DISI 编码格式更紧凑
+    - 取消 random advance API
+    - codec 名换为 Lucene90DocValuesMetadata
+
+  推荐做法:
+    跨大版本(8.x → 9.x)直接重建索引
+    IndexUpgrader 仅适合调试或小规模索引</code></pre>
+</div>
+<!-- ============================================================ -->
+<h2 id="s32-12">32.12 陷阱与限制</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">图 32-12-1:.dvm 陷阱分类</div>
+<svg viewBox="0 0 1200 480" width="100%" style="max-width:1200px;display:block;margin:0 auto" font-family="-apple-system,Segoe UI,sans-serif" font-size="11">
+  <rect x="500" y="20" width="200" height="50" rx="10" fill="url(#g-red)" stroke="#f85149"/>
+  <text x="600" y="50" text-anchor="middle" fill="#fff" font-weight="700">.dvm 陷阱(8 项)</text>
+
+  <rect x="80" y="120" width="240" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+  <text x="200" y="145" text-anchor="middle" fill="#fff" font-weight="700">缺失类</text>
+  <line x1="540" y1="70" x2="200" y2="118" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect x="480" y="120" width="240" height="40" rx="8" fill="url(#g-orange)" stroke="#f0883e"/>
+  <text x="600" y="145" text-anchor="middle" fill="#fff" font-weight="700">不一致类</text>
+  <line x1="600" y1="70" x2="600" y2="118" stroke="#f0883e" stroke-width="1.5" marker-end="url(#arr-o)"/>
+
+  <rect x="880" y="120" width="240" height="40" rx="8" fill="url(#g-purple)" stroke="#a371f7"/>
+  <text x="1000" y="145" text-anchor="middle" fill="#fff" font-weight="700">性能类</text>
+  <line x1="660" y1="70" x2="1000" y2="118" stroke="#a371f7" stroke-width="1.5" marker-end="url(#arr-p)"/>
+
+  <g font-size="11">
+    <rect x="60" y="200" width="280" height="40" rx="6" fill="#161b22" stroke="#58a6ff"/>
+    <text x="200" y="225" text-anchor="middle" fill="#79c0ff">1. .dvm 缺失</text>
+    <rect x="60" y="252" width="280" height="40" rx="6" fill="#161b22" stroke="#58a6ff"/>
+    <text x="200" y="277" text-anchor="middle" fill="#79c0ff">2. 字段未启用 DocValues</text>
+
+    <rect x="460" y="200" width="280" height="40" rx="6" fill="#161b22" stroke="#f0883e"/>
+    <text x="600" y="225" text-anchor="middle" fill="#f0883e">3. .dvm 与 .dvd objectID 不一致</text>
+    <rect x="460" y="252" width="280" height="40" rx="6" fill="#161b22" stroke="#f0883e"/>
+    <text x="600" y="277" text-anchor="middle" fill="#f0883e">4. fieldType 改变</text>
+    <rect x="460" y="304" width="280" height="40" rx="6" fill="#161b22" stroke="#f0883e"/>
+    <text x="600" y="329" text-anchor="middle" fill="#f0883e">5. 跨版本 metadata 解析错</text>
+
+    <rect x="860" y="200" width="280" height="40" rx="6" fill="#161b22" stroke="#a371f7"/>
+    <text x="1000" y="225" text-anchor="middle" fill="#bc8cff">6. 字段数过多(数万)</text>
+    <rect x="860" y="252" width="280" height="40" rx="6" fill="#161b22" stroke="#a371f7"/>
+    <text x="1000" y="277" text-anchor="middle" fill="#bc8cff">7. 高基数字典</text>
+    <rect x="860" y="304" width="280" height="40" rx="6" fill="#161b22" stroke="#a371f7"/>
+    <text x="1000" y="329" text-anchor="middle" fill="#bc8cff">8. 启动阶段 .dvm 解析慢</text>
+  </g>
+
+  <g stroke-width="1.2">
+    <line x1="200" y1="160" x2="200" y2="198" stroke="#58a6ff" marker-end="url(#arr)"/>
+    <line x1="170" y1="160" x2="170" y2="250" stroke="#58a6ff" marker-end="url(#arr)"/>
+    <line x1="600" y1="160" x2="600" y2="198" stroke="#f0883e" marker-end="url(#arr-o)"/>
+    <line x1="570" y1="160" x2="570" y2="250" stroke="#f0883e" marker-end="url(#arr-o)"/>
+    <line x1="540" y1="160" x2="540" y2="302" stroke="#f0883e" marker-end="url(#arr-o)"/>
+    <line x1="1000" y1="160" x2="1000" y2="198" stroke="#a371f7" marker-end="url(#arr-p)"/>
+    <line x1="970" y1="160" x2="970" y2="250" stroke="#a371f7" marker-end="url(#arr-p)"/>
+    <line x1="940" y1="160" x2="940" y2="302" stroke="#a371f7" marker-end="url(#arr-p)"/>
+  </g>
+
+  <rect x="120" y="380" width="960" height="80" rx="10" fill="rgba(248,81,73,0.06)" stroke="#f85149" stroke-dasharray="4 3"/>
+  <text x="600" y="408" text-anchor="middle" fill="#f85149" font-weight="700" font-size="13">.dvm 是 reader 启动阶段的关键路径</text>
+  <text x="600" y="432" text-anchor="middle" fill="#c9d1d9" font-size="11">字段表损坏 → segment 整段不可用;字段数膨胀 → 启动 latency 上升</text>
+</svg>
+</div>
+<div class="diagram">
+<div class="diagram-title">表 32-12-1:陷阱明细</div>
+<table>
+<thead><tr>
+<th>#</th>
+<th>陷阱</th>
+<th>症状</th>
+<th>根因</th>
+<th>影响</th>
+<th>修复</th>
+<th>监控</th>
+</tr></thead><tbody>
+<tr>
+<td>1</td>
+<td>.dvm 缺失</td>
+<td>segment 无法打开</td>
+<td>文件被删 / 备份不完整</td>
+<td>索引损坏</td>
+<td>重建索引</td>
+<td>CheckIndex</td>
+</tr>
+<tr>
+<td>2</td>
+<td>字段未启用 DocValues</td>
+<td>getNumericDocValues == null</td>
+<td>字段未声明 NumericDocValuesField</td>
+<td>排序/聚合失败</td>
+<td>重建索引加 DocValues</td>
+<td>-</td>
+</tr>
+<tr>
+<td>3</td>
+<td>objectID 不一致</td>
+<td>CorruptIndexException</td>
+<td>文件混用</td>
+<td>索引损坏</td>
+<td>重建</td>
+<td>启动日志</td>
+</tr>
+<tr>
+<td>4</td>
+<td>fieldType 改变</td>
+<td>reader IllegalArgException</td>
+<td>同 segment 内字段类型不能变</td>
+<td>写入失败</td>
+<td>字段建模一致</td>
+<td>-</td>
+</tr>
+<tr>
+<td>5</td>
+<td>跨版本 metadata 解析错</td>
+<td>IndexFormatTooNewException</td>
+<td>9.x 索引被 8.x 读</td>
+<td>索引不可读</td>
+<td>用对应版本</td>
+<td>-</td>
+</tr>
+<tr>
+<td>6</td>
+<td>字段数过多</td>
+<td>reader 启动慢</td>
+<td>1000+ 字段</td>
+<td>启动延迟</td>
+<td>减少冗余字段</td>
+<td>field count</td>
+</tr>
+<tr>
+<td>7</td>
+<td>高基数字典</td>
+<td>dict 加载慢</td>
+<td>100K+ unique term</td>
+<td>dict 占 GB</td>
+<td>hash + 倒排替代</td>
+<td>dict size</td>
+</tr>
+<tr>
+<td>8</td>
+<td>启动 .dvm 解析慢</td>
+<td>open ms 高</td>
+<td>字段多 + I/O 慢</td>
+<td>启动延迟</td>
+<td>预热 / 提速磁盘</td>
+<td>open latency</td>
+</tr>
+</tbody></table>
+</div>
+<h3>反例与正例对比</h3>
+<pre><code class="language-text">反例(忽视 fieldType 一致性):
+
+  // segment 1 写入
+  doc1.add(new NumericDocValuesField("status", 1));
+
+  // 同 segment 改字段类型
+  doc2.add(new SortedDocValuesField("status", new BytesRef("PENDING")));
+  // 抛 IllegalArgumentException: cannot change DocValues type
+
+正例(字段建模时确定类型):
+
+  // 全 segment 内一致
+  doc1.add(new NumericDocValuesField("status_id", 1));
+  doc1.add(new SortedDocValuesField("status_label", new BytesRef("PENDING")));
+  // 不同字段名,不同类型,可以共存</code></pre>
+<!-- ============================================================ -->
+<h2 id="s32-13">32.13 本章要点</h2>
+<!-- ============================================================ -->
+<div class="diagram">
+<div class="diagram-title">表 32-13-1:.dvm 关键事实</div>
+<table>
+<thead><tr>
+<th>要点</th>
+<th>关键依据</th>
+<th>易错点</th>
+</tr></thead><tbody>
+<tr>
+<td>.dvm 是 .dvd 的字段目录,启动时全量加载</td>
+<td>Lucene90DocValuesMetadata</td>
+<td>缺失 segment 不可读</td>
+</tr>
+<tr>
+<td>每字段有通用前缀 + 类型相关 metadata</td>
+<td>fieldType 分支</td>
+<td>五种类型 metadata 不同</td>
+</tr>
+<tr>
+<td>字段记录按 fieldNumber 升序排列</td>
+<td>writeFieldEntry</td>
+<td>与 .dvd 顺序一致</td>
+</tr>
+<tr>
+<td>终止用 fieldNumber = -1</td>
+<td>writeVInt(-1)</td>
+<td>无显式 fieldCount</td>
+</tr>
+<tr>
+<td>metadata 含 offsets/lengths 指向 .dvd</td>
+<td>seek 入口</td>
+<td>不可独立使用</td>
+</tr>
+<tr>
+<td>NUMERIC metadata 含 min/gcd/tableLen/blockShift</td>
+<td>五种编码模式区分</td>
+<td>-</td>
+</tr>
+<tr>
+<td>SORTED metadata 额外含 termsDict offsets</td>
+<td>字典分块</td>
+<td>高基数 dict 大</td>
+</tr>
+<tr>
+<td>SORTED_SET / SORTED_NUMERIC 额外含 ord_addresses</td>
+<td>多值字段</td>
+<td>单值会退化</td>
+</tr>
+<tr>
+<td>objectID 必须与 .dvd 一致</td>
+<td>Header 校验</td>
+<td>文件混用 Corrupt</td>
+</tr>
+<tr>
+<td>加载时间 &lt; 1 ms / segment(典型)</td>
+<td>readMeta 全量</td>
+<td>字段数线性增长</td>
+</tr>
+</tbody></table>
+</div>
+<h3>最小回归验证</h3>
+<pre><code class="language-bash"># 1. 文件存在
+ls -la /path/to/index | grep -E '\.dv[md]$'
+
+# 期望:每 segment 有 .dvd + .dvm 配对
+
+# 2. .dvm 大小检查
+ls -la /path/to/index/*.dvm
+# 期望:
+#   10 字段索引: ~ 1 KB
+#   100 字段索引: ~ 10 KB
+#   1000 字段索引: ~ 100 KB
+
+# 3. CheckIndex 验证
+java -cp lucene-core.jar org.apache.lucene.index.CheckIndex /path/to/index
+# 期望片段:
+# test: docvalues...
+#   number of fields with docvalues: 10
+#   field "price" NUMERIC...OK [encoding=DELTA, blockShift=14]
+#   field "brand" SORTED...OK [1024 ord]</code></pre>
+<div class="diagram">
+<div class="diagram-title">表 32-13-2:.dvm 字段记录速查</div>
+<table>
+<thead><tr>
+<th>字段</th>
+<th>NUMERIC</th>
+<th>BINARY</th>
+<th>SORTED</th>
+<th>SORTED_SET</th>
+<th>SORTED_NUMERIC</th>
+</tr></thead><tbody>
+<tr>
+<td>docsWithField</td>
+<td>有</td>
+<td>有</td>
+<td>有</td>
+<td>有</td>
+<td>有</td>
+</tr>
+<tr>
+<td>numValues</td>
+<td>有</td>
+<td>有</td>
+<td>有</td>
+<td>有</td>
+<td>有</td>
+</tr>
+<tr>
+<td>tableLength</td>
+<td>有</td>
+<td></td>
+<td></td>
+<td></td>
+<td>有</td>
+</tr>
+<tr>
+<td>minValue / gcd</td>
+<td>有</td>
+<td></td>
+<td></td>
+<td></td>
+<td>有</td>
+</tr>
+<tr>
+<td>blockShift</td>
+<td>有</td>
+<td></td>
+<td></td>
+<td></td>
+<td>有</td>
+</tr>
+<tr>
+<td>valuesOffset</td>
+<td>有</td>
+<td></td>
+<td>有</td>
+<td>有</td>
+<td>有</td>
+</tr>
+<tr>
+<td>dataOffset</td>
+<td></td>
+<td>有</td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>addresses</td>
+<td></td>
+<td>变长</td>
+<td></td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>termsDict</td>
+<td></td>
+<td></td>
+<td>有</td>
+<td>有</td>
+<td></td>
+</tr>
+<tr>
+<td>ord_addresses</td>
+<td></td>
+<td></td>
+<td></td>
+<td>有</td>
+<td>有</td>
+</tr>
+</tbody></table>
+</div>
+<h3>下一章预告</h3>
+<p>
+下一章讨论 .dim 文件,即 Points Data。Points 是 Lucene 用于多维数值索引的 BKD-tree 实现,支持地理坐标(2D)、IP 范围、时间戳范围、向量近邻等场景。下一章拆解 .dim 中 BKD 叶节点的字节布局与 leafBlock 编码。
+</p>
+
+<!-- ============================================================ -->
+<h2 id="s32-summary">本章小结</h2>
+<!-- ============================================================ -->
+
+<div class="chapter-summary">
+  <h3>核心要点</h3>
+  <ul class="key-takeaways">
+    <li><code>.dvm</code> 是 <code>.dvd</code> 的<strong>字段表</strong> + <strong>编码描述</strong></li>
+    <li>1:1 配对:<code>.dvd</code> 数据本体几 MB-几 GB,<code>.dvm</code> 字段表几 KB-几 MB</li>
+    <li>FieldEntry:每字段 fieldNumber + DocValuesType + 类型相关元信息 + valuesOffset</li>
+    <li>5 种 DocValuesType 各自的 FieldEntry 结构差异 + 字典/ord_addresses 偏移指针</li>
+    <li>NUMERIC 6 种编码模式:CONST / TABLE / GCD / DELTA / MONOTONIC / BLOCK_PFOR</li>
+    <li>DENSE / SPARSE / ALL 三种 docsWithField 自动选择</li>
+    <li>reader 打开时全量加载 <code>.dvm</code> 到 <code>Map&lt;String, FieldEntry&gt;</code></li>
+    <li>merge 时 <code>.dvm</code> 重建,字段顺序按合并后 fieldInfos 排序</li>
+  </ul>
+
+  <div class="key-insight">
+    <strong>一句话总结</strong>:第 32 章核心是把"该文件在 codec 中的角色 / 字节布局 / 编码细节 / 写入读取路径 / 合并行为 / 性能特征 / 生产陷阱"七件事讲清楚。理解了本章,下次遇到该文件相关的 corruption / 性能 / 合并 issue 都能从字节级回答。
+  </div>
+
+  <div class="real-world">
+    <strong>生产建议</strong>:① 监控该文件大小占比,占比异常需要分析;② <code>CheckIndex</code> 定期校验 checksum;③ 索引体积大时优先考虑 forceMerge 减少 segment 数量;④ 升级 Lucene 版本时关注 codec 名称变化(如 <code>Lucene90</code> → <code>Lucene99</code> → <code>Lucene103</code>);⑤ 不要直接动文件本体,所有写入都通过 IndexWriter 完成。
+  </div>
+
+  <h3>下一章预告</h3>
+  <p>下一章拆解 <code>.dim</code> Points Data 文件:BKD-Tree 多维点的叶子页存储。</p>
+</div>
+
+
+<p class="footer">&copy; 2026 图解 Lucene &middot; 第 32 章</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+</body>
+</html>

@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.21 Kafka Connect — 图解 Kafka</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Kafka</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="20-quotas.html">上一章</a>
+  <a href="22-kafka-streams.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s21-0">21.0 章首速览</a>
+  <a href="#s21-1">21.1 适用场景</a>
+  <a href="#s21-2">21.2 核心模型</a>
+  <a href="#s21-3">21.3 Distributed 模式</a>
+  <a href="#s21-4">21.4 Rebalance</a>
+  <a href="#s21-5">21.5 Converter & SMT</a>
+  <a href="#s21-6">21.6 Source offset 与 EOS</a>
+  <a href="#s21-7">21.7 DLQ 死信</a>
+  <a href="#s21-8">21.8 REST API</a>
+  <a href="#s21-9">21.9 监控</a>
+  <a href="#s21-10">21.10 取舍与陷阱</a>
+  <a href="#s21-summary">21.11 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 21 章 · Kafka Connect</h1>
+<p class="subtitle">DistributedHerder · Worker · Source/SinkTask · Converter · SMT · connect-configs/offsets/status · DLQ · REST API</p>
+
+<div class="chapter-intro">
+  <p class="lead">"<em>把 MySQL CDC 写到 Kafka,再从 Kafka 写到 Elasticsearch + S3 + Snowflake</em>" — 这种"<em>把 Kafka 当数据总线</em>" 的场景每个公司都有。手写 Producer / Consumer 跑通一条链路简单,但在生产环境会重复造轮子:任务拆分、failure retry、offset commit、schema 演进、监控告警、滚动升级。<strong>Kafka Connect</strong> 是 Kafka 官方提供的<em>数据集成框架</em>,把上面这些公共关注点抽成框架,你只需写 Connector / Task 类(或装 Confluent / Debezium 提供的现成 connector),其他都框架代办。</p>
+  <p>本章按"运行时拓扑 → 核心模型 → Source/Sink → Distributed → Rebalance → Converter → SMT → Offset 与 EOS → DLQ → REST → 监控"组织,对应 Apache Kafka 3.7 的 <code>org.apache.kafka.connect.runtime</code>。</p>
+  <ul class="will-learn">
+    <li>Connect 三大角色:Connector(声明性配置)/ Task(实际搬数据)/ Worker(执行环境)</li>
+    <li>Distributed 模式:worker 集群、internal topics、rebalance</li>
+    <li>Converter(JSON / Avro / Protobuf / String)+ SMT 变换链</li>
+    <li>Source offset 持久化在 <code>connect-offsets</code> + EOS Source(KIP-618)</li>
+    <li>DLQ:errors.tolerance + errors.deadletterqueue.topic.name</li>
+    <li>REST API:管理 connector 全生命周期</li>
+    <li>Schema Registry 与 Connect 的协作</li>
+    <li>典型反例:offset 不推进、connector 不停 rebalance</li>
+  </ul>
+  <p class="prereq">第 8 章 Consumer Group;Producer / Consumer 基础;JSON / Avro / Protobuf 序列化;REST API。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s21-0">21.0 章首速览</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">图 21-0 · Connect 运行时全景</div>
+<svg viewBox="0 0 900 480" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="480" fill="#0f172a" rx="8"/>
+
+  <!-- External Source -->
+  <rect x="20" y="40" width="140" height="60" rx="8" fill="url(#g-purple)" stroke="#a78bfa"/>
+  <text x="90" y="65" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">External Source</text>
+  <text x="90" y="85" text-anchor="middle" fill="#e9d5ff" font-size="10">MySQL / File / API</text>
+
+  <!-- REST -->
+  <rect x="370" y="20" width="160" height="40" rx="6" fill="url(#g-orange)" stroke="#f59e0b"/>
+  <text x="450" y="45" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">REST API</text>
+
+  <!-- Worker JVM box -->
+  <rect x="200" y="80" width="500" height="280" rx="12" fill="#1e293b" stroke="#475569" stroke-width="2"/>
+  <text x="450" y="105" text-anchor="middle" fill="#cbd5e1" font-size="13" font-weight="700">Worker JVM (group.id=connect-cluster-A)</text>
+
+  <rect x="220" y="125" width="180" height="50" rx="6" fill="url(#g-blue)"/>
+  <text x="310" y="148" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">DistributedHerder</text>
+  <text x="310" y="166" text-anchor="middle" fill="#dbeafe" font-size="10">集群协调 / rebalance</text>
+
+  <rect x="500" y="125" width="180" height="50" rx="6" fill="url(#g-blue)"/>
+  <text x="590" y="148" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Worker</text>
+  <text x="590" y="166" text-anchor="middle" fill="#dbeafe" font-size="10">task lifecycle / plugins</text>
+
+  <rect x="220" y="200" width="220" height="60" rx="6" fill="url(#g-green)"/>
+  <text x="330" y="225" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">WorkerSourceTask × N</text>
+  <text x="330" y="245" text-anchor="middle" fill="#dcfce7" font-size="10">poll() → write Kafka</text>
+
+  <rect x="460" y="200" width="220" height="60" rx="6" fill="url(#g-orange)"/>
+  <text x="570" y="225" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">WorkerSinkTask × N</text>
+  <text x="570" y="245" text-anchor="middle" fill="#fef3c7" font-size="10">consume → put()</text>
+
+  <rect x="220" y="285" width="460" height="50" rx="6" fill="#0d1117"/>
+  <text x="450" y="308" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Converter + SMT chain</text>
+  <text x="450" y="326" text-anchor="middle" fill="#cbd5e1" font-size="10">JSON / Avro / Protobuf + transforms</text>
+
+  <!-- External Sink -->
+  <rect x="740" y="40" width="140" height="60" rx="8" fill="url(#g-purple)" stroke="#a78bfa"/>
+  <text x="810" y="65" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">External Sink</text>
+  <text x="810" y="85" text-anchor="middle" fill="#e9d5ff" font-size="10">S3 / ES / Warehouse</text>
+
+  <!-- Internal topics -->
+  <rect x="20" y="400" width="860" height="60" rx="8" fill="url(#g-red)" stroke="#ef4444"/>
+  <text x="450" y="425" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">Internal Topics(状态全在 Kafka)</text>
+  <text x="450" y="445" text-anchor="middle" fill="#fecaca" font-size="11">connect-configs(compacted) · connect-offsets(compacted) · connect-status(compacted)</text>
+
+  <!-- arrows -->
+  <path d="M160 70 L220 235" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M680 235 L740 70" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M450 60 L310 125" stroke="#fbbf24" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+  <path d="M310 360 L310 400" stroke="#94a3b8" stroke-width="1.5" fill="none" stroke-dasharray="3 3"/>
+  <path d="M590 360 L590 400" stroke="#94a3b8" stroke-width="1.5" fill="none" stroke-dasharray="3 3"/>
+</svg>
+</div>
+
+<table>
+  <thead><tr><th>源码入口</th><th>角色</th><th>负责什么</th></tr></thead>
+  <tbody>
+    <tr><td><code>ConnectDistributed</code></td><td>进程启动</td><td>加载 worker 配置、启动 REST、创建 herder</td></tr>
+    <tr><td><code>DistributedHerder</code></td><td>集群协调</td><td>监听 config topic、参与 rebalance、分配任务</td></tr>
+    <tr><td><code>Worker</code></td><td>本地执行</td><td>创建 connector、启动 task、管理 converter</td></tr>
+    <tr><td><code>WorkerSourceTask</code></td><td>Source 循环</td><td>调 poll()、写 Kafka、提交 source offset</td></tr>
+    <tr><td><code>WorkerSinkTask</code></td><td>Sink 循环</td><td>Consumer poll、调 put()、提交 consumer offset</td></tr>
+    <tr><td><code>KafkaConfigBackingStore</code></td><td>配置存储</td><td>写入 connect-configs</td></tr>
+    <tr><td><code>KafkaOffsetBackingStore</code></td><td>Source offset 存储</td><td>写入 connect-offsets</td></tr>
+    <tr><td><code>KafkaStatusBackingStore</code></td><td>状态存储</td><td>写入 connect-status</td></tr>
+  </tbody>
+</table>
+
+<div class="diagram">
+  <div class="diagram-title">图 21-0-1 · 三句话</div>
+<pre><code>1 Connector 不搬数据
+  Connector 只生成 Task 配置
+  Task 执行 poll() / put()
+  并行度由 tasks.max 决定
+
+2 状态全在 Kafka internal topics
+  connect-configs / offsets / status
+  Worker 本地无状态, 崩溃可恢复
+  internal topics 副本不足是塌陷源头
+
+3 EOS 必须显式开
+  exactly.once.source.support=enabled
+  Sink 端用 idempotent 下游
+  否则就是 at-least-once</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s21-1">21.1 适用场景</h2>
+<!-- ============================================================ -->
+
+<div class="compare-grid">
+  <div>
+    <h4>✅ 用 Connect</h4>
+    <ul>
+      <li>定型的 source / sink 集成(MySQL CDC、S3 sink、ES sink)</li>
+      <li>需要 task 拆分 / failover / rebalance</li>
+      <li>需要 Schema Registry 协作</li>
+      <li>不想自己管 offset 持久化</li>
+      <li>需要 DLQ + retry policy</li>
+    </ul>
+  </div>
+  <div>
+    <h4>❌ 自己写 Producer/Consumer</h4>
+    <ul>
+      <li>需要复杂业务逻辑(不仅是 search-replace 变换)</li>
+      <li>需要跨数据源 join 或聚合(用 Streams)</li>
+      <li>极致延迟要求(Connect 多一跳 framework 开销)</li>
+      <li>单次 ETL 任务(Connect 部署成本高)</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s21-2">21.2 核心模型</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>概念</th><th>含义</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Connector</strong></td><td>声明性配置 + 生成 Task 配置的工厂(Source 或 Sink)</td></tr>
+    <tr><td><strong>Task</strong></td><td>实际搬数据的执行单元;Source 调 poll(),Sink 调 put()</td></tr>
+    <tr><td><strong>Worker</strong></td><td>JVM 进程,实际跑 Task;一个集群多个 worker</td></tr>
+    <tr><td><strong>Converter</strong></td><td>序列化器:Java 对象 ↔ Kafka 字节</td></tr>
+    <tr><td><strong>SMT (Single Message Transform)</strong></td><td>单消息变换链:加字段、改字段、过滤等</td></tr>
+    <tr><td><strong>Header / Schema</strong></td><td>Connect 内部表示;支持 Schema Registry</td></tr>
+  </tbody>
+</table>
+
+<div class="diagram">
+  <div class="diagram-title">图 21-2 · Connector 与 Task 的工厂模式</div>
+<svg viewBox="0 0 900 280" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="280" fill="#0f172a" rx="8"/>
+
+  <rect x="40" y="40" width="220" height="80" rx="8" fill="url(#g-purple)" stroke="#a78bfa"/>
+  <text x="150" y="65" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">MySqlSourceConnector</text>
+  <text x="150" y="85" text-anchor="middle" fill="#e9d5ff" font-size="10">声明配置</text>
+  <text x="150" y="103" text-anchor="middle" fill="#e9d5ff" font-size="10">tasks.max=4, table.list=...</text>
+
+  <path d="M260 80 L400 80" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="330" y="73" text-anchor="middle" fill="#fbbf24" font-size="11">taskConfigs(4) →</text>
+
+  <g transform="translate(420, 30)">
+    <rect x="0" y="0" width="200" height="50" rx="6" fill="url(#g-green)"/>
+    <text x="100" y="20" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">SourceTask 0</text>
+    <text x="100" y="38" text-anchor="middle" fill="#dcfce7" font-size="10">tables: users, orders</text>
+
+    <rect x="0" y="60" width="200" height="50" rx="6" fill="url(#g-green)"/>
+    <text x="100" y="80" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">SourceTask 1</text>
+    <text x="100" y="98" text-anchor="middle" fill="#dcfce7" font-size="10">tables: products</text>
+
+    <rect x="0" y="120" width="200" height="50" rx="6" fill="url(#g-green)"/>
+    <text x="100" y="140" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">SourceTask 2</text>
+    <text x="100" y="158" text-anchor="middle" fill="#dcfce7" font-size="10">tables: payments</text>
+
+    <rect x="0" y="180" width="200" height="50" rx="6" fill="url(#g-green)"/>
+    <text x="100" y="200" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">SourceTask 3</text>
+    <text x="100" y="218" text-anchor="middle" fill="#dcfce7" font-size="10">tables: shipments</text>
+  </g>
+
+  <rect x="680" y="100" width="200" height="80" rx="8" fill="url(#g-blue)" stroke="#60a5fa"/>
+  <text x="780" y="125" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">Kafka Topics</text>
+  <text x="780" y="143" text-anchor="middle" fill="#dbeafe" font-size="10">mysql.users / orders /</text>
+  <text x="780" y="160" text-anchor="middle" fill="#dbeafe" font-size="10">products / payments / ...</text>
+
+  <path d="M620 90 L680 140" stroke="#22c55e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  <path d="M620 130 L680 140" stroke="#22c55e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  <path d="M620 170 L680 145" stroke="#22c55e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  <path d="M620 210 L680 150" stroke="#22c55e" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+  <text x="450" y="260" text-anchor="middle" fill="#cbd5e1" font-size="11">Connector 不直接搬数据,它把工作划分成 N 个 Task,框架分发到 Worker 执行</text>
+</svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s21-3">21.3 Distributed 模式</h2>
+<!-- ============================================================ -->
+
+<p>Connect 有两种部署模式:Standalone(单 JVM,本地文件存 offset)和 Distributed(多 worker 集群)。生产<strong>必用</strong> Distributed。它的核心是用 Kafka 自己的 Consumer Group 协议做 worker 间协调 — 所有 worker 共享 <code>group.id</code>,通过 GroupCoordinator rebalance 决定哪个 worker 跑哪个 task。</p>
+
+<pre><code class="language-bash"># worker 配置
+bootstrap.servers=kafka:9092
+group.id=connect-cluster-A           # 同 group.id 的 worker 加入同一集群
+config.storage.topic=connect-configs
+offset.storage.topic=connect-offsets
+status.storage.topic=connect-status
+config.storage.replication.factor=3
+offset.storage.replication.factor=3
+status.storage.replication.factor=3
+plugin.path=/opt/connect-plugins</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s21-4">21.4 Rebalance</h2>
+<!-- ============================================================ -->
+
+<p>Connect 用 Incremental Cooperative Rebalance(KIP-415)— 与 Consumer Group 的 cooperative 类似但更精细。worker 加入 / 退出 / 配置变化都会触发 rebalance,但只有<em>真正受影响</em>的 task 会迁移,无关 task 继续跑。</p>
+
+<table>
+  <thead><tr><th>触发场景</th><th>受影响 task</th><th>停顿</th></tr></thead>
+  <tbody>
+    <tr><td>worker 加入</td><td>分配新 task 给它</td><td>无,新 task 启动</td></tr>
+    <tr><td>worker 退出</td><td>它的 task 重分配</td><td>仅那些 task 短停顿</td></tr>
+    <tr><td>配置变更(scale tasks.max)</td><td>所有该 connector 的 task</td><td>该 connector 短停顿</td></tr>
+    <tr><td>连接 broker 失败</td><td>所有 task</td><td>全部停顿,直到恢复</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s21-5">21.5 Converter & SMT</h2>
+<!-- ============================================================ -->
+
+<div class="compare-grid">
+  <div>
+    <h4>Converter</h4>
+    <p>序列化器,负责"<em>SourceTask 输出 Struct → byte[]</em>" 或反向。常见:</p>
+    <ul>
+      <li><code>StringConverter</code> — UTF-8</li>
+      <li><code>JsonConverter</code> — JSON,可带 schema</li>
+      <li><code>AvroConverter</code> — Avro + Schema Registry</li>
+      <li><code>ProtobufConverter</code> — Protobuf + Registry</li>
+    </ul>
+  </div>
+  <div>
+    <h4>SMT(Single Message Transform)</h4>
+    <p>一条消息的内联变换链。例子:</p>
+    <pre><code class="language-text">transforms=AddTopicPrefix,ExtractField
+transforms.AddTopicPrefix.type=org.apache.kafka.connect.transforms.RegexRouter
+transforms.AddTopicPrefix.regex=(.*)
+transforms.AddTopicPrefix.replacement=prod.$1
+
+transforms.ExtractField.type=org.apache.kafka.connect.transforms.ExtractField$Value
+transforms.ExtractField.field=payload</code></pre>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s21-6">21.6 Source offset 与 EOS</h2>
+<!-- ============================================================ -->
+
+<p>Source connector 的 offset 是"<em>外部系统的位置</em>"(MySQL binlog position、File line number、API cursor),与 Kafka offset 没关系。Connect 把它存到 <code>connect-offsets</code> internal topic。</p>
+
+<pre><code>connect-offsets record(简化):
+
+  KEY: { connector: "mysql-cdc",
+         partition: { server: "mysql-1", database: "shop", table: "orders" } }
+  VAL: { binlog_file: "mysql-bin.000123",
+         binlog_pos: 456789,
+         row: 42 }
+
+Worker SourceTask 每完成一批 poll():
+  1 把 records 写 Kafka(异步)
+  2 records 都 ack 后, 把 SourceOffset 写 connect-offsets
+  3 崩溃后, 新 worker 从 connect-offsets 读出位置, 继续 poll</code></pre>
+
+<h3>EOS Source(KIP-618)</h3>
+
+<p>从 Kafka 3.0 起,Connect 支持<strong>Source EOS</strong>:把"<em>写 Kafka</em>" 和"<em>提交 source offset 到 connect-offsets</em>" 包在<em>一个事务</em>。两者要么都成功要么都失败。开启:</p>
+
+<pre><code class="language-bash"># worker level
+exactly.once.source.support=enabled
+
+# producer 自动开启 idempotent + transactional</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s21-7">21.7 DLQ 死信</h2>
+<!-- ============================================================ -->
+
+<p>Connect 内置 DLQ 机制 — 当 Sink task 处理一条 record 失败(反序列化错、下游写失败),框架可以选:跳过、停 task、或写 DLQ topic。</p>
+
+<pre><code class="language-bash">errors.tolerance=all              # 容忍所有错(否则会停 task)
+errors.deadletterqueue.topic.name=es-sink-dlq
+errors.deadletterqueue.topic.replication.factor=3
+errors.deadletterqueue.context.headers.enable=true  # 加诊断 header</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s21-8">21.8 REST API</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>API</th><th>用途</th></tr></thead>
+  <tbody>
+    <tr><td><code>GET /connectors</code></td><td>列所有 connector</td></tr>
+    <tr><td><code>POST /connectors</code></td><td>创建 connector(body=配置 JSON)</td></tr>
+    <tr><td><code>GET /connectors/{name}/status</code></td><td>查 connector + 所有 task 状态</td></tr>
+    <tr><td><code>POST /connectors/{name}/restart</code></td><td>重启 connector</td></tr>
+    <tr><td><code>POST /connectors/{name}/tasks/{id}/restart</code></td><td>重启某 task</td></tr>
+    <tr><td><code>PUT /connectors/{name}/config</code></td><td>更新配置(触发 rebalance)</td></tr>
+    <tr><td><code>DELETE /connectors/{name}</code></td><td>删 connector</td></tr>
+    <tr><td><code>GET /connector-plugins</code></td><td>列已加载插件</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s21-9">21.9 监控</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>JMX</th><th>含义</th><th>异常</th></tr></thead>
+  <tbody>
+    <tr><td>connector-metrics.connector-startup-failure-total</td><td>启动失败</td><td>&gt; 0 看 log</td></tr>
+    <tr><td>connector-task-metrics.batch-size-avg</td><td>每批 record 数</td><td>太小 → poll 慢</td></tr>
+    <tr><td>source-task-metrics.source-record-write-rate</td><td>写 Kafka 速率</td><td>对比业务期望</td></tr>
+    <tr><td>sink-task-metrics.put-batch-avg-time-ms</td><td>每批写下游耗时</td><td>飙升 = 下游问题</td></tr>
+    <tr><td>connect-worker-rebalance-metrics</td><td>rebalance 频率</td><td>分钟级 = 异常</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s21-10">21.10 取舍与陷阱</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>#</th><th>陷阱</th><th>现象</th><th>修复</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>internal topic RF=1</td><td>worker 集群崩塌后无法恢复</td><td>RF ≥ 3</td></tr>
+    <tr><td>2</td><td>tasks.max 太小</td><td>并行度不够</td><td>= partition 数 (sink) 或 = 资源单元 (source)</td></tr>
+    <tr><td>3</td><td>Converter 不匹配</td><td>反序列化失败</td><td>客户端 / Connect 用同 Converter</td></tr>
+    <tr><td>4</td><td>不开 EOS Source</td><td>故障重启可能丢/重</td><td>3.0+ 开 exactly.once.source.support</td></tr>
+    <tr><td>5</td><td>忽视 DLQ</td><td>一条坏数据停 task</td><td>errors.tolerance=all + DLQ</td></tr>
+    <tr><td>6</td><td>plugin.path 错</td><td>connector 加载不到</td><td>检查目录权限</td></tr>
+    <tr><td>7</td><td>不监控 rebalance</td><td>频繁 rebalance 导致延迟</td><td>看 connect-worker-rebalance-metrics</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s21-summary">21.11 本章要点</h2>
+<!-- ============================================================ -->
+
+<div class="chapter-summary">
+  <h3>本章小结</h3>
+  <p>Kafka Connect 是把"<em>Kafka 与外部系统的胶水代码</em>" 工程化的框架。三大角色清晰:Connector 声明(不搬数据)、Task 实际搬、Worker 提供执行环境。状态全在 Kafka internal topics(<code>connect-configs</code> / <code>offsets</code> / <code>status</code>),所以 worker 是无状态可重启。生产部署的关键:RF ≥ 3 的 internal topics、Incremental Cooperative Rebalance、Source EOS + Sink 幂等、DLQ + errors.tolerance。下一章我们讲 Connect 的"<em>近亲</em>" <strong>Kafka Streams</strong> — 它在 Kafka 之上跑流处理(state store / window / KTable / 拓扑)。</p>
+</div>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script>hljs.highlightAll();</script>
+
+</body>
+</html>

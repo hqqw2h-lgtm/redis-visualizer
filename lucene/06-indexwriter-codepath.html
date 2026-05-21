@@ -1,0 +1,2199 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.6 IndexWriter 写入路径源码深潜 — 图解 Lucene</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr"   markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    <marker id="arr-g" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#3fb950"/></marker>
+    <marker id="arr-o" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#d29922"/></marker>
+    <marker id="arr-r" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#f85149"/></marker>
+    <marker id="arr-p" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#bc8cff"/></marker>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Lucene</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="05-production-search-service.html">上一章</a>
+  <a href="07-order-search-practice.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s6-1">6.1 IndexWriter 角色边界</a>
+  <a href="#s6-2">6.2 addDocument 调用栈</a>
+  <a href="#s6-3">6.3 IndexingChain 字段分派</a>
+  <a href="#s6-4">6.4 PerField 内存结构</a>
+  <a href="#s6-5">6.5 invert 流程拆解</a>
+  <a href="#s6-6">6.6 RAM postings 与 BlockPool</a>
+  <a href="#s6-7">6.7 DWPT 与多线程并发</a>
+  <a href="#s6-8">6.8 DeleteQueue 与 update</a>
+  <a href="#s6-9">6.9 flushSegment 全过程</a>
+  <a href="#s6-10">6.10 commit 两阶段</a>
+  <a href="#s6-11">6.11 rollback 语义</a>
+  <a href="#s6-12">6.12 异常处理</a>
+  <a href="#s6-13">6.13 性能调参</a>
+  <a href="#s6-14">6.14 源码阅读路径</a>
+  <a href="#s6-summary">6.15 本章小结</a>
+</aside>
+
+<div class="article">
+
+<h1>第 6 章 · IndexWriter 写入路径源码深潜</h1>
+<p class="subtitle">addDocument · IndexingChain · PerField · TermsHash · DWPT · DeleteQueue · flushSegment · commit · rollback · tragic event</p>
+
+<div class="chapter-intro">
+  <p class="lead">业务代码看到的是 <code>writer.addDocument(doc)</code> 一行 API,源码层面要走过 <strong>五层抽象、十几个组件、数十个文件、两阶段提交协议</strong>。从 <code>IndexWriter</code> 持有 <code>write.lock</code> 开始,到 <code>DocumentsWriter</code> 把请求路由到一个 <code>DocumentsWriterPerThread</code>(DWPT),再到 <code>DefaultIndexingChain</code> 把字段分派给 invert/stored/DV/points/vector 五种消费者,接着 <code>TermsHash</code> 把 token 写入 <code>BytesRefHash + ByteBlockPool</code> 的紧凑结构,最后 <code>flushSegment</code> 调用 Codec 五大写器把 RAM 物化为 14 个段文件,<code>SegmentInfos</code> 通过 rename <code>pending_segments_N → segments_N</code> 完成原子提交——任何一步出错都可能导致索引损坏或数据丢失。这一章把这条调用链一刀切开,逐层暴露每个组件的职责、并发模型、内存管理与异常恢复路径。</p>
+  <p>读完这一章你应能精确回答四个问题:多线程并发写入时如何把请求绑定到 DWPT;字段如何按 <code>FieldType</code> 分流到五种物理路径;<code>flush</code> 与 <code>commit</code> 的语义边界在哪里(为什么 flush 完的数据进程崩溃后会丢但 commit 完的不会);一笔 OOM/磁盘满之后 IndexWriter 进入什么状态、怎么恢复。这些问题的答案不在 Javadoc 里,而散落在 <code>IndexWriter.updateDocuments</code>、<code>DocumentsWriter.preUpdate</code>、<code>DefaultIndexingChain.processField</code>、<code>FreqProxTermsWriter.flush</code>、<code>SegmentInfos.commit</code> 等几十个方法里。本章用图解 + 最小可运行代码把它们摊在一张大图上,每张图都标注了 v9.10 源码位置,你可以一边读一边在 IDE 里设断点跟读。</p>
+  <ul class="will-learn">
+    <li>五层调用栈:<code>IndexWriter</code> → <code>DocumentsWriter</code> → <code>DWPT</code> → <code>IndexingChain</code> → <code>Codec</code> 每一层的边界与共享状态</li>
+    <li>字段五条物理路径:<code>TermsHash</code>(invert) / <code>StoredFieldsConsumer</code>(stored) / <code>DocValuesWriter</code>(DV) / <code>PointValuesWriter</code>(points) / <code>KnnVectorsWriter</code>(vector)</li>
+    <li>PerField 三槽内存:<code>BytesRefHash</code>(term 去重)+ <code>ByteBlockPool</code>(变长 byte 缓冲)+ <code>ParallelPostingsArray</code>(termID → 状态)</li>
+    <li>DWPT 池 + StallControl 全局背压:为什么"per-thread 私有 segment + 无锁写入"是 Lucene 写吞吐的核心</li>
+    <li>DeleteQueue 异步广播:<code>updateDocument(term, doc)</code> 如何在不阻塞 add 的前提下把删除项推到所有 in-flight DWPT</li>
+    <li>flushSegment 八步全过程:从 seal DWPT 到写 .si、登记 SegmentInfos、IndexFileDeleter 引用计数</li>
+    <li>commit 两阶段协议:<code>prepareCommit</code> → 写 <code>pending_segments_N.tmp</code> → 原子 rename → fsync 目录</li>
+    <li>tragic event 状态机:OOM/IO 错误后 IndexWriter 进入不可继续状态、必须 close 重开,以及"半成品 segment"的清理责任</li>
+  </ul>
+  <p class="prereq">前置知识:已读第 1 章对 <code>addDocument</code> 入口和五个倒排文件(.tim/.tip/.doc/.pos/.pay)的形态有印象;已读第 3 章理解 segment 不可变性、<code>segments_N</code> 提交点与 LiveDocs 的 delGen 机制;对 Java 并发原语(<code>ReentrantLock</code> / <code>AtomicLong</code> / <code>volatile</code>)有基础了解。本章是写入路径所有故障定位的"地图"——后续第 7 章把本章的源码模型落到订单履约系统的实战代码;第 8 章 BKD-tree 写入复用本章 Codec 模型;第 14 章崩溃恢复复用本章 commit 协议。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s6-1">6.1 IndexWriter 的角色边界</h2>
+<!-- ============================================================ -->
+
+<p>IndexWriter 不是一个"写文件"的对象,而是<strong>一个事务外壳 + 一组共享状态的协调者</strong>。它对外只暴露 <code>addDocument / updateDocument / deleteDocuments / commit / rollback / close</code> 等几个接口,内部把"多线程并发"、"内存累积"、"flush 与 segment 落盘"、"两阶段提交"、"后台合并"等所有复杂度封装起来。理解 IndexWriter 的第一步,是看清它和周围组件的边界——<code>DocumentsWriter</code> 负责什么、<code>SegmentMerger</code> 负责什么、<code>IndexCommit</code> 又是什么角色,边界划清,源码就不再难读。</p>
+
+<h3>IndexWriter 内部组件层次</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 6-1 · IndexWriter 持有的五类共享状态</div>
+  <div style="padding:18px 4px;">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px;font-family:'Cascadia Code','SFMono-Regular',Consolas,monospace;font-size:12px;">
+
+      <div style="background:#0d1117;border:1.5px solid #58a6ff;border-radius:10px;padding:14px;">
+        <div style="color:#58a6ff;font-weight:700;font-size:13px;margin-bottom:8px;">① write.lock 写锁</div>
+        <div style="color:#a5d6ff;line-height:1.7;font-size:11px;">
+          构造时 <code>FSLockFactory.NATIVE</code> 取文件锁<br>
+          确保单 JVM 单 IndexWriter / 目录<br>
+          释放时机:<code>close()</code> 或 JVM 退出
+        </div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #3fb950;border-radius:10px;padding:14px;">
+        <div style="color:#3fb950;font-weight:700;font-size:13px;margin-bottom:8px;">② SegmentInfos</div>
+        <div style="color:#a5d6ff;line-height:1.7;font-size:11px;">
+          当前活跃 segment 列表 + version + counter<br>
+          每次 commit 写出新 <code>segments_(N+1)</code><br>
+          rollback 回退到上次 commit 视图
+        </div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #d2a8ff;border-radius:10px;padding:14px;">
+        <div style="color:#d2a8ff;font-weight:700;font-size:13px;margin-bottom:8px;">③ DocumentsWriter</div>
+        <div style="color:#a5d6ff;line-height:1.7;font-size:11px;">
+          DWPT 池 + DeleteQueue<br>
+          全局 RAM 阈值 / StallControl<br>
+          全局递增 seqNo 分配器
+        </div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #f0883e;border-radius:10px;padding:14px;">
+        <div style="color:#f0883e;font-weight:700;font-size:13px;margin-bottom:8px;">④ MergeScheduler</div>
+        <div style="color:#a5d6ff;line-height:1.7;font-size:11px;">
+          后台合并线程池(<code>ConcurrentMergeScheduler</code>)<br>
+          <code>maybeMerge()</code> 触发 / 异步执行<br>
+          IO 速率限制 / 并发数限制
+        </div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #f778ba;border-radius:10px;padding:14px;">
+        <div style="color:#f778ba;font-weight:700;font-size:13px;margin-bottom:8px;">⑤ IndexFileDeleter</div>
+        <div style="color:#a5d6ff;line-height:1.7;font-size:11px;">
+          段文件引用计数<br>
+          决定哪些"过期 segment"可被物理删除<br>
+          配合 <code>IndexDeletionPolicy</code>(默认仅保留最新 commit)
+        </div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #39d2c0;border-radius:10px;padding:14px;">
+        <div style="color:#39d2c0;font-weight:700;font-size:13px;margin-bottom:8px;">⑥ tragedy 状态</div>
+        <div style="color:#a5d6ff;line-height:1.7;font-size:11px;">
+          <code>AtomicReference&lt;Throwable&gt;</code><br>
+          OOM/IO 异常时被设置<br>
+          后续所有 add/update 直接抛 <code>AlreadyClosedException</code>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<h3>边界划分:谁负责什么</h3>
+
+<table>
+  <thead>
+    <tr><th>组件</th><th>持有方</th><th>核心职责</th><th>不负责</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>IndexWriter</code></td><td>用户构造</td><td>事务外壳 / 协调器 / 锁</td><td>不直接写 RAM postings</td></tr>
+    <tr><td><code>DocumentsWriter</code></td><td>IW 持有 1 个</td><td>DWPT 池 / DeleteQueue / seqNo</td><td>不直接持锁</td></tr>
+    <tr><td><code>DWPT</code></td><td>per-thread 借出</td><td>单 segment 的内存表示</td><td>不跨线程共享</td></tr>
+    <tr><td><code>IndexingChain</code></td><td>每个 DWPT 持 1 个</td><td>字段分派 + invert</td><td>不写文件(直到 flush)</td></tr>
+    <tr><td><code>SegmentMerger</code></td><td>合并任务持有</td><td>把多个段合并为一个</td><td>不参与 add 路径</td></tr>
+    <tr><td><code>IndexCommit</code></td><td>commit 后产生</td><td>不可变快照引用</td><td>不直接对应 reader</td></tr>
+    <tr><td><code>Codec</code></td><td>IWConfig 配置</td><td>把内存形态编码为文件</td><td>不持有内存</td></tr>
+  </tbody>
+</table>
+
+<h3>构造时序:IndexWriter 启动做了什么</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 6-2 · IndexWriter 构造函数的初始化时序</div>
+  <svg viewBox="0 0 1200 540" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 6 个 actor lane -->
+    <g font-size="13" font-weight="700" text-anchor="middle">
+      <rect x="40"   y="20" width="140" height="40" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="1.5"/>
+      <text x="110"  y="46" fill="#cfe9ff">App</text>
+
+      <rect x="220"  y="20" width="160" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="300"  y="46" fill="#e6d3ff">IndexWriter</text>
+
+      <rect x="420"  y="20" width="160" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="500"  y="46" fill="#ffd591">LockFactory</text>
+
+      <rect x="620"  y="20" width="160" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="700"  y="46" fill="#ffd591">Directory</text>
+
+      <rect x="820"  y="20" width="160" height="40" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="1.5"/>
+      <text x="900"  y="46" fill="#9be7b3">SegmentInfos</text>
+
+      <rect x="1020" y="20" width="160" height="40" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="1.5"/>
+      <text x="1100" y="46" fill="#9be7b3">DocumentsWriter</text>
+    </g>
+    <!-- lifeline -->
+    <g stroke="#30363d" stroke-dasharray="4 4" stroke-width="1">
+      <line x1="110"  y1="60" x2="110"  y2="510"/>
+      <line x1="300"  y1="60" x2="300"  y2="510"/>
+      <line x1="500"  y1="60" x2="500"  y2="510"/>
+      <line x1="700"  y1="60" x2="700"  y2="510"/>
+      <line x1="900"  y1="60" x2="900"  y2="510"/>
+      <line x1="1100" y1="60" x2="1100" y2="510"/>
+    </g>
+    <!-- 消息 -->
+    <g font-size="12" fill="#a5d6ff">
+      <!-- ① -->
+      <line x1="110"  y1="100" x2="296"  y2="100" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <text x="200"  y="92" text-anchor="middle">① new IndexWriter(dir, config)</text>
+
+      <!-- ② -->
+      <line x1="300"  y1="140" x2="496"  y2="140" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <text x="395"  y="132" text-anchor="middle">② obtainLock("write.lock")</text>
+
+      <!-- ③ 返回 Lock -->
+      <line x1="500"  y1="180" x2="304"  y2="180" stroke="#d29922" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr-o)"/>
+      <text x="395"  y="172" text-anchor="middle">③ ⟵ Lock 实例 (NativeFSLock)</text>
+
+      <!-- ④ -->
+      <line x1="300"  y1="220" x2="696"  y2="220" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <text x="495"  y="212" text-anchor="middle">④ 列出 segments_* 文件 (listAll)</text>
+
+      <!-- ⑤ -->
+      <line x1="300"  y1="260" x2="896"  y2="260" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <text x="595"  y="252" text-anchor="middle">⑤ SegmentInfos.readLatest(dir, segments_N)</text>
+
+      <!-- ⑥ 返回 SI -->
+      <line x1="900"  y1="300" x2="304"  y2="300" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr-g)"/>
+      <text x="595"  y="292" text-anchor="middle">⑥ ⟵ 上次 commit 的 SegmentInfos (version, generation)</text>
+
+      <!-- ⑦ -->
+      <line x1="300"  y1="340" x2="1096" y2="340" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <text x="700"  y="332" text-anchor="middle">⑦ new DocumentsWriter(IW, SI, config) — DWPT 池就绪 (空)</text>
+
+      <!-- ⑧ self -->
+      <path d="M300,380 h60 v20 h-60" fill="none" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+      <text x="370" y="395" fill="#ffd591">⑧ new IndexFileDeleter(SI) · refCount 表初始化</text>
+
+      <!-- ⑨ self -->
+      <path d="M300,430 h60 v20 h-60" fill="none" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+      <text x="370" y="445" fill="#ffd591">⑨ tragedy = null · ensureOpen 进入可用状态</text>
+
+      <!-- ⑩ 返回 -->
+      <line x1="296"  y1="490" x2="114"  y2="490" stroke="#3fb950" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#arr-g)"/>
+      <text x="200"  y="482" text-anchor="middle">⑩ ⟵ 构造完成 · 可以 add</text>
+    </g>
+  </svg>
+</div>
+
+<div class="key-insight">
+  <strong>"为什么 add 走 update 接口" — unify code path</strong>。Lucene 9.x 把 <code>addDocument</code> / <code>updateDocument</code> / <code>updateDocuments</code> 全部收敛到 <code>IndexWriter.updateDocuments(Term, Iterable&lt;Document&gt;)</code>:term 为 null 即纯添加,非空则先广播删除项再追加文档。这种统一让 IndexWriter 的并发控制、flush 触发、commit 协议只需要一份实现。源码注释直白地写着 "<em>delegate to updateDocuments to unify the code path</em>"——所以从 IndexWriter 内部视角看,<code>addDocument</code> 才是 <code>update</code> 的特例,而非反过来。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s6-2">6.2 addDocument 的内部调用栈</h2>
+<!-- ============================================================ -->
+
+<p>当业务调用 <code>writer.addDocument(doc)</code>,这一行在 1 ms 之内会经过<strong>七层方法调用</strong>。把这条调用栈背下来,后续所有"为什么写入慢"、"为什么 segment 多"、"为什么 commit 卡顿"的诊断都有了起点。</p>
+
+<h3>七层调用栈展开</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 6-3 · 单文档 addDocument 的完整内部调用</div>
+  <svg viewBox="0 0 1200 720" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 7 个 actor lane -->
+    <g font-size="13" font-weight="700" text-anchor="middle">
+      <rect x="20"   y="20" width="120" height="40" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="1.5"/>
+      <text x="80"   y="46" fill="#cfe9ff">App</text>
+
+      <rect x="170"  y="20" width="140" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="240"  y="46" fill="#e6d3ff">IndexWriter</text>
+
+      <rect x="340"  y="20" width="160" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="420"  y="46" fill="#e6d3ff">DocumentsWriter</text>
+
+      <rect x="530"  y="20" width="120" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="590"  y="46" fill="#ffd591">DWPTPool</text>
+
+      <rect x="680"  y="20" width="120" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="740"  y="46" fill="#ffd591">DWPT</text>
+
+      <rect x="830"  y="20" width="180" height="40" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="1.5"/>
+      <text x="920"  y="46" fill="#9be7b3">DefaultIndexingChain</text>
+
+      <rect x="1040" y="20" width="140" height="40" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="1.5"/>
+      <text x="1110" y="46" fill="#9be7b3">PerField</text>
+    </g>
+    <!-- lifeline -->
+    <g stroke="#30363d" stroke-dasharray="4 4" stroke-width="1">
+      <line x1="80"   y1="60" x2="80"   y2="690"/>
+      <line x1="240"  y1="60" x2="240"  y2="690"/>
+      <line x1="420"  y1="60" x2="420"  y2="690"/>
+      <line x1="590"  y1="60" x2="590"  y2="690"/>
+      <line x1="740"  y1="60" x2="740"  y2="690"/>
+      <line x1="920"  y1="60" x2="920"  y2="690"/>
+      <line x1="1110" y1="60" x2="1110" y2="690"/>
+    </g>
+    <!-- 消息 -->
+    <g font-size="12" fill="#a5d6ff">
+      <line x1="80"   y1="100" x2="236"  y2="100" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <text x="158"  y="92" text-anchor="middle">① addDocument(doc)</text>
+
+      <path d="M240,140 h60 v20 h-60" fill="none" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="310" y="155" fill="#e6d3ff">② ensureOpen() · 检查 tragedy</text>
+
+      <line x1="240"  y1="190" x2="416"  y2="190" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <text x="328"  y="182" text-anchor="middle">③ updateDocuments(term=null, [doc])</text>
+
+      <path d="M420,225 h70 v20 h-70" fill="none" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="500" y="240" fill="#e6d3ff">④ 分配 seqNo (AtomicLong.incrementAndGet)</text>
+
+      <line x1="420"  y1="280" x2="586"  y2="280" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <text x="503"  y="272" text-anchor="middle">⑤ getAndLock(threadState)</text>
+
+      <line x1="590"  y1="320" x2="424"  y2="320" stroke="#d29922" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr-o)"/>
+      <text x="503"  y="312" text-anchor="middle">⑥ ⟵ 绑定 DWPT (同线程粘连)</text>
+
+      <line x1="420"  y1="360" x2="736"  y2="360" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <text x="578"  y="352" text-anchor="middle">⑦ updateDocuments([doc])</text>
+
+      <line x1="740"  y1="400" x2="916"  y2="400" stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+      <text x="828"  y="392" text-anchor="middle">⑧ processDocument(doc)</text>
+
+      <!-- loop 框 -->
+      <rect x="855" y="425" width="320" height="80" rx="6" fill="rgba(63,185,80,0.06)" stroke="#3fb950" stroke-width="1" stroke-dasharray="4 3"/>
+      <text x="868" y="442" fill="#9be7b3" font-size="11" font-weight="700">loop · 每个 IndexableField</text>
+      <line x1="920"  y1="460" x2="1106" y2="460" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="1013" y="455" text-anchor="middle">processField(f, fieldGen)</text>
+      <path d="M1110,475 h-60 v15 h60" fill="none" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="1080" y="500" text-anchor="end" fill="#9be7b3">invert · stored · DV · point · vector</text>
+
+      <line x1="916"  y1="540" x2="744"  y2="540" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr-g)"/>
+      <text x="828"  y="532" text-anchor="middle">⑨ ⟵ numDocsInRAM++</text>
+
+      <path d="M740,575 h60 v20 h-60" fill="none" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+      <text x="810" y="590" fill="#ffd591">⑩ maybeFlush(ramUsage) — 超阈值则 flush 单段</text>
+
+      <line x1="736"  y1="630" x2="424"  y2="630" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr-g)"/>
+      <text x="578"  y="622" text-anchor="middle">⑪ ⟵ 完成 / 可能触发 flush</text>
+
+      <line x1="416"  y1="668" x2="84"   y2="668" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr-g)"/>
+      <text x="250"  y="660" text-anchor="middle">⑫ ⟵ seqNo (可观测的写入位点)</text>
+    </g>
+  </svg>
+</div>
+
+<h3>每一层做了什么</h3>
+
+<table>
+  <thead>
+    <tr><th>层级</th><th>方法</th><th>职责</th><th>耗时占比</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td><code>IndexWriter.addDocument</code></td><td>入口、ensureOpen</td><td>&lt; 1%</td></tr>
+    <tr><td>2</td><td><code>IndexWriter.updateDocuments</code></td><td>统一接口、参数标准化</td><td>&lt; 1%</td></tr>
+    <tr><td>3</td><td><code>DocumentsWriter.updateDocuments</code></td><td>seqNo 分配 / DWPT 选择</td><td>1-2%</td></tr>
+    <tr><td>4</td><td><code>DWPT.updateDocuments</code></td><td>per-thread 入口 / DeleteSlice</td><td>1%</td></tr>
+    <tr><td>5</td><td><code>DefaultIndexingChain.processDocument</code></td><td>遍历字段、PerField 分发</td><td>5-10%</td></tr>
+    <tr><td>6</td><td><code>DefaultIndexingChain.processField</code></td><td>按 FieldType 分流</td><td>10-15%</td></tr>
+    <tr><td>7</td><td>各 consumer.invert/store/...</td><td>token 化、RAM postings 写入</td><td>70-80%</td></tr>
+  </tbody>
+</table>
+
+<p>明显看出:<strong>耗时 70-80% 在第 7 层</strong>——具体的字段编码(尤其是 invert + Analyzer.tokenStream)。优化写入吞吐的发力点,几乎都集中在 Analyzer 选型 / 字段裁剪 / DV 压缩这一层。</p>
+
+<h3>最小可运行示例</h3>
+
+<pre><code class="language-java">Path indexPath = Path.of("target/lucene-orders");
+Directory dir = FSDirectory.open(indexPath);
+
+IndexWriterConfig cfg = new IndexWriterConfig(new StandardAnalyzer())
+    .setOpenMode(IndexWriterConfig.OpenMode.CREATE)
+    .setRAMBufferSizeMB(64)
+    .setMaxBufferedDocs(IndexWriterConfig.DISABLE_AUTO_FLUSH)
+    .setUseCompoundFile(false)
+    .setMergeScheduler(new ConcurrentMergeScheduler())
+    .setMergePolicy(new TieredMergePolicy());
+
+try (IndexWriter writer = new IndexWriter(dir, cfg)) {
+    Document doc = new Document();
+    doc.add(new StringField("orderId", "O1001", Field.Store.YES));
+    doc.add(new StringField("status", "PAID", Field.Store.YES));
+    doc.add(new TextField("title", "Wireless charger USB-C fast charging", Field.Store.YES));
+    doc.add(new LongPoint("paidAtEpochMs", 1714805700000L));
+    doc.add(new NumericDocValuesField("amountSort", 12800L));
+    long seqNo = writer.addDocument(doc);
+    System.out.println("addDocument seqNo=" + seqNo);
+    writer.commit();
+}</code></pre>
+
+<pre><code class="language-text">addDocument seqNo=1
+[InfoStream] DW: anyChanges=true; numDocsInRAM=1; deletes=false
+[InfoStream] DWPT: ramUsedBytes=4232; numDocsInRAM=1
+[InfoStream] IW: commit: start
+[InfoStream] IW: commit: enter lock
+[InfoStream] IW: nrtIsCurrent: infoVersion matches; DW changes: true
+[InfoStream] IW: prepareCommit: flush
+[InfoStream] DWPT: flush postings as segment _0 numDocs=1</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s6-3">6.3 IndexingChain 与字段分派</h2>
+<!-- ============================================================ -->
+
+<p>IndexingChain 是字段的"分流器"。同一个 <code>IndexableField</code> 进来,根据它的 <code>IndexableFieldType</code> 配置(<code>indexOptions / stored / docValuesType / pointDimensionCount / vectorDimension</code>),会被分发到 5 种<strong>独立</strong>的物理路径——而且这 5 条路径互不阻塞,字段如果同时声明多种能力(例如 LongPoint + NumericDocValuesField),会同时进入多条路径。</p>
+
+<h3>DefaultIndexingChain.processField 的五条分支</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 6-4 · 字段五条物理路径</div>
+  <svg viewBox="0 0 1200 600" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 入口纵向 -->
+    <rect x="490" y="20"  width="220" height="50" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="600" y="50" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">Document (fields)</text>
+
+    <rect x="490" y="100" width="220" height="50" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="600" y="130" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">遍历 IndexableField</text>
+
+    <rect x="450" y="180" width="300" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="600" y="206" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">PerField (按 fieldName 缓存)</text>
+    <text x="600" y="226" text-anchor="middle" fill="#a5d6ff" font-size="11">复用 invert / stored / DV / point / vector consumer</text>
+
+    <!-- 决策菱形 -->
+    <polygon points="600,260 770,330 600,400 430,330" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="600" y="328" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">FieldType 检查</text>
+    <text x="600" y="348" text-anchor="middle" fill="#a5d6ff" font-size="11">indexOptions / stored / DV / point / vector</text>
+
+    <!-- 5 条物理路径 -->
+    <g>
+      <rect x="20"  y="450" width="220" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+      <text x="130" y="478" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">invert path</text>
+      <text x="130" y="496" text-anchor="middle" fill="#a5d6ff" font-size="11">TermsHash / Analyzer</text>
+
+      <rect x="260" y="450" width="220" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+      <text x="370" y="478" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">stored path</text>
+      <text x="370" y="496" text-anchor="middle" fill="#a5d6ff" font-size="11">StoredFieldsConsumer</text>
+
+      <rect x="500" y="450" width="220" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+      <text x="610" y="478" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">DV path</text>
+      <text x="610" y="496" text-anchor="middle" fill="#a5d6ff" font-size="11">DocValuesWriter</text>
+
+      <rect x="740" y="450" width="220" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+      <text x="850" y="478" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">points path</text>
+      <text x="850" y="496" text-anchor="middle" fill="#a5d6ff" font-size="11">PointValuesWriter</text>
+
+      <rect x="980" y="450" width="200" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+      <text x="1080" y="478" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">vector path</text>
+      <text x="1080" y="496" text-anchor="middle" fill="#a5d6ff" font-size="11">KnnVectorsWriter</text>
+    </g>
+
+    <!-- 内存形态 (路径下方) -->
+    <g font-size="11" fill="#39d2c0">
+      <text x="130"  y="540" text-anchor="middle" font-weight="700">→ BytesRefHash</text>
+      <text x="370"  y="540" text-anchor="middle" font-weight="700">→ LZ4 chunk buffer</text>
+      <text x="610"  y="540" text-anchor="middle" font-weight="700">→ PackedLongValues / BytesRefArray</text>
+      <text x="850"  y="540" text-anchor="middle" font-weight="700">→ BKD buffer arrays</text>
+      <text x="1080" y="540" text-anchor="middle" font-weight="700">→ HNSW graph buffer</text>
+      <text x="600" y="580" text-anchor="middle" fill="#8b949e">五条路径互不阻塞,字段同时声明多种能力会同时进入</text>
+    </g>
+
+    <!-- 箭头 -->
+    <g fill="none">
+      <line x1="600" y1="70"  x2="600" y2="98"  stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <line x1="600" y1="150" x2="600" y2="178" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <line x1="600" y1="240" x2="600" y2="258" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+
+      <line x1="500" y1="380" x2="170" y2="448" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <line x1="540" y1="395" x2="400" y2="448" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <line x1="600" y1="400" x2="610" y2="448" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <line x1="660" y1="395" x2="820" y2="448" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <line x1="700" y1="380" x2="1050" y2="448" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+
+      <text x="295" y="425" fill="#3fb950" font-size="11" font-weight="700">indexOptions != NONE</text>
+      <text x="465" y="430" fill="#3fb950" font-size="11" font-weight="700">stored=true</text>
+      <text x="630" y="430" fill="#3fb950" font-size="11" font-weight="700">DV != NONE</text>
+      <text x="780" y="430" fill="#3fb950" font-size="11" font-weight="700">pointDim &gt; 0</text>
+      <text x="935" y="425" fill="#3fb950" font-size="11" font-weight="700">vectorDim &gt; 0</text>
+    </g>
+  </svg>
+</div>
+
+<h3>字段类型 → 路径映射</h3>
+
+<table>
+  <thead>
+    <tr><th>字段类型</th><th>invert</th><th>stored</th><th>DocValues</th><th>points</th><th>vector</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>TextField</td><td>✓</td><td>可选</td><td>✗</td><td>✗</td><td>✗</td></tr>
+    <tr><td>StringField</td><td>✓</td><td>可选</td><td>✗</td><td>✗</td><td>✗</td></tr>
+    <tr><td>StoredField</td><td>✗</td><td>✓</td><td>✗</td><td>✗</td><td>✗</td></tr>
+    <tr><td>LongPoint</td><td>✗</td><td>✗</td><td>✗</td><td>✓</td><td>✗</td></tr>
+    <tr><td>NumericDocValuesField</td><td>✗</td><td>✗</td><td>✓</td><td>✗</td><td>✗</td></tr>
+    <tr><td>SortedDocValuesField</td><td>✗</td><td>✗</td><td>✓</td><td>✗</td><td>✗</td></tr>
+    <tr><td>SortedSetDocValuesField</td><td>✗</td><td>✗</td><td>✓</td><td>✗</td><td>✗</td></tr>
+    <tr><td>KnnVectorField</td><td>✗</td><td>✗</td><td>✗</td><td>✗</td><td>✓</td></tr>
+  </tbody>
+</table>
+
+<h3>processField 源码骨架</h3>
+
+<pre><code class="language-java">// org.apache.lucene.index.DefaultIndexingChain (简化版)
+private int processField(int docID, IndexableField field, long fieldGen,
+                          int fieldCount) throws IOException {
+    String fieldName = field.name();
+    IndexableFieldType ft = field.fieldType();
+
+    PerField fp = getOrAddPerField(fieldName, ft);
+    fp.fieldInfo.update(ft);
+
+    if (ft.indexOptions() != IndexOptions.NONE) {
+        if (fp.fieldGen != fieldGen) {
+            fp.invert(field, true);
+            fp.fieldGen = fieldGen;
+        } else {
+            fp.invert(field, false);
+        }
+    }
+
+    if (ft.stored()) {
+        storedFieldsConsumer.writeField(fp.fieldInfo, field);
+    }
+
+    DocValuesType dvType = ft.docValuesType();
+    if (dvType != DocValuesType.NONE) {
+        indexDocValue(fp, dvType, field);
+    }
+
+    if (ft.pointDimensionCount() != 0) {
+        pointValuesWriter(fp, field);
+    }
+
+    if (ft.vectorDimension() != 0) {
+        vectorValuesWriter(fp, field);
+    }
+    return fieldCount;
+}</code></pre>
+
+<div class="key-insight">
+  <strong>同一字段写多份不是浪费,是必要</strong>。订单的 <code>amount</code> 字段如果只写 <code>StoredField</code>,排序时 Lucene 必须解压整个 LZ4 chunk(默认 16 KiB)拿到 amount——代价比 DV 列读高 100 倍。正确做法是同时写 <code>LongPoint("amount", v)</code>(范围过滤走 BKD)+ <code>NumericDocValuesField("amountSort", v)</code>(排序走 DV 列)+ <code>StoredField("amountText", text)</code>(展示走 LZ4 chunk)。三份数据加起来索引膨胀 ~30%,但每条访问路径都最优,P99 稳定可控。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s6-4">6.4 PerField 内存结构</h2>
+<!-- ============================================================ -->
+
+<p>每个字段在 IndexingChain 内部对应一个 <code>PerField</code> 对象。PerField 不是一个简单的数据结构,而是把"该字段在 RAM 中的所有状态"封装到一起的容器:倒排路径有 TermsHashPerField、stored 路径有 stored buffer、DV 路径有 DocValuesWriter、Points 路径有 BKD buffer。把 PerField 看作"字段在内存里的占位",理解 RAM 占用就有了着力点。</p>
+
+<h3>PerField 的三槽内存结构(invert 路径)</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 6-5 · PerField 内存三槽:Hash + Pool + PostingsArray</div>
+  <div style="padding:18px 4px;">
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;font-family:'Cascadia Code',Consolas,monospace;font-size:12px;">
+
+      <div style="background:#0d1117;border:1.5px solid #58a6ff;border-radius:10px;padding:14px;">
+        <div style="color:#58a6ff;font-weight:700;font-size:13px;margin-bottom:8px;">① BytesRefHash</div>
+        <div style="color:#a5d6ff;line-height:1.7;font-size:11px;">
+          term → termID(int) 映射<br>
+          内部:<br>
+          &nbsp;• <code>int[] ids</code>(开放寻址表)<br>
+          &nbsp;• 实际 term 字节存在 ByteBlockPool<br>
+          &nbsp;• 哈希冲突走线性探测<br>
+          典型占用:<br>
+          &nbsp;~40 byte / 唯一 term
+        </div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #3fb950;border-radius:10px;padding:14px;">
+        <div style="color:#3fb950;font-weight:700;font-size:13px;margin-bottom:8px;">② ByteBlockPool</div>
+        <div style="color:#a5d6ff;line-height:1.7;font-size:11px;">
+          变长 byte 缓冲(共享池)<br>
+          每块固定 32 KiB<br>
+          按需扩容(append-only)<br>
+          存放:<br>
+          &nbsp;• term 字节<br>
+          &nbsp;• docID delta<br>
+          &nbsp;• freq / pos / offset / payload<br>
+          GC 友好:<br>
+          &nbsp;不会释放小对象
+        </div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #d2a8ff;border-radius:10px;padding:14px;">
+        <div style="color:#d2a8ff;font-weight:700;font-size:13px;margin-bottom:8px;">③ ParallelPostingsArray</div>
+        <div style="color:#a5d6ff;line-height:1.7;font-size:11px;">
+          termID → 状态(并行数组)<br>
+          每 termID 一组 int 槽:<br>
+          &nbsp;• <code>byteStart[id]</code> 起始偏移<br>
+          &nbsp;• <code>lastDocID[id]</code> 最近 doc<br>
+          &nbsp;• <code>lastPosition[id]</code> 最近 pos<br>
+          &nbsp;• <code>termFreqs[id]</code> 当前 doc freq<br>
+          扩容:<br>
+          &nbsp;ArrayUtil.grow(int[]) 翻倍
+        </div>
+      </div>
+    </div>
+
+    <div style="margin-top:12px;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px 14px;color:#8b949e;font-size:11px;">
+      <strong style="color:#39d2c0;">三槽协作:</strong> 写入 token "<code style="color:#a5d6ff;">charger</code>" → BytesRefHash 查 termID(若新则 add 进 ByteBlockPool 拿到 byteStart 写入 array)→ 用 termID 索引到 ParallelPostingsArray 拿到 lastDocID/lastPosition → 计算 delta 编码后写入 ByteBlockPool 的 postings slice。
+    </div>
+  </div>
+</div>
+
+<h3>PerField 持有的所有缓冲</h3>
+
+<table>
+  <thead>
+    <tr><th>路径</th><th>关键对象</th><th>形态</th><th>flush 后产物</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>invert</td><td><code>FreqProxTermsWriterPerField</code></td><td>BytesRefHash + 两个 ByteBlockPool slice 链</td><td>.tim / .tip / .doc / .pos / .pay</td></tr>
+    <tr><td>stored</td><td><code>StoredFieldsConsumer</code>(全字段共享)</td><td>chunk buffer(16 KiB / chunk)</td><td>.fdt / .fdx / .fdm</td></tr>
+    <tr><td>DV numeric</td><td><code>NumericDocValuesWriter</code></td><td>PackedLongValues + docs bitset</td><td>.dvd / .dvm</td></tr>
+    <tr><td>DV sorted</td><td><code>SortedDocValuesWriter</code></td><td>BytesRefHash(去重)+ ord 数组</td><td>.dvd / .dvm</td></tr>
+    <tr><td>points</td><td><code>PointValuesWriter</code></td><td>docIDs[] + packedValues[]</td><td>.kdd / .kdi / .kdm</td></tr>
+    <tr><td>vector</td><td><code>HnswGraphWriter</code></td><td>邻接表 + 向量 buffer</td><td>.vec / .vex / .vem</td></tr>
+    <tr><td>norms</td><td><code>NormValuesWriter</code></td><td>SmallFloat 量化 byte[]</td><td>.nvd / .nvm</td></tr>
+  </tbody>
+</table>
+
+<h3>PerField 是怎么被生成的</h3>
+
+<pre><code class="language-java">// DefaultIndexingChain.getOrAddPerField 简化
+PerField getOrAddPerField(String name, IndexableFieldType ft) {
+    final int hashPos = name.hashCode() & hashMask;
+    PerField fp = fieldHash[hashPos];
+    while (fp != null && !fp.fieldInfo.name.equals(name)) {
+        fp = fp.next;
+    }
+    if (fp == null) {
+        FieldInfo fi = fieldInfos.add(name, ft);
+        fp = new PerField(fi, indexCreatedVersionMajor,
+                          invertState, termsHash, ...);
+        fp.next = fieldHash[hashPos];
+        fieldHash[hashPos] = fp;
+        totalFieldCount++;
+    }
+    return fp;
+}</code></pre>
+
+<p>注意 <code>fieldHash</code> 是<strong>每个 DWPT 私有</strong>的——不同 DWPT 各有一份 PerField 集合,这就是为什么 Lucene 的多线程写入<strong>无需锁</strong>:每个线程对自己 DWPT 的 PerField 独占读写。</p>
+
+<!-- ============================================================ -->
+<h2 id="s6-5">6.5 invert 流程拆解</h2>
+<!-- ============================================================ -->
+
+<p>"invert" 是 IndexingChain 中最重的一条路径——CPU 占用 50% 以上,内存占用 60% 以上。它把"字段文本"转成"内存倒排表":<code>Analyzer.tokenStream</code> 切 token → <code>BytesRefHash</code> 把 term 哈希成 termID → <code>ParallelPostingsArray</code> 按 termID 索引状态 → <code>ByteBlockPool</code> 写入 postings 字节流(docID delta + freq + position + payload + offset)。</p>
+
+<h3>invert 的五步流水</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 6-6 · 一个字段 invert 时的五步流水</div>
+  <svg viewBox="0 0 1200 460" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 顶部主流水 (5 步水平) -->
+    <g>
+      <rect x="20"   y="40"  width="200" height="80" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+      <text x="120"  y="70"  text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">① IndexableField</text>
+      <text x="120"  y="90"  text-anchor="middle" fill="#a5d6ff" font-size="11">'wireless charger usb-c'</text>
+      <text x="120"  y="108" text-anchor="middle" fill="#8b949e" font-size="11">String / Reader</text>
+
+      <rect x="260"  y="40"  width="200" height="80" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="360"  y="70"  text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">② Analyzer.tokenStream</text>
+      <text x="360"  y="90"  text-anchor="middle" fill="#a5d6ff" font-size="11">CharFilter→Tok→TokFilter</text>
+      <text x="360"  y="108" text-anchor="middle" fill="#8b949e" font-size="11">复用 ReuseStrategy</text>
+
+      <rect x="500"  y="40"  width="200" height="80" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="600"  y="70"  text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">③ TokenStream</text>
+      <text x="600"  y="90"  text-anchor="middle" fill="#a5d6ff" font-size="11">{term, pos, offset, payload}</text>
+      <text x="600"  y="108" text-anchor="middle" fill="#8b949e" font-size="11">incrementToken() 循环</text>
+
+      <rect x="740"  y="40"  width="200" height="80" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="840"  y="70"  text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">④ BytesRefHash.add</text>
+      <text x="840"  y="90"  text-anchor="middle" fill="#a5d6ff" font-size="11">term → termID (int)</text>
+      <text x="840"  y="108" text-anchor="middle" fill="#8b949e" font-size="11">开放寻址 + ByteBlockPool</text>
+
+      <rect x="980"  y="40"  width="200" height="80" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="1080" y="70"  text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">⑤ ParallelPostingsArray</text>
+      <text x="1080" y="90"  text-anchor="middle" fill="#a5d6ff" font-size="11">[termID].lastDocID 检查</text>
+      <text x="1080" y="108" text-anchor="middle" fill="#8b949e" font-size="11">SoA · termID 索引</text>
+    </g>
+
+    <!-- 横向箭头 -->
+    <g fill="none">
+      <line x1="220"  y1="80"  x2="258"  y2="80" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <line x1="460"  y1="80"  x2="498"  y2="80" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <line x1="700"  y1="80"  x2="738"  y2="80" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <line x1="940"  y1="80"  x2="978"  y2="80" stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+    </g>
+
+    <!-- 决策分支 (新 doc / 同 doc) -->
+    <g>
+      <rect x="690"  y="200" width="220" height="80" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+      <text x="800"  y="228" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">新 doc 出现</text>
+      <text x="800"  y="248" text-anchor="middle" fill="#a5d6ff" font-size="11">写 prev doc freq · 重置</text>
+      <text x="800"  y="266" text-anchor="middle" fill="#8b949e" font-size="11">分配新 slice (level 0)</text>
+
+      <rect x="990"  y="200" width="200" height="80" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+      <text x="1090" y="228" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">同 doc 多次</text>
+      <text x="1090" y="248" text-anchor="middle" fill="#a5d6ff" font-size="11">termFreqs[id]++</text>
+      <text x="1090" y="266" text-anchor="middle" fill="#8b949e" font-size="11">追加 position</text>
+
+      <line x1="1050" y1="120" x2="800"  y2="200" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <line x1="1090" y1="120" x2="1090" y2="200" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="900"  y="160" fill="#3fb950" font-size="11" font-weight="700">lastDocID ≠ doc</text>
+      <text x="1100" y="160" fill="#3fb950" font-size="11" font-weight="700">lastDocID = doc</text>
+    </g>
+
+    <!-- 收敛 → ByteBlockPool 写入 + Norm -->
+    <g>
+      <rect x="380"  y="320" width="320" height="80" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="540"  y="350" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">写 docID delta + freq + pos + payload</text>
+      <text x="540"  y="368" text-anchor="middle" fill="#a5d6ff" font-size="11">→ ByteBlockPool slice (vInt 编码)</text>
+      <text x="540"  y="386" text-anchor="middle" fill="#8b949e" font-size="11">slice 满则跨级到 14/20/30/40/80 byte</text>
+
+      <rect x="780"  y="320" width="320" height="80" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="1.5"/>
+      <text x="940"  y="350" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">累计字段长度 → NormValuesWriter</text>
+      <text x="940"  y="368" text-anchor="middle" fill="#a5d6ff" font-size="11">SmallFloat 量化到 1 byte / doc</text>
+      <text x="940"  y="386" text-anchor="middle" fill="#8b949e" font-size="11">flush 后写 .nvd / .nvm</text>
+
+      <line x1="800" y1="280" x2="540" y2="318" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <line x1="1090" y1="280" x2="940" y2="318" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <line x1="700" y1="360" x2="778" y2="360" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+    </g>
+  </svg>
+</div>
+
+<h3>BytesRefHash:term 去重的核心</h3>
+
+<p>每个字段(per-field)有自己的 <code>BytesRefHash</code>。它是一个<strong>开放寻址哈希表</strong>,key 是 term 字节,value 是单调递增的 <code>termID</code>(int)。当一个新 token 进来:</p>
+
+<ol>
+  <li>计算 <code>BytesRef.hashCode()</code>(MurmurHash3 变种)</li>
+  <li>用 hash & mask 找 bucket</li>
+  <li>若 bucket 空 → 新 termID = count++;把 term 字节写入 ByteBlockPool 拿到 byteStart;<code>ids[bucket] = termID</code></li>
+  <li>若 bucket 占用 → 比较 term 字节是否相同;相同 → 复用 termID;不同 → 线性探测下一个 bucket</li>
+  <li>装载因子超过 0.5 → 双倍扩容 + rehash</li>
+</ol>
+
+<pre><code class="language-java">// BytesRefHash.add(BytesRef bytes) 简化
+public int add(BytesRef bytes) {
+    final int length = bytes.length;
+    int hashPos = findHash(bytes);
+    int e = ids[hashPos];
+
+    if (e == -1) {
+        // 新 term:写入 ByteBlockPool 并分配 ID
+        int len2 = 2 + length;
+        if (len2 + pool.byteUpto > BYTE_BLOCK_SIZE) {
+            pool.nextBuffer();
+        }
+        final byte[] buffer = pool.buffer;
+        final int bufferUpto = pool.byteUpto;
+
+        bytesStart[count] = bufferUpto + pool.byteOffset;
+        // 长度前缀 (vshort) + 字节内容
+        if (length < 128) {
+            buffer[bufferUpto] = (byte) length;
+            pool.byteUpto += length + 1;
+            System.arraycopy(bytes.bytes, bytes.offset, buffer, bufferUpto + 1, length);
+        } else {
+            buffer[bufferUpto]     = (byte) (0x80 | (length & 0x7f));
+            buffer[bufferUpto + 1] = (byte) ((length >> 7) & 0xff);
+            pool.byteUpto += length + 2;
+            System.arraycopy(bytes.bytes, bytes.offset, buffer, bufferUpto + 2, length);
+        }
+        e = count++;
+        ids[hashPos] = e;
+
+        if (count == hashHalfSize) {
+            rehash(2 * hashSize, true);
+        }
+    }
+    return e;
+}</code></pre>
+
+<h3>ParallelPostingsArray:termID 的状态机</h3>
+
+<p>有了 termID,接下来需要<strong>给每个 termID 维护当前状态</strong>:它最近一次出现在哪个 docID?最近一次的 position 是多少?当前 doc 内累计 freq 是多少?Lucene 把这些状态拆到几个并行的 int 数组里(SoA 而非 AoS),用 termID 作为下标:</p>
+
+<table>
+  <thead>
+    <tr><th>数组</th><th>类型</th><th>含义</th><th>更新时机</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>byteStarts[termID]</code></td><td>int</td><td>postings slice 起始偏移</td><td>新 term 时分配一次</td></tr>
+    <tr><td><code>lastDocIDs[termID]</code></td><td>int</td><td>该 term 最近写入的 docID</td><td>每次 doc 切换</td></tr>
+    <tr><td><code>termFreqs[termID]</code></td><td>int</td><td>当前 doc 内累计 freq</td><td>每次 token 命中</td></tr>
+    <tr><td><code>lastPositions[termID]</code></td><td>int</td><td>当前 doc 内最近 position</td><td>每次 token 命中</td></tr>
+    <tr><td><code>lastOffsets[termID]</code></td><td>int</td><td>最近 offset(若开启)</td><td>每次 token 命中</td></tr>
+  </tbody>
+</table>
+
+<p>当一个 token <code>charger</code> 进来,termID=42,DefaultIndexingChain 会:</p>
+
+<ol>
+  <li>检查 <code>lastDocIDs[42]</code>:若 ≠ 当前 docID → 新 doc 出现 → 把上一个 doc 的 freq 写入 postings stream(用 vInt 编码)</li>
+  <li>更新 <code>lastDocIDs[42] = 当前 docID</code>,重置 <code>termFreqs[42] = 1</code></li>
+  <li>把 <code>(position, payload)</code> 写入 .pos / .pay 对应的 slice</li>
+  <li>若 <code>lastDocIDs[42] == 当前 docID</code> → 同 doc 多次出现 → <code>termFreqs[42]++</code></li>
+</ol>
+
+<div class="real-world">
+  <strong>Elasticsearch <code>thread_pool.write.size</code> 与 DWPT 数量协同</strong>。ES 默认 <code>thread_pool.write.size = # of allocated processors</code>(节点 CPU 数,不超过 32)。每个 thread 写入时会从 IndexWriter 的 DWPT 池借出一个 DWPT,典型情况下"激活的 DWPT 数 ≈ 写线程数"。如果 <code>thread_pool.write.queue_size</code> 设得过大(默认 200),写突发时会同时激活几十个 DWPT,每个 RAM 占用都计入全局 256 MiB 限额——一旦超限,StallControl 立刻把所有写线程阻塞,业务侧表现就是"批量导入到一半突然卡住几秒"。生产经验是把 <code>queue_size</code> 调到 50-100,让背压更早生效,而不是等到 RAM 满了再 stall。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s6-6">6.6 RAM postings 与 ByteBlockPool</h2>
+<!-- ============================================================ -->
+
+<p>"为什么 Lucene 的 RAM postings 不直接用 <code>ArrayList&lt;Integer&gt;</code>?"——这是任何认真读源码的人都会问的问题。答案在两个字:<strong>GC 压力</strong>。一个有 100 万 term × 平均 freq 100 的字段,如果每个 termID 都对应一个 ArrayList,就会有 1 亿个 Integer 装箱对象,Young GC 频率瞬间飙升。Lucene 用 <code>ByteBlockPool</code>(32 KiB 一块的字节池)+ <code>IntBlockPool</code>(8192 int 一块的 int 池)把所有变长缓冲<strong>共享到几十个大 byte[] 上</strong>,GC 看到的只是少量大对象,无装箱、无对象图遍历。</p>
+
+<h3>ByteBlockPool 的工作方式</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 6-7 · ByteBlockPool:slice + 链表 + 五级容量</div>
+  <pre style="background:#0d1117;border:none;margin:0;padding:14px;color:#a5d6ff;line-height:1.8;font-size:12px;">ByteBlockPool 内部:
+
+  ┌──────────────────────────────────────────────────────────┐
+  │ buffers: byte[][]    每个元素是 32 KiB 的 byte[]          │
+  │   buffers[0]:  [.....32 KiB.....]                         │
+  │   buffers[1]:  [.....32 KiB.....]                         │
+  │   buffers[2]:  [.....32 KiB.....]                         │
+  │   ...按需扩展                                              │
+  ├──────────────────────────────────────────────────────────┤
+  │ Slice 分配(按 termID 隔离):                              │
+  │   每个 term 在 pool 中拥有自己的链式 slice                │
+  │   level 0: 5 byte    → level 1: 14 byte                   │
+  │   level 1: 14 byte   → level 2: 20 byte                   │
+  │   level 2: 20 byte   → level 3: 30 byte                   │
+  │   level 3: 30 byte   → level 4: 40 byte                   │
+  │   level 4: 40 byte   → level 5: 80 byte                   │
+  │   每级末尾保存"下一段地址"指针(forward pointer)          │
+  ├──────────────────────────────────────────────────────────┤
+  │ 写满当前 slice → 分配下一级 slice → 写 forward pointer    │
+  │ 读时跟随 forward pointer 跨段顺序读取                     │
+  └──────────────────────────────────────────────────────────┘
+
+为什么是 5 → 14 → 20 → 30 → 40 → 80?
+  • 经验值,适配 freq 分布(大多 term freq 小)
+  • 几何级数让"小 term 不浪费空间,大 term 不频繁切换"
+  • level 5(80 byte)之后保持 80 一直延续,避免无限增长</pre>
+</div>
+
+<h3>ByteBlockPool 与 IntBlockPool 的分工</h3>
+
+<table>
+  <thead>
+    <tr><th>Pool</th><th>每块容量</th><th>存放内容</th><th>访问模式</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>ByteBlockPool</code></td><td>32 KiB byte</td><td>term 字节、postings stream、stored chunk</td><td>变长追加</td></tr>
+    <tr><td><code>IntBlockPool</code></td><td>8192 int</td><td>postings 的 docID slice 索引、posting array fallback</td><td>定长追加</td></tr>
+  </tbody>
+</table>
+
+<h3>RAM 增长曲线(英文文本字段)</h3>
+
+<pre><code class="language-text">TermsHash RAM 占用(单 DWPT,文本字段,IndexOptions.DOCS_AND_FREQS_AND_POSITIONS):
+
+  100K   docs  →   8 MiB
+  500K   docs  →  35 MiB
+  1M     docs  →  62 MiB
+  5M     docs  → 280 MiB ← 触发 flush(默认 256 MiB / DWPT 全局)
+
+  增长因子:
+    • 唯一 term 数(主导,~40 byte / 唯一 term)
+    • 平均 term 长度
+    • IndexOptions(POS / OFFSETS / PAYLOADS 占用更高)
+    • doc 数(决定 postings stream 总长)
+
+  关键观察:
+    BytesRefHash 占用的是 "唯一 term × 40 byte",不是文档数 × term 数
+    所以"文档很多但词汇很集中"的场景 RAM 占用反而低</code></pre>
+
+<h3>GC 友好的设计哲学</h3>
+
+<pre><code class="language-java">// 反例:naive 实现
+Map&lt;String, List&lt;Integer&gt;&gt; postings = new HashMap&lt;&gt;();
+for (Token t : tokens) {
+    postings.computeIfAbsent(t.text, k -&gt; new ArrayList&lt;&gt;()).add(t.docID);
+}
+// 100 万 term × 100 freq → 至少 1 亿个 Integer 对象 → GC 噩梦
+
+// Lucene 实现:固定数量的大 byte[]
+// • 整个 DWPT 总对象数 ≈ buffers 数(几十个)+ 几个 PerField + 几个 Hash
+// • Young GC 看到的对象图小、扫描快
+// • Old GC 不参与(buffers 只在 flush 后才被释放)</code></pre>
+
+<div class="key-insight">
+  <strong>"DWPT 池让多线程写入零锁竞争 — 但代价是更多 segment"</strong>。Lucene 的写入吞吐能在 16 核机器上线性扩展到 14-15 倍,核心机制是:每个写线程绑定一个 DWPT,DWPT 内的所有 BytesRefHash / PostingsArray / ByteBlockPool 都是<strong>线程私有</strong>的,写入路径上完全没有锁。代价是 N 个 DWPT 同时 flush 时会产生 N 个独立的小 segment,merge 压力陡增。这就是为什么"加大写线程数"和"增加 segment 数"是同一枚硬币的两面——你必须配套调整 <code>TieredMergePolicy</code> 的合并目标段大小,否则查询时打开的 SegmentReader 数会爆炸。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s6-7">6.7 DocumentsWriterPerThread 与多线程并发</h2>
+<!-- ============================================================ -->
+
+<p>DWPT 是 Lucene 写入扩展性的灵魂。<code>DocumentsWriter</code> 维护一个 DWPT 池,池里的每个 DWPT 都是一个"私有 segment 工厂"——它持有自己的 IndexingChain、自己的 BytesRefHash、自己的 ByteBlockPool,只在 flush 时和外界交互(通过 SegmentInfos.add)。多线程并发写入时,每个线程通过 <code>ThreadState</code> 绑定到一个 DWPT,完全无锁。</p>
+
+<h3>DWPT 池的状态可视化</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 6-8 · DWPT 池实时状态(每 DWPT 显示 RAM / segment ID / 状态)</div>
+  <div style="padding:18px 4px;font-family:'Cascadia Code',Consolas,monospace;font-size:12px;">
+
+    <div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px 14px;margin-bottom:12px;">
+      <div style="color:#8b949e;font-size:11px;margin-bottom:6px;">DocumentsWriter 全局视图</div>
+      <div style="color:#c9d1d9;font-size:12px;line-height:1.8;">
+        全局 RAM 上限: <code style="color:#a5d6ff;">256 MiB</code>(<code>config.setRAMBufferSizeMB</code>) ·
+        当前累计: <code style="color:#3fb950;">182 MiB</code> ·
+        StallControl: <code style="color:#3fb950;">healthy</code> ·
+        seqNo 已分配: <code style="color:#a5d6ff;">42851</code>
+      </div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;">
+
+      <div style="background:#0d1117;border:1.5px solid #3fb950;border-radius:10px;padding:14px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <div style="color:#3fb950;font-weight:700;font-size:13px;">DWPT-0</div>
+          <div style="color:#3fb950;font-size:10px;background:rgba(63,185,80,.15);padding:2px 8px;border-radius:10px;">writing</div>
+        </div>
+        <div style="color:#a5d6ff;line-height:1.7;font-size:11px;">
+          线程: <code>T0</code><br>
+          segment: <code>_8</code> (pending)<br>
+          numDocsInRAM: <code>12480</code><br>
+          ramUsedBytes: <code>48 MiB</code><br>
+          lastSeqNo: <code>42849</code>
+        </div>
+        <div style="margin-top:8px;height:5px;background:#21262d;border-radius:3px;overflow:hidden;">
+          <div style="width:75%;height:100%;background:linear-gradient(to right,#3fb950,#3fb950);"></div>
+        </div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #3fb950;border-radius:10px;padding:14px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <div style="color:#3fb950;font-weight:700;font-size:13px;">DWPT-1</div>
+          <div style="color:#3fb950;font-size:10px;background:rgba(63,185,80,.15);padding:2px 8px;border-radius:10px;">writing</div>
+        </div>
+        <div style="color:#a5d6ff;line-height:1.7;font-size:11px;">
+          线程: <code>T1</code><br>
+          segment: <code>_9</code> (pending)<br>
+          numDocsInRAM: <code>5210</code><br>
+          ramUsedBytes: <code>22 MiB</code><br>
+          lastSeqNo: <code>42851</code>
+        </div>
+        <div style="margin-top:8px;height:5px;background:#21262d;border-radius:3px;overflow:hidden;">
+          <div style="width:34%;height:100%;background:#3fb950;"></div>
+        </div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #d29922;border-radius:10px;padding:14px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <div style="color:#d29922;font-weight:700;font-size:13px;">DWPT-2</div>
+          <div style="color:#d29922;font-size:10px;background:rgba(214,153,34,.15);padding:2px 8px;border-radius:10px;">flushing</div>
+        </div>
+        <div style="color:#a5d6ff;line-height:1.7;font-size:11px;">
+          线程: <code>(已脱离)</code><br>
+          segment: <code>_7</code> (writing files)<br>
+          numDocsInRAM: <code>—</code><br>
+          ramUsedBytes: <code>108 MiB → 0</code><br>
+          lastSeqNo: <code>42501</code>
+        </div>
+        <div style="margin-top:8px;height:5px;background:#21262d;border-radius:3px;overflow:hidden;">
+          <div style="width:60%;height:100%;background:linear-gradient(to right,#d29922,#d29922 60%,transparent 60%);background-size:8px 100%;animation:none;"></div>
+        </div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #f85149;border-radius:10px;padding:14px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <div style="color:#f85149;font-weight:700;font-size:13px;">DWPT-3</div>
+          <div style="color:#f85149;font-size:10px;background:rgba(248,81,73,.15);padding:2px 8px;border-radius:10px;">stalled</div>
+        </div>
+        <div style="color:#a5d6ff;line-height:1.7;font-size:11px;">
+          线程: <code>T3</code> (waiting)<br>
+          segment: <code>_a</code> (pending)<br>
+          numDocsInRAM: <code>16800</code><br>
+          ramUsedBytes: <code>52 MiB</code><br>
+          lastSeqNo: <code>42820</code>
+        </div>
+        <div style="margin-top:8px;height:5px;background:#21262d;border-radius:3px;overflow:hidden;">
+          <div style="width:81%;height:100%;background:#f85149;"></div>
+        </div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #8b949e;border-radius:10px;padding:14px;opacity:0.5;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <div style="color:#8b949e;font-weight:700;font-size:13px;">DWPT-4</div>
+          <div style="color:#8b949e;font-size:10px;background:rgba(139,148,158,.15);padding:2px 8px;border-radius:10px;">idle</div>
+        </div>
+        <div style="color:#8b949e;line-height:1.7;font-size:11px;">
+          线程: <code>(未绑定)</code><br>
+          segment: <code>—</code><br>
+          numDocsInRAM: <code>0</code><br>
+          ramUsedBytes: <code>0</code>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<h3>线程绑定策略:DocumentsWriterPerThreadPool</h3>
+
+<table>
+  <thead>
+    <tr><th>策略</th><th>描述</th><th>优势</th><th>劣势</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>thread sticky(默认)</td><td>同一 Java 线程粘连同一 DWPT</td><td>cache 友好、无切换开销</td><td>DWPT 数 ≈ 写线程数,可能膨胀</td></tr>
+    <tr><td>round-robin</td><td>轮转分配</td><td>负载均衡好</td><td>失去 cache locality</td></tr>
+    <tr><td>least-loaded</td><td>挑选 RAM 最小的</td><td>单 DWPT 不会突然胀大</td><td>调度开销略高</td></tr>
+  </tbody>
+</table>
+
+<h3>StallControl:全局背压机制</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 6-9 · StallControl 状态机</div>
+  <svg viewBox="0 0 1200 360" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 起始 -->
+    <circle cx="100" cy="180" r="14" fill="#0d1117" stroke="#58a6ff" stroke-width="2"/>
+    <circle cx="100" cy="180" r="6"  fill="#58a6ff"/>
+    <text x="100" y="215" text-anchor="middle" fill="#a5d6ff" font-size="11">[*]</text>
+
+    <!-- Healthy -->
+    <rect x="220" y="120" width="280" height="120" rx="14" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.6"/>
+    <text x="360" y="155" text-anchor="middle" fill="#9be7b3" font-size="15" font-weight="700">Healthy</text>
+    <text x="360" y="180" text-anchor="middle" fill="#a5d6ff" font-size="11">累计 RAM ≤ 全局限额 (256 MiB)</text>
+    <text x="360" y="200" text-anchor="middle" fill="#a5d6ff" font-size="11">所有 DWPT.borrow 直接返回</text>
+    <text x="360" y="220" text-anchor="middle" fill="#8b949e" font-size="11">add 路径无阻塞</text>
+
+    <!-- Stalled -->
+    <rect x="700" y="120" width="280" height="120" rx="14" fill="url(#g-red)" stroke="#f85149" stroke-width="1.6"/>
+    <text x="840" y="155" text-anchor="middle" fill="#ffadad" font-size="15" font-weight="700">Stalled</text>
+    <text x="840" y="180" text-anchor="middle" fill="#a5d6ff" font-size="11">累计 RAM &gt; 全局限额</text>
+    <text x="840" y="200" text-anchor="middle" fill="#a5d6ff" font-size="11">DWPT.borrow 阻塞 (numWaiting++)</text>
+    <text x="840" y="220" text-anchor="middle" fill="#8b949e" font-size="11">stalledCondition.await()</text>
+
+    <!-- 终态注释 -->
+    <rect x="1010" y="140" width="170" height="80" rx="10" fill="rgba(248,81,73,0.08)" stroke="#f85149" stroke-width="1" stroke-dasharray="4 3"/>
+    <text x="1095" y="165" text-anchor="middle" fill="#f85149" font-size="11" font-weight="700">note · Stalled</text>
+    <text x="1095" y="184" text-anchor="middle" fill="#a5d6ff" font-size="10">所有 add 阻塞</text>
+    <text x="1095" y="200" text-anchor="middle" fill="#a5d6ff" font-size="10">直到 flush 队列清空</text>
+    <text x="1095" y="216" text-anchor="middle" fill="#8b949e" font-size="10">signalAll() → 唤醒</text>
+
+    <!-- 箭头与转移条件 -->
+    <g fill="none">
+      <line x1="118" y1="180" x2="218" y2="180" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+
+      <path d="M500,160 Q600,90 700,160" stroke="#f85149" stroke-width="1.6" marker-end="url(#arr-r)"/>
+      <text x="600" y="105" text-anchor="middle" fill="#f85149" font-size="12" font-weight="700">RAM &gt; limit · 触发 stall</text>
+
+      <path d="M700,200 Q600,275 500,200" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+      <text x="600" y="290" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="700">flush 完成 · RAM 释放 · signalAll</text>
+
+      <!-- self-loops -->
+      <path d="M270,120 Q230,70 320,80 Q370,85 360,120" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="320" y="55" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="700">正常 add</text>
+
+      <path d="M770,120 Q740,70 820,75 Q870,80 870,120" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+      <text x="830" y="55" text-anchor="middle" fill="#f85149" font-size="11" font-weight="700">后续线程继续 wait</text>
+    </g>
+  </svg>
+</div>
+
+<pre><code class="language-java">// DocumentsWriterStallControl 的核心
+private boolean stalled;
+private int numWaiting;
+private final ReentrantLock lock = new ReentrantLock();
+private final Condition stalledCondition = lock.newCondition();
+
+public void waitIfStalled() {
+    if (stalled) {
+        lock.lock();
+        try {
+            while (stalled) {
+                numWaiting++;
+                try {
+                    stalledCondition.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } finally {
+                    numWaiting--;
+                }
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+}
+
+public void updateStalled(boolean stalled) {
+    if (this.stalled != stalled) {
+        lock.lock();
+        try {
+            this.stalled = stalled;
+            if (!stalled) stalledCondition.signalAll();
+        } finally {
+            lock.unlock();
+        }
+    }
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s6-8">6.8 DeleteQueue 与 update 实现</h2>
+<!-- ============================================================ -->
+
+<p>"删除"在 Lucene 是一种<strong>延迟操作</strong>:<code>writer.deleteDocuments(term)</code> 不会立刻去 segment 文件里改任何东西,而是把删除项放进一个全局的 <code>DocumentsWriterDeleteQueue</code>,等到 flush 或 commit 时才<strong>广播</strong>到所有 in-flight DWPT 和已落盘的 segment。<code>updateDocument(term, doc)</code> 是 <code>delete + add</code> 的原子组合,但内部顺序是"先记录 delete term,后追加 doc",这样新 doc 不会被自己刚记录的 delete 误删。</p>
+
+<h3>DeleteQueue 的链表结构</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 6-10 · DeleteQueue 全局链表 + 每 DWPT 的 DeleteSlice</div>
+  <svg viewBox="0 0 1200 460" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 4 个节点链表 -->
+    <g>
+      <rect x="40"   y="170" width="200" height="90" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+      <text x="140"  y="198" text-anchor="middle" fill="#cfe9ff" font-size="12" font-weight="700">Node #1001</text>
+      <text x="140"  y="218" text-anchor="middle" fill="#a5d6ff" font-size="11">term=orderId:O1</text>
+      <text x="140"  y="236" text-anchor="middle" fill="#a5d6ff" font-size="11">type=Term · seqNo=1001</text>
+      <text x="140"  y="252" text-anchor="middle" fill="#8b949e" font-size="10">即将被 GC (head 已过)</text>
+
+      <rect x="290"  y="170" width="200" height="90" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="390"  y="198" text-anchor="middle" fill="#e6d3ff" font-size="12" font-weight="700">Node #1002</text>
+      <text x="390"  y="218" text-anchor="middle" fill="#a5d6ff" font-size="11">term=orderId:O2</text>
+      <text x="390"  y="236" text-anchor="middle" fill="#a5d6ff" font-size="11">type=Term · seqNo=1002</text>
+
+      <rect x="540"  y="170" width="200" height="90" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="640"  y="198" text-anchor="middle" fill="#ffd591" font-size="12" font-weight="700">Node #1003</text>
+      <text x="640"  y="218" text-anchor="middle" fill="#a5d6ff" font-size="11">query status:CANCELLED</text>
+      <text x="640"  y="236" text-anchor="middle" fill="#a5d6ff" font-size="11">type=Query · seqNo=1003</text>
+
+      <rect x="790"  y="170" width="200" height="90" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+      <text x="890"  y="198" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">Node #1004 (tail)</text>
+      <text x="890"  y="218" text-anchor="middle" fill="#a5d6ff" font-size="11">term=orderId:O3</text>
+      <text x="890"  y="236" text-anchor="middle" fill="#a5d6ff" font-size="11">type=Term · seqNo=1004</text>
+      <text x="890"  y="252" text-anchor="middle" fill="#9be7b3" font-size="10">queue.tail (volatile)</text>
+    </g>
+
+    <!-- 节点 next 指针 -->
+    <g fill="none" stroke="#8b949e" stroke-width="1.4">
+      <line x1="240" y1="215" x2="288" y2="215" marker-end="url(#arr)"/>
+      <line x1="490" y1="215" x2="538" y2="215" marker-end="url(#arr)"/>
+      <line x1="740" y1="215" x2="788" y2="215" marker-end="url(#arr)"/>
+    </g>
+
+    <!-- queue.tail 标识 (顶部 → Node #1004) -->
+    <rect x="1030" y="40" width="150" height="50" rx="10" fill="rgba(63,185,80,0.12)" stroke="#3fb950" stroke-width="1.4"/>
+    <text x="1105" y="62" text-anchor="middle" fill="#9be7b3" font-size="12" font-weight="700">queue.tail</text>
+    <text x="1105" y="80" text-anchor="middle" fill="#8b949e" font-size="10">volatile · 全局推进</text>
+    <line x1="1030" y1="65" x2="990" y2="180" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#arr-g)"/>
+
+    <!-- DWPT slice 行 -->
+    <g>
+      <rect x="40"   y="320" width="280" height="100" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="180"  y="348" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">DWPT-0 deleteSlice</text>
+      <text x="180"  y="370" text-anchor="middle" fill="#a5d6ff" font-size="11">head → #1001 · tail → #1004</text>
+      <text x="180"  y="388" text-anchor="middle" fill="#a5d6ff" font-size="11">读取范围: 1001 ... 1004 (4 项)</text>
+      <text x="180"  y="406" text-anchor="middle" fill="#8b949e" font-size="10">flush 时全部进 BufferedUpdates</text>
+
+      <rect x="540"  y="320" width="280" height="100" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="680"  y="348" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">DWPT-1 deleteSlice</text>
+      <text x="680"  y="370" text-anchor="middle" fill="#a5d6ff" font-size="11">head → #1003 · tail → #1004</text>
+      <text x="680"  y="388" text-anchor="middle" fill="#a5d6ff" font-size="11">读取范围: 1003 ... 1004 (2 项)</text>
+      <text x="680"  y="406" text-anchor="middle" fill="#8b949e" font-size="10">已跳过 1001/1002 (新建 DWPT)</text>
+
+      <rect x="900"  y="320" width="280" height="100" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="1.5"/>
+      <text x="1040" y="348" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">GC 触发条件</text>
+      <text x="1040" y="370" text-anchor="middle" fill="#a5d6ff" font-size="11">所有 DWPT slice 都已读过</text>
+      <text x="1040" y="388" text-anchor="middle" fill="#a5d6ff" font-size="11">→ queue.head 推进 → 节点出队</text>
+      <text x="1040" y="406" text-anchor="middle" fill="#8b949e" font-size="10">无 DWPT 持有 → JVM 可回收</text>
+    </g>
+
+    <!-- DWPT → 起点节点的虚线 -->
+    <g fill="none" stroke-dasharray="6 4">
+      <line x1="180" y1="320" x2="140" y2="262" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <line x1="680" y1="320" x2="640" y2="262" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    </g>
+
+    <text x="600" y="30" text-anchor="middle" fill="#39d2c0" font-size="13" font-weight="700">单链表 + 每 DWPT 持 [head, tail] 范围 — 节点全部被消费才能 GC</text>
+  </svg>
+</div>
+
+<h3>DeleteSlice 的工作机制</h3>
+
+<p>每个 DWPT 持有一个 <code>DeleteSlice</code>,记录"我已经看到了 queue 的哪个节点"。当 DWPT 处理新文档时:</p>
+
+<ol>
+  <li>读 queue 当前 tail(volatile read)→ 与自己的 slice.tail 对比</li>
+  <li>若 queue 推进了 → 把新节点(delete term/query)累加到 DWPT 私有的 <code>BufferedUpdates</code></li>
+  <li>flush 该 DWPT 时,<code>BufferedUpdates</code> 跟着 segment 一起持久化为 <code>.del</code> 文件</li>
+  <li>所有 DWPT slice 都读过的节点 → queue head 推进 → 旧节点可被 GC</li>
+</ol>
+
+<h3>updateDocument 内部时序</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 6-11 · updateDocument 的 delete + add 原子时序</div>
+  <svg viewBox="0 0 1200 540" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 5 lane -->
+    <g font-size="13" font-weight="700" text-anchor="middle">
+      <rect x="40"   y="20" width="140" height="40" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="1.5"/>
+      <text x="110"  y="46" fill="#cfe9ff">App</text>
+
+      <rect x="240"  y="20" width="160" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="320"  y="46" fill="#e6d3ff">IndexWriter</text>
+
+      <rect x="460"  y="20" width="160" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="540"  y="46" fill="#ffd591">DeleteQueue</text>
+
+      <rect x="680"  y="20" width="180" height="40" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="1.5"/>
+      <text x="770"  y="46" fill="#9be7b3">当前 DWPT</text>
+
+      <rect x="920"  y="20" width="240" height="40" rx="8" fill="url(#g-red)"    stroke="#f85149" stroke-width="1.5"/>
+      <text x="1040" y="46" fill="#ffadad">其他 in-flight DWPT</text>
+    </g>
+    <!-- lifeline -->
+    <g stroke="#30363d" stroke-dasharray="4 4" stroke-width="1">
+      <line x1="110"  y1="60" x2="110"  y2="510"/>
+      <line x1="320"  y1="60" x2="320"  y2="510"/>
+      <line x1="540"  y1="60" x2="540"  y2="510"/>
+      <line x1="770"  y1="60" x2="770"  y2="510"/>
+      <line x1="1040" y1="60" x2="1040" y2="510"/>
+    </g>
+    <g font-size="12" fill="#a5d6ff">
+      <line x1="110" y1="100" x2="316" y2="100" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <text x="213" y="92" text-anchor="middle">① updateDocument(orderId:O1001, newDoc)</text>
+
+      <line x1="320" y1="140" x2="536" y2="140" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <text x="428" y="132" text-anchor="middle">② addDelete(term=orderId:O1001)</text>
+
+      <!-- Note over DQ -->
+      <rect x="450" y="160" width="180" height="32" rx="6" fill="rgba(210,153,34,0.12)" stroke="#d29922" stroke-width="1" stroke-dasharray="3 2"/>
+      <text x="540" y="180" text-anchor="middle" fill="#ffd591" font-size="11">Note · 节点写入 tail (volatile)</text>
+
+      <line x1="540" y1="220" x2="324" y2="220" stroke="#d29922" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr-o)"/>
+      <text x="432" y="212" text-anchor="middle">③ ⟵ seqNo=N</text>
+
+      <line x1="320" y1="260" x2="766" y2="260" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <text x="543" y="252" text-anchor="middle">④ 同 seqNo 上下文 add(newDoc)</text>
+
+      <path d="M770,290 h60 v20 h-60" fill="none" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="838" y="305" fill="#9be7b3">⑤ invert 新 doc (orderId:O1001)</text>
+
+      <line x1="770" y1="340" x2="544" y2="340" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+      <text x="657" y="332" text-anchor="middle">⑥ peekTail → 自己 slice 推进</text>
+
+      <!-- Note over DWPT -->
+      <rect x="660" y="358" width="240" height="50" rx="6" fill="rgba(63,185,80,0.10)" stroke="#3fb950" stroke-width="1" stroke-dasharray="3 2"/>
+      <text x="780" y="376" text-anchor="middle" fill="#9be7b3" font-size="11">Note · 自己刚 add 的 doc 不在</text>
+      <text x="780" y="392" text-anchor="middle" fill="#9be7b3" font-size="11">deleteSlice 范围内 → 不会自删</text>
+
+      <line x1="1040" y1="430" x2="544" y2="430" stroke="#f85149" stroke-width="1.6" marker-end="url(#arr-r)"/>
+      <text x="792" y="422" text-anchor="middle">⑦ peekTail → 看到 delete term</text>
+
+      <path d="M1040,460 h-70 v20 h70" fill="none" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+      <text x="965" y="475" text-anchor="end" fill="#ffadad">⑧ 旧 orderId:O1001 → BufferedUpdates</text>
+    </g>
+  </svg>
+</div>
+
+<h3>为什么 updateDocument 不是简单的 delete+add</h3>
+
+<table>
+  <thead>
+    <tr><th>方案</th><th>语义</th><th>问题</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>纯 delete + add(两次调用)</td><td>用户分两步</td><td>NRT 时刻可能看到"既无旧也无新"的中间态</td></tr>
+    <tr><td>同步全局锁的 delete+add</td><td>原子但单线程</td><td>吞吐崩塌</td></tr>
+    <tr><td>DeleteQueue 异步广播(实际)</td><td>delete 在 add 之前 enqueue</td><td>需要 slice 隔离防止"自杀"</td></tr>
+  </tbody>
+</table>
+
+<pre><code class="language-java">// IndexWriter.updateDocuments 简化
+private long updateDocuments(final DocumentsWriterDeleteQueue.Node&lt;?&gt; delNode,
+                              Iterable&lt;? extends Iterable&lt;? extends IndexableField&gt;&gt; docs)
+        throws IOException {
+    ensureOpen();
+    boolean success = false;
+    try {
+        long seqNo = docWriter.updateDocuments(docs, delNode);
+        success = true;
+        return seqNo;
+    } finally {
+        if (!success) {
+            maybeCloseOnTragicEvent();
+        }
+    }
+}
+
+// DocumentsWriter.updateDocuments
+long updateDocuments(Iterable&lt;? extends Iterable&lt;? extends IndexableField&gt;&gt; docs,
+                     DeleteQueue.Node&lt;?&gt; delNode) throws IOException {
+    boolean hasEvents = preUpdate();
+
+    final ThreadState perThread = perThreadPool.getAndLock();
+    long seqNo;
+    try {
+        ensureInitialized(perThread);
+        DWPT dwpt = perThread.dwpt;
+        try {
+            seqNo = dwpt.updateDocuments(docs, delNode, flushNotifications);
+        } finally {
+            if (dwpt.isAborted()) {
+                flushControl.doOnAbort(dwpt);
+            }
+        }
+    } finally {
+        perThread.unlock();
+    }
+    if (postUpdate(null, hasEvents)) maybeFlush();
+    return seqNo;
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s6-9">6.9 flushSegment 的全过程</h2>
+<!-- ============================================================ -->
+
+<p>flushSegment 是把 DWPT 的 RAM 形态<strong>物化</strong>为磁盘 segment 的过程。整个过程涉及 8 步,每步都对应至少一个 Codec 写器,每个写器输出一组特定后缀的文件。flush 完成后,该 DWPT 的所有 RAM 缓冲被释放,新生成的段加入 SegmentInfos 但<strong>尚未 commit</strong>——重启后会被 IndexFileDeleter 清理。</p>
+
+<h3>flushSegment 八步</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 6-12 · flushSegment 八步全过程</div>
+  <svg viewBox="0 0 1200 760" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 触发 -->
+    <rect x="430" y="20" width="340" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="600" y="48" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">flush 触发</text>
+    <text x="600" y="68" text-anchor="middle" fill="#a5d6ff" font-size="11">RAM 满 / commit / close / forceFlush</text>
+
+    <!-- 8 步纵向 -->
+    <g>
+      <rect x="80"  y="120" width="500" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="100" y="148" fill="#e6d3ff" font-size="13" font-weight="700">① seal DWPT</text>
+      <text x="100" y="168" fill="#a5d6ff" font-size="11">markFlushReady · 后续 add 走新 DWPT (无锁切换)</text>
+
+      <rect x="620" y="120" width="500" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="640" y="148" fill="#e6d3ff" font-size="13" font-weight="700">② 应用 BufferedUpdates</text>
+      <text x="640" y="168" fill="#a5d6ff" font-size="11">把 delete term/query 序列化进 .liv (LiveDocs)</text>
+
+      <rect x="80"  y="200" width="500" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="100" y="228" fill="#ffd591" font-size="13" font-weight="700">③ 写 postings · FreqProxTermsWriter.flush</text>
+      <text x="100" y="248" fill="#a5d6ff" font-size="11">.tim / .tip / .doc / .pos / .pay  (BlockTree term dict)</text>
+
+      <rect x="620" y="200" width="500" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="640" y="228" fill="#ffd591" font-size="13" font-weight="700">④ 写 stored fields · StoredFieldsConsumer.flush</text>
+      <text x="640" y="248" fill="#a5d6ff" font-size="11">.fdt / .fdx / .fdm  (LZ4 chunk · 16 KiB / chunk)</text>
+
+      <rect x="80"  y="280" width="500" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+      <text x="100" y="308" fill="#9be7b3" font-size="13" font-weight="700">⑤ 写 DocValues · DocValuesWriter.flush</text>
+      <text x="100" y="328" fill="#a5d6ff" font-size="11">.dvd / .dvm  (PackedLongValues · BytesRefArray)</text>
+
+      <rect x="620" y="280" width="500" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+      <text x="640" y="308" fill="#9be7b3" font-size="13" font-weight="700">⑥ 写 Points · PointValuesWriter.flush</text>
+      <text x="640" y="328" fill="#a5d6ff" font-size="11">.kdd / .kdi / .kdm  (BKD 多级树排序)</text>
+
+      <rect x="80"  y="360" width="500" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+      <text x="100" y="388" fill="#9be7b3" font-size="13" font-weight="700">⑦ 写 Norms / Vectors / FieldInfos</text>
+      <text x="100" y="408" fill="#a5d6ff" font-size="11">.nvd / .nvm / .vec / .vex / .vem / .fnm</text>
+
+      <rect x="620" y="360" width="500" height="60" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="1.5"/>
+      <text x="640" y="388" fill="#ffadad" font-size="13" font-weight="700">⑧ 写 .si + 加入 SegmentInfos</text>
+      <text x="640" y="408" fill="#a5d6ff" font-size="11">IndexFileDeleter.incRef · pending segment</text>
+    </g>
+
+    <!-- 完成 -->
+    <rect x="370" y="460" width="460" height="80" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="600" y="488" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">pending segment 列表更新</text>
+    <text x="600" y="508" text-anchor="middle" fill="#a5d6ff" font-size="11">(尚未持久化为 segments_N · NRT 内存可见)</text>
+    <text x="600" y="526" text-anchor="middle" fill="#8b949e" font-size="11">DirectoryReader.open(dir) 看不到 · open(writer) 可见</text>
+
+    <!-- 箭头 -->
+    <g fill="none">
+      <line x1="430" y1="80"  x2="330" y2="118" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <line x1="770" y1="80"  x2="870" y2="118" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+
+      <line x1="580" y1="150" x2="618" y2="150" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <line x1="870" y1="180" x2="330" y2="200" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+      <line x1="580" y1="230" x2="618" y2="230" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+      <line x1="870" y1="260" x2="330" y2="280" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <line x1="580" y1="310" x2="618" y2="310" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <line x1="870" y1="340" x2="330" y2="360" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <line x1="580" y1="390" x2="618" y2="390" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+
+      <line x1="870" y1="420" x2="600" y2="458" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+    </g>
+
+    <!-- 文件输出 sidebar -->
+    <g>
+      <rect x="40" y="600" width="1120" height="140" rx="10" fill="rgba(57,210,192,0.04)" stroke="#39d2c0" stroke-width="1" stroke-dasharray="6 4"/>
+      <text x="60" y="625" fill="#39d2c0" font-size="13" font-weight="700">flush 输出的物理文件 (单 segment _N)</text>
+      <text x="60" y="650" fill="#a5d6ff" font-size="11">postings:  _N_Lucene90_0.tim · .tip · .doc · .pos · .pay         stored:  _N.fdt · .fdx · .fdm</text>
+      <text x="60" y="670" fill="#a5d6ff" font-size="11">DV:        _N_Lucene90_0.dvd · .dvm                              points:  _N.kdd · .kdi · .kdm</text>
+      <text x="60" y="690" fill="#a5d6ff" font-size="11">norms:     _N.nvd · .nvm                                         vector:  _N.vec · .vex · .vem</text>
+      <text x="60" y="712" fill="#8b949e" font-size="11">meta:      _N.si (segment info) · _N.fnm (FieldInfos) · _N_*.liv (LiveDocs · 删除位图)</text>
+      <text x="60" y="732" fill="#f85149" font-size="11" font-weight="700">⚠ 此时 segments_N 仍只引用之前的 segment · 进程崩溃 → IndexFileDeleter 清理 orphan</text>
+    </g>
+  </svg>
+</div>
+
+<h3>每步的输入输出</h3>
+
+<table>
+  <thead>
+    <tr><th>步</th><th>组件</th><th>输入(RAM)</th><th>输出(文件)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td>DWPT.markFlushReady</td><td>当前 PerField 集合</td><td>—</td></tr>
+    <tr><td>2</td><td>BufferedUpdates.serialize</td><td>delete term/query</td><td>(进入 segment 的 .del / .liv)</td></tr>
+    <tr><td>3</td><td>Lucene90PostingsFormat</td><td>BytesRefHash + ByteBlockPool</td><td>.tim .tip .doc .pos .pay</td></tr>
+    <tr><td>4</td><td>Lucene90StoredFieldsFormat</td><td>chunk buffer + LZ4</td><td>.fdt .fdx .fdm</td></tr>
+    <tr><td>5</td><td>Lucene90DocValuesFormat</td><td>PackedLongValues / BytesRefArray</td><td>.dvd .dvm</td></tr>
+    <tr><td>6</td><td>Lucene90PointsFormat</td><td>BKDWriter(排序 + 多级树)</td><td>.kdd .kdi .kdm</td></tr>
+    <tr><td>7</td><td>Lucene90NormsFormat / Vectors</td><td>SmallFloat / HNSW graph</td><td>.nvd .nvm .vec .vex</td></tr>
+    <tr><td>8</td><td>SegmentInfos.add</td><td>SegmentInfo</td><td>.si</td></tr>
+  </tbody>
+</table>
+
+<h3>flush 后磁盘目录的样子</h3>
+
+<pre><code class="language-text">flush 后(尚未 commit)的目录:
+
+  /index/
+    write.lock
+    segments_42                  ← 上次 commit 点(只引用 _0)
+    _0.si _0.fnm
+    _0_Lucene90_0.tim _0_Lucene90_0.tip
+    _0_Lucene90_0.doc _0_Lucene90_0.pos
+    _0.fdt _0.fdx _0.fdm
+    _0_Lucene90_0.dvd _0_Lucene90_0.dvm
+    _0.kdd _0.kdi _0.kdm
+    _0.nvd _0.nvm
+
+    _1.si _1.fnm                 ← 新 flush(待 commit)
+    _1_Lucene90_0.tim _1_Lucene90_0.tip ...
+    _2.si _2.fnm                 ← 新 flush(待 commit)
+    _2_Lucene90_0.tim ...
+
+可见性规则:
+  • segments_42 仍然只列出 _0,_1 / _2 对外不可见
+  • DirectoryReader.open(dir) 会读 segments_42 → 看不到 _1 / _2
+  • DirectoryReader.open(writer) NRT 模式可看到内存中已 flush 的 _1 / _2
+  • 进程崩溃 → 重启时 IndexFileDeleter 删除 _1 / _2 (orphan files)</code></pre>
+
+<h3>flush 触发条件</h3>
+
+<table>
+  <thead>
+    <tr><th>触发源</th><th>判断条件</th><th>是 sync 还是 async</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>RAM 阈值</td><td><code>config.getRAMBufferSizeMB()</code> 累计超限</td><td>add 路径中触发 sync</td></tr>
+    <tr><td>doc 数阈值</td><td><code>maxBufferedDocs</code>(默认 disable)</td><td>sync</td></tr>
+    <tr><td>主动 commit</td><td>用户调 <code>writer.commit()</code></td><td>sync 阻塞 commit</td></tr>
+    <tr><td>主动 flush</td><td>用户调 <code>writer.flush()</code></td><td>sync</td></tr>
+    <tr><td>close</td><td>writer.close()</td><td>sync</td></tr>
+    <tr><td>合并需要</td><td>MergePolicy 选中正在 RAM 的 DWPT</td><td>async</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s6-10">6.10 commit 的两阶段</h2>
+<!-- ============================================================ -->
+
+<p>commit 是 Lucene 持久化语义的"分水岭":commit 之前的所有 flush 都<strong>不算数</strong>,进程崩溃重启后会被清理。commit 之后写出的 <code>segments_N</code> 文件是新的<strong>提交点</strong>,DirectoryReader 看到的就是这个文件指向的 segment 集合。两阶段协议保证 commit 是<strong>原子</strong>的:要么完全成功,要么完全失败,绝无"半成品 commit"。</p>
+
+<h3>commit 时序</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 6-13 · commit 两阶段协议</div>
+  <svg viewBox="0 0 1200 800" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 5 lane -->
+    <g font-size="13" font-weight="700" text-anchor="middle">
+      <rect x="40"   y="20" width="140" height="40" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="1.5"/>
+      <text x="110"  y="46" fill="#cfe9ff">App</text>
+
+      <rect x="240"  y="20" width="160" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="320"  y="46" fill="#e6d3ff">IndexWriter</text>
+
+      <rect x="460"  y="20" width="180" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="550"  y="46" fill="#e6d3ff">DocumentsWriter</text>
+
+      <rect x="700"  y="20" width="160" height="40" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="1.5"/>
+      <text x="780"  y="46" fill="#9be7b3">SegmentInfos</text>
+
+      <rect x="900"  y="20" width="240" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="1020" y="46" fill="#ffd591">FileSystem</text>
+    </g>
+    <g stroke="#30363d" stroke-dasharray="4 4" stroke-width="1">
+      <line x1="110"  y1="60" x2="110"  y2="780"/>
+      <line x1="320"  y1="60" x2="320"  y2="780"/>
+      <line x1="550"  y1="60" x2="550"  y2="780"/>
+      <line x1="780"  y1="60" x2="780"  y2="780"/>
+      <line x1="1020" y1="60" x2="1020" y2="780"/>
+    </g>
+
+    <!-- 阶段背景: 阶段一 80-380 / 阶段二 400-770 -->
+    <rect x="20" y="78" width="1170" height="304" rx="8" fill="rgba(58,131,255,0.04)" stroke="#58a6ff" stroke-width="1" stroke-dasharray="6 4"/>
+    <text x="40" y="100" fill="#58a6ff" font-size="13" font-weight="700">阶段一 · prepareCommit (写 pending_*.tmp)</text>
+
+    <rect x="20" y="394" width="1170" height="376" rx="8" fill="rgba(63,185,80,0.04)" stroke="#3fb950" stroke-width="1" stroke-dasharray="6 4"/>
+    <text x="40" y="416" fill="#3fb950" font-size="13" font-weight="700">阶段二 · finishCommit (rename + fsync · 原子可见性)</text>
+
+    <g font-size="12" fill="#a5d6ff">
+      <line x1="110" y1="125" x2="316" y2="125" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <text x="213" y="118" text-anchor="middle">① commit()</text>
+
+      <path d="M320,150 h60 v20 h-60" fill="none" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="392" y="165" fill="#e6d3ff">② prepareCommit() · 抢 commitLock</text>
+
+      <line x1="320" y1="195" x2="546" y2="195" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <text x="433" y="188" text-anchor="middle">③ doFlush(applyAllDeletes=true)</text>
+
+      <path d="M550,215 h60 v20 h-60" fill="none" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="620" y="230" fill="#e6d3ff">④ flush 所有 in-flight DWPT (产生 _N+1 ... _N+k)</text>
+
+      <line x1="550" y1="260" x2="776" y2="260" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <text x="663" y="252" text-anchor="middle">⑤ 加入新 SegmentCommitInfo</text>
+
+      <line x1="546" y1="295" x2="324" y2="295" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr-g)"/>
+      <text x="435" y="287" text-anchor="middle">⑥ ⟵ 完成</text>
+
+      <line x1="320" y1="325" x2="776" y2="325" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <text x="548" y="318" text-anchor="middle">⑦ 复制 SegmentInfos 快照 (lastGen=43)</text>
+
+      <line x1="320" y1="360" x2="1016" y2="360" stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+      <text x="668" y="352" text-anchor="middle">⑧ write pending_segments_43.tmp</text>
+
+      <!-- 阶段二 -->
+      <line x1="1016" y1="445" x2="324" y2="445" stroke="#d29922" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr-o)"/>
+      <text x="668" y="437" text-anchor="middle">⑨ ⟵ 写入完成</text>
+
+      <line x1="320" y1="480" x2="1016" y2="480" stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+      <text x="668" y="472" text-anchor="middle">⑩ fsync(pending_segments_43.tmp)</text>
+
+      <line x1="1016" y1="515" x2="324" y2="515" stroke="#d29922" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr-o)"/>
+      <text x="668" y="507" text-anchor="middle">⑪ ⟵ fsync 落盘</text>
+
+      <line x1="320" y1="555" x2="1016" y2="555" stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+      <text x="668" y="547" text-anchor="middle">⑫ rename pending_segments_43.tmp → segments_43</text>
+
+      <rect x="900" y="575" width="240" height="32" rx="6" fill="rgba(210,153,34,0.12)" stroke="#d29922" stroke-width="1" stroke-dasharray="3 2"/>
+      <text x="1020" y="595" text-anchor="middle" fill="#ffd591" font-size="11">Note · 原子 rename (POSIX 保证)</text>
+
+      <line x1="1016" y1="635" x2="324" y2="635" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr-g)"/>
+      <text x="668" y="627" text-anchor="middle">⑬ ⟵ rename 成功</text>
+
+      <line x1="320" y1="670" x2="1016" y2="670" stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+      <text x="668" y="662" text-anchor="middle">⑭ fsync(directory) — 目录元数据落盘</text>
+
+      <line x1="320" y1="710" x2="776" y2="710" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <text x="548" y="702" text-anchor="middle">⑮ 更新 lastCommitGeneration = 43</text>
+
+      <line x1="316" y1="750" x2="114" y2="750" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr-g)"/>
+      <text x="215" y="742" text-anchor="middle">⑯ ⟵ commit 成功</text>
+    </g>
+  </svg>
+</div>
+
+<h3>两阶段的可恢复性</h3>
+
+<table>
+  <thead>
+    <tr><th>阶段</th><th>动作</th><th>失败现象</th><th>重启后恢复</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>prepareCommit</td><td>flush + applyDeletes + 收集元数据</td><td>抛异常,IW 不进入 commit 状态</td><td>下次 commit 重做</td></tr>
+    <tr><td>写 pending_segments_N.tmp</td><td>临时文件</td><td>tmp 残留</td><td>下次 commit 覆盖</td></tr>
+    <tr><td>fsync(tmp)</td><td>fsync 临时文件</td><td>OS error</td><td>下次重试</td></tr>
+    <tr><td>rename → segments_N</td><td>原子 rename(POSIX)</td><td>rename 失败</td><td>tmp 残留,清理</td></tr>
+    <tr><td>fsync(directory)</td><td>目录元数据落盘</td><td>电源断电</td><td>POSIX 保证 rename 已生效</td></tr>
+    <tr><td>更新 commit generation</td><td>内存状态</td><td>—</td><td>下次启动从 segments_N 重读</td></tr>
+  </tbody>
+</table>
+
+<h3>commit 与 flush 的语义差别</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4>flush(进程崩溃丢失)</h4>
+    <ul style="margin:0;padding-left:18px;">
+      <li>把 RAM postings 物化为段文件</li>
+      <li>新段文件已写入磁盘</li>
+      <li>但 <strong>segments_N 还指向旧 segment</strong></li>
+      <li>NRT reader 通过 IndexWriter 引用可见</li>
+      <li>进程崩溃 → IndexFileDeleter 清理这些 orphan 段</li>
+      <li>用 <code>DirectoryReader.open(dir)</code>(无 writer)<strong>看不到</strong></li>
+    </ul>
+  </div>
+  <div class="compare-good">
+    <h4>commit(持久化)</h4>
+    <ul style="margin:0;padding-left:18px;">
+      <li>包含 prepareCommit 的所有动作</li>
+      <li>+ 写 pending_segments_N.tmp</li>
+      <li>+ fsync 临时文件</li>
+      <li>+ <strong>原子 rename → segments_N</strong></li>
+      <li>+ fsync 目录</li>
+      <li>进程崩溃可恢复 → <code>DirectoryReader.open(dir)</code> 能读到</li>
+    </ul>
+  </div>
+</div>
+
+<pre><code class="language-java">// IndexWriter.commit 简化
+public final long commit() throws IOException {
+    ensureOpen();
+    return commitInternal(config.getMergePolicy());
+}
+
+private long commitInternal(MergePolicy mp) throws IOException {
+    if (pendingCommit != null) {
+        throw new IllegalStateException("prepareCommit was already called");
+    }
+    long seqNo = prepareCommitInternal(); // 第一阶段:收集 + 写 pending_*.tmp
+    finishCommit();                        // 第二阶段:rename + fsync(dir)
+    return seqNo;
+}
+
+private void finishCommit() throws IOException {
+    boolean commitCompleted = false;
+    try {
+        synchronized (commitLock) {
+            ensureOpen(false);
+            if (tragedy.get() != null) {
+                throw new IllegalStateException("commit failed: tragedy", tragedy.get());
+            }
+            if (pendingCommit != null) {
+                pendingCommit.finishCommit(directory);   // rename pending → segments_N
+                lastCommitChangeCount = pendingCommitChangeCount;
+                segmentInfos.updateGeneration(pendingCommit);
+                deleter.checkpoint(pendingCommit, true); // 引用计数 + 可能 delete 旧 segments_N
+                pendingCommit = null;
+                commitCompleted = true;
+            }
+        }
+    } finally {
+        if (!commitCompleted) {
+            // 失败:清理 pending_segments_N.tmp
+            deleter.decRef(filesToCommit);
+        }
+    }
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s6-11">6.11 rollback 的语义</h2>
+<!-- ============================================================ -->
+
+<p><code>rollback()</code> 在 Lucene 里的语义比一般数据库的 rollback 要弱:它只能撤销"上次 commit 之后的所有 flushed segment + RAM 中未 flush 的内容",但<strong>对已经 commit 的数据无能为力</strong>。把它当作"放弃当前事务"而不是"撤销过去 5 分钟的写入",就不会用错。</p>
+
+<h3>rollback 影响范围</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 6-14 · commit / flush / rollback 三态时间线</div>
+  <pre style="background:#0d1117;border:none;margin:0;padding:14px;color:#a5d6ff;line-height:1.8;font-size:12px;">时间线:
+
+  t=0    commit()         → segments_42 持久化(包含 _0)
+  t=10   addDocument × 1k → DWPT-A RAM 累积 50 MiB
+  t=20   flush()          → _1 落盘(尚未 commit)
+  t=30   addDocument × 2k → DWPT-A RAM 再 30 MiB
+  t=40   flush()          → _2 落盘(尚未 commit)
+  t=50   addDocument × 500 → DWPT-A 还在 RAM(_3 候选)
+  t=60   rollback()
+         ↓
+         撤销范围: _1 / _2 物理删除,DWPT-A RAM 清空
+         保留:    segments_42 + _0(已 commit 的)
+         状态:    回到 t=0 时的视图
+
+  rollback 之后:
+    DirectoryReader.open(dir)   → 看到 _0(numDocs=1000)
+    writer.numRamDocs()          → 0
+    writer.numDocs()             → 1000(只剩 _0)
+
+  无法 rollback 的:
+    t=0 之前的 commit 历史(那是上一个 generation)
+    已经 fsync 但未 commit 的段(只能靠 IndexFileDeleter 物理删)</pre>
+</div>
+
+<h3>rollback 时序</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 6-15 · rollback 内部时序</div>
+  <svg viewBox="0 0 1200 540" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 5 lane -->
+    <g font-size="13" font-weight="700" text-anchor="middle">
+      <rect x="40"   y="20" width="140" height="40" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="1.5"/>
+      <text x="110"  y="46" fill="#cfe9ff">App</text>
+
+      <rect x="240"  y="20" width="160" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="320"  y="46" fill="#e6d3ff">IndexWriter</text>
+
+      <rect x="460"  y="20" width="180" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="550"  y="46" fill="#e6d3ff">DocumentsWriter</text>
+
+      <rect x="700"  y="20" width="160" height="40" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="1.5"/>
+      <text x="780"  y="46" fill="#9be7b3">SegmentInfos</text>
+
+      <rect x="900"  y="20" width="240" height="40" rx="8" fill="url(#g-red)"    stroke="#f85149" stroke-width="1.5"/>
+      <text x="1020" y="46" fill="#ffadad">IndexFileDeleter</text>
+    </g>
+    <g stroke="#30363d" stroke-dasharray="4 4" stroke-width="1">
+      <line x1="110"  y1="60" x2="110"  y2="510"/>
+      <line x1="320"  y1="60" x2="320"  y2="510"/>
+      <line x1="550"  y1="60" x2="550"  y2="510"/>
+      <line x1="780"  y1="60" x2="780"  y2="510"/>
+      <line x1="1020" y1="60" x2="1020" y2="510"/>
+    </g>
+    <g font-size="12" fill="#a5d6ff">
+      <line x1="110" y1="100" x2="316" y2="100" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <text x="213" y="92" text-anchor="middle">① rollback()</text>
+
+      <path d="M320,130 h60 v20 h-60" fill="none" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="392" y="145" fill="#e6d3ff">② ensureOpen() · 抢 commitLock</text>
+
+      <line x1="320" y1="180" x2="546" y2="180" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <text x="433" y="172" text-anchor="middle">③ abort()</text>
+
+      <path d="M550,200 h60 v20 h-60" fill="none" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="620" y="215" fill="#e6d3ff">④ 中止所有 DWPT · RAM 清空 · DeleteQueue 重置</text>
+
+      <line x1="546" y1="250" x2="324" y2="250" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr-g)"/>
+      <text x="435" y="242" text-anchor="middle">⑤ ⟵ 完成</text>
+
+      <line x1="320" y1="290" x2="776" y2="290" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <text x="548" y="282" text-anchor="middle">⑥ 重新加载上次 commit 的 SegmentInfos</text>
+
+      <line x1="320" y1="335" x2="1016" y2="335" stroke="#f85149" stroke-width="1.6" marker-end="url(#arr-r)"/>
+      <text x="668" y="327" text-anchor="middle">⑦ revertChanges()</text>
+
+      <path d="M1020,360 h70 v20 h-70" fill="none" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+      <text x="1098" y="375" fill="#ffadad">⑧ 引用计数减 · 删除 orphan 段文件 (_1, _2 ...)</text>
+
+      <line x1="1016" y1="410" x2="324" y2="410" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr-g)"/>
+      <text x="668" y="402" text-anchor="middle">⑨ ⟵ 清理完成</text>
+
+      <path d="M320,440 h60 v20 h-60" fill="none" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="392" y="455" fill="#e6d3ff">⑩ 重置内存状态 · pendingCommit=null · numDocsInRAM=0</text>
+
+      <line x1="316" y1="490" x2="114" y2="490" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr-g)"/>
+      <text x="215" y="482" text-anchor="middle">⑪ ⟵ rollback 完成 · 视图回到 lastGen</text>
+    </g>
+  </svg>
+</div>
+
+<div class="warning">
+  <strong>rollback 不能撤销已 commit 的数据</strong>。这是 Lucene 与 Postgres / MySQL 的本质区别——后者的 rollback 可以撤销整个事务,Lucene 的"事务"边界是<strong>两次 commit 之间</strong>。如果你 t=0 commit,t=10 commit,t=20 commit,t=30 想撤回 t=10 的写入,<strong>不可能</strong>。要做到这种"时间旅行",必须配合 <code>SnapshotDeletionPolicy</code>:每次 commit 时打一个 snapshot,需要回退时基于 snapshot 重新打开。生产里更常见的做法是在业务层做 soft delete + 版本号,而不是依赖 Lucene 的 rollback。
+</div>
+
+<table>
+  <thead>
+    <tr><th>需求</th><th>正确手段</th><th>错误手段</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>放弃当前未 commit 的写入</td><td><code>rollback()</code></td><td>—</td></tr>
+    <tr><td>回到 5 分钟前的状态</td><td>SnapshotDeletionPolicy + 重新 open</td><td><code>rollback()</code></td></tr>
+    <tr><td>撤销已 commit 的某条文档</td><td><code>deleteDocuments(term)</code> + commit</td><td><code>rollback()</code></td></tr>
+    <tr><td>清空索引</td><td><code>deleteAll()</code> + commit</td><td><code>rollback()</code></td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s6-12">6.12 异常处理</h2>
+<!-- ============================================================ -->
+
+<p>"写到一半 OOM 了怎么办?" "磁盘满了 IndexWriter 还能用吗?"——这些问题的答案在 Lucene 的 <strong>tragic event</strong> 机制里。Lucene 把异常分成两类:可恢复异常(IllegalArgument、字段格式错)和 tragic event(OOM、IO 错、Codec 损坏)。前者拒绝当前 doc 但 IndexWriter 还能用;后者直接把 IndexWriter 标记为<strong>不可继续</strong>,后续所有 add/update 都抛 <code>AlreadyClosedException</code>,你必须 close 重开。</p>
+
+<h3>异常分类与处理</h3>
+
+<table>
+  <thead>
+    <tr><th>异常类型</th><th>触发场景</th><th>IW 状态</th><th>恢复手段</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>IllegalArgumentException</td><td>字段类型不一致 / null term</td><td>仅当前 doc 失败</td><td>修正 doc 后重试</td></tr>
+    <tr><td>IndexFormatTooNewException</td><td>读不识别的 segment 版本</td><td>构造时即抛</td><td>升级 Lucene 版本</td></tr>
+    <tr><td>CorruptIndexException</td><td>Codec 校验失败</td><td>tragic event</td><td>close + CheckIndex 修复</td></tr>
+    <tr><td>OutOfMemoryError</td><td>RAM 分配失败</td><td>tragic event</td><td>close + 降低 RAMBufferSize</td></tr>
+    <tr><td>IOException(磁盘满)</td><td>flush 写文件失败</td><td>tragic event</td><td>close + 清磁盘 + 重开</td></tr>
+    <tr><td>VirtualMachineError</td><td>StackOverflow / OOM</td><td>tragic event</td><td>close + 重启 JVM</td></tr>
+    <tr><td>InterruptedException</td><td>线程被打断</td><td>不影响 IW</td><td>恢复线程状态</td></tr>
+  </tbody>
+</table>
+
+<h3>tragic event 状态机</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 6-16 · IndexWriter 的 tragedy 状态转换</div>
+  <svg viewBox="0 0 1200 460" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 起始 -->
+    <circle cx="60" cy="180" r="14" fill="#0d1117" stroke="#58a6ff" stroke-width="2"/>
+    <circle cx="60" cy="180" r="6"  fill="#58a6ff"/>
+    <text x="60" y="215" text-anchor="middle" fill="#a5d6ff" font-size="11">[*]</text>
+
+    <!-- Open -->
+    <rect x="160" y="120" width="240" height="120" rx="14" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.6"/>
+    <text x="280" y="155" text-anchor="middle" fill="#9be7b3" font-size="15" font-weight="700">Open</text>
+    <text x="280" y="180" text-anchor="middle" fill="#a5d6ff" font-size="11">tragedy = null</text>
+    <text x="280" y="200" text-anchor="middle" fill="#a5d6ff" font-size="11">add / update / commit OK</text>
+    <text x="280" y="220" text-anchor="middle" fill="#8b949e" font-size="11">写锁持有 · DWPT 池可用</text>
+
+    <!-- RecoverableFail -->
+    <rect x="160" y="320" width="240" height="100" rx="14" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.6"/>
+    <text x="280" y="352" text-anchor="middle" fill="#ffd591" font-size="14" font-weight="700">RecoverableFail</text>
+    <text x="280" y="375" text-anchor="middle" fill="#a5d6ff" font-size="11">字段格式错 · IllegalArgument</text>
+    <text x="280" y="392" text-anchor="middle" fill="#a5d6ff" font-size="11">仅当前 doc 失败</text>
+    <text x="280" y="408" text-anchor="middle" fill="#8b949e" font-size="11">IW 仍可继续 add</text>
+
+    <!-- Tragedy -->
+    <rect x="540" y="120" width="280" height="120" rx="14" fill="url(#g-red)" stroke="#f85149" stroke-width="1.6"/>
+    <text x="680" y="155" text-anchor="middle" fill="#ffadad" font-size="15" font-weight="700">Tragedy</text>
+    <text x="680" y="180" text-anchor="middle" fill="#a5d6ff" font-size="11">OOM · IO error · Codec 损坏</text>
+    <text x="680" y="200" text-anchor="middle" fill="#a5d6ff" font-size="11">tragedy.compareAndSet(null, e)</text>
+    <text x="680" y="220" text-anchor="middle" fill="#8b949e" font-size="11">后续 API → AlreadyClosedException</text>
+
+    <!-- Closed -->
+    <rect x="950" y="120" width="200" height="120" rx="14" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.6"/>
+    <text x="1050" y="155" text-anchor="middle" fill="#e6d3ff" font-size="15" font-weight="700">Closed</text>
+    <text x="1050" y="180" text-anchor="middle" fill="#a5d6ff" font-size="11">close() / rollbackInternal</text>
+    <text x="1050" y="200" text-anchor="middle" fill="#a5d6ff" font-size="11">写锁释放 · RAM 清空</text>
+
+    <!-- 终点 -->
+    <circle cx="1100" cy="380" r="14" fill="#0d1117" stroke="#bc8cff" stroke-width="2"/>
+    <circle cx="1100" cy="380" r="6"  fill="#bc8cff"/>
+    <text x="1100" y="415" text-anchor="middle" fill="#bc8cff" font-size="11">[*]</text>
+
+    <!-- 转移 -->
+    <g fill="none">
+      <line x1="78" y1="180" x2="158" y2="180" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <text x="118" y="170" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="700">new IndexWriter()</text>
+
+      <!-- Open self -->
+      <path d="M210,120 Q170,70 260,80 Q320,85 320,120" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="280" y="55" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="700">addDocument 成功</text>
+
+      <!-- Open ↔ RecoverableFail -->
+      <line x1="240" y1="240" x2="240" y2="318" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+      <text x="200" y="280" text-anchor="end" fill="#d29922" font-size="11" font-weight="700">字段错</text>
+      <line x1="320" y1="318" x2="320" y2="240" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="360" y="280" fill="#3fb950" font-size="11" font-weight="700">拒绝该 doc</text>
+
+      <!-- Open → Tragedy -->
+      <line x1="400" y1="180" x2="538" y2="180" stroke="#f85149" stroke-width="1.6" marker-end="url(#arr-r)"/>
+      <text x="469" y="170" text-anchor="middle" fill="#f85149" font-size="11" font-weight="700">OOM / IO error</text>
+
+      <!-- Tragedy self -->
+      <path d="M610,120 Q570,70 660,80 Q720,85 720,120" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+      <text x="680" y="55" text-anchor="middle" fill="#f85149" font-size="11" font-weight="700">后续 API 仍抛</text>
+
+      <!-- Tragedy → Closed -->
+      <line x1="820" y1="180" x2="948" y2="180" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <text x="884" y="170" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="700">close() 强制</text>
+
+      <!-- Open → Closed (主动) -->
+      <path d="M400,140 Q700,80 950,140" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="700" y="100" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="700">主动 close()</text>
+
+      <!-- Closed → end -->
+      <line x1="1080" y1="240" x2="1100" y2="362" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    </g>
+  </svg>
+</div>
+
+<h3>tragic event 的处理路径</h3>
+
+<pre><code class="language-java">// IndexWriter.maybeCloseOnTragicEvent 简化
+private void maybeCloseOnTragicEvent() throws IOException {
+    if (this.tragedy.get() != null && shouldClose(false)) {
+        rollbackInternal();   // 内部 rollback,不再持有 RAM
+    }
+}
+
+private void onTragicEvent(Throwable tragedy, String location) throws IOException {
+    if (this.tragedy.compareAndSet(null, tragedy)) {
+        infoStream.message("IW", "hit tragic " + tragedy.getClass().getSimpleName() +
+                                  " at " + location);
+    }
+    if (!(tragedy instanceof VirtualMachineError)) {
+        // VM error 不能继续做 IO 操作
+        maybeCloseOnTragicEvent();
+    }
+}
+
+// 用户侧:add 时如何感知
+try {
+    writer.addDocument(doc);
+} catch (AlreadyClosedException e) {
+    Throwable cause = writer.getTragicException();
+    log.error("IndexWriter is dead due to: ", cause);
+    writer.close();              // close 不会再 flush
+    writer = new IndexWriter(dir, cfg);  // 重新打开,自动 rollback 到 segments_N
+}</code></pre>
+
+<div class="real-world">
+  <strong>OOM 后 IndexWriter 状态自检 — 不能继续 addDocument 必须 close + 重开</strong>。生产中遇到 OOM 后最常见的错误是"我捕获了 OOM,继续重试 addDocument",结果发现仍然抛 <code>AlreadyClosedException</code>——这就是 tragic event 标记的作用。正确做法是:① 立即停止所有 addDocument 调用;② 调 <code>writer.close()</code>(此时不会 flush,只清理 RAM 和写锁);③ 排查是不是 RAMBufferSize 设得过大、并发写线程太多、单文档字段太长(text 字段超过 1 MiB 单 doc);④ 调整后用 <code>new IndexWriter(dir, cfg)</code> 重新打开,Lucene 会自动 rollback 到上次 commit 的 segments_N,孤儿文件由 IndexFileDeleter 清理。生产事故复盘时记得查 <code>writer.getTragicException()</code> 拿到原始 Throwable。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s6-13">6.13 性能调参</h2>
+<!-- ============================================================ -->
+
+<p>本章前面所有源码细节都是为了这一节的调参服务的。Lucene 9.x 的写入吞吐瓶颈不在某一个组件,而在多个旋钮的<strong>组合</strong>:RAM buffer 决定 flush 频率,maxBufferedDocs 决定 doc 数 ceiling,DWPT 数与写线程数协同决定并发度,合并策略决定后台 IO 占用。把这些旋钮放在一起看,才能调出一个稳定的写入剖面。</p>
+
+<h3>核心调参矩阵</h3>
+
+<table>
+  <thead>
+    <tr><th>参数</th><th>默认</th><th>推荐生产值</th><th>影响</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>RAMBufferSizeMB</code></td><td>16 MiB</td><td>64-512 MiB</td><td>大 buffer 减少 flush 频率;过大单次 flush 耗时长</td></tr>
+    <tr><td><code>maxBufferedDocs</code></td><td>DISABLE</td><td>保持 DISABLE</td><td>用 RAM 控制更稳定</td></tr>
+    <tr><td><code>maxThreadStates</code></td><td>8</td><td>≈ 写线程数(8-16)</td><td>太多 → segment 暴涨</td></tr>
+    <tr><td><code>useCompoundFile</code></td><td>true(段大时)</td><td>false</td><td>关掉减少 sync 开销</td></tr>
+    <tr><td><code>commitOnClose</code></td><td>true</td><td>视情况</td><td>true 关闭即 commit</td></tr>
+    <tr><td><code>iocConcurrency</code>(MMap)</td><td>—</td><td>—</td><td>flush IO 并发度</td></tr>
+    <tr><td><code>mergePolicy</code></td><td>TieredMergePolicy</td><td>保持默认</td><td>调 maxMergedSegmentMB(5 GiB) / maxMergeAtOnce(10)</td></tr>
+    <tr><td><code>mergeScheduler</code></td><td>Concurrent</td><td>设 IO throttle</td><td>限制后台 IO 抢占</td></tr>
+  </tbody>
+</table>
+
+<h3>瓶颈定位:看 InfoStream 找最慢环节</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 6-17 · 写入瓶颈分布(典型 SSD,英文文本字段)</div>
+  <svg viewBox="0 0 1200 540" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 中心 -->
+    <rect x="490" y="30" width="220" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="600" y="58" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">写入瓶颈分布</text>
+    <text x="600" y="78" text-anchor="middle" fill="#a5d6ff" font-size="11">典型 SSD · 英文文本字段</text>
+
+    <!-- 4 个一级分类 -->
+    <g>
+      <rect x="40"   y="160" width="240" height="80" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="160"  y="190" text-anchor="middle" fill="#ffd591" font-size="14" font-weight="700">① CPU 40-50%</text>
+      <text x="160"  y="210" text-anchor="middle" fill="#a5d6ff" font-size="11">Analyzer + 压缩 + 排序</text>
+      <text x="160"  y="228" text-anchor="middle" fill="#8b949e" font-size="11">最大瓶颈 · 单核饱和最先</text>
+
+      <rect x="320"  y="160" width="240" height="80" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="440"  y="190" text-anchor="middle" fill="#e6d3ff" font-size="14" font-weight="700">② 磁盘 IO 20-30%</text>
+      <text x="440"  y="210" text-anchor="middle" fill="#a5d6ff" font-size="11">flush + merge 读写</text>
+      <text x="440"  y="228" text-anchor="middle" fill="#8b949e" font-size="11">SSD 顺序优势明显</text>
+
+      <rect x="600"  y="160" width="240" height="80" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+      <text x="720"  y="190" text-anchor="middle" fill="#9be7b3" font-size="14" font-weight="700">③ 内存分配 10-15%</text>
+      <text x="720"  y="210" text-anchor="middle" fill="#a5d6ff" font-size="11">BytesRefHash + BlockPool</text>
+      <text x="720"  y="228" text-anchor="middle" fill="#8b949e" font-size="11">几何级扩容 · GC 友好</text>
+
+      <rect x="880"  y="160" width="240" height="80" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="1.5"/>
+      <text x="1000" y="190" text-anchor="middle" fill="#ffadad" font-size="14" font-weight="700">④ 锁竞争 5-10%</text>
+      <text x="1000" y="210" text-anchor="middle" fill="#a5d6ff" font-size="11">DWPT 借还 + SI 共享</text>
+      <text x="1000" y="228" text-anchor="middle" fill="#8b949e" font-size="11">绝大多数写路径无锁</text>
+    </g>
+
+    <!-- 二级细分: 每列 2-3 个子项 -->
+    <g font-size="11">
+      <rect x="40"   y="290" width="240" height="50" rx="8" fill="rgba(210,153,34,0.12)" stroke="#d29922" stroke-width="1"/>
+      <text x="160"  y="312" text-anchor="middle" fill="#ffd591" font-weight="700">Analyzer.tokenStream</text>
+      <text x="160"  y="328" text-anchor="middle" fill="#a5d6ff">Standard / Smart 中文</text>
+
+      <rect x="40"   y="350" width="240" height="50" rx="8" fill="rgba(210,153,34,0.12)" stroke="#d29922" stroke-width="1"/>
+      <text x="160"  y="372" text-anchor="middle" fill="#ffd591" font-weight="700">LZ4 压缩 stored / DV</text>
+      <text x="160"  y="388" text-anchor="middle" fill="#a5d6ff">chunk 16 KiB · 压缩 30%</text>
+
+      <rect x="40"   y="410" width="240" height="50" rx="8" fill="rgba(210,153,34,0.12)" stroke="#d29922" stroke-width="1"/>
+      <text x="160"  y="432" text-anchor="middle" fill="#ffd591" font-weight="700">BKD 排序 (Points)</text>
+      <text x="160"  y="448" text-anchor="middle" fill="#a5d6ff">多级树 · 排序后写</text>
+
+      <rect x="320"  y="290" width="240" height="50" rx="8" fill="rgba(188,140,255,0.12)" stroke="#bc8cff" stroke-width="1"/>
+      <text x="440"  y="312" text-anchor="middle" fill="#e6d3ff" font-weight="700">flush 顺序写</text>
+      <text x="440"  y="328" text-anchor="middle" fill="#a5d6ff">写满 buffer 一次性 sync</text>
+
+      <rect x="320"  y="350" width="240" height="50" rx="8" fill="rgba(188,140,255,0.12)" stroke="#bc8cff" stroke-width="1"/>
+      <text x="440"  y="372" text-anchor="middle" fill="#e6d3ff" font-weight="700">merge 读旧 + 写新</text>
+      <text x="440"  y="388" text-anchor="middle" fill="#a5d6ff">10× 段大小的 IO 放大</text>
+
+      <rect x="600"  y="290" width="240" height="50" rx="8" fill="rgba(63,185,80,0.12)" stroke="#3fb950" stroke-width="1"/>
+      <text x="720"  y="312" text-anchor="middle" fill="#9be7b3" font-weight="700">BytesRefHash 扩容</text>
+      <text x="720"  y="328" text-anchor="middle" fill="#a5d6ff">装载因子 0.5 → 双倍 + rehash</text>
+
+      <rect x="600"  y="350" width="240" height="50" rx="8" fill="rgba(63,185,80,0.12)" stroke="#3fb950" stroke-width="1"/>
+      <text x="720"  y="372" text-anchor="middle" fill="#9be7b3" font-weight="700">BlockPool 分配</text>
+      <text x="720"  y="388" text-anchor="middle" fill="#a5d6ff">32 KiB 一块 · 链式 slice</text>
+
+      <rect x="880"  y="290" width="240" height="50" rx="8" fill="rgba(248,81,73,0.12)" stroke="#f85149" stroke-width="1"/>
+      <text x="1000" y="312" text-anchor="middle" fill="#ffadad" font-weight="700">DWPT 借还</text>
+      <text x="1000" y="328" text-anchor="middle" fill="#a5d6ff">getAndLock(threadState)</text>
+
+      <rect x="880"  y="350" width="240" height="50" rx="8" fill="rgba(248,81,73,0.12)" stroke="#f85149" stroke-width="1"/>
+      <text x="1000" y="372" text-anchor="middle" fill="#ffadad" font-weight="700">SegmentInfos 共享</text>
+      <text x="1000" y="388" text-anchor="middle" fill="#a5d6ff">只在 commit / merge 时</text>
+    </g>
+
+    <!-- 箭头 -->
+    <g fill="none">
+      <line x1="540" y1="90"  x2="200" y2="158" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+      <line x1="580" y1="90"  x2="450" y2="158" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <line x1="620" y1="90"  x2="710" y2="158" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <line x1="660" y1="90"  x2="970" y2="158" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+
+      <line x1="160" y1="240" x2="160" y2="288" stroke="#d29922" stroke-width="1.4" marker-end="url(#arr-o)"/>
+      <line x1="440" y1="240" x2="440" y2="288" stroke="#bc8cff" stroke-width="1.4" marker-end="url(#arr-p)"/>
+      <line x1="720" y1="240" x2="720" y2="288" stroke="#3fb950" stroke-width="1.4" marker-end="url(#arr-g)"/>
+      <line x1="1000" y1="240" x2="1000" y2="288" stroke="#f85149" stroke-width="1.4" marker-end="url(#arr-r)"/>
+    </g>
+
+    <!-- 总结 -->
+    <text x="600" y="500" text-anchor="middle" fill="#39d2c0" font-size="13" font-weight="700">
+      → 90% 优化空间在 CPU + IO 这两栏: Analyzer 选型 / 字段裁剪 / 合并节奏 / RAMBuffer 调优
+    </text>
+  </svg>
+</div>
+
+<h3>调参动作清单</h3>
+
+<table>
+  <thead>
+    <tr><th>症状</th><th>诊断</th><th>调整</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>QPS 低 / CPU 不饱和</td><td>单线程写</td><td>多线程 + maxThreadStates 与之对齐</td></tr>
+    <tr><td>QPS 抖动 / P99 跳跃</td><td>flush 太频繁</td><td>提高 RAMBufferSizeMB</td></tr>
+    <tr><td>commit 耗时长(秒级)</td><td>RAM 太大,单次 flush 太重</td><td>降低 RAMBuffer 或异步 flush</td></tr>
+    <tr><td>merge 抢资源 / 查询慢</td><td>合并并发太高</td><td>ConcurrentMergeScheduler.setMaxMergesAndThreads</td></tr>
+    <tr><td>OOM</td><td>RAM 设置过激 + 大字段</td><td>降 RAMBuffer,审视字段裁剪</td></tr>
+    <tr><td>段数暴涨</td><td>DWPT 多 + 合并跟不上</td><td>调 maxMergeAtOnce 与 floorSegmentMB</td></tr>
+    <tr><td>调优盲目</td><td>无 InfoStream</td><td>开 InfoStream → System.out 或文件</td></tr>
+  </tbody>
+</table>
+
+<h3>InfoStream 配置</h3>
+
+<pre><code class="language-java">IndexWriterConfig cfg = new IndexWriterConfig(analyzer);
+
+PrintStreamInfoStream is = new PrintStreamInfoStream(
+    new PrintStream(Files.newOutputStream(Path.of("lucene-info.log"),
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND)));
+cfg.setInfoStream(is);
+
+cfg.setRAMBufferSizeMB(256);
+cfg.setMergePolicy(new TieredMergePolicy()
+    .setMaxMergedSegmentMB(5_000)
+    .setSegmentsPerTier(10)
+    .setMaxMergeAtOnce(10));
+
+ConcurrentMergeScheduler ms = new ConcurrentMergeScheduler();
+ms.setMaxMergesAndThreads(4, 1);  // SSD 上 1 线程 4 同时合并 OK
+ms.disableAutoIOThrottle();
+cfg.setMergeScheduler(ms);</code></pre>
+
+<pre><code class="language-text">lucene-info.log 关键条目:
+
+[InfoStream] DW: anyChanges; DWPT: ramBytesUsed=53,418,240
+[InfoStream] DW: applyAllDeletes
+[InfoStream] DWPT: flush postings as segment _8 numDocs=12480
+[InfoStream] DWPT: new segment has 0 deleted docs
+[InfoStream] IW: 218 ms to flush
+[InfoStream] CMS: now merge maxNumSegments=-1 maxMergeAtOnce=10
+[InfoStream] CMS: queueMerge merge size=2.4 GB
+[InfoStream] IW: commit: start
+[InfoStream] IW: commit: pendingCommit != null
+[InfoStream] IW: 38 ms to commit</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s6-14">6.14 源码阅读路径</h2>
+<!-- ============================================================ -->
+
+<p>把这一章在 IDE 里跟一遍,需要在 8 个关键位置打断点。下面这条阅读路径覆盖 add → flush → commit 的全部关键节点,跟一次 <code>writer.addDocument(doc); writer.commit();</code> 就能把本章描述的 7 层调用栈、5 条字段路径、8 步 flush、2 阶段 commit 全部走通。</p>
+
+<h3>断点矩阵(v9.10 源码)</h3>
+
+<table>
+  <thead>
+    <tr><th>#</th><th>类</th><th>方法</th><th>看什么</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td><code>IndexWriter</code></td><td>updateDocuments</td><td>seqNo 分配 / tragedy 检查</td></tr>
+    <tr><td>2</td><td><code>DocumentsWriter</code></td><td>updateDocuments</td><td>DWPT 选择策略</td></tr>
+    <tr><td>3</td><td><code>DocumentsWriterPerThread</code></td><td>updateDocuments</td><td>per-thread 入口、deleteSlice</td></tr>
+    <tr><td>4</td><td><code>DefaultIndexingChain</code></td><td>processField</td><td>5 条路径分发</td></tr>
+    <tr><td>5</td><td><code>FreqProxTermsWriterPerField</code></td><td>newTerm / addTerm</td><td>BytesRefHash + ByteBlockPool 协作</td></tr>
+    <tr><td>6</td><td><code>DocumentsWriterFlushControl</code></td><td>flushPending / markForFullFlush</td><td>flush 触发判断</td></tr>
+    <tr><td>7</td><td><code>SegmentMerger</code></td><td>merge</td><td>(后台合并阶段)</td></tr>
+    <tr><td>8</td><td><code>SegmentInfos</code></td><td>commit / finishCommit</td><td>原子 rename + fsync</td></tr>
+  </tbody>
+</table>
+
+<h3>调用栈速查表</h3>
+
+<pre><code class="language-text">addDocument 一次调用的完整栈(自顶向下):
+
+IndexWriter.addDocument
+  → IndexWriter.updateDocuments(term=null, [doc])
+    → DocumentsWriter.updateDocuments
+      → DocumentsWriterPerThreadPool.getAndLock
+      → DocumentsWriterPerThread.updateDocuments
+        → DocumentsWriterPerThread.updateDocument
+          → DefaultIndexingChain.processDocument
+            → DefaultIndexingChain.processField
+              → invert path:
+                  PerField.invert
+                    → Analyzer.tokenStream
+                    → TermsHashPerField.add
+                      → BytesRefHash.add
+                      → newTerm / addTerm
+              → stored path:
+                  StoredFieldsConsumer.writeField
+              → DV path:
+                  NumericDocValuesWriter.addValue
+              → points path:
+                  PointValuesWriter.addPackedValue
+              → vector path:
+                  KnnVectorsWriter.addValue
+            → DefaultIndexingChain.finishStoredFields
+        → DocumentsWriterPerThread.finishDocument
+        → DocumentsWriterFlushControl.doAfterDocument
+          → maybe flushPending(this DWPT)
+      → DocumentsWriterPerThreadPool.unlock
+    → IndexWriter.flushIfNeeded</code></pre>
+
+<h3>常用调试工具</h3>
+
+<table>
+  <thead>
+    <tr><th>工具</th><th>用途</th><th>开启方式</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>InfoStream</code></td><td>flush / commit / merge 详情</td><td><code>cfg.setInfoStream(...)</code></td></tr>
+    <tr><td><code>writer.getMaxCompletedSequenceNumber()</code></td><td>当前已完成 seqNo</td><td>API</td></tr>
+    <tr><td><code>writer.numRamDocs()</code></td><td>当前 RAM 中 doc 数</td><td>API</td></tr>
+    <tr><td><code>writer.ramBytesUsed()</code></td><td>当前 RAM byte 数</td><td>API</td></tr>
+    <tr><td><code>writer.getMergingSegments()</code></td><td>正在合并的 segment</td><td>API</td></tr>
+    <tr><td><code>CheckIndex</code></td><td>段完整性</td><td>命令行 / API</td></tr>
+    <tr><td>JFR / async-profiler</td><td>CPU / 锁火焰图</td><td>JVM agent</td></tr>
+  </tbody>
+</table>
+
+<pre><code class="language-bash">java -cp "lucene-core-9.10.0.jar:lucene-codecs-9.10.0.jar" \
+     org.apache.lucene.index.CheckIndex /var/lib/lucene/orders -verbose</code></pre>
+
+<pre><code class="language-text">CheckIndex 健康输出:
+
+Opening index @ /var/lib/lucene/orders
+Segments file=segments_43 numSegments=8 version=9.10.0
+  1 of 8: name=_0 maxDoc=1,200,000
+    version=9.10.0
+    compound=false
+    has deletions=true [60,000 deletions]
+    test: terms, freq, prox..........OK [156,432 terms; 4,820,118 terms/docs pairs]
+    test: stored fields...............OK [1,140,000 total field count]
+    test: term vectors................OK [no term vectors]
+    test: docvalues...................OK [4 docvalues fields]
+    test: points......................OK [3 fields, 3,600,000 total points]
+  ...
+
+No problems were detected with this index.</code></pre>
+
+<!-- ============================================================ -->
+<!-- Chapter Summary -->
+<!-- ============================================================ -->
+
+<div class="chapter-summary" id="s6-summary">
+  <h2>6.15 本章小结</h2>
+  <table>
+    <thead>
+      <tr><th>关注点</th><th>核心 API / 类</th><th>关键建议</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>角色边界</td><td><code>IndexWriter</code> · <code>DocumentsWriter</code> · <code>DWPT</code></td><td>IW 是事务外壳 / DW 是协调者 / DWPT 是私有 segment 工厂</td></tr>
+      <tr><td>调用栈</td><td><code>addDocument → updateDocuments → DWPT → IndexingChain</code></td><td>耗时 70-80% 在第 7 层(具体字段编码)</td></tr>
+      <tr><td>字段分派</td><td><code>DefaultIndexingChain.processField</code></td><td>5 条路径独立 / 同字段可走多条 / 不要用 StoredField 排序</td></tr>
+      <tr><td>PerField 内存</td><td>BytesRefHash + ByteBlockPool + ParallelPostingsArray</td><td>三槽协作 / GC 友好 / per-DWPT 私有</td></tr>
+      <tr><td>invert 流程</td><td><code>FreqProxTermsWriterPerField.add</code></td><td>termID 隔离 / postings stream 链式 slice</td></tr>
+      <tr><td>RAM postings</td><td>ByteBlockPool 32 KiB / 5-14-20-30-40-80 字节 slice</td><td>共享池 + 几何级数避免内存 churn</td></tr>
+      <tr><td>DWPT 并发</td><td>thread-sticky 池 + StallControl 背压</td><td>无锁写 / 多 DWPT 并发线性扩展</td></tr>
+      <tr><td>DeleteQueue</td><td><code>DocumentsWriterDeleteQueue</code> + 每 DWPT slice</td><td>异步广播 / update = delete + add 原子</td></tr>
+      <tr><td>flushSegment</td><td>8 步 / 5 个 Codec 写器</td><td>RAM → 14 个段文件 / 加入 SI(尚未 commit)</td></tr>
+      <tr><td>commit 协议</td><td>prepareCommit + rename + fsync(dir)</td><td>POSIX 原子 rename / 进程崩溃可恢复</td></tr>
+      <tr><td>rollback</td><td><code>writer.rollback()</code></td><td>仅撤销当前事务 / 不能撤销已 commit / 用 Snapshot 替代时间旅行</td></tr>
+      <tr><td>异常处理</td><td>tragedy + AlreadyClosedException</td><td>OOM/IO 后必须 close + 重开 / 看 getTragicException</td></tr>
+      <tr><td>性能调参</td><td>RAMBufferSize / maxThreadStates / mergePolicy</td><td>SSD 上 64-512 MiB / DWPT = 写线程数 / 关 CFS</td></tr>
+      <tr><td>源码路径</td><td>8 个断点 / InfoStream + CheckIndex</td><td>跟一次 add+commit 走完所有关键节点</td></tr>
+    </tbody>
+  </table>
+  <p class="next-hint">下一章 <a href="07-order-search-practice.html">第 7 章 · 订单搜索实战</a> 把前 6 章的所有源码模型落到一个完整的订单履约系统:Schema 设计、Analyzer 选型、字段建模、查询构造、性能基线、回归测试、生产事故复盘——给出可运行的代码与可复制的工程模板。本章描述的 IndexWriter 调用栈、字段分派、commit 协议会在第 7 章的"主键建模"、"NRT 读"、"批量写吞吐基线"等章节里直接复用。</p>
+</div>
+
+<!-- ============================================================ -->
+<!-- Chapter navigation -->
+<!-- ============================================================ -->
+<div class="chapter-nav">
+  <a href="05-production-search-service.html">&larr; 第 5 章 &middot; 生产搜索服务</a>
+  <a href="07-order-search-practice.html">第 7 章 &middot; 订单搜索实战 &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 Lucene &middot; 第 6 章 &middot; IndexWriter 写入路径源码深潜</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){setTimeout(function(){document.querySelectorAll('.mermaid svg,.diagram svg').forEach(function(svg){var h=parseInt(svg.getAttribute('height')||svg.getBoundingClientRect().height);if(h>500){svg.style.maxHeight='500px';svg.style.width='auto';var p=svg.closest('.diagram');if(p)p.style.overflowX='auto';}});},1500);});</script>
+</body>
+</html>

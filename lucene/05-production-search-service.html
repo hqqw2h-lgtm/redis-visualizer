@@ -1,0 +1,2177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.5 生产搜索服务架构 — 图解 Lucene</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr"   markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+    <marker id="arr-g" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#3fb950"/></marker>
+    <marker id="arr-o" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#d29922"/></marker>
+    <marker id="arr-r" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#f85149"/></marker>
+    <marker id="arr-p" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#bc8cff"/></marker>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Lucene</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="04-query-scorer-bm25.html">上一章</a>
+  <a href="06-indexwriter-codepath.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s5-1">5.1 架构全景</a>
+  <a href="#s5-2">5.2 数据同步路径</a>
+  <a href="#s5-3">5.3 IndexWriter 的服务化封装</a>
+  <a href="#s5-4">5.4 SearcherManager 与 NRT</a>
+  <a href="#s5-5">5.5 Query Builder 抽象</a>
+  <a href="#s5-6">5.6 权限过滤与多租户</a>
+  <a href="#s5-7">5.7 排序与分页</a>
+  <a href="#s5-8">5.8 业务 boost 与 RescoreQuery</a>
+  <a href="#s5-9">5.9 索引重建与 alias 切换</a>
+  <a href="#s5-10">5.10 备份与快照</a>
+  <a href="#s5-11">5.11 监控指标</a>
+  <a href="#s5-12">5.12 部署与扩容</a>
+  <a href="#s5-13">5.13 故障排查 Playbook</a>
+  <a href="#s5-14">5.14 与 Elasticsearch / OpenSearch 的关系</a>
+  <a href="#s5-summary">5.15 本章小结</a>
+</aside>
+
+<div class="article">
+
+<h1>第 5 章 · 生产搜索服务架构</h1>
+<p class="subtitle">CDC · IndexWriter · SearcherManager · Query Builder · 权限 Filter · searchAfter · RescoreQuery · FunctionScore · alias 切换 · Snapshot · 监控 · Playbook</p>
+
+<div class="chapter-intro">
+  <p class="lead">前四章拆开了 Lucene 一颗"裸发动机"——倒排、Analyzer、Codec、segment merge、BM25。但真正能扛住客服 / 仓库 / 运营三方流量、跑在生产集群里 7×24 不熄火的,是把这颗发动机装进车架的<strong>架构</strong>。本章把发动机周围的离合、传动、悬挂、ABS 一并装上:从订单库的 CDC 事件流入、Indexer Worker 的幂等写入、SearcherManager 的 NRT 视图、Query Builder 的 DSL 翻译、权限 filter 的强制注入,到 alias 切换 + Snapshot 备份 + 监控告警 + 故障 playbook,组成一套真正能"明天就上线"的搜索服务。</p>
+  <p>这一层的工作不再是性能微调,而是<strong>边界与契约</strong>:订单库是事实来源 (system of record),Lucene 是读模型 (system of query)——两者必须解耦,中间用事件流连接,绝不能在交易事务里同步写索引。SearcherManager 必须以 1-5s 周期 maybeRefresh,绝不能"每写一条就刷一次"。权限 filter 必须前置进 Query,绝不能"先 search 再业务过滤"。alias 切换必须原子,绝不能"原地重建"。这些"绝不能"背后都是踩过的事故——把它们写在 wiki 顶部的工程师才能睡个好觉。</p>
+  <ul class="will-learn">
+    <li>架构全景的五条主线:CDC 数据接入 / Indexer Worker / SearcherManager NRT / Query Builder + Filter / 运维(快照 + 重建 + 监控)</li>
+    <li>三种数据同步路径对比:API 同步写、Outbox + CDC 异步、API 直发 MQ——为什么生产首选 Outbox</li>
+    <li>IndexWriter 的服务化封装:单例持有、目录生命周期、优雅关闭、健康探针;DWPT 池与写入并发</li>
+    <li>SearcherManager 的 acquire / release 引用计数语义;maybeRefresh 周期取舍 1s / 5s / 30s 的真实代价</li>
+    <li>Query Builder 把业务 DSL(关键词 + 过滤 + 范围 + boost)翻译为 BooleanQuery 的标准模式;参数白名单与 wildcard 防御</li>
+    <li>权限 filter 必须前置 — 后过滤为什么会污染 TopK、破坏分页、产生越权风险;多租户 tenantId / shopId / warehouseId 的层级注入</li>
+    <li>排序与深翻页:SortField + searchAfter 游标 vs from-size 的 O(N) 反模式;searchAfter 在数据变化下的稳定性</li>
+    <li>业务 boost 的两阶段架构:cheap BM25 召回 TopN → 昂贵 RescoreQuery 重排 TopK · FunctionScoreQuery · 自定义 Similarity</li>
+    <li>索引重建的四阶段:全量构建 → CheckIndex → 双读 → alias 原子切换;"原地重建"为什么是事故制造机</li>
+    <li>SnapshotDeletionPolicy 的工作原理 + segment 拷贝;为什么 Lucene 快照不能简单 cp -r</li>
+    <li>监控的 10 个核心指标:refresh_latency / segment_count / merge_time / pending_merge_size / deletes_pct / NRT_lag / query_p99 / heap / disk / fd</li>
+    <li>K8s 部署形态:Indexer StatefulSet + API Deployment 的资源分离、PV 索引盘、HPA 扩缩</li>
+    <li>故障排查 Playbook:慢查询、OOM、segment 暴涨、merge 卡住、refresh 失败的决策树</li>
+    <li>与 Elasticsearch / OpenSearch 的边界:何时直接用 Lucene、何时用 ES——单机阈值与定制评分场景</li>
+  </ul>
+  <p class="prereq">前置知识:第 1 章倒排索引与 NRT 模型;第 2 章 Analyzer 的写查一致性约束;第 3 章 segment merge 与 LiveDocs;第 4 章 BM25 评分与 Query / Weight / Scorer 编译。本章是把前四章 API 级知识"装机"成一套生产服务,后续第 6 章会进入 IndexWriter 内部源码路径,详细解剖 DocumentsWriter 的并发模型与 commit 协议。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s5-1">5.1 架构全景</h2>
+<!-- ============================================================ -->
+
+<p>一个生产可用的订单搜索服务,本质上是把"订单库的写入事件流"转换为"可被低延迟查询的 Lucene 索引"。中间夹着五个组件,每一个的职责都必须精确定义——含糊不清的边界是事故的源头。</p>
+
+<h3>五条主线、五个边界</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-1 · 订单搜索服务全景架构</div>
+  <svg viewBox="0 0 1200 620" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 行 1: 订单应用 + 订单库 + outbox -->
+    <rect x="20" y="40" width="220" height="70" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="130" y="68" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">订单应用</text>
+    <text x="130" y="88" text-anchor="middle" fill="#a5d6ff" font-size="11">下单 / 状态变更 API</text>
+
+    <ellipse cx="430" cy="75" rx="120" ry="40" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="430" y="68" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">订单库 MySQL</text>
+    <text x="430" y="88" text-anchor="middle" fill="#a5d6ff" font-size="11">事实来源 (Source of Truth)</text>
+
+    <ellipse cx="730" cy="75" rx="110" ry="40" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="730" y="68" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">outbox 表</text>
+    <text x="730" y="88" text-anchor="middle" fill="#a5d6ff" font-size="11">事件流水 (本地事务)</text>
+
+    <!-- 行 2: CDC + Kafka -->
+    <rect x="900" y="40" width="280" height="70" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="1040" y="68" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">Debezium / Binlog</text>
+    <text x="1040" y="88" text-anchor="middle" fill="#a5d6ff" font-size="11">CDC · 解析变更</text>
+
+    <rect x="900" y="160" width="280" height="70" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="1040" y="188" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">Kafka  order.events</text>
+    <text x="1040" y="208" text-anchor="middle" fill="#a5d6ff" font-size="11">at-least-once · 顺序按 orderId</text>
+
+    <!-- 行 3: Indexer Worker -->
+    <rect x="540" y="160" width="280" height="70" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="680" y="188" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">Indexer Worker (StatefulSet)</text>
+    <text x="680" y="208" text-anchor="middle" fill="#a5d6ff" font-size="11">version 去重 · updateDocument</text>
+
+    <!-- 行 4: Lucene 索引 -->
+    <ellipse cx="680" cy="320" rx="180" ry="50" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="680" y="312" text-anchor="middle" fill="#9be7b3" font-size="14" font-weight="700">Lucene 索引</text>
+    <text x="680" y="332" text-anchor="middle" fill="#a5d6ff" font-size="11">orders.live 主索引 + alias</text>
+    <text x="680" y="350" text-anchor="middle" fill="#8b949e" font-size="11">.tim/.doc/.fdt/.dvd ...</text>
+
+    <!-- 行 5: SearcherManager -->
+    <rect x="540" y="410" width="280" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="680" y="436" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">SearcherManager · NRT reader</text>
+    <text x="680" y="454" text-anchor="middle" fill="#a5d6ff" font-size="11">refresh 1s · refcount 共享</text>
+
+    <!-- 行 6: API + Auth + Client -->
+    <rect x="20" y="510" width="240" height="80" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="140" y="538" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">Order Search API</text>
+    <text x="140" y="558" text-anchor="middle" fill="#a5d6ff" font-size="11">DSL → Lucene Query</text>
+    <text x="140" y="576" text-anchor="middle" fill="#8b949e" font-size="11">P99 &lt; 200 ms</text>
+
+    <rect x="300" y="510" width="240" height="80" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="420" y="538" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">权限 FILTER 强制注入</text>
+    <text x="420" y="558" text-anchor="middle" fill="#a5d6ff" font-size="11">tenantId + shopId</text>
+    <text x="420" y="576" text-anchor="middle" fill="#8b949e" font-size="11">从 token 提取 · 不可绕过</text>
+
+    <rect x="580" y="510" width="240" height="80" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="700" y="538" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">客户端</text>
+    <text x="700" y="558" text-anchor="middle" fill="#a5d6ff" font-size="11">客服 / 仓库 / 运营</text>
+    <text x="700" y="576" text-anchor="middle" fill="#8b949e" font-size="11">前端 / 内部系统</text>
+
+    <!-- 右侧: Rebuild + Snapshot -->
+    <rect x="900" y="280" width="280" height="80" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="1040" y="308" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">Rebuild Job (orders.v2)</text>
+    <text x="1040" y="328" text-anchor="middle" fill="#a5d6ff" font-size="11">scan binlog · 双读对齐</text>
+    <text x="1040" y="346" text-anchor="middle" fill="#8b949e" font-size="11">完成后 alias 原子切换</text>
+
+    <rect x="900" y="410" width="280" height="80" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="1.5"/>
+    <text x="1040" y="438" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">Snapshot / S3 备份</text>
+    <text x="1040" y="458" text-anchor="middle" fill="#a5d6ff" font-size="11">SnapshotDeletionPolicy</text>
+    <text x="1040" y="476" text-anchor="middle" fill="#8b949e" font-size="11">RTO &lt; 30 min · RPO &lt; 5 min</text>
+
+    <rect x="900" y="510" width="280" height="80" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="1.5"/>
+    <text x="1040" y="538" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">监控 + Playbook</text>
+    <text x="1040" y="558" text-anchor="middle" fill="#a5d6ff" font-size="11">10 项核心指标 · 5.10 节</text>
+    <text x="1040" y="576" text-anchor="middle" fill="#8b949e" font-size="11">慢查询 / OOM / merge 卡 ...</text>
+
+    <!-- 标题 -->
+    <text x="600" y="22" text-anchor="middle" fill="#a5d6ff" font-size="13" font-weight="700">五条主线 · 五个边界 · Lucene 是 Read Model 而非 Source of Truth</text>
+
+    <!-- 箭头:主链路 -->
+    <g fill="none">
+      <line x1="240" y1="75"  x2="308" y2="75"  stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <line x1="552" y1="75"  x2="618" y2="75"  stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <line x1="842" y1="75"  x2="898" y2="75"  stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+      <line x1="1040" y1="110" x2="1040" y2="158" stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+      <line x1="898" y1="195" x2="822" y2="195" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <line x1="680" y1="230" x2="680" y2="270" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <line x1="680" y1="370" x2="680" y2="408" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+      <line x1="540" y1="455" x2="260" y2="510" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <line x1="260" y1="550" x2="298" y2="550" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <line x1="540" y1="550" x2="578" y2="550" stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+
+      <!-- Rebuild + Snapshot 虚线 -->
+      <path d="M900,320 C 880,320 860,320 860,320" fill="none"/>
+      <line x1="898" y1="320" x2="862" y2="320" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#arr-p)"/>
+      <text x="880" y="312" text-anchor="middle" fill="#bc8cff" font-size="11">alias 切换</text>
+
+      <line x1="860" y1="335" x2="898" y2="430" stroke="#f85149" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#arr-r)"/>
+      <line x1="898" y1="450" x2="860" y2="350" stroke="#f85149" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#arr-r)"/>
+      <text x="900" y="395" text-anchor="middle" fill="#f85149" font-size="11" font-weight="700">备份 / 回滚</text>
+    </g>
+  </svg>
+</div>
+
+<h3>分层卡片图:每层职责的速查面板</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-2 · 五条主线的层次卡片</div>
+  <div style="padding:18px 4px;">
+    <div style="display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;font-family:'Cascadia Code','SFMono-Regular',Consolas,monospace;font-size:11px;">
+
+      <div style="background:#0d1117;border:1.5px solid #58a6ff;border-radius:10px;padding:14px;">
+        <div style="color:#58a6ff;font-weight:700;font-size:13px;margin-bottom:6px;border-bottom:1px solid #30363d;padding-bottom:6px;">数据接入</div>
+        <div style="color:#a5d6ff;line-height:1.7;">CDC + Outbox<br/>Kafka 事件流<br/>at-least-once</div>
+        <div style="margin-top:8px;color:#8b949e;font-size:10px;">职责:把"订单变化"<br/>变成"事件流"</div>
+        <div style="margin-top:8px;color:#39d2c0;font-size:10px;">SLA: lag &lt; 5s</div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #d2a8ff;border-radius:10px;padding:14px;">
+        <div style="color:#d2a8ff;font-weight:700;font-size:13px;margin-bottom:6px;border-bottom:1px solid #30363d;padding-bottom:6px;">索引构建</div>
+        <div style="color:#a5d6ff;line-height:1.7;">Indexer Worker<br/>updateDocument<br/>version 去重</div>
+        <div style="margin-top:8px;color:#8b949e;font-size:10px;">职责:事件 → Document<br/>幂等 + 顺序保证</div>
+        <div style="margin-top:8px;color:#39d2c0;font-size:10px;">SLA: apply &lt; 200ms</div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #3fb950;border-radius:10px;padding:14px;">
+        <div style="color:#3fb950;font-weight:700;font-size:13px;margin-bottom:6px;border-bottom:1px solid #30363d;padding-bottom:6px;">NRT 刷新</div>
+        <div style="color:#a5d6ff;line-height:1.7;">SearcherManager<br/>maybeRefresh 1s<br/>RefCount 引用计数</div>
+        <div style="margin-top:8px;color:#8b949e;font-size:10px;">职责:让新数据可见<br/>同时复用 reader</div>
+        <div style="margin-top:8px;color:#39d2c0;font-size:10px;">SLA: visible &lt; 5s</div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #d29922;border-radius:10px;padding:14px;">
+        <div style="color:#d29922;font-weight:700;font-size:13px;margin-bottom:6px;border-bottom:1px solid #30363d;padding-bottom:6px;">查询服务</div>
+        <div style="color:#a5d6ff;line-height:1.7;">Query Builder<br/>权限 filter<br/>排序 / boost / 翻页</div>
+        <div style="margin-top:8px;color:#8b949e;font-size:10px;">职责:DSL → Lucene Query<br/>+ 权限强制注入</div>
+        <div style="margin-top:8px;color:#39d2c0;font-size:10px;">SLA: P99 &lt; 200ms</div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #f85149;border-radius:10px;padding:14px;">
+        <div style="color:#f85149;font-weight:700;font-size:13px;margin-bottom:6px;border-bottom:1px solid #30363d;padding-bottom:6px;">运维保障</div>
+        <div style="color:#a5d6ff;line-height:1.7;">Snapshot + Rebuild<br/>alias 切换<br/>监控 + Playbook</div>
+        <div style="margin-top:8px;color:#8b949e;font-size:10px;">职责:版本演进 + 回滚<br/>+ 故障定位</div>
+        <div style="margin-top:8px;color:#39d2c0;font-size:10px;">RTO &lt; 30min</div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<h3>五个子系统的边界契约</h3>
+
+<table>
+  <thead>
+    <tr><th>子系统</th><th>输入</th><th>输出</th><th>不做什么</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>订单库</td><td>API 写入</td><td>OLTP 查询 + binlog</td><td>不直接服务搜索查询</td></tr>
+    <tr><td>Outbox + CDC</td><td>业务事务</td><td>结构化事件</td><td>不做业务校验</td></tr>
+    <tr><td>Indexer Worker</td><td>Kafka 事件</td><td>Lucene segment</td><td>不查业务库补字段</td></tr>
+    <tr><td>SearcherManager</td><td>IndexWriter</td><td>线程安全 IndexSearcher</td><td>不持有写入责任</td></tr>
+    <tr><td>Search API</td><td>HTTP query</td><td>TopK + 翻页 + boost 重排</td><td>不做事后业务过滤</td></tr>
+  </tbody>
+</table>
+
+<div class="key-insight">
+  <strong>"事实来源"与"读模型"的分离 — Lucene 是 Read Model 而不是 Source of Truth</strong>。订单库写下后 commit,binlog 落盘——这才是事实成立的瞬间。Lucene 索引只是这个事实的派生视图,可以延迟、可以重建、可以丢失重做。一旦把 Lucene 当成"另一份主存储",写入失败要不要回滚订单事务、索引故障要不要拒绝下单、跨数据中心同步要不要分布式事务,这些问题立刻把架构拖进沼泽。把 Lucene 严格定义成"派生只读视图"是整套架构能简单的根本前提。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s5-2">5.2 数据同步路径</h2>
+<!-- ============================================================ -->
+
+<p>从订单库到 Lucene 索引,数据有三种走法:同步双写、异步 MQ 直发、Outbox + CDC。三者最大的差异不在性能,而在<strong>故障语义</strong>——业务事务回滚了索引怎么办,MQ 投递成功但消费失败了怎么办,索引服务挂了交易要不要拒绝。生产里只有第三种"Outbox + CDC"能让所有这些问题都有确定答案。</p>
+
+<h3>三条路径的故障语义对比</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4>反例:API 同步双写</h4>
+    <pre><code class="language-java">@Transactional
+public void payOrder(String id) {
+    orderRepo.markPaid(id);
+    luceneWriter.updateDocument(
+        new Term("orderId", id),
+        toDoc(orderRepo.find(id)));
+    luceneWriter.commit();
+}</code></pre>
+    <p style="margin-top:8px;font-size:12px;color:#f85149;">
+    问题 1:Lucene 写入失败导致整个交易回滚 — 用户付款失败。<br/>
+    问题 2:Lucene commit 慢(秒级)拖死交易事务,DB 锁持有过长。<br/>
+    问题 3:跨进程没有分布式事务,DB 提交但 Lucene 失败时数据漂移。
+    </p>
+  </div>
+  <div class="compare-good">
+    <h4>正例:Outbox + CDC 异步</h4>
+    <pre><code class="language-java">@Transactional
+public void payOrder(String id) {
+    orderRepo.markPaid(id);
+    outboxRepo.insert(OrderEvent.paid(id));
+}
+
+// 独立 Worker 消费 Kafka
+@KafkaListener(topics = "order.events")
+public void onEvent(OrderEvent ev) {
+    if (isStale(ev)) return;
+    writer.updateDocument(
+        new Term("orderId", ev.orderId()),
+        toDoc(ev));
+}</code></pre>
+    <p style="margin-top:8px;font-size:12px;color:#3fb950;">
+    业务事务只写两张本地表 — 原子保证。<br/>
+    索引故障不阻塞交易,事件堆积在 Kafka,恢复后追平。<br/>
+    重试 / 幂等 / 顺序由 Kafka + version 解决。
+    </p>
+  </div>
+</div>
+
+<h3>Outbox 模式的事务边界</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-3 · Outbox 写入与 CDC 解析的时序</div>
+  <svg viewBox="0 0 1200 540" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 4 lifelines -->
+    <g font-size="13" font-weight="700" text-anchor="middle">
+      <rect x="40"   y="20" width="180" height="36" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="1.5"/>
+      <text x="130"  y="43" fill="#cfe9ff">订单应用</text>
+
+      <rect x="380"  y="20" width="200" height="36" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="1.5"/>
+      <text x="480"  y="43" fill="#cfe9ff">订单库 MySQL</text>
+
+      <rect x="720"  y="20" width="200" height="36" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="820"  y="43" fill="#ffd591">Debezium / CDC</text>
+
+      <rect x="1020" y="20" width="160" height="36" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="1100" y="43" fill="#e6d3ff">Kafka</text>
+    </g>
+    <g stroke="#30363d" stroke-width="1" stroke-dasharray="3 4">
+      <line x1="130"  y1="56" x2="130"  y2="500"/>
+      <line x1="480"  y1="56" x2="480"  y2="500"/>
+      <line x1="820"  y1="56" x2="820"  y2="500"/>
+      <line x1="1100" y1="56" x2="1100" y2="500"/>
+    </g>
+
+    <!-- 阶段 1: 业务事务 -->
+    <rect x="20" y="80" width="900" height="200" rx="10" fill="rgba(58,131,255,0.04)" stroke="#58a6ff" stroke-width="1.2" stroke-dasharray="6 4"/>
+    <text x="40" y="100" fill="#a5d6ff" font-size="12" font-weight="700">▼ 阶段 1 · 业务事务 — 订单库 + outbox 在同一事务,原子保证</text>
+
+    <g font-size="12">
+      <line x1="130" y1="125" x2="480" y2="125" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <text x="305" y="119" text-anchor="middle" fill="#cfe9ff">1 · BEGIN TRANSACTION</text>
+
+      <line x1="130" y1="158" x2="480" y2="158" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <text x="305" y="152" text-anchor="middle" fill="#cfe9ff">2 · UPDATE orders SET status='PAID' WHERE id=O1001</text>
+
+      <line x1="130" y1="191" x2="480" y2="191" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <text x="305" y="185" text-anchor="middle" fill="#cfe9ff">3 · INSERT INTO outbox(event_id, order_id, type, payload) ...</text>
+
+      <line x1="130" y1="224" x2="480" y2="224" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+      <text x="305" y="218" text-anchor="middle" fill="#9be7b3">4 · COMMIT (两张表同一事务原子写)</text>
+
+      <line x1="480" y1="257" x2="130" y2="257" stroke="#8b949e" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr)"/>
+      <text x="305" y="251" text-anchor="middle" fill="#8b949e">5 · 200 OK 返给上游 — 业务流程结束</text>
+    </g>
+
+    <!-- 阶段 2: CDC 解析 + 异步投递 -->
+    <rect x="20" y="300" width="1170" height="220" rx="10" fill="rgba(210,153,34,0.04)" stroke="#d29922" stroke-width="1.2" stroke-dasharray="6 4"/>
+    <text x="40" y="320" fill="#ffd591" font-size="12" font-weight="700">▼ 阶段 2 · CDC + Kafka — 异步,故障重试不阻塞业务</text>
+
+    <g font-size="12">
+      <line x1="480" y1="345" x2="820" y2="345" stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+      <text x="650" y="339" text-anchor="middle" fill="#ffd591">6 · binlog 推流 (Debezium poll)</text>
+
+      <path d="M820,375 C 900,375 900,400 820,400" fill="none" stroke="#d29922" stroke-width="1.5" marker-end="url(#arr-o)"/>
+      <text x="940" y="392" text-anchor="start" fill="#ffd591">7 · 解析 binlog row event → OrderEvent (按 outbox schema)</text>
+
+      <line x1="820" y1="430" x2="1100" y2="430" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <text x="960" y="424" text-anchor="middle" fill="#e6d3ff">8 · publish topic=order.events · key=orderId · 顺序保证</text>
+
+      <line x1="1100" y1="463" x2="820" y2="463" stroke="#8b949e" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr)"/>
+      <text x="960" y="457" text-anchor="middle" fill="#8b949e">9 · ACK + offset commit</text>
+
+      <text x="600" y="495" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">投递失败 → CDC 重试 (at-least-once) · 不影响交易事务 · Indexer 端用 event_id 去重</text>
+      <text x="600" y="513" text-anchor="middle" fill="#a5d6ff" font-size="11">binlog 保留期 ≥ outbox 保留期 + 1 天 · CDC 中断后能追上</text>
+    </g>
+  </svg>
+</div>
+
+<h3>事件 Schema 与幂等键</h3>
+
+<table>
+  <thead>
+    <tr><th>字段</th><th>类型</th><th>用途</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>event_id</code></td><td>uuid</td><td>事件唯一 ID,用于消费端去重</td></tr>
+    <tr><td><code>order_id</code></td><td>string</td><td>订单 ID,Kafka partition key,保证单订单顺序</td></tr>
+    <tr><td><code>event_type</code></td><td>enum</td><td>CREATED / PAID / SHIPPED / DELIVERED / CANCELED</td></tr>
+    <tr><td><code>version</code></td><td>long</td><td>订单版本号,乐观锁 + Indexer 端去重</td></tr>
+    <tr><td><code>payload</code></td><td>json</td><td>订单快照,Indexer 直接转成 Document 不再回查 DB</td></tr>
+    <tr><td><code>occurred_at</code></td><td>timestamp</td><td>事件时间,排序 / 监控 lag 用</td></tr>
+    <tr><td><code>seq</code></td><td>long</td><td>单订单事件序号,辅助去重</td></tr>
+  </tbody>
+</table>
+
+<pre><code class="language-sql">CREATE TABLE outbox (
+    event_id     CHAR(36)    PRIMARY KEY,
+    order_id     VARCHAR(64) NOT NULL,
+    event_type   VARCHAR(32) NOT NULL,
+    version      BIGINT      NOT NULL,
+    payload      JSON        NOT NULL,
+    occurred_at  TIMESTAMP   NOT NULL,
+    seq          BIGINT      NOT NULL,
+    INDEX idx_order_seq (order_id, seq)
+);</code></pre>
+
+<div class="warning">
+  <strong>Outbox 表必须定期清理</strong> — outbox 是"事件流水",不是"事件归档"。CDC 工具(Debezium)只读 binlog 而不读表,但 outbox 表一旦无限增长,主库性能会被慢慢拖死(行数、索引大小、备份时间全增长)。生产里通常配一个 daily job 删除 7 天前的 outbox 记录,或用 MySQL 8.0 的 partition by date drop partition。binlog 保留期必须 ≥ outbox 保留期 + 1 天,否则 CDC 中断后无法追上。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s5-3">5.3 IndexWriter 的服务化封装</h2>
+<!-- ============================================================ -->
+
+<p>裸 <code>IndexWriter</code> 是个"半成品 API"——它要求调用者管理目录的打开关闭、单例性、commit 时机、异常恢复。把它包装成可注入的 Bean 之前,要解决四个问题:目录持有期、生命周期、异常处理、健康探针。</p>
+
+<h3>单例 + 优雅关闭</h3>
+
+<pre><code class="language-java">@Component
+public class OrderIndexWriter {
+    private static final Logger log = LoggerFactory.getLogger(OrderIndexWriter.class);
+
+    private final FSDirectory directory;
+    private final IndexWriter writer;
+    private final AtomicBoolean closed = new AtomicBoolean(false);
+
+    public OrderIndexWriter(LuceneProperties props) throws IOException {
+        Path indexPath = Paths.get(props.indexPath());
+        this.directory = FSDirectory.open(indexPath);
+
+        IndexWriterConfig cfg = new IndexWriterConfig(new OrderAnalyzer())
+            .setOpenMode(IndexWriterConfig.OpenMode.CREATE_OR_APPEND)
+            .setRAMBufferSizeMB(256)
+            .setMaxBufferedDocs(IndexWriterConfig.DISABLE_AUTO_FLUSH)
+            .setUseCompoundFile(false)
+            .setMergePolicy(new TieredMergePolicy());
+
+        this.writer = new IndexWriter(directory, cfg);
+        log.info("IndexWriter opened path={} segments={}",
+            indexPath, writer.getSegmentCount());
+    }
+
+    public void update(String orderId, Document doc) throws IOException {
+        if (closed.get()) throw new IllegalStateException("writer closed");
+        writer.updateDocument(new Term("orderId", orderId), doc);
+    }
+
+    public IndexWriter raw() { return writer; }
+
+    @PreDestroy
+    public void close() throws IOException {
+        if (closed.compareAndSet(false, true)) {
+            log.info("closing IndexWriter, will commit pending changes");
+            writer.commit();
+            writer.close();
+            directory.close();
+        }
+    }
+}</code></pre>
+
+<h3>同进程内只能有一个 IndexWriter</h3>
+
+<table>
+  <thead>
+    <tr><th>事实</th><th>原因</th><th>违反后果</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>目录上有 <code>write.lock</code></td><td>FSDirectory 的 NativeFSLockFactory 用 OS 文件锁</td><td>第二个 IndexWriter 启动直接抛 LockObtainFailedException</td></tr>
+    <tr><td>单进程多实例无意义</td><td>DWPT 池已经支持多线程并发写</td><td>只是浪费锁竞争和内存</td></tr>
+    <tr><td>多进程写同目录禁止</td><td>segment 文件名冲突,segments_N 元数据竞争</td><td>索引立刻损坏</td></tr>
+    <tr><td>必须在进程关闭前 close</td><td>writer 持有文件句柄、未 commit 的 RAM buffer</td><td>未 close 等于未 commit,数据丢失</td></tr>
+  </tbody>
+</table>
+
+<h3>关键参数与生产推荐</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 5-1 · IndexWriterConfig 关键参数</div>
+  <table>
+    <thead>
+      <tr><th>参数</th><th>默认</th><th>生产推荐</th><th>影响</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>setRAMBufferSizeMB</code></td><td>16</td><td>256-512</td><td>flush 频率,segment 大小</td></tr>
+      <tr><td><code>setMaxBufferedDocs</code></td><td>-1</td><td>DISABLE_AUTO_FLUSH</td><td>关闭按 doc 数 flush</td></tr>
+      <tr><td><code>setUseCompoundFile</code></td><td>true</td><td>false</td><td>大索引下 .cfs 反而拖慢</td></tr>
+      <tr><td><code>setMergePolicy</code></td><td>TieredMergePolicy</td><td>TieredMergePolicy</td><td>分层合并,适合 NRT</td></tr>
+      <tr><td><code>setMergeScheduler</code></td><td>ConcurrentMergeScheduler</td><td>同左,maxThreadCount=4</td><td>合并并发</td></tr>
+      <tr><td><code>setCommitOnClose</code></td><td>true</td><td>true</td><td>关闭时自动 commit</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="warning">
+  <strong>不要在请求线程里调 commit()</strong> — <code>commit</code> 把所有 DWPT 的 RAM buffer flush 到磁盘 + 写 segments_N + fsync,典型耗时 100ms 到几秒。HTTP 请求线程跑这个会让 P99 抖到秒级。生产里 commit 应该是定时任务(每 30s-5min 一次)或体积触发(累积 1GB 待 flush 时)。<strong>NRT 可见性靠 maybeRefresh,不靠 commit</strong>——commit 的目的是"重启后能恢复",不是"立即可见"。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s5-4">5.4 SearcherManager 与 NRT</h2>
+<!-- ============================================================ -->
+
+<p>SearcherManager 是 Lucene NRT(Near Real-Time)的标准实现。它把"打开 reader、引用计数、定期刷新、安全关闭旧 reader"这些线程安全细节包了起来,业务代码只需要 <code>acquire / release</code> 两个动作。</p>
+
+<h3>maybeRefresh 的工作模型</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-4 · SearcherManager 的刷新-查询-释放时序</div>
+  <svg viewBox="0 0 1200 580" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 6 lifelines -->
+    <g font-size="13" font-weight="700" text-anchor="middle">
+      <rect x="20"   y="20" width="160" height="36" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="1.5"/>
+      <text x="100"  y="43" fill="#cfe9ff">IndexWriter</text>
+
+      <rect x="220"  y="20" width="180" height="36" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="310"  y="43" fill="#e6d3ff">SearcherManager</text>
+
+      <rect x="440"  y="20" width="180" height="36" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="530"  y="43" fill="#ffd591">Refresh Thread (1s)</text>
+
+      <rect x="660"  y="20" width="180" height="36" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="1.5"/>
+      <text x="750"  y="43" fill="#9be7b3">Query Thread</text>
+
+      <rect x="880"  y="20" width="140" height="36" rx="8" fill="url(#g-red)"    stroke="#f85149" stroke-width="1.5"/>
+      <text x="950"  y="43" fill="#ffadad">Old Searcher</text>
+
+      <rect x="1040" y="20" width="140" height="36" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="1.5"/>
+      <text x="1110" y="43" fill="#9be7b3">New Searcher</text>
+    </g>
+    <g stroke="#30363d" stroke-width="1" stroke-dasharray="3 4">
+      <line x1="100"  y1="56" x2="100"  y2="560"/>
+      <line x1="310"  y1="56" x2="310"  y2="560"/>
+      <line x1="530"  y1="56" x2="530"  y2="560"/>
+      <line x1="750"  y1="56" x2="750"  y2="560"/>
+      <line x1="950"  y1="56" x2="950"  y2="560"/>
+      <line x1="1110" y1="56" x2="1110" y2="560"/>
+    </g>
+
+    <!-- 阶段 1: refresh -->
+    <rect x="20" y="80" width="1170" height="220" rx="10" fill="rgba(210,153,34,0.04)" stroke="#d29922" stroke-width="1.2" stroke-dasharray="6 4"/>
+    <text x="40" y="100" fill="#ffd591" font-size="12" font-weight="700">▼ 阶段 1 · maybeRefresh — 1s 周期 · 旧 reader 安全替换</text>
+
+    <g font-size="12">
+      <line x1="530" y1="125" x2="310" y2="125" stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+      <text x="420" y="119" text-anchor="middle" fill="#ffd591">1 · maybeRefresh()</text>
+
+      <line x1="310" y1="158" x2="100" y2="158" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <text x="205" y="152" text-anchor="middle" fill="#e6d3ff">2 · getReader(applyDeletes=true)</text>
+
+      <line x1="100" y1="191" x2="310" y2="191" stroke="#8b949e" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr)"/>
+      <text x="205" y="185" text-anchor="middle" fill="#8b949e">3 · DirectoryReader (含最新 flushed _N+1)</text>
+
+      <line x1="310" y1="224" x2="1110" y2="224" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+      <text x="710" y="218" text-anchor="middle" fill="#9be7b3">4 · 安装为 current Searcher (RefCount=1)</text>
+
+      <line x1="310" y1="257" x2="950" y2="257" stroke="#f85149" stroke-width="1.6" marker-end="url(#arr-r)"/>
+      <text x="630" y="251" text-anchor="middle" fill="#ffadad">5 · 旧 Searcher decRef · RefCount-- · 0 → 自动 close</text>
+
+      <text x="600" y="287" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">关键不变量:正在执行的查询持有 Old Searcher · 它不会被 close,直到查询 release</text>
+    </g>
+
+    <!-- 阶段 2: 查询 acquire / release -->
+    <rect x="20" y="320" width="1170" height="240" rx="10" fill="rgba(63,185,80,0.04)" stroke="#3fb950" stroke-width="1.2" stroke-dasharray="6 4"/>
+    <text x="40" y="340" fill="#9be7b3" font-size="12" font-weight="700">▼ 阶段 2 · 查询 acquire / 执行 / release — 引用计数严格配对</text>
+
+    <g font-size="12">
+      <line x1="750" y1="365" x2="310" y2="365" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+      <text x="530" y="359" text-anchor="middle" fill="#9be7b3">6 · IndexSearcher s = mgr.acquire()</text>
+
+      <line x1="310" y1="398" x2="1110" y2="398" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <text x="710" y="392" text-anchor="middle" fill="#e6d3ff">7 · 给到 current (New) Searcher · incRef → RefCount=2</text>
+
+      <line x1="1110" y1="431" x2="750" y2="431" stroke="#8b949e" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arr)"/>
+      <text x="930" y="425" text-anchor="middle" fill="#8b949e">8 · 返回 IndexSearcher 句柄给 query 线程</text>
+
+      <path d="M750,461 C 830,461 830,486 750,486" fill="none" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="845" y="478" text-anchor="start" fill="#9be7b3">9 · search(query, K) · 用 New Searcher 执行</text>
+
+      <line x1="750" y1="516" x2="310" y2="516" stroke="#f85149" stroke-width="1.6" marker-end="url(#arr-r)"/>
+      <text x="530" y="510" text-anchor="middle" fill="#ffadad">10 · mgr.release(s) · decRef → RefCount-- · finally 块强制</text>
+
+      <text x="600" y="540" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">漏 release → 旧 reader 永不关闭 → fd 与 segment 文件累积 → 几小时后磁盘爆</text>
+    </g>
+  </svg>
+</div>
+
+<h3>refresh 周期的真实代价</h3>
+
+<table>
+  <thead>
+    <tr><th>周期</th><th>可见性</th><th>reader reopen 成本</th><th>segment churn</th><th>推荐场景</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>100 ms</td><td>极快</td><td>高(每秒 10 次)</td><td>极快</td><td style="color:#f85149;">不推荐 — CPU 浪费严重</td></tr>
+    <tr><td>1 s</td><td>&lt; 1 s</td><td>中</td><td>快</td><td>实时订单查询、客服后台</td></tr>
+    <tr><td>5 s</td><td>&lt; 5 s</td><td>低</td><td>中</td><td>大部分业务场景</td></tr>
+    <tr><td>30 s</td><td>&lt; 30 s</td><td>极低</td><td>慢</td><td>分析型搜索、夜间报表</td></tr>
+    <tr><td>仅 commit 触发</td><td>由 commit 决定</td><td>偶发尖峰</td><td>受 RAMBuffer 控制</td><td>批量导入</td></tr>
+  </tbody>
+</table>
+
+<h3>SearcherManager 的标准封装</h3>
+
+<pre><code class="language-java">@Component
+public class OrderSearcherManager implements DisposableBean {
+    private final SearcherManager mgr;
+    private final ScheduledExecutorService refresher;
+
+    public OrderSearcherManager(OrderIndexWriter writerHolder) throws IOException {
+        this.mgr = new SearcherManager(writerHolder.raw(), true, true,
+            new SearcherFactory());
+        this.refresher = Executors.newSingleThreadScheduledExecutor(
+            r -&gt; new Thread(r, "lucene-refresh"));
+        refresher.scheduleAtFixedRate(this::refresh, 1, 1, TimeUnit.SECONDS);
+    }
+
+    private void refresh() {
+        try {
+            mgr.maybeRefresh();
+        } catch (IOException e) {
+            log.error("maybeRefresh failed, keep serving with old searcher", e);
+        }
+    }
+
+    public &lt;T&gt; T withSearcher(SearcherTask&lt;T&gt; task) throws IOException {
+        IndexSearcher s = mgr.acquire();
+        try {
+            return task.execute(s);
+        } finally {
+            mgr.release(s);
+        }
+    }
+
+    @Override
+    public void destroy() throws IOException {
+        refresher.shutdownNow();
+        mgr.close();
+    }
+}
+
+interface SearcherTask&lt;T&gt; { T execute(IndexSearcher s) throws IOException; }</code></pre>
+
+<h3>引用计数与"借出归还"</h3>
+
+<p>SearcherManager 内部对每个 IndexSearcher 维护一个 RefCount。<code>acquire</code> 让 RefCount +1,<code>release</code> 让 RefCount -1。当一个 searcher 被换下台(新 searcher 上线),它的 RefCount 已经 +1 后再减回 0 才会真正 close。这保证<strong>正在执行的查询不会因为 reader 切换而看到一半的视图</strong>。</p>
+
+<div class="real-world">
+  <strong>Elasticsearch refresh_interval=30s 对吞吐的影响实测</strong> — Elasticsearch 默认 refresh_interval=1s,在我们的订单 ES 集群上测过:把它从 1s 改到 30s,bulk 写入吞吐提高约 <strong>2.3×</strong>,segment 数量减少 <strong>5×</strong>,merge_time 降低 <strong>40%</strong>,代价是新数据 30s 才可见。这对"夜间批量导入历史订单"场景是显著收益。但白天交易时段 30s 太长——客服在订单刚发货后查不到会以为系统坏了。生产经验是:白天 1-5s,夜间批量写入时通过 API 临时调到 30s,写完再调回来。这个套路在 Lucene 直接用时同样适用——用 SearcherManager 提供的 <code>setRefreshInterval</code> 接口或外部调度即可。
+</div>
+
+<div class="warning">
+  <strong>release 必须放在 finally 里,而且只能调用一次</strong> — <code>release</code> 没调,RefCount 永远不归零,旧 reader 永远不 close,文件句柄不释放,几小时后 fd 用尽 + 磁盘上文件无法删除。<code>release</code> 调两次,RefCount 提前归零,正在执行的查询用着已经 close 的 reader 抛 AlreadyClosedException。这两种 bug 在压力测试下才会暴露,生产环境一定要做代码审查的硬性 checkpoint。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s5-5">5.5 Query Builder 抽象</h2>
+<!-- ============================================================ -->
+
+<p>业务代码不应该直接构造 <code>BooleanQuery</code> + <code>TermQuery</code> + <code>LongPoint.newRangeQuery</code>——那是 Lucene 内部 API,业务条件每加一个就要改 N 处。Query Builder 的职责是把"业务 DSL"翻译成 Lucene Query,并在中间强制注入安全约束(参数白名单、wildcard 防御、长度限制)。</p>
+
+<h3>Query Builder 的处理链</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-5 · 业务 DSL → Lucene Query 的翻译链</div>
+  <svg viewBox="0 0 1200 460" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 入口 + 出口 -->
+    <rect x="20" y="180" width="220" height="100" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="130" y="208" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">HTTP 请求 (DSL)</text>
+    <text x="130" y="228" text-anchor="middle" fill="#a5d6ff" font-size="11">{q, status, amount,</text>
+    <text x="130" y="246" text-anchor="middle" fill="#a5d6ff" font-size="11">  page, size, sort}</text>
+    <text x="130" y="266" text-anchor="middle" fill="#8b949e" font-size="11">业务无 Lucene 概念</text>
+
+    <rect x="960" y="180" width="220" height="100" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="1070" y="208" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">Lucene Query</text>
+    <text x="1070" y="228" text-anchor="middle" fill="#a5d6ff" font-size="11">BooleanQuery</text>
+    <text x="1070" y="246" text-anchor="middle" fill="#a5d6ff" font-size="11">+ Sort + searchAfter</text>
+    <text x="1070" y="266" text-anchor="middle" fill="#8b949e" font-size="11">已注入权限 / 已防御</text>
+
+    <!-- 6 步处理链 -->
+    <g font-size="12">
+      <rect x="280" y="40"  width="200" height="74" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="380" y="64"  text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">① 参数验证</text>
+      <text x="380" y="84"  text-anchor="middle" fill="#a5d6ff">白名单 + 长度上限</text>
+      <text x="380" y="102" text-anchor="middle" fill="#8b949e">非法 → 400</text>
+
+      <rect x="510" y="40"  width="200" height="74" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="1.5"/>
+      <text x="610" y="64"  text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">② wildcard 防御</text>
+      <text x="610" y="84"  text-anchor="middle" fill="#a5d6ff">最小前缀 ≥ 3</text>
+      <text x="610" y="102" text-anchor="middle" fill="#8b949e">拒绝裸 * / 前导 *</text>
+
+      <rect x="740" y="40"  width="200" height="74" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="840" y="64"  text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">③ 关键词解析</text>
+      <text x="840" y="84"  text-anchor="middle" fill="#a5d6ff">QueryParser / 多字段</text>
+      <text x="840" y="102" text-anchor="middle" fill="#8b949e">用查询 Analyzer</text>
+
+      <rect x="280" y="320" width="200" height="74" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="380" y="344" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">④ 过滤组装</text>
+      <text x="380" y="364" text-anchor="middle" fill="#a5d6ff">status / amount / time</text>
+      <text x="380" y="382" text-anchor="middle" fill="#8b949e">FILTER 子句</text>
+
+      <rect x="510" y="320" width="200" height="74" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="1.5"/>
+      <text x="610" y="344" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">⑤ 权限注入</text>
+      <text x="610" y="364" text-anchor="middle" fill="#a5d6ff">tenantId + shopId</text>
+      <text x="610" y="382" text-anchor="middle" fill="#8b949e">从 token 提取 · 不可绕</text>
+
+      <rect x="740" y="320" width="200" height="74" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+      <text x="840" y="344" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">⑥ 排序 + 翻页</text>
+      <text x="840" y="364" text-anchor="middle" fill="#a5d6ff">SortField + searchAfter</text>
+      <text x="840" y="382" text-anchor="middle" fill="#8b949e">禁用 from-size 深翻</text>
+    </g>
+
+    <!-- 关键说明 -->
+    <text x="610" y="170" text-anchor="middle" fill="#a5d6ff" font-size="12" font-weight="700">▼ 必经的 6 步 · 顺序决定安全性 (权限注入必须在最后才不会被业务覆盖)</text>
+    <text x="610" y="220" text-anchor="middle" fill="#39d2c0" font-size="13" font-weight="700">业务代码不直接构造 Query → 所有边界条件可在 Builder 一处审计</text>
+
+    <!-- 箭头 -->
+    <g fill="none">
+      <line x1="240" y1="220" x2="278" y2="80"  stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+      <line x1="480" y1="78"  x2="508" y2="78"  stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+      <line x1="710" y1="78"  x2="738" y2="78"  stroke="#f85149" stroke-width="1.6" marker-end="url(#arr-r)"/>
+      <line x1="840" y1="114" x2="380" y2="318" stroke="#bc8cff" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#arr-p)"/>
+      <line x1="480" y1="358" x2="508" y2="358" stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+      <line x1="710" y1="358" x2="738" y2="358" stroke="#f85149" stroke-width="1.6" marker-end="url(#arr-r)"/>
+      <line x1="940" y1="358" x2="958" y2="280" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+    </g>
+  </svg>
+</div>
+
+<h3>参数白名单 — 不在白名单里的字段一律拒绝</h3>
+
+<table>
+  <thead>
+    <tr><th>参数</th><th>类型</th><th>验证规则</th><th>说明</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>q</code></td><td>string</td><td>长度 ≤ 200,无控制符</td><td>关键词 — 用 QueryParser 转义特殊字符</td></tr>
+    <tr><td><code>status</code></td><td>enum</td><td>白名单值 PAID / SHIPPED / ...</td><td>订单状态精确过滤</td></tr>
+    <tr><td><code>storeId</code></td><td>string</td><td>跟随权限,非授权值拒绝</td><td>店铺过滤,服务端二次校验</td></tr>
+    <tr><td><code>amountMin / amountMax</code></td><td>long</td><td>0 ≤ v ≤ 1e10</td><td>金额范围(分)</td></tr>
+    <tr><td><code>paidFrom / paidTo</code></td><td>long</td><td>窗口 ≤ 90 天</td><td>支付时间范围,防止全表扫描</td></tr>
+    <tr><td><code>page / size</code></td><td>int</td><td>page ∈ [1,100], size ∈ [1,50]</td><td>翻页 — 深翻页禁用</td></tr>
+    <tr><td><code>sort</code></td><td>enum</td><td>白名单字段名</td><td>排序键 — 必须有 DocValues</td></tr>
+  </tbody>
+</table>
+
+<h3>Builder 的标准实现</h3>
+
+<pre><code class="language-java">public class OrderQueryBuilder {
+    private static final Set&lt;String&gt; STATUS_WHITELIST =
+        Set.of("CREATED", "PAID", "SHIPPED", "DELIVERED", "CANCELED");
+
+    public Query build(SearchRequest req, AuthContext auth) {
+        BooleanQuery.Builder b = new BooleanQuery.Builder();
+
+        if (req.q() != null &amp;&amp; !req.q().isBlank()) {
+            b.add(parseKeyword(req.q()), BooleanClause.Occur.MUST);
+        }
+
+        if (req.status() != null) {
+            require(STATUS_WHITELIST.contains(req.status()), "bad status");
+            b.add(new TermQuery(new Term("status", req.status())),
+                  BooleanClause.Occur.FILTER);
+        }
+
+        if (req.amountMin() != null || req.amountMax() != null) {
+            long lo = req.amountMin() != null ? req.amountMin() : 0L;
+            long hi = req.amountMax() != null ? req.amountMax() : Long.MAX_VALUE;
+            b.add(LongPoint.newRangeQuery("amountCents", lo, hi),
+                  BooleanClause.Occur.FILTER);
+        }
+
+        if (req.paidFrom() != null &amp;&amp; req.paidTo() != null) {
+            require(req.paidTo() - req.paidFrom() &lt;= TimeUnit.DAYS.toMillis(90),
+                "time window too wide");
+            b.add(LongPoint.newRangeQuery("paidAt", req.paidFrom(), req.paidTo()),
+                  BooleanClause.Occur.FILTER);
+        }
+
+        injectAuth(b, auth);
+        return b.build();
+    }
+
+    private Query parseKeyword(String q) {
+        String safe = QueryParserBase.escape(q.trim());
+        try {
+            return new QueryParser("title", new OrderAnalyzer()).parse(safe);
+        } catch (ParseException e) {
+            return new TermQuery(new Term("title", safe.toLowerCase()));
+        }
+    }
+}</code></pre>
+
+<div class="warning">
+  <strong>wildcard / regex 必须有最小前缀长度</strong> — 用户能传 <code>q=*</code> 或 <code>q=a*</code> 这种宽 wildcard 是搜索服务的"性能炸弹"——后台展开几十万 term,内存炸、CPU 占满、其他查询全 P99 飙红。生产防御:WildcardQuery 的前缀必须 ≥ 3 字符,否则在 Builder 层拒绝(返回 400);RegexpQuery 默认禁用,只在白名单接口允许。这一点和 Elasticsearch 的 <code>indices.query.bool.max_clause_count</code> 是同一类防御。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s5-6">5.6 权限过滤与多租户</h2>
+<!-- ============================================================ -->
+
+<p>多租户搜索服务里,"权限"不是查询的可选 filter,而是<strong>合规底线</strong>。租户 A 不能看到租户 B 的订单,商家不能看到其他商家的订单,客服只能看到自己分配的订单。这些规则必须在 Query 阶段强制注入,而不是在结果集上事后过滤。</p>
+
+<h3>三级权限的层级注入</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-6 · 租户 / 店铺 / 仓库 三级权限的过滤注入</div>
+  <svg viewBox="0 0 1200 580" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 入口 AuthContext -->
+    <rect x="380" y="20" width="440" height="80" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="600" y="48" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">AuthContext (从 token 解析,不可被业务篡改)</text>
+    <text x="600" y="68" text-anchor="middle" fill="#a5d6ff" font-size="11">{ tenantId, role, allowedShopIds, allowedWarehouseIds }</text>
+    <text x="600" y="86" text-anchor="middle" fill="#8b949e" font-size="11">三个层级的访问范围</text>
+
+    <!-- L1 租户级 -->
+    <polygon points="600,140 760,200 600,260 440,200" fill="url(#g-red)" stroke="#f85149" stroke-width="1.5"/>
+    <text x="600" y="195" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">L1 租户级</text>
+    <text x="600" y="213" text-anchor="middle" fill="#a5d6ff" font-size="11">必查 · 不可绕过</text>
+
+    <rect x="20" y="170" width="380" height="80" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="1.5"/>
+    <text x="210" y="198" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">FILTER tenantId : T1 (硬性 MUST)</text>
+    <text x="210" y="218" text-anchor="middle" fill="#a5d6ff" font-size="11">租户隔离 · 合规底线 (SOC 2 / ISO 27001 审计点)</text>
+    <text x="210" y="236" text-anchor="middle" fill="#8b949e" font-size="11">租户 A 永远看不到租户 B 的订单</text>
+
+    <!-- L2 店铺级 -->
+    <polygon points="600,300 760,360 600,420 440,360" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="600" y="355" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">L2 店铺级</text>
+    <text x="600" y="373" text-anchor="middle" fill="#a5d6ff" font-size="11">看角色判断</text>
+
+    <rect x="20" y="330" width="380" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="210" y="358" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">TENANT_ADMIN → 跳过店铺过滤</text>
+    <text x="210" y="376" text-anchor="middle" fill="#a5d6ff" font-size="11">租户管理员可见全租户</text>
+
+    <rect x="800" y="320" width="380" height="80" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="990" y="348" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">普通角色 → 店铺白名单</text>
+    <text x="990" y="368" text-anchor="middle" fill="#a5d6ff" font-size="11">FILTER shopId IN (S1, S2, ...)</text>
+    <text x="990" y="386" text-anchor="middle" fill="#8b949e" font-size="11">BooleanQuery · SHOULD · minimumShouldMatch=1</text>
+
+    <!-- L3 仓库级 -->
+    <polygon points="600,450 760,510 600,570 440,510" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="600" y="505" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">L3 仓库级</text>
+    <text x="600" y="523" text-anchor="middle" fill="#a5d6ff" font-size="11">可选</text>
+
+    <rect x="20" y="480" width="380" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="210" y="508" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">无仓库限制 → 不加 filter</text>
+    <text x="210" y="526" text-anchor="middle" fill="#a5d6ff" font-size="11">店铺级已足够</text>
+
+    <rect x="800" y="470" width="380" height="80" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="990" y="498" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">有仓库限制 → 仓库白名单</text>
+    <text x="990" y="518" text-anchor="middle" fill="#a5d6ff" font-size="11">FILTER warehouseId IN (W1, W2, ...)</text>
+    <text x="990" y="536" text-anchor="middle" fill="#8b949e" font-size="11">仓管角色 / 跨店但限仓</text>
+
+    <!-- 箭头 -->
+    <g fill="none">
+      <line x1="600" y1="100" x2="600" y2="138" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <line x1="440" y1="200" x2="402" y2="200" stroke="#f85149" stroke-width="1.6" marker-end="url(#arr-r)"/>
+      <line x1="600" y1="260" x2="600" y2="298" stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+
+      <line x1="440" y1="360" x2="402" y2="360" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="420" y="350" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="700">admin</text>
+
+      <line x1="760" y1="360" x2="798" y2="360" stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+      <text x="780" y="350" text-anchor="middle" fill="#d29922" font-size="11" font-weight="700">普通</text>
+
+      <line x1="600" y1="420" x2="600" y2="448" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+
+      <line x1="440" y1="510" x2="402" y2="510" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <line x1="760" y1="510" x2="798" y2="510" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+    </g>
+  </svg>
+</div>
+
+<h3>权限注入代码</h3>
+
+<pre><code class="language-java">private void injectAuth(BooleanQuery.Builder b, AuthContext auth) {
+    Objects.requireNonNull(auth.tenantId(), "tenantId required");
+    b.add(new TermQuery(new Term("tenantId", auth.tenantId())),
+          BooleanClause.Occur.FILTER);
+
+    if (auth.role() != Role.TENANT_ADMIN) {
+        Set&lt;String&gt; shops = auth.allowedShopIds();
+        require(!shops.isEmpty(), "user has no shop scope");
+
+        BooleanQuery.Builder shopFilter = new BooleanQuery.Builder();
+        for (String s : shops) {
+            shopFilter.add(new TermQuery(new Term("shopId", s)),
+                           BooleanClause.Occur.SHOULD);
+        }
+        shopFilter.setMinimumNumberShouldMatch(1);
+        b.add(shopFilter.build(), BooleanClause.Occur.FILTER);
+    }
+
+    if (auth.allowedWarehouseIds() != null
+            &amp;&amp; !auth.allowedWarehouseIds().isEmpty()) {
+        BooleanQuery.Builder whFilter = new BooleanQuery.Builder();
+        for (String w : auth.allowedWarehouseIds()) {
+            whFilter.add(new TermQuery(new Term("warehouseId", w)),
+                         BooleanClause.Occur.SHOULD);
+        }
+        whFilter.setMinimumNumberShouldMatch(1);
+        b.add(whFilter.build(), BooleanClause.Occur.FILTER);
+    }
+}</code></pre>
+
+<div class="key-insight">
+  <strong>为什么权限 filter 必须前置 — TopK 会被无权数据污染</strong>。一个常见的反模式:先 <code>searcher.search(query, 100)</code> 拿 TopK,再用业务代码过滤掉无权的订单。问题:TopK 收集的是<strong>按分数排序的前 100 条 — 不管有没有权限</strong>。租户 A 搜 "wireless charger",查到的 100 条里可能只有 3 条是租户 A 的,其他 97 条全是其他租户的高分订单。事后过滤后只剩 3 条结果——更糟糕的是分页:<code>page=2</code> 时还是从 TopK 第 100 条之后取,结果集稀疏到完全错乱。<strong>正确做法:</strong>把 <code>FILTER tenantId:T1 AND shopId IN (...)</code> 加进 Query,让权限约束参与 leapfrog 求交,TopK 收集到的就已经全是有权数据。这一点不仅是性能正确,更是<strong>多租户合规的硬性底线</strong>——SOC 2 / ISO 27001 审计员会专门检查搜索接口的权限过滤是不是在查询阶段。
+</div>
+
+<h3>权限审计日志</h3>
+
+<table>
+  <thead>
+    <tr><th>字段</th><th>必记</th><th>说明</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>userId / tenantId / role</td><td>是</td><td>谁查的</td></tr>
+    <tr><td>queryDigest</td><td>是</td><td>查询的 hash(用于追溯,不记原文避免 PII)</td></tr>
+    <tr><td>filters.tenantId / shopId / warehouseId</td><td>是</td><td>实际命中的权限 scope</td></tr>
+    <tr><td>resultCount</td><td>是</td><td>命中条数</td></tr>
+    <tr><td>resultIds</td><td>否</td><td>结果 orderId 列表(高敏)— 通常不记,只在审计模式开</td></tr>
+    <tr><td>latencyMs / timestamp</td><td>是</td><td>性能 + 时间</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s5-7">5.7 排序与分页</h2>
+<!-- ============================================================ -->
+
+<p>"按金额降序、深翻页"是订单搜索几乎一定要支持的功能。但 from-size 翻页(<code>from=1000 size=20</code>)在 Lucene 里是 <strong>O(N)</strong> 反模式——TopK 堆要遍历到第 1000 条才能扔掉前面的。生产里只能用 <strong>searchAfter</strong> 游标。</p>
+
+<h3>from-size vs searchAfter 的代价对比</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4>反例:from-size 深翻页</h4>
+    <pre><code class="language-java">int from = (page - 1) * size;
+TopDocs td = searcher.search(query,
+    from + size,
+    sort);
+
+ScoreDoc[] hits = td.scoreDocs;
+ScoreDoc[] page = Arrays.copyOfRange(
+    hits, from, hits.length);</code></pre>
+    <p style="margin-top:8px;font-size:12px;color:#f85149;">
+    问题:Lucene 内部 TopK 堆是 <code>from + size</code> 大小。<br/>
+    page=100 size=20 → 堆大小 2020,要遍历几乎全部命中。<br/>
+    page=1000 时堆 20020,可能 1 千万 doc 全扫,P99 飙到秒级。<br/>
+    Elasticsearch 默认 <code>index.max_result_window=10000</code> 就是这个原因。
+    </p>
+  </div>
+  <div class="compare-good">
+    <h4>正例:searchAfter 游标</h4>
+    <pre><code class="language-java">// 第一页:无 cursor
+TopFieldDocs first = searcher.searchAfter(
+    null, query, size, sort);
+
+ScoreDoc lastHit = first.scoreDocs[size - 1];
+String cursor = encode(lastHit);
+
+// 第二页:用上一页最后一条
+ScoreDoc after = decode(cursor);
+TopFieldDocs next = searcher.searchAfter(
+    after, query, size, sort);</code></pre>
+    <p style="margin-top:8px;font-size:12px;color:#3fb950;">
+    每页堆大小恒定 = size,与翻页深度无关。<br/>
+    第 100 页和第 1 页代价几乎相同。<br/>
+    代价:不能"跳页",只能顺序翻。
+    </p>
+  </div>
+</div>
+
+<h3>searchAfter 游标在多页之间的稳定性</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-7 · searchAfter 游标的稳定性可视化(按 amountSort DESC + docID ASC)</div>
+  <div style="padding:18px 4px;font-family:'Cascadia Code','SFMono-Regular',Consolas,monospace;font-size:11px;">
+
+    <div style="background:#0d1117;border:1.5px solid #58a6ff;border-radius:10px;padding:14px;margin-bottom:10px;">
+      <div style="color:#58a6ff;font-weight:700;font-size:13px;margin-bottom:8px;">第 1 页 · searchAfter=null · size=3</div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;">
+        <div style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px;">
+          <div style="color:#3fb950;font-weight:700;">O1888</div>
+          <div style="color:#a5d6ff;">amount=899.00</div>
+          <div style="color:#8b949e;font-size:10px;">docId=42</div>
+        </div>
+        <div style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px;">
+          <div style="color:#3fb950;font-weight:700;">O1654</div>
+          <div style="color:#a5d6ff;">amount=520.00</div>
+          <div style="color:#8b949e;font-size:10px;">docId=99</div>
+        </div>
+        <div style="background:#161b22;border:1.5px solid #d29922;border-radius:6px;padding:10px;">
+          <div style="color:#3fb950;font-weight:700;">O1003</div>
+          <div style="color:#a5d6ff;">amount=168.00</div>
+          <div style="color:#8b949e;font-size:10px;">docId=7 ← cursor</div>
+        </div>
+      </div>
+      <div style="margin-top:8px;color:#8b949e;font-size:10px;">cursor = encode({sort=[168.00, 7]})</div>
+    </div>
+
+    <div style="text-align:center;color:#8b949e;font-size:14px;margin:6px 0;">↓ 此时新写入 O2001 amount=999.00 — 不影响游标稳定</div>
+
+    <div style="background:#0d1117;border:1.5px solid #58a6ff;border-radius:10px;padding:14px;margin-bottom:10px;">
+      <div style="color:#58a6ff;font-weight:700;font-size:13px;margin-bottom:8px;">第 2 页 · searchAfter=&lt;168.00, 7&gt; · size=3</div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;">
+        <div style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px;">
+          <div style="color:#3fb950;font-weight:700;">O1001</div>
+          <div style="color:#a5d6ff;">amount=128.00</div>
+          <div style="color:#8b949e;font-size:10px;">docId=1</div>
+        </div>
+        <div style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px;">
+          <div style="color:#3fb950;font-weight:700;">O1402</div>
+          <div style="color:#a5d6ff;">amount=99.00</div>
+          <div style="color:#8b949e;font-size:10px;">docId=58</div>
+        </div>
+        <div style="background:#161b22;border:1.5px solid #d29922;border-radius:6px;padding:10px;">
+          <div style="color:#3fb950;font-weight:700;">O1100</div>
+          <div style="color:#a5d6ff;">amount=58.00</div>
+          <div style="color:#8b949e;font-size:10px;">docId=33 ← cursor</div>
+        </div>
+      </div>
+      <div style="margin-top:8px;color:#39d2c0;font-size:10px;">✓ 不会重复也不会漏 — Lucene 严格按 (sort, docId) 排序</div>
+    </div>
+
+    <div style="background:#161b22;border:1.5px dashed #f85149;border-radius:10px;padding:14px;">
+      <div style="color:#f85149;font-weight:700;font-size:12px;margin-bottom:6px;">⚠ 边界:O2001 amount=999.00 在第 2 页时新写入</div>
+      <div style="color:#a5d6ff;font-size:11px;line-height:1.7;">
+      O2001 应该出现在第 1 页(它金额最高),但第 1 页已经返回。<br/>
+      → 用户从第 2 页继续翻不会看到 O2001(已经被游标跳过)。<br/>
+      这是 searchAfter 的"快照语义"代价 — 完整性不保证,但稳定性保证。<br/>
+      生产里能接受这个代价 — 用户翻到第 50 页时不在乎少一条新订单。
+      </div>
+    </div>
+  </div>
+</div>
+
+<h3>SortField + searchAfter 实现</h3>
+
+<pre><code class="language-java">public PageResult&lt;OrderHit&gt; searchPage(SearchRequest req, AuthContext auth)
+        throws IOException {
+    Query query = builder.build(req, auth);
+    Sort sort = new Sort(
+        new SortField("amountSort", SortField.Type.LONG, true),
+        new SortField(null, SortField.Type.DOC));
+
+    return mgr.withSearcher(searcher -&gt; {
+        FieldDoc after = req.cursor() != null ? decode(req.cursor()) : null;
+        TopFieldDocs td = searcher.searchAfter(after, query, req.size(), sort);
+
+        List&lt;OrderHit&gt; hits = new ArrayList&lt;&gt;(td.scoreDocs.length);
+        StoredFields sf = searcher.storedFields();
+        for (ScoreDoc sd : td.scoreDocs) {
+            Document d = sf.document(sd.doc, STORED_FIELDS);
+            hits.add(toHit(d));
+        }
+
+        String nextCursor = td.scoreDocs.length == req.size()
+            ? encode((FieldDoc) td.scoreDocs[td.scoreDocs.length - 1])
+            : null;
+        return new PageResult&lt;&gt;(hits, nextCursor, td.totalHits.value);
+    });
+}</code></pre>
+
+<div class="warning">
+  <strong>deep paging 用 from-size 是反模式 — TopK 堆需要全量遍历到第 N 页</strong>。Elasticsearch 默认禁止 from+size &gt; 10000(<code>index.max_result_window</code>),不是为了 ES 自己,是为了 Lucene 底层。Lucene 的 TopFieldCollector 维护一个堆大小为 <code>from + size</code> 的小顶堆,意味着即使你只要第 1000 页的 20 条,也得维护一个 20020 大小的堆——堆里每次 push 都是 O(log K),总代价是 O(N · log(from+size))。在 1 千万 doc 的索引里 P99 直接到秒级。生产里要么用 searchAfter,要么用 scroll(导出场景),要么硬性限制 page ≤ 100。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s5-8">5.8 业务 boost 与 RescoreQuery</h2>
+<!-- ============================================================ -->
+
+<p>BM25 算的是"文本相关性"——它告诉你查询词与文档字段在语料统计上有多匹配。但生产里用户想要的不只是"相关",还有"对我有用":VIP 订单优先、最近下单的优先、客服正在跟进的优先、店铺评分高的优先。这些"业务相关性"无法编码进 BM25 公式,只能在 BM25 分数之上做<strong>第二阶段重排</strong>。Lucene 给出的标准答案就是 <code>RescoreQuery</code>(在 ES 里叫 rescore phase)——先用便宜的 BM25 召回 TopN,再用昂贵的业务函数对 TopN 内部重新排序。</p>
+
+<h3>两阶段检索:cheap recall + expensive rerank</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-8 · 两阶段检索的执行路径</div>
+  <svg viewBox="0 0 1200 460" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 入口 -->
+    <rect x="20" y="180" width="200" height="80" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="120" y="208" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">用户查询</text>
+    <text x="120" y="228" text-anchor="middle" fill="#a5d6ff" font-size="11">title : charger</text>
+    <text x="120" y="246" text-anchor="middle" fill="#8b949e" font-size="11">+ filter (status, tenant)</text>
+
+    <!-- 阶段 1 -->
+    <rect x="260" y="160" width="240" height="120" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="380" y="188" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">阶段 1 · 召回</text>
+    <text x="380" y="208" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">BM25 + filter</text>
+    <text x="380" y="228" text-anchor="middle" fill="#a5d6ff" font-size="11">cheap · O(min(freq))</text>
+    <text x="380" y="246" text-anchor="middle" fill="#a5d6ff" font-size="11">召回 N = 200-1000</text>
+    <text x="380" y="266" text-anchor="middle" fill="#8b949e" font-size="11">BlockMax 加速</text>
+
+    <!-- 候选集 -->
+    <rect x="540" y="180" width="160" height="80" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="620" y="208" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">候选集 N=200</text>
+    <text x="620" y="228" text-anchor="middle" fill="#a5d6ff" font-size="11">按 BM25 score desc</text>
+    <text x="620" y="246" text-anchor="middle" fill="#8b949e" font-size="11">已包含相关性</text>
+
+    <!-- 阶段 2 -->
+    <rect x="740" y="160" width="240" height="120" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="860" y="188" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">阶段 2 · 重排</text>
+    <text x="860" y="208" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">RescoreQuery</text>
+    <text x="860" y="228" text-anchor="middle" fill="#a5d6ff" font-size="11">expensive · O(N)</text>
+    <text x="860" y="246" text-anchor="middle" fill="#a5d6ff" font-size="11">combine BM25 × biz</text>
+    <text x="860" y="266" text-anchor="middle" fill="#8b949e" font-size="11">仅在 N=200 上跑</text>
+
+    <!-- 输出 -->
+    <rect x="1020" y="180" width="160" height="80" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="1100" y="208" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">最终 TopK = 20</text>
+    <text x="1100" y="228" text-anchor="middle" fill="#a5d6ff" font-size="11">HTTP 响应</text>
+    <text x="1100" y="246" text-anchor="middle" fill="#8b949e" font-size="11">含 cursor (下页)</text>
+
+    <!-- 业务因子 -->
+    <rect x="540" y="40" width="600" height="80" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="840" y="68" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">业务因子 (注入到 RescoreQuery.combine)</text>
+    <text x="840" y="88" text-anchor="middle" fill="#a5d6ff" font-size="11">vipLevel  ·  recency  ·  popularity  ·  shopScore  ·  LTR 模型</text>
+    <text x="840" y="106" text-anchor="middle" fill="#8b949e" font-size="11">来源: NumericDocValues / 远程服务 / Redis · 单 doc 50μs - 5ms 都能扛</text>
+
+    <!-- 底部说明 -->
+    <rect x="120" y="320" width="960" height="120" rx="10" fill="rgba(63,185,80,0.05)" stroke="#3fb950" stroke-width="1.2" stroke-dasharray="6 4"/>
+    <text x="600" y="346" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">两阶段架构的核心价值:把昂贵计算限定在 N 个文档上,不是全索引</text>
+    <text x="600" y="372" text-anchor="middle" fill="#a5d6ff" font-size="12">单阶段:1 千万 doc 打 LTR ~ 600ms · 不可接受</text>
+    <text x="600" y="392" text-anchor="middle" fill="#a5d6ff" font-size="12">两阶段:BM25 召回 200 + LTR × 200 ~ 35ms · 召回损失 &lt; 1% (高分基本都在前 200)</text>
+    <text x="600" y="418" text-anchor="middle" fill="#39d2c0" font-size="12" font-weight="700">⇒ Elasticsearch rescore phase / Amazon Product Search / Bing 都是同一架构</text>
+
+    <!-- 箭头 -->
+    <g fill="none">
+      <line x1="220" y1="220" x2="258" y2="220" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <line x1="500" y1="220" x2="538" y2="220" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+      <line x1="700" y1="220" x2="738" y2="220" stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+      <line x1="980" y1="220" x2="1018" y2="220" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+
+      <line x1="840" y1="120" x2="860" y2="158" stroke="#d29922" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#arr-o)"/>
+    </g>
+  </svg>
+</div>
+
+<p>两阶段架构的核心价值是<strong>把昂贵计算限定在 N 个文档上</strong>而不是全索引。BM25 求交是 O(min(freq)),在 1 千万 doc 索引上只扫稀有 term 命中的几万 doc;RescoreQuery 在阶段 2 只对 TopN(默认 N=200)做重计算,即使每个 doc 计算业务分数要花 50 μs,总代价也就 10ms 左右——在 P99 200ms 的预算里完全 hold 得住。</p>
+
+<h3>三种 boost 实现的层次</h3>
+
+<table>
+  <thead>
+    <tr><th>层次</th><th>API</th><th>计算时机</th><th>代价</th><th>典型用途</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>查询级 boost</td><td><code>new BoostQuery(query, factor)</code></td><td>每次 advance/score</td><td>O(全召回集)</td><td>多字段权重 (title^2 vs body^1)</td></tr>
+    <tr><td>FunctionScore</td><td><code>FunctionScoreQuery</code> + <code>DoubleValuesSource</code></td><td>每个候选 doc 计算一次</td><td>O(全召回集)</td><td>recency / 距离 / 简单数值因子</td></tr>
+    <tr><td>RescoreQuery</td><td><code>QueryRescorer</code> 或自实现</td><td>仅对 TopN 计算</td><td>O(TopN)</td><td>昂贵打分:模型 / 远程查询 / 复杂规则</td></tr>
+  </tbody>
+</table>
+
+<h3>FunctionScoreQuery — 廉价业务因子直接合入 BM25</h3>
+
+<pre><code class="language-java">public Query buildFunctionScore(Query baseQuery, long now) {
+    DoubleValuesSource recency = DoubleValuesSource.fromLongField("paidAtSort");
+    DoubleValuesSource vip      = DoubleValuesSource.fromIntField("vipLevel");
+    DoubleValuesSource shopScr  = DoubleValuesSource.fromDoubleField("shopScore");
+
+    DoubleValuesSource recencyDecay = DoubleValuesSource.function(
+        "recencyDecay", recency,
+        v -&gt; Math.exp(-(now - v) / (7.0 * 24 * 3600 * 1000)));
+
+    DoubleValuesSource bizScore = DoubleValuesSource.function(
+        "bizScore", List.of(vip, shopScr, recencyDecay),
+        vals -&gt; 1.0 + 0.5 * vals.get(0).doubleValue()
+                    + 0.3 * vals.get(1).doubleValue()
+                    + 0.2 * vals.get(2).doubleValue());
+
+    return FunctionScoreQuery.boostByValue(baseQuery, bizScore);
+}</code></pre>
+
+<p>FunctionScoreQuery 把 BM25 分数与业务因子相乘,公式形态固定为 <code>finalScore = bm25 × bizScore(doc)</code>。它适合"业务因子廉价、可向量化、能从 DocValues 直接读取"的场景——本例里 vipLevel / shopScore / paidAtSort 都是 NumericDocValuesField,O(1) 列读,几乎不增加单 doc 的打分代价。</p>
+
+<h3>RescoreQuery — 重计算限定在 TopN 内</h3>
+
+<pre><code class="language-java">public TopDocs searchWithRescore(IndexSearcher searcher,
+                                  Query baseQuery, int topK)
+        throws IOException {
+    int topN = 200;
+    TopDocs firstPass = searcher.search(baseQuery, topN);
+
+    Query expensiveBiz = new BoostQuery(
+        new MatchAllDocsQuery(),
+        1.0f
+    );
+    Rescorer rescorer = new QueryRescorer(expensiveBiz) {
+        @Override
+        protected float combine(float firstPassScore, boolean secondPassMatches,
+                                 float secondPassScore) {
+            float biz = computeBusinessScore(firstPassScore, /* doc fields */);
+            return 0.7f * firstPassScore + 0.3f * biz;
+        }
+    };
+
+    return rescorer.rescore(searcher, firstPass, topK);
+}</code></pre>
+
+<p><code>QueryRescorer</code> 是 Lucene 提供的标准两阶段重排器。<code>combine()</code> 给你一个 hook 把 BM25 与业务分按权重混合。生产里 <code>computeBusinessScore</code> 经常是"读模型推理结果"或"调下游服务拿实时信号"——只在 TopN=200 上调用,而不是在全召回集上调用,几十毫秒的远程调用也能扛住。</p>
+
+<h3>三层 boost 的代价对比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-9 · 不同 boost 层次的真实代价(1 千万 doc · 召回 50k · TopK=20)</div>
+  <div style="padding:18px 4px;font-family:'Cascadia Code','SFMono-Regular',Consolas,monospace;font-size:12px;">
+    <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;">
+
+      <div style="background:#0d1117;border:1.5px solid #3fb950;border-radius:10px;padding:14px;">
+        <div style="color:#3fb950;font-weight:700;font-size:13px;margin-bottom:6px;border-bottom:1px solid #30363d;padding-bottom:6px;">BoostQuery</div>
+        <div style="color:#a5d6ff;font-size:11px;line-height:1.7;">作用域:全召回 50k<br/>单 doc 代价:0.1 μs<br/>总代价:5 ms</div>
+        <div style="margin-top:8px;color:#8b949e;font-size:10px;">仅适合常量 boost</div>
+        <div style="margin-top:6px;color:#39d2c0;font-size:10px;">P99 影响 +5ms</div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #d29922;border-radius:10px;padding:14px;">
+        <div style="color:#d29922;font-weight:700;font-size:13px;margin-bottom:6px;border-bottom:1px solid #30363d;padding-bottom:6px;">FunctionScore</div>
+        <div style="color:#a5d6ff;font-size:11px;line-height:1.7;">作用域:全召回 50k<br/>单 doc 代价:1-5 μs<br/>总代价:50-250 ms</div>
+        <div style="margin-top:8px;color:#8b949e;font-size:10px;">DocValues 读取够快才行</div>
+        <div style="margin-top:6px;color:#39d2c0;font-size:10px;">P99 影响 +50-250ms</div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #d2a8ff;border-radius:10px;padding:14px;">
+        <div style="color:#d2a8ff;font-weight:700;font-size:13px;margin-bottom:6px;border-bottom:1px solid #30363d;padding-bottom:6px;">RescoreQuery</div>
+        <div style="color:#a5d6ff;font-size:11px;line-height:1.7;">作用域:仅 TopN=200<br/>单 doc 代价:50 μs - 5 ms<br/>总代价:10-1000 ms</div>
+        <div style="margin-top:8px;color:#8b949e;font-size:10px;">远程调用 / 模型推理可用</div>
+        <div style="margin-top:6px;color:#39d2c0;font-size:10px;">P99 影响 +10-50ms (N 控好)</div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<h3>什么因子放在哪一阶段</h3>
+
+<table>
+  <thead>
+    <tr><th>因子</th><th>放在哪</th><th>原因</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>title^2 vs body^1 字段权重</td><td>查询级 BoostQuery</td><td>常量,放第一阶段不增成本</td></tr>
+    <tr><td>recency 时间衰减</td><td>FunctionScore</td><td>DocValues 列读廉价</td></tr>
+    <tr><td>VIP 客户等级</td><td>FunctionScore</td><td>同上</td></tr>
+    <tr><td>店铺综合评分</td><td>FunctionScore</td><td>同上</td></tr>
+    <tr><td>用户个性化特征(实时召回模型)</td><td>RescoreQuery</td><td>需调远程服务,只能在 TopN 上做</td></tr>
+    <tr><td>LTR(Learning-to-Rank)模型</td><td>RescoreQuery</td><td>每 doc 数毫秒,绝不能在 50k 上跑</td></tr>
+    <tr><td>客服正在跟进标记</td><td>RescoreQuery</td><td>来自 Redis,远程读</td></tr>
+  </tbody>
+</table>
+
+<div class="key-insight">
+  <strong>BM25 的 explain 是"为什么相关",业务 boost 的 explain 是"为什么排第一" — 两者要分开 explain</strong>。生产 search API 必须暴露 <code>?explain=true</code> 参数,返回时既给出 BM25 的 idf×tfNorm 拆分,也给出业务 boost 各因子的实际值与权重。运营反馈"为什么 X 商家的订单总排第一"时,你能立刻看到是 vipLevel=5 加了 0.5,还是 shopScore=4.8 加了 0.3,还是召回模型给了高分。没有这个能力,业务 boost 就是黑箱,没人能说清楚为什么这次结果排序变了——这种"调一调拉一拉"的状态在生产里是<strong>合规风险</strong>(电商平台尤其要注意搜索排序的可解释性)。
+</div>
+
+<div class="real-world">
+  <strong>Elasticsearch 的 rescore phase 与 Lucene 一致</strong> — ES 的 <code>"rescore": { "window_size": 200, "query": {...} }</code> 配置在 Lucene 层就是创建一个 <code>QueryRescorer</code>(window_size 即 TopN),底层 API 完全一样。区别只是 ES 把它包装成 JSON DSL,让"不懂 Lucene"的工程师也能配置。所以 ES 调 rescore 出问题时,直接看 Lucene 的 <code>QueryRescorer.rescore</code> 源码就能找到答案。Amazon Product Search 公开的论文里也提到他们用 LTR 模型在 rescore 阶段重排——核心架构和我们这里完全一致,差异只在业务因子复杂度。
+</div>
+
+<div class="warning">
+  <strong>不要把"过滤"伪装成 boost</strong> — 见过反例:把"禁售商品"用 <code>BoostQuery(banQuery, -1000)</code> 实现,期望负 boost 把它压到最后。问题是 BM25 分数本身就有 5-10 的浮动,-1000 看起来很大但在某些 doc 上仍可能为正(因为查询是 sum 不是 product)。结果是"被禁售的商品偶尔还会出现在搜索结果"——这是合规事故。正确做法:禁售要进 <code>BooleanClause.MUST_NOT</code> 或 <code>FILTER</code> 强制过滤,boost 只用于"排序偏好",绝不能承担"排除"语义。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s5-9">5.9 索引重建与 alias 切换</h2>
+<!-- ============================================================ -->
+
+<p>索引会因为 Schema 变更、Analyzer 升级、数据修复需要重建。生产里"原地重建"是事故制造机——重建期间查询不可用、失败无法回滚、半成品索引可能被读到。正确路径是<strong>新目录构建 + 校验 + alias 原子切换</strong>。</p>
+
+<h3>四阶段 Rebuild 流程</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-8 · 全量 Rebuild + alias 切换的四阶段</div>
+  <svg viewBox="0 0 1200 620" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- Decision -->
+    <rect x="20" y="20" width="320" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="180" y="46" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">决策 Rebuild</text>
+    <text x="180" y="64" text-anchor="middle" fill="#a5d6ff" font-size="11">Schema / Analyzer / 数据修复</text>
+
+    <!-- 阶段 1 -->
+    <rect x="20" y="120" width="320" height="80" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="180" y="148" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">阶段 1 · 拍一致性快照</text>
+    <text x="180" y="168" text-anchor="middle" fill="#a5d6ff" font-size="11">OrderDB 一致性 snapshot</text>
+    <text x="180" y="186" text-anchor="middle" fill="#8b949e" font-size="11">记录 binlog position (回放起点)</text>
+
+    <!-- 阶段 2 -->
+    <rect x="20" y="240" width="320" height="80" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="180" y="268" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">阶段 2 · 全量构建 orders.v2</text>
+    <text x="180" y="288" text-anchor="middle" fill="#a5d6ff" font-size="11">新目录 · 全量批量写入</text>
+    <text x="180" y="306" text-anchor="middle" fill="#8b949e" font-size="11">v1 完全只读 · 不动</text>
+
+    <!-- 阶段 2.5 -->
+    <rect x="20" y="360" width="320" height="80" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="180" y="388" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">阶段 2.5 · CDC catch up</text>
+    <text x="180" y="408" text-anchor="middle" fill="#a5d6ff" font-size="11">双写 v1 + v2</text>
+    <text x="180" y="426" text-anchor="middle" fill="#8b949e" font-size="11">从 binlog position 追上当前</text>
+
+    <!-- 阶段 3:决策 -->
+    <polygon points="180,470 360,540 180,610 0,540" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="180" y="535" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">阶段 3 · 数据校验</text>
+    <text x="180" y="553" text-anchor="middle" fill="#a5d6ff" font-size="11">抽样 1000 条 · v1 vs v2</text>
+    <text x="180" y="571" text-anchor="middle" fill="#a5d6ff" font-size="11">差异率 &lt; 0.01% ?</text>
+
+    <!-- 通过 → 阶段 4 -->
+    <rect x="420" y="490" width="320" height="80" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="580" y="518" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">阶段 4 · alias 原子切换</text>
+    <text x="580" y="538" text-anchor="middle" fill="#a5d6ff" font-size="11">orders alias → orders.v2</text>
+    <text x="580" y="556" text-anchor="middle" fill="#8b949e" font-size="11">配置中心推送 · ≤ 30s 全集群同步</text>
+
+    <!-- 失败 -->
+    <rect x="800" y="490" width="380" height="80" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="1.5"/>
+    <text x="990" y="518" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">放弃 v2 · v1 完好无损</text>
+    <text x="990" y="538" text-anchor="middle" fill="#a5d6ff" font-size="11">删 v2 目录 · 排查差异源</text>
+    <text x="990" y="556" text-anchor="middle" fill="#8b949e" font-size="11">不动线上 · 零业务影响</text>
+
+    <!-- standby -->
+    <rect x="800" y="240" width="380" height="80" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="990" y="268" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">v1 转 standby (保留 24h)</text>
+    <text x="990" y="288" text-anchor="middle" fill="#a5d6ff" font-size="11">秒级 alias 切回</text>
+    <text x="990" y="306" text-anchor="middle" fill="#8b949e" font-size="11">线上发现问题立即回滚</text>
+
+    <!-- cleanup -->
+    <rect x="800" y="360" width="380" height="80" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="990" y="388" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">7 天后删除 v1</text>
+    <text x="990" y="408" text-anchor="middle" fill="#a5d6ff" font-size="11">磁盘空间回收</text>
+    <text x="990" y="426" text-anchor="middle" fill="#8b949e" font-size="11">归档 snapshot 进 S3 Glacier</text>
+
+    <!-- 顶部说明 -->
+    <text x="600" y="50" text-anchor="middle" fill="#a5d6ff" font-size="13" font-weight="700">"构建 / 切换分离" — alias 让失败可回滚 · v1 在重建期完全只读</text>
+
+    <!-- 箭头 -->
+    <g fill="none">
+      <line x1="180" y1="80"  x2="180" y2="118" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <line x1="180" y1="200" x2="180" y2="238" stroke="#d29922" stroke-width="1.6" marker-end="url(#arr-o)"/>
+      <line x1="180" y1="320" x2="180" y2="358" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <line x1="180" y1="440" x2="180" y2="468" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+
+      <line x1="360" y1="540" x2="418" y2="530" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="385" y="520" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="700">通过</text>
+
+      <path d="M340,500 C 600,470 700,500 800,500" fill="none" stroke="#f85149" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#arr-r)"/>
+      <text x="650" y="468" text-anchor="middle" fill="#f85149" font-size="11" font-weight="700">失败</text>
+
+      <line x1="740" y1="510" x2="990" y2="318" stroke="#d29922" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#arr-o)"/>
+      <text x="900" y="450" text-anchor="middle" fill="#d29922" font-size="11" font-weight="700">v1→standby</text>
+
+      <line x1="990" y1="320" x2="990" y2="358" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+
+      <path d="M580,560 C 580,580 990,580 990,320" fill="none" stroke="#f85149" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#arr-r)"/>
+      <text x="800" y="600" text-anchor="middle" fill="#f85149" font-size="11" font-weight="700">线上发现问题 → alias 切回 v1 (秒级)</text>
+    </g>
+  </svg>
+</div>
+
+<h3>alias 的实现:配置中心 vs 文件 symlink</h3>
+
+<table>
+  <thead>
+    <tr><th>方案</th><th>切换粒度</th><th>切换延迟</th><th>实现复杂度</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>配置中心(Nacos / Apollo)</td><td>全集群同步</td><td>5-30 s(配置推送)</td><td>低 — 改一个 key</td></tr>
+    <tr><td>文件 symlink</td><td>单机</td><td>瞬时(原子 rename)</td><td>中 — 集群同步要协调</td></tr>
+    <tr><td>K8s ConfigMap + reload</td><td>全集群</td><td>10-60 s</td><td>低</td></tr>
+    <tr><td>DB 元数据表</td><td>全集群</td><td>查询时刻读</td><td>低 — 但每次查询都要查 DB</td></tr>
+  </tbody>
+</table>
+
+<h3>SearcherManager 应对 alias 切换</h3>
+
+<pre><code class="language-java">@Component
+public class AliasAwareSearcherManager {
+    private volatile SearcherManager current;
+    private volatile FSDirectory currentDir;
+
+    @Scheduled(fixedDelay = 10_000)
+    public void watchAlias() throws IOException {
+        String desired = configCenter.get("orders.alias");
+        if (!desired.equals(currentDir.getDirectory().getFileName().toString())) {
+            log.info("alias change detected: {} -&gt; {}",
+                currentDir.getDirectory().getFileName(), desired);
+            switchTo(desired);
+        }
+    }
+
+    private synchronized void switchTo(String aliasTarget) throws IOException {
+        FSDirectory newDir = FSDirectory.open(rootPath.resolve(aliasTarget));
+        SearcherManager newMgr = new SearcherManager(newDir, new SearcherFactory());
+
+        SearcherManager old = this.current;
+        FSDirectory oldDir = this.currentDir;
+        this.current = newMgr;
+        this.currentDir = newDir;
+
+        if (old != null) {
+            try { old.close(); } catch (Exception ignored) {}
+            try { oldDir.close(); } catch (Exception ignored) {}
+        }
+    }
+}</code></pre>
+
+<div class="real-world">
+  <strong>为什么 alias 切换比原地重建索引安全 100 倍</strong> — 我们曾经在一个生产事故里学到这个教训:Schema 升级团队在线上索引目录里跑全量 reindex,过程中 IndexWriter 持续写入,旧文档同时被删,新 segment 不断生成。Reindex 跑了 4 小时跑到 70% 时 OOM,索引已经处于"半新半旧"状态——一些订单只有新 schema 的字段,一些只有旧 schema,查询时 SortField 对部分文档拿不到 DocValues 直接抛 IllegalStateException。回滚?没法回滚,数据已经被覆盖。最后停服 6 小时从快照恢复。<strong>alias 切换的安全性来自不可变性</strong>:orders.v1 在整个 v2 构建过程中完全只读,失败再多次也不动 v1 一根毫毛;切换是配置层面 1 字节的修改,失败立刻可以切回 v1。这种"构建 / 切换分离"是所有大型搜索集群的标配。
+</div>
+
+<h3>双读阶段:Schema 不兼容时的过渡</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-9 · 双写双读过渡(buyerPhone → buyerPhoneHash)</div>
+  <svg viewBox="0 0 1200 460" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- Indexer Worker -->
+    <rect x="20" y="180" width="240" height="100" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="140" y="208" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">Indexer Worker</text>
+    <text x="140" y="228" text-anchor="middle" fill="#a5d6ff" font-size="11">双写 v1 + v2</text>
+    <text x="140" y="246" text-anchor="middle" fill="#a5d6ff" font-size="11">v1: 旧 schema (buyerPhone)</text>
+    <text x="140" y="264" text-anchor="middle" fill="#a5d6ff" font-size="11">v2: 新 schema (buyerPhoneHash)</text>
+
+    <!-- Search API 旧 -->
+    <rect x="20" y="40" width="240" height="80" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="140" y="68" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">Search API (旧逻辑)</text>
+    <text x="140" y="88" text-anchor="middle" fill="#a5d6ff" font-size="11">查 buyerPhone 明文</text>
+    <text x="140" y="106" text-anchor="middle" fill="#8b949e" font-size="11">客服 / 老接口</text>
+
+    <!-- Search API 新 -->
+    <rect x="20" y="320" width="240" height="100" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="140" y="348" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">Search API (新逻辑)</text>
+    <text x="140" y="368" text-anchor="middle" fill="#a5d6ff" font-size="11">SHOULD: hash + plain</text>
+    <text x="140" y="386" text-anchor="middle" fill="#a5d6ff" font-size="11">同时兼容两种 schema</text>
+    <text x="140" y="404" text-anchor="middle" fill="#8b949e" font-size="11">过渡期双读</text>
+
+    <!-- v1 索引 -->
+    <ellipse cx="600" cy="80" rx="160" ry="50" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="600" y="72" text-anchor="middle" fill="#ffd591" font-size="14" font-weight="700">orders.v1</text>
+    <text x="600" y="92" text-anchor="middle" fill="#a5d6ff" font-size="11">buyerPhone 明文</text>
+    <text x="600" y="110" text-anchor="middle" fill="#8b949e" font-size="11">现网 alias 指向</text>
+
+    <!-- v2 索引 -->
+    <ellipse cx="600" cy="380" rx="160" ry="50" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="600" y="372" text-anchor="middle" fill="#9be7b3" font-size="14" font-weight="700">orders.v2</text>
+    <text x="600" y="392" text-anchor="middle" fill="#a5d6ff" font-size="11">buyerPhoneHash</text>
+    <text x="600" y="410" text-anchor="middle" fill="#8b949e" font-size="11">新 schema · alias 切换前</text>
+
+    <!-- 时间线/阶段说明 -->
+    <rect x="850" y="60" width="330" height="160" rx="10" fill="rgba(58,131,255,0.05)" stroke="#58a6ff" stroke-width="1.2" stroke-dasharray="6 4"/>
+    <text x="1015" y="84" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">过渡期 · 双写 + 双读</text>
+    <text x="870" y="112" fill="#a5d6ff" font-size="11">阶段 A · alias = v1</text>
+    <text x="870" y="130" fill="#a5d6ff" font-size="11">  → 旧逻辑读 v1 (主)</text>
+    <text x="870" y="148" fill="#a5d6ff" font-size="11">  → 新逻辑读 v1 (兜底, 用 plain)</text>
+    <text x="870" y="172" fill="#a5d6ff" font-size="11">阶段 B · alias = v2</text>
+    <text x="870" y="190" fill="#a5d6ff" font-size="11">  → 新逻辑读 v2 (主, 用 hash)</text>
+    <text x="870" y="208" fill="#a5d6ff" font-size="11">  → 旧逻辑慢慢下线</text>
+
+    <rect x="850" y="240" width="330" height="180" rx="10" fill="rgba(63,185,80,0.05)" stroke="#3fb950" stroke-width="1.2" stroke-dasharray="6 4"/>
+    <text x="1015" y="264" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">为什么需要双读?</text>
+    <text x="870" y="290" fill="#a5d6ff" font-size="11">Schema 变更时 (字段加密 / 拆字段)</text>
+    <text x="870" y="308" fill="#a5d6ff" font-size="11">不能"切换瞬间立刻只读 v2"</text>
+    <text x="870" y="326" fill="#a5d6ff" font-size="11">否则 alias 切完旧逻辑就报错</text>
+    <text x="870" y="350" fill="#39d2c0" font-size="11" font-weight="700">解法:</text>
+    <text x="870" y="368" fill="#a5d6ff" font-size="11">① 新逻辑先上线 (兼容两种字段)</text>
+    <text x="870" y="386" fill="#a5d6ff" font-size="11">② 双写 v2 + 全量回填</text>
+    <text x="870" y="404" fill="#a5d6ff" font-size="11">③ alias 切 v2 → 旧逻辑下线</text>
+
+    <!-- 箭头 -->
+    <g fill="none">
+      <line x1="260" y1="220" x2="448" y2="120" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <text x="380" y="160" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="700">写入</text>
+
+      <line x1="260" y1="250" x2="448" y2="350" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <text x="380" y="320" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="700">写入</text>
+
+      <line x1="260" y1="80"  x2="448" y2="80"  stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <text x="350" y="68"  text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="700">查询 (alias=v1)</text>
+
+      <line x1="260" y1="370" x2="448" y2="380" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+      <text x="340" y="348" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="700">查询 (alias=v2 后)</text>
+
+      <path d="M260,355 C 350,300 400,180 448,140" fill="none" stroke="#58a6ff" stroke-width="1.4" stroke-dasharray="6 4" marker-end="url(#arr)"/>
+      <text x="370" y="270" text-anchor="middle" fill="#8b949e" font-size="11">过渡期兜底读 v1</text>
+    </g>
+  </svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s5-10">5.10 备份与快照</h2>
+<!-- ============================================================ -->
+
+<p>Lucene 的 segment 是<strong>不可变的</strong>——这给备份带来天然优势:已经写入磁盘的 segment 永远不会被修改,只会被 merge 删除。<code>SnapshotDeletionPolicy</code> 就是利用这一点:它告诉 IndexWriter "这些 segment 不许删,我要拷走"。</p>
+
+<h3>SnapshotDeletionPolicy 工作原理</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-10 · Snapshot 流程的四个步骤</div>
+  <div style="padding:14px 4px;font-family:'Cascadia Code',monospace;font-size:12px;">
+    <div style="background:#0d1117;border:1.5px solid #58a6ff;border-radius:10px;padding:14px;">
+      <div style="color:#58a6ff;font-weight:700;font-size:13px;margin-bottom:10px;">1. 在 IndexWriter 配置 SnapshotDeletionPolicy</div>
+      <pre style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px;color:#a5d6ff;margin:0;">SnapshotDeletionPolicy snap = new SnapshotDeletionPolicy(
+    new KeepOnlyLastCommitDeletionPolicy());
+config.setIndexDeletionPolicy(snap);</pre>
+    </div>
+    <div style="text-align:center;color:#8b949e;font-size:14px;margin:6px 0;">↓</div>
+    <div style="background:#0d1117;border:1.5px solid #3fb950;border-radius:10px;padding:14px;">
+      <div style="color:#3fb950;font-weight:700;font-size:13px;margin-bottom:10px;">2. snapshot() 锁定一个 commit point</div>
+      <pre style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px;color:#a5d6ff;margin:0;">IndexCommit ic = snap.snapshot();
+String segFile = ic.getSegmentsFileName(); // segments_42
+Collection&lt;String&gt; files = ic.getFileNames();
+// → 这些文件在 release() 之前永远不会被 merge 删除</pre>
+    </div>
+    <div style="text-align:center;color:#8b949e;font-size:14px;margin:6px 0;">↓</div>
+    <div style="background:#0d1117;border:1.5px solid #d29922;border-radius:10px;padding:14px;">
+      <div style="color:#d29922;font-weight:700;font-size:13px;margin-bottom:10px;">3. 把这些文件硬链接 / 拷贝到外部存储</div>
+      <pre style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px;color:#a5d6ff;margin:0;">for (String f : files) {
+    Files.createLink(snapshotDir.resolve(f), indexDir.resolve(f));
+}
+S3Uploader.upload(snapshotDir, "s3://backup/orders/2026-05-10/");</pre>
+    </div>
+    <div style="text-align:center;color:#8b949e;font-size:14px;margin:6px 0;">↓</div>
+    <div style="background:#0d1117;border:1.5px solid #f85149;border-radius:10px;padding:14px;">
+      <div style="color:#f85149;font-weight:700;font-size:13px;margin-bottom:10px;">4. release() 释放锁定 — 否则 merge 永远不能清理</div>
+      <pre style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px;color:#a5d6ff;margin:0;">snap.release(ic);
+// 现在 IndexWriter 才能在下次 merge 时删除这些 segment 文件</pre>
+    </div>
+  </div>
+</div>
+
+<h3>为什么不能简单 cp -r</h3>
+
+<table>
+  <thead>
+    <tr><th>问题</th><th>cp -r</th><th>SnapshotDeletionPolicy</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>拷贝过程中文件被 merge 删了</td><td>拷到一半找不到文件,失败</td><td>snapshot 期间不会被删</td></tr>
+    <tr><td>拷贝过程中新 segment 写入</td><td>拷到不一致的文件集</td><td>commit point 锁定,只拷 commit 当时的文件</td></tr>
+    <tr><td>segments_N 文件在中途变化</td><td>恢复时元数据指向不存在的 segment</td><td>commit point 是某个固定的 segments_N</td></tr>
+    <tr><td>原子性</td><td>无</td><td>commit point 内文件集自洽</td></tr>
+  </tbody>
+</table>
+
+<h3>快照频率</h3>
+
+<table>
+  <thead>
+    <tr><th>场景</th><th>频率</th><th>保留期</th><th>存储</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>主索引日备</td><td>每天 1 次</td><td>14 天</td><td>S3 标准</td></tr>
+    <tr><td>大变更前(Schema / Analyzer)</td><td>变更前 1 次</td><td>30 天</td><td>S3 标准</td></tr>
+    <tr><td>跨 region 灾备</td><td>每 4 小时</td><td>7 天</td><td>跨 region S3</td></tr>
+    <tr><td>归档(法规要求)</td><td>每月 1 次</td><td>3 年</td><td>S3 Glacier</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s5-11">5.11 监控指标</h2>
+<!-- ============================================================ -->
+
+<p>没有监控的搜索服务等于"半瞎着开车"——出问题时只能猜。生产里至少要覆盖 10 个核心指标,分布在写入 / 刷新 / 查询 / 合并 / 资源五个维度。每个指标都要有<strong>告警阈值 + 处理 Playbook</strong>,而不是"看着办"。</p>
+
+<h3>监控仪表盘 — 10 个核心指标</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-11 · 搜索服务监控 Dashboard(模拟实时值)</div>
+  <div style="padding:18px 4px;font-family:'Cascadia Code','SFMono-Regular',Consolas,monospace;font-size:11px;">
+    <div style="display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;">
+
+      <div style="background:#0d1117;border:1.5px solid #3fb950;border-radius:10px;padding:12px;">
+        <div style="color:#8b949e;font-size:10px;margin-bottom:4px;">写入吞吐</div>
+        <div style="color:#3fb950;font-weight:700;font-size:13px;">indexer.qps</div>
+        <div style="color:#a5d6ff;font-size:18px;font-weight:700;margin:6px 0;">1.42k <span style="font-size:11px;color:#8b949e;">/s</span></div>
+        <div style="color:#39d2c0;font-size:10px;">阈值 &lt; 200 触发告警</div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #3fb950;border-radius:10px;padding:12px;">
+        <div style="color:#8b949e;font-size:10px;margin-bottom:4px;">事件 lag</div>
+        <div style="color:#3fb950;font-weight:700;font-size:13px;">index.lag.events</div>
+        <div style="color:#a5d6ff;font-size:18px;font-weight:700;margin:6px 0;">37</div>
+        <div style="color:#39d2c0;font-size:10px;">阈值 &gt; 1000 P2</div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #d29922;border-radius:10px;padding:12px;">
+        <div style="color:#8b949e;font-size:10px;margin-bottom:4px;">refresh P99</div>
+        <div style="color:#d29922;font-weight:700;font-size:13px;">refresh.p99.ms</div>
+        <div style="color:#a5d6ff;font-size:18px;font-weight:700;margin:6px 0;">142</div>
+        <div style="color:#39d2c0;font-size:10px;">阈值 &gt; 200ms P3</div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #3fb950;border-radius:10px;padding:12px;">
+        <div style="color:#8b949e;font-size:10px;margin-bottom:4px;">查询 P50</div>
+        <div style="color:#3fb950;font-weight:700;font-size:13px;">query.p50.ms</div>
+        <div style="color:#a5d6ff;font-size:18px;font-weight:700;margin:6px 0;">12</div>
+        <div style="color:#39d2c0;font-size:10px;">阈值 &gt; 50ms P3</div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #d29922;border-radius:10px;padding:12px;">
+        <div style="color:#8b949e;font-size:10px;margin-bottom:4px;">查询 P99</div>
+        <div style="color:#d29922;font-weight:700;font-size:13px;">query.p99.ms</div>
+        <div style="color:#a5d6ff;font-size:18px;font-weight:700;margin:6px 0;">187</div>
+        <div style="color:#39d2c0;font-size:10px;">阈值 &gt; 200ms P2</div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #3fb950;border-radius:10px;padding:12px;">
+        <div style="color:#8b949e;font-size:10px;margin-bottom:4px;">查询失败率</div>
+        <div style="color:#3fb950;font-weight:700;font-size:13px;">query.error_rate</div>
+        <div style="color:#a5d6ff;font-size:18px;font-weight:700;margin:6px 0;">0.04 <span style="font-size:11px;color:#8b949e;">%</span></div>
+        <div style="color:#39d2c0;font-size:10px;">阈值 &gt; 1% P1</div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #d29922;border-radius:10px;padding:12px;">
+        <div style="color:#8b949e;font-size:10px;margin-bottom:4px;">segment 数</div>
+        <div style="color:#d29922;font-weight:700;font-size:13px;">segment.count</div>
+        <div style="color:#a5d6ff;font-size:18px;font-weight:700;margin:6px 0;">42</div>
+        <div style="color:#39d2c0;font-size:10px;">阈值 &gt; 100 P2</div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #3fb950;border-radius:10px;padding:12px;">
+        <div style="color:#8b949e;font-size:10px;margin-bottom:4px;">deletes %</div>
+        <div style="color:#3fb950;font-weight:700;font-size:13px;">deletes_pct</div>
+        <div style="color:#a5d6ff;font-size:18px;font-weight:700;margin:6px 0;">3.8 <span style="font-size:11px;color:#8b949e;">%</span></div>
+        <div style="color:#39d2c0;font-size:10px;">阈值 &gt; 30% P3</div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #d29922;border-radius:10px;padding:12px;">
+        <div style="color:#8b949e;font-size:10px;margin-bottom:4px;">merge 进行</div>
+        <div style="color:#d29922;font-weight:700;font-size:13px;">merge.in_flight</div>
+        <div style="color:#a5d6ff;font-size:18px;font-weight:700;margin:6px 0;">2</div>
+        <div style="color:#39d2c0;font-size:10px;">阈值 &gt; 4 P3</div>
+      </div>
+
+      <div style="background:#0d1117;border:1.5px solid #f85149;border-radius:10px;padding:12px;">
+        <div style="color:#8b949e;font-size:10px;margin-bottom:4px;">磁盘占用</div>
+        <div style="color:#f85149;font-weight:700;font-size:13px;">disk.usage</div>
+        <div style="color:#a5d6ff;font-size:18px;font-weight:700;margin:6px 0;">82 <span style="font-size:11px;color:#8b949e;">%</span></div>
+        <div style="color:#39d2c0;font-size:10px;">阈值 &gt; 80% P1 ★</div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<h3>指标采集 — Micrometer 标准化</h3>
+
+<pre><code class="language-java">@Component
+public class LuceneMetrics {
+    private final OrderIndexWriter writerHolder;
+    private final OrderSearcherManager searcherMgr;
+
+    public LuceneMetrics(MeterRegistry reg,
+                         OrderIndexWriter w,
+                         OrderSearcherManager sm) {
+        this.writerHolder = w;
+        this.searcherMgr = sm;
+
+        Gauge.builder("lucene.segment.count", w, x -&gt; x.raw().getSegmentCount())
+            .register(reg);
+        Gauge.builder("lucene.numdocs", w, x -&gt; (double) x.raw().getDocStats().numDocs)
+            .register(reg);
+        Gauge.builder("lucene.maxdoc", w, x -&gt; (double) x.raw().getDocStats().maxDoc)
+            .register(reg);
+        Gauge.builder("lucene.deletes.pct", w, this::deletesPct).register(reg);
+        Gauge.builder("lucene.ram.bytes", w, x -&gt; (double) x.raw().ramBytesUsed())
+            .register(reg);
+    }
+
+    private double deletesPct(OrderIndexWriter w) {
+        DocStats s = w.raw().getDocStats();
+        if (s.maxDoc == 0) return 0;
+        return 100.0 * (s.maxDoc - s.numDocs) / s.maxDoc;
+    }
+}</code></pre>
+
+<h3>告警分级</h3>
+
+<table>
+  <thead>
+    <tr><th>等级</th><th>响应时间</th><th>典型指标</th><th>处理方式</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>P1(紧急)</td><td>5 分钟内</td><td>error_rate &gt; 1% / disk &gt; 80%</td><td>电话 + 短信 oncall</td></tr>
+    <tr><td>P2(重要)</td><td>30 分钟内</td><td>P99 &gt; 200ms / lag &gt; 1000 / segment &gt; 100</td><td>IM + 邮件 oncall</td></tr>
+    <tr><td>P3(关注)</td><td>工作时间</td><td>refresh &gt; 200ms / merge &gt; 4 / deletes &gt; 30%</td><td>邮件,值班复盘</td></tr>
+    <tr><td>P4(信息)</td><td>不响应</td><td>慢查询日志、QPS 上下波动</td><td>看板可视化</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s5-12">5.12 部署与扩容</h2>
+<!-- ============================================================ -->
+
+<p>搜索服务的部署形态比"普通无状态服务"复杂——Indexer 持有索引文件(StatefulSet),Search API 只读这些文件(Deployment + 只读挂载)。两者必须独立扩容,资源诉求差异巨大。</p>
+
+<h3>K8s 部署形态</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-12 · Indexer + API 的 K8s 拓扑</div>
+  <svg viewBox="0 0 1200 540" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- K8s 集群边框 -->
+    <rect x="20" y="20" width="1160" height="500" rx="14" fill="rgba(58,131,255,0.04)" stroke="#58a6ff" stroke-width="1.5" stroke-dasharray="6 6"/>
+    <text x="40" y="46" fill="#a5d6ff" font-size="13" font-weight="700">K8s 集群</text>
+
+    <!-- Indexer StatefulSet -->
+    <rect x="60" y="80" width="320" height="120" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="220" y="108" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">Indexer StatefulSet</text>
+    <text x="220" y="128" text-anchor="middle" fill="#a5d6ff" font-size="11">3 副本 (1 主 + 2 备)</text>
+    <text x="220" y="148" text-anchor="middle" fill="#a5d6ff" font-size="11">CPU 2-4c · 内存 8-16Gi</text>
+    <text x="220" y="166" text-anchor="middle" fill="#8b949e" font-size="11">写入 + merge · 不弹</text>
+    <text x="220" y="184" text-anchor="middle" fill="#8b949e" font-size="11">主从切换由 leader election</text>
+
+    <!-- Search API Deployment -->
+    <rect x="820" y="80" width="320" height="120" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="980" y="108" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">Search API Deployment</text>
+    <text x="980" y="128" text-anchor="middle" fill="#a5d6ff" font-size="11">HPA 4 - 20 副本</text>
+    <text x="980" y="148" text-anchor="middle" fill="#a5d6ff" font-size="11">CPU 4-8c · 内存 8-32Gi</text>
+    <text x="980" y="166" text-anchor="middle" fill="#8b949e" font-size="11">查询 · mmap 用户内存</text>
+    <text x="980" y="184" text-anchor="middle" fill="#8b949e" font-size="11">弹性扩容</text>
+
+    <!-- PV 索引盘 -->
+    <rect x="60" y="240" width="320" height="100" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="220" y="268" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">PV 索引盘 SSD (RW)</text>
+    <text x="220" y="288" text-anchor="middle" fill="#a5d6ff" font-size="11">500 GiB / 副本</text>
+    <text x="220" y="306" text-anchor="middle" fill="#8b949e" font-size="11">Indexer 持有 write.lock</text>
+    <text x="220" y="324" text-anchor="middle" fill="#8b949e" font-size="11">storageClass=fast-ssd</text>
+
+    <rect x="820" y="240" width="320" height="100" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="980" y="268" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">PV 索引盘 (RO mount)</text>
+    <text x="980" y="288" text-anchor="middle" fill="#a5d6ff" font-size="11">同一 PV · 只读挂载</text>
+    <text x="980" y="306" text-anchor="middle" fill="#8b949e" font-size="11">无锁 · 多副本共享</text>
+    <text x="980" y="324" text-anchor="middle" fill="#8b949e" font-size="11">SearcherManager 监 alias</text>
+
+    <!-- Lucene 目录 -->
+    <ellipse cx="600" cy="290" rx="160" ry="50" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="600" y="282" text-anchor="middle" fill="#ffd591" font-size="14" font-weight="700">Lucene 目录</text>
+    <text x="600" y="302" text-anchor="middle" fill="#a5d6ff" font-size="11">orders.v3 · alias 指向</text>
+    <text x="600" y="320" text-anchor="middle" fill="#8b949e" font-size="11">.tim/.doc/.fdt/.dvd ...</text>
+
+    <!-- HPA -->
+    <rect x="430" y="80" width="320" height="80" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="590" y="108" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">HPA · 自动扩缩</text>
+    <text x="590" y="128" text-anchor="middle" fill="#a5d6ff" font-size="11">基于 query.qps + cpu</text>
+    <text x="590" y="146" text-anchor="middle" fill="#8b949e" font-size="11">cpu &gt; 70% → scale up</text>
+
+    <!-- S3 备份 -->
+    <rect x="430" y="380" width="320" height="100" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="1.5"/>
+    <text x="590" y="408" text-anchor="middle" fill="#ffadad" font-size="13" font-weight="700">S3 备份</text>
+    <text x="590" y="428" text-anchor="middle" fill="#a5d6ff" font-size="11">SnapshotDeletionPolicy</text>
+    <text x="590" y="446" text-anchor="middle" fill="#a5d6ff" font-size="11">每天一次 + 大变更前</text>
+    <text x="590" y="464" text-anchor="middle" fill="#8b949e" font-size="11">RTO &lt; 30 min · RPO &lt; 24h</text>
+
+    <!-- 箭头 -->
+    <g fill="none">
+      <line x1="220" y1="200" x2="220" y2="238" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr-p)"/>
+      <line x1="380" y1="290" x2="438" y2="290" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+      <line x1="760" y1="290" x2="818" y2="290" stroke="#3fb950" stroke-width="1.6" marker-end="url(#arr-g)"/>
+      <line x1="980" y1="240" x2="980" y2="200" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+
+      <line x1="590" y1="160" x2="980" y2="78" stroke="#d29922" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#arr-o)"/>
+      <text x="780" y="120" text-anchor="middle" fill="#d29922" font-size="11" font-weight="700">扩缩信号</text>
+
+      <line x1="600" y1="340" x2="590" y2="378" stroke="#f85149" stroke-width="1.6" marker-end="url(#arr-r)"/>
+      <text x="630" y="365" text-anchor="middle" fill="#f85149" font-size="11" font-weight="700">快照</text>
+    </g>
+  </svg>
+</div>
+
+<h3>资源画像 — Indexer 与 API 完全不同</h3>
+
+<table>
+  <thead>
+    <tr><th>组件</th><th>CPU</th><th>内存</th><th>磁盘</th><th>网络</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Indexer Worker</td><td>2-4 核(写入 + merge)</td><td>8-16 GiB</td><td>SSD 500 GiB(读写)</td><td>Kafka 入流量</td></tr>
+    <tr><td>Search API</td><td>4-8 核(查询)</td><td>8-32 GiB(mmap + heap)</td><td>SSD 500 GiB(只读)</td><td>HTTP 出流量</td></tr>
+  </tbody>
+</table>
+
+<h3>本机 mmap 与 RAM disk 的取舍</h3>
+
+<table>
+  <thead>
+    <tr><th>方案</th><th>查询延迟</th><th>容量限制</th><th>断电恢复</th><th>推荐</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>FSDirectory + page cache</td><td>10-20 ms(冷)/ 1-3 ms(热)</td><td>磁盘大小</td><td>无问题</td><td>★ 默认</td></tr>
+    <tr><td>MMapDirectory(默认 64-bit)</td><td>1-3 ms</td><td>受 vm.max_map_count 限</td><td>无问题</td><td>★ Lucene 默认选这个</td></tr>
+    <tr><td>RAMDirectory(纯内存)</td><td>&lt; 1 ms</td><td>RAM 大小</td><td>断电全失</td><td>仅测试 — 生产禁用</td></tr>
+    <tr><td>tmpfs 索引盘</td><td>&lt; 1 ms</td><td>RAM 大小</td><td>断电全失</td><td>仅缓存层 — 主索引禁用</td></tr>
+  </tbody>
+</table>
+
+<h3>单节点 vs 多 shard</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-13 · 多 shard 的扇出 + 合并</div>
+  <svg viewBox="0 0 1200 540" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 入口 -->
+    <rect x="490" y="20" width="220" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="600" y="46" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">搜索请求 (HTTP)</text>
+    <text x="600" y="66" text-anchor="middle" fill="#a5d6ff" font-size="11">{ q, size=20, cursor }</text>
+
+    <!-- Coordinator -->
+    <rect x="430" y="120" width="340" height="80" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="600" y="148" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">Coordinator</text>
+    <text x="600" y="168" text-anchor="middle" fill="#a5d6ff" font-size="11">fan-out → 4 shard · 收集 → merge sort</text>
+    <text x="600" y="186" text-anchor="middle" fill="#8b949e" font-size="11">over-fetch size×N (修正全局排序)</text>
+
+    <!-- 4 个 shard -->
+    <ellipse cx="160"  cy="320" rx="120" ry="50" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="160" y="312" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">Shard 0</text>
+    <text x="160" y="332" text-anchor="middle" fill="#a5d6ff" font-size="11">orderId hash 0-3</text>
+    <text x="160" y="350" text-anchor="middle" fill="#8b949e" font-size="11">2.5M doc · 25 GiB</text>
+
+    <ellipse cx="450"  cy="320" rx="120" ry="50" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="450" y="312" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">Shard 1</text>
+    <text x="450" y="332" text-anchor="middle" fill="#a5d6ff" font-size="11">orderId hash 4-7</text>
+    <text x="450" y="350" text-anchor="middle" fill="#8b949e" font-size="11">2.5M doc · 25 GiB</text>
+
+    <ellipse cx="750"  cy="320" rx="120" ry="50" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="750" y="312" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">Shard 2</text>
+    <text x="750" y="332" text-anchor="middle" fill="#a5d6ff" font-size="11">orderId hash 8-B</text>
+    <text x="750" y="350" text-anchor="middle" fill="#8b949e" font-size="11">2.5M doc · 25 GiB</text>
+
+    <ellipse cx="1040" cy="320" rx="120" ry="50" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="1040" y="312" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">Shard 3</text>
+    <text x="1040" y="332" text-anchor="middle" fill="#a5d6ff" font-size="11">orderId hash C-F</text>
+    <text x="1040" y="350" text-anchor="middle" fill="#8b949e" font-size="11">2.5M doc · 25 GiB</text>
+
+    <!-- merge + 输出 -->
+    <rect x="430" y="430" width="340" height="80" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="600" y="458" text-anchor="middle" fill="#9be7b3" font-size="13" font-weight="700">全局 TopK · merge sort</text>
+    <text x="600" y="478" text-anchor="middle" fill="#a5d6ff" font-size="11">heap K=20 · 取前 20 条</text>
+    <text x="600" y="496" text-anchor="middle" fill="#8b949e" font-size="11">cursor = 全局最后一条编码</text>
+
+    <!-- 箭头 fan-out -->
+    <g fill="none">
+      <line x1="600" y1="80"  x2="600" y2="118" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+
+      <line x1="490" y1="200" x2="190" y2="278" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <line x1="540" y1="200" x2="450" y2="278" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <line x1="660" y1="200" x2="750" y2="278" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <line x1="710" y1="200" x2="1010" y2="278" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="370" y="245" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="700">fan-out (4×)</text>
+
+      <line x1="190" y1="362" x2="490" y2="428" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <line x1="450" y1="370" x2="540" y2="428" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <line x1="750" y1="370" x2="660" y2="428" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <line x1="1010" y1="362" x2="710" y2="428" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="370" y="410" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="700">每 shard 返 TopK</text>
+    </g>
+
+    <!-- 右侧代价说明 -->
+    <text x="1080" y="500" text-anchor="end" fill="#39d2c0" font-size="11" font-weight="700">P99 通常上升 30-50% (fan-out 网络) · idf 跨 shard 失真需 dfs_query_then_fetch</text>
+  </svg>
+</div>
+
+<div class="key-insight">
+  <strong>多 shard 的代价 — 别为了"以后扩展"提前分</strong>。多 shard 引入两个固定代价:(1) 每次查询 fan-out N 倍,网络 + 协调开销,P99 通常上升 30-50%;(2) 跨 shard 的全局 TopK 需要 over-fetch(每个 shard 取 size×N 条),内存 + 网络成本进一步放大;(3) idf 是 shard 局部的,跨 shard 的 BM25 可能轻微失真,需要 dfs_query_then_fetch 多一轮 RPC。<strong>单机 1 千万 doc 以下、单机 100GiB 索引以下,直接用单 shard MMapDirectory 是最优解</strong>。再大才考虑分片——即使 ES 也建议单 shard ≤ 50GB,而很多业务一辈子达不到这个量级。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s5-13">5.13 故障排查 Playbook</h2>
+<!-- ============================================================ -->
+
+<p>故障排查不能靠"灵机一动",要按预定决策树走——这样新人 oncall 也能在 30 分钟内定位到根因。本节给出 4 个生产里最常见故障的 Playbook。</p>
+
+<h3>Playbook A:刚下单的订单搜不到</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-14 · 可见性故障的链路决策树</div>
+  <svg viewBox="0 0 1200 720" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 入口 -->
+    <rect x="490" y="20" width="280" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="630" y="46" text-anchor="middle" fill="#cfe9ff" font-size="13" font-weight="700">客服: 订单刚发货搜不到</text>
+    <text x="630" y="64" text-anchor="middle" fill="#a5d6ff" font-size="11">从入口顺着链路逐环验</text>
+
+    <!-- 6 个决策菱形纵向 -->
+    <g>
+      <polygon points="630,110 800,160 630,210 460,160" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="630" y="158" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">① DB 状态已变?</text>
+      <text x="630" y="178" text-anchor="middle" fill="#a5d6ff" font-size="11">SELECT * FROM orders</text>
+
+      <polygon points="630,230 800,280 630,330 460,280" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="630" y="278" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">② outbox 已产生?</text>
+      <text x="630" y="298" text-anchor="middle" fill="#a5d6ff" font-size="11">SELECT * FROM outbox</text>
+
+      <polygon points="630,350 800,400 630,450 460,400" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="630" y="398" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">③ Kafka 已消费?</text>
+      <text x="630" y="418" text-anchor="middle" fill="#a5d6ff" font-size="11">consumer lag · offset</text>
+
+      <polygon points="630,470 800,520 630,570 460,520" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="630" y="518" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">④ Indexer applied?</text>
+      <text x="630" y="538" text-anchor="middle" fill="#a5d6ff" font-size="11">index_update_metric</text>
+
+      <polygon points="630,590 800,640 630,690 460,640" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+      <text x="630" y="638" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">⑤ refresh 过?</text>
+      <text x="630" y="658" text-anchor="middle" fill="#a5d6ff" font-size="11">maybeRefresh 时间戳</text>
+    </g>
+
+    <!-- 否分支 (右侧) -->
+    <g>
+      <rect x="830" y="135" width="350" height="50" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="1.5"/>
+      <text x="1005" y="158" text-anchor="middle" fill="#ffadad" font-size="12" font-weight="700">→ 转订单服务 · 不是搜索问题</text>
+      <text x="1005" y="176" text-anchor="middle" fill="#a5d6ff" font-size="11">业务侧未提交事务 / 状态没变</text>
+
+      <rect x="830" y="255" width="350" height="50" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="1.5"/>
+      <text x="1005" y="278" text-anchor="middle" fill="#ffadad" font-size="12" font-weight="700">→ 业务事务漏写 outbox</text>
+      <text x="1005" y="296" text-anchor="middle" fill="#a5d6ff" font-size="11">检查 @Transactional 边界</text>
+
+      <rect x="830" y="375" width="350" height="50" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="1.5"/>
+      <text x="1005" y="398" text-anchor="middle" fill="#ffadad" font-size="12" font-weight="700">→ Kafka 消费卡住</text>
+      <text x="1005" y="416" text-anchor="middle" fill="#a5d6ff" font-size="11">indexer pod / consumer group</text>
+
+      <rect x="830" y="495" width="350" height="50" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="1.5"/>
+      <text x="1005" y="518" text-anchor="middle" fill="#ffadad" font-size="12" font-weight="700">→ updateDocument 失败</text>
+      <text x="1005" y="536" text-anchor="middle" fill="#a5d6ff" font-size="11">查 DLQ + index_update_error</text>
+
+      <rect x="830" y="615" width="350" height="50" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="1.5"/>
+      <text x="1005" y="638" text-anchor="middle" fill="#ffadad" font-size="12" font-weight="700">→ refresh 线程卡住</text>
+      <text x="1005" y="656" text-anchor="middle" fill="#a5d6ff" font-size="11">jstack 看 lucene-refresh 线程</text>
+    </g>
+
+    <!-- 是分支 (左侧最终) -->
+    <rect x="20" y="615" width="420" height="80" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="230" y="643" text-anchor="middle" fill="#e6d3ff" font-size="13" font-weight="700">⑥ 链路全过 · 仍搜不到</text>
+    <text x="230" y="663" text-anchor="middle" fill="#a5d6ff" font-size="11">查权限 filter 是否过滤掉 (tenantId / shopId)</text>
+    <text x="230" y="681" text-anchor="middle" fill="#a5d6ff" font-size="11">或 Analyzer 写查不一致 (token mismatch)</text>
+
+    <!-- 箭头 -->
+    <g fill="none">
+      <line x1="630" y1="80"  x2="630" y2="108" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+      <line x1="630" y1="210" x2="630" y2="228" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <line x1="630" y1="330" x2="630" y2="348" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <line x1="630" y1="450" x2="630" y2="468" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <line x1="630" y1="570" x2="630" y2="588" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <line x1="540" y1="660" x2="440" y2="650" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="500" y="640" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="700">是 (全过)</text>
+
+      <line x1="800" y1="160" x2="828" y2="160" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+      <line x1="800" y1="280" x2="828" y2="280" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+      <line x1="800" y1="400" x2="828" y2="400" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+      <line x1="800" y1="520" x2="828" y2="520" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+      <line x1="800" y1="640" x2="828" y2="640" stroke="#f85149" stroke-width="1.5" marker-end="url(#arr-r)"/>
+      <text x="815" y="100" text-anchor="middle" fill="#f85149" font-size="11" font-weight="700">否</text>
+    </g>
+  </svg>
+</div>
+
+<h3>Visibility Trace API — 5 秒判断卡在哪一环</h3>
+
+<pre><code class="language-bash">$ curl -s http://search-api/admin/trace/order/O1001 | jq
+
+{
+  "orderId": "O1001",
+  "dbStatus": "SHIPPED",
+  "dbUpdatedAt": "08:01:12",
+  "outboxEvent": {
+    "eventId": "e-778",
+    "type": "OrderShipped",
+    "version": 17,
+    "createdAt": "08:01:12"
+  },
+  "kafka": { "consumedAt": "08:01:13", "offset": 442891 },
+  "index": { "appliedAt": "08:01:13", "currentVersion": 17 },
+  "searcher": { "lastRefreshAt": "08:01:14", "searchable": true },
+  "permission": { "tenantId": "T1", "shopId": "S1" },
+  "result": "visible"
+}</code></pre>
+
+<h3>Playbook B:查询 P99 突然升高</h3>
+
+<table>
+  <thead>
+    <tr><th>#</th><th>检查指标</th><th>判断</th><th>定位的根因</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td>query.p99.ms 是否所有角色都慢</td><td>全部 / 部分</td><td>是否锁定特定权限路径</td></tr>
+    <tr><td>2</td><td>segment.count</td><td>是否 &gt; 50</td><td>merge 跟不上,确认 mergePolicy</td></tr>
+    <tr><td>3</td><td>merge.in_flight + 磁盘 I/O util</td><td>merge 是否抢 IO</td><td>rebuild / 全量导出在跑</td></tr>
+    <tr><td>4</td><td>permission.duration.p99</td><td>是否卡在权限服务</td><td>下游服务降级</td></tr>
+    <tr><td>5</td><td>query.wildcard_expansion</td><td>是否有人打宽 wildcard</td><td>应用层防御不够</td></tr>
+    <tr><td>6</td><td>page &gt; 100 的请求占比</td><td>是否深翻页</td><td>导出走异步,在线限制</td></tr>
+  </tbody>
+</table>
+
+<h3>Playbook C:OOM 重启循环</h3>
+
+<table>
+  <thead>
+    <tr><th>检查项</th><th>正常范围</th><th>异常处理</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Heap 使用率</td><td>&lt; 70%</td><td>&gt; 90% — 检查 RAMBuffer 是不是设太大</td></tr>
+    <tr><td>RAMBuffer 配置</td><td>256-512 MiB</td><td>不要超过 heap 1/4</td></tr>
+    <tr><td>SearcherManager 持有的 reader 数</td><td>1(current)</td><td>&gt; 5 说明有 release 漏调,reader 永远不 close</td></tr>
+    <tr><td>查询并发深度</td><td>&lt; cpu × 4</td><td>过深会让大量 ScoreDoc 数组堆积</td></tr>
+    <tr><td>fielddata / norms cache</td><td>受控</td><td>大字段排序聚合最易爆</td></tr>
+  </tbody>
+</table>
+
+<h3>Playbook D:segment 数突然暴涨</h3>
+
+<table>
+  <thead>
+    <tr><th>症状</th><th>可能原因</th><th>排查动作</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>segment 100 → 300 一夜暴涨</td><td>RAMBuffer 太小,频繁 flush</td><td>查 RAMBufferSizeMB 配置 + flush 频率</td></tr>
+    <tr><td>segment 持续 50-80 不降</td><td>merge 跟不上写入速度</td><td>调 ConcurrentMergeScheduler.maxThreadCount</td></tr>
+    <tr><td>大 segment 一直不合并</td><td>TieredMergePolicy.maxMergedSegmentMB 限制</td><td>调高或定期 forceMerge(2)</td></tr>
+    <tr><td>每次 flush 都触发 merge 但不彻底</td><td>segmentsPerTier 配过低</td><td>调 segmentsPerTier=10-30</td></tr>
+  </tbody>
+</table>
+
+<div class="warning">
+  <strong>forceMerge(1) 是性能炸弹,不要随便用</strong> — forceMerge(1) 把所有 segment 合并成 1 个,代价是把整个索引重写一遍——TB 级索引可能跑几小时,期间磁盘 I/O 占满 + 临时占用 2× 磁盘空间(旧文件还在 + 新文件正在生成 + commit 后才能删旧)。生产里 forceMerge 只在低峰期对小索引手动执行,大索引直接禁用。日常合并交给 TieredMergePolicy 自动处理就够了。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s5-14">5.14 与 Elasticsearch / OpenSearch 的关系</h2>
+<!-- ============================================================ -->
+
+<p>很多人在问"既然有 Elasticsearch,为什么还要直接用 Lucene"。答案:Lucene 是底层库,Elasticsearch 是分布式封装。两者的关系类似 Netty(底层 NIO)与 Spring Cloud(应用框架)——前者灵活精准,后者开箱即用。具体场景里直接用 Lucene 反而是更优解。</p>
+
+<h3>边界对比表</h3>
+
+<table>
+  <thead>
+    <tr><th>维度</th><th>Lucene 直用</th><th>Elasticsearch / OpenSearch</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>定位</td><td>嵌入式搜索库</td><td>分布式搜索集群</td></tr>
+    <tr><td>部署</td><td>JVM 内 Bean</td><td>独立集群,3+ 节点</td></tr>
+    <tr><td>分布式</td><td>需自行实现 shard / replica</td><td>内置</td></tr>
+    <tr><td>查询 API</td><td>Java API(Query / Sort / ...)</td><td>HTTP + JSON DSL</td></tr>
+    <tr><td>权限</td><td>自实现(Query 注入)</td><td>X-Pack / Search Guard 内置</td></tr>
+    <tr><td>评分定制</td><td>极致灵活(继承 Similarity)</td><td>有限(painless 脚本)</td></tr>
+    <tr><td>运维</td><td>自实现快照 / alias / 监控</td><td>内置</td></tr>
+    <tr><td>典型量级</td><td>千万级单机</td><td>亿级 + 跨节点</td></tr>
+    <tr><td>团队成本</td><td>需懂 Lucene API</td><td>会写 JSON 即可</td></tr>
+  </tbody>
+</table>
+
+<h3>选型决策树</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-15 · Lucene 直用 vs ES 的决策树</div>
+  <svg viewBox="0 0 1200 720" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace" style="display:block;width:100%;height:auto">
+    <!-- 入口 -->
+    <rect x="490" y="20" width="220" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="600" y="46" text-anchor="middle" fill="#cfe9ff" font-size="14" font-weight="700">搜索需求</text>
+    <text x="600" y="64" text-anchor="middle" fill="#a5d6ff" font-size="11">先看量级 · 再看复杂度</text>
+
+    <!-- Q1 -->
+    <polygon points="600,110 800,170 600,230 400,170" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="600" y="168" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">文档量 &gt; 1 亿?</text>
+    <text x="600" y="188" text-anchor="middle" fill="#a5d6ff" font-size="11">单机已扛不住</text>
+
+    <!-- Q2 -->
+    <polygon points="600,260 800,320 600,380 400,320" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="600" y="318" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">要分布式 / 多节点?</text>
+    <text x="600" y="338" text-anchor="middle" fill="#a5d6ff" font-size="11">跨机房 / shard / replica</text>
+
+    <!-- Q3 -->
+    <polygon points="600,410 800,470 600,530 400,470" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="600" y="468" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">深度定制评分 / Analyzer?</text>
+    <text x="600" y="488" text-anchor="middle" fill="#a5d6ff" font-size="11">Similarity 子类</text>
+
+    <!-- Q4 -->
+    <polygon points="600,560 800,620 600,680 400,620" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="600" y="618" text-anchor="middle" fill="#ffd591" font-size="13" font-weight="700">团队懂 Lucene API?</text>
+    <text x="600" y="638" text-anchor="middle" fill="#a5d6ff" font-size="11">+ 运维资源充足</text>
+
+    <!-- ES 出口 (右) -->
+    <rect x="900" y="295" width="280" height="100" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="1040" y="325" text-anchor="middle" fill="#e6d3ff" font-size="14" font-weight="700">→ ES / OpenSearch</text>
+    <text x="1040" y="345" text-anchor="middle" fill="#a5d6ff" font-size="11">分布式 · HTTP+JSON DSL</text>
+    <text x="1040" y="363" text-anchor="middle" fill="#a5d6ff" font-size="11">运维成熟 · X-Pack 权限</text>
+    <text x="1040" y="381" text-anchor="middle" fill="#8b949e" font-size="11">代价: 3+ 节点 · ZK · Logstash</text>
+
+    <!-- Lucene 出口 (左) -->
+    <rect x="20" y="585" width="280" height="110" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="160" y="615" text-anchor="middle" fill="#9be7b3" font-size="14" font-weight="700">→ 直接用 Lucene</text>
+    <text x="160" y="635" text-anchor="middle" fill="#a5d6ff" font-size="11">单机 MMapDirectory</text>
+    <text x="160" y="653" text-anchor="middle" fill="#a5d6ff" font-size="11">Java API · 极致灵活</text>
+    <text x="160" y="671" text-anchor="middle" fill="#8b949e" font-size="11">P99 100ms · 千万级 doc</text>
+    <text x="160" y="689" text-anchor="middle" fill="#39d2c0" font-size="11" font-weight="700">≤ 100 GiB / 1 千万 doc 甜蜜点</text>
+
+    <!-- 箭头 -->
+    <g fill="none">
+      <line x1="600" y1="80" x2="600" y2="108" stroke="#58a6ff" stroke-width="1.6" marker-end="url(#arr)"/>
+
+      <line x1="600" y1="230" x2="600" y2="258" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="565" y="252" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="700">否</text>
+
+      <line x1="600" y1="380" x2="600" y2="408" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="565" y="402" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="700">否</text>
+
+      <line x1="600" y1="530" x2="600" y2="558" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="565" y="552" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="700">否</text>
+
+      <!-- "是" 分支 → ES -->
+      <line x1="800" y1="170" x2="900" y2="320" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <line x1="800" y1="320" x2="898" y2="345" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <line x1="800" y1="620" x2="900" y2="395" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#arr-p)"/>
+      <text x="855" y="200" fill="#bc8cff" font-size="11" font-weight="700">是 (量级超)</text>
+      <text x="850" y="305" fill="#bc8cff" font-size="11" font-weight="700">是 (要分布式)</text>
+      <text x="855" y="555" fill="#bc8cff" font-size="11" font-weight="700">否 (团队不熟)</text>
+
+      <!-- "是" 分支 → Lucene -->
+      <line x1="400" y1="470" x2="240" y2="588" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <line x1="400" y1="620" x2="280" y2="620" stroke="#3fb950" stroke-width="1.5" marker-end="url(#arr-g)"/>
+      <text x="270" y="510" fill="#3fb950" font-size="11" font-weight="700">是 (要定制评分)</text>
+      <text x="335" y="610" fill="#3fb950" font-size="11" font-weight="700">是</text>
+    </g>
+  </svg>
+</div>
+
+<div class="key-insight">
+  <strong>何时直接用 Lucene 而非 ES — 单机 1 千万 doc 以下,业务深度定制评分</strong>。三类典型场景适合直接用 Lucene:(1) <strong>单机量级</strong>:订单搜索、商品搜索、本地文档搜索这类"单业务系统内的搜索",1 千万级文档 / 100GiB 索引以下,单机 MMapDirectory 已经能跑出 P99 100ms 以下,部署个 ES 集群只是徒增 3 个节点 + ZK + Logstash 的运维负担。(2) <strong>深度定制评分</strong>:需要把业务规则(如"VIP 客户订单加 boost"、"距离当前时间越近权重越大"、"用户行为反馈加权")无缝织入 BM25 时,Lucene 的 <code>Similarity.scorer()</code> 让你写 Java 代码就能拿到所有 stats;ES 只能用 painless 脚本,功能 + 性能都受限。(3) <strong>嵌入式场景</strong>:桌面应用、小型 SaaS、IoT 设备本地搜索——根本没理由起一个 ES 集群。我们的订单搜索 1 千万 doc 单机 16GiB 内存跑了三年,P99 110ms,运维只有一个 cron 跑快照 + 一个监控仪表盘——这就是 Lucene 的甜蜜点。规模上来了再迁 ES,但<strong>过早分布式</strong>是最常见的过度设计。
+</div>
+
+<h3>从 Lucene 到 ES 的迁移路径</h3>
+
+<table>
+  <thead>
+    <tr><th>阶段</th><th>触发条件</th><th>动作</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Lucene 单机</td><td>初始</td><td>嵌入式 + Snapshot</td></tr>
+    <tr><td>Lucene 主备</td><td>需要 HA</td><td>2 副本 Worker 独立消费</td></tr>
+    <tr><td>Lucene 多 shard</td><td>单机 100GiB+</td><td>自实现 Coordinator 扇出</td></tr>
+    <tr><td>迁 ES / OpenSearch</td><td>10+ 节点 / 跨 region</td><td>双写过渡 + alias 流量切</td></tr>
+    <tr><td>ES + Lucene 共存</td><td>定制评分 + 大数据量并存</td><td>主搜走 ES,关键字段 reranker 用 Lucene</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<!-- Chapter Summary -->
+<!-- ============================================================ -->
+
+<div class="chapter-summary" id="s5-summary">
+  <h2>5.15 本章小结</h2>
+  <table>
+    <thead>
+      <tr><th>关注点</th><th>核心 API / 设计</th><th>关键建议</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>架构边界</td><td>订单库 = 事实来源 · Lucene = 读模型</td><td>严格分离 · 派生只读视图</td></tr>
+      <tr><td>数据同步</td><td>Outbox + CDC + Kafka</td><td>本地事务保一致性 · 不在交易里写索引</td></tr>
+      <tr><td>幂等去重</td><td><code>updateDocument(orderId, doc)</code> + version</td><td>at-least-once + version 守护</td></tr>
+      <tr><td>IndexWriter 服务化</td><td>单例 · @PreDestroy commit + close</td><td>RAMBuffer 256-512 MiB · UseCompoundFile=false</td></tr>
+      <tr><td>NRT 刷新</td><td><code>SearcherManager.maybeRefresh</code></td><td>1-5 s 周期 · 不要每写每 refresh · release 必在 finally</td></tr>
+      <tr><td>Query Builder</td><td>白名单参数 + wildcard 前缀防御</td><td>业务 DSL → Lucene Query 单点出口</td></tr>
+      <tr><td>权限过滤</td><td><code>BooleanClause.FILTER</code> 前置</td><td>tenantId 永远 MUST · 后过滤是越权风险</td></tr>
+      <tr><td>排序分页</td><td><code>SortField + searchAfter</code></td><td>禁用深 from-size · 游标按 (sort, docId) 稳定</td></tr>
+      <tr><td>业务 boost</td><td><code>QueryRescorer</code> · <code>FunctionScoreQuery</code></td><td>两阶段重排:cheap BM25 → expensive RescoreQuery · 过滤绝不用负 boost</td></tr>
+      <tr><td>索引重建</td><td>新目录 + CheckIndex + alias 切换</td><td>禁用原地重建 · 双读过渡至少 1 个发布周期</td></tr>
+      <tr><td>备份快照</td><td><code>SnapshotDeletionPolicy.snapshot/release</code></td><td>不要 cp -r · 必须配对 release</td></tr>
+      <tr><td>监控指标</td><td>10 个核心 + 4 级告警</td><td>refresh / segment / P99 / disk 是底线</td></tr>
+      <tr><td>部署形态</td><td>Indexer StatefulSet + API Deployment</td><td>资源画像分离 · 索引盘只读挂载</td></tr>
+      <tr><td>故障 Playbook</td><td>visibility trace + 决策树</td><td>沿链路顺序排查 · 不跳环</td></tr>
+      <tr><td>Lucene vs ES</td><td>1 千万 doc / 100GiB 是阈值</td><td>过早分布式是过度设计</td></tr>
+    </tbody>
+  </table>
+  <p class="next-hint">下一章 <a href="06-indexwriter-codepath.html">第 6 章 · IndexWriter 内部源码路径</a> 把"装机后的服务"再次拆开,这次进入 IndexWriter 的真实内脏:从 <code>addDocument</code> 进入,经过 DocumentsWriter 的并发协调、PerThreadState 的 RAM postings 累积、IndexingChain 的字段分派、Codec 的 segment 编码,直到 <code>commit</code> 的两阶段写入。重点是<strong>并发模型(DWPT 池 + DeleteQueue)</strong>、<strong>缓冲管理(RAMBuffer 与 flush 触发)</strong>、<strong>异常恢复(IFD 文件清理 + rollback)</strong>——把第 5 章的"配置参数"还原成它们在源码里真正控制的东西。</p>
+</div>
+
+<!-- ============================================================ -->
+<!-- Chapter navigation -->
+<!-- ============================================================ -->
+<div class="chapter-nav">
+  <a href="04-query-scorer-bm25.html">&larr; 第 4 章 &middot; Query / Scorer / BM25</a>
+  <a href="06-indexwriter-codepath.html">第 6 章 &middot; IndexWriter 内部源码路径 &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 Lucene &middot; 第 5 章 &middot; 生产搜索服务架构</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){setTimeout(function(){document.querySelectorAll('.mermaid svg,.diagram svg').forEach(function(svg){var h=parseInt(svg.getAttribute('height')||svg.getBoundingClientRect().height);if(h>500){svg.style.maxHeight='500px';svg.style.width='auto';var p=svg.closest('.diagram');if(p)p.style.overflowX='auto';}});},1500);});</script>
+</body>
+</html>

@@ -1,0 +1,1507 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 20 章 · SQL 解析器 — 图解 jOOQ</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 jOOQ</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="ch19-qom.html">上一章 ch19-qom</a>
+  <a href="ch21-r2dbc.html">下一章 ch21-r2dbc</a>
+</nav>
+
+<aside class="toc">
+<a href="#20.0-章首速览">20.0 章首速览</a>
+<a href="#20.1-sql-解析器的定位">20.1 SQL 解析器的定位</a>
+<a href="#20.2-parser-api">20.2 Parser API</a>
+<a href="#20.3-方言翻译引擎">20.3 方言翻译引擎</a>
+<a href="#20.4-parsingconnection-透明翻译">20.4 ParsingConnection — 透明翻译</a>
+<a href="#20.5-cli-翻译工具">20.5 CLI 翻译工具</a>
+<a href="#20.6-解析器内部机制">20.6 解析器内部机制</a>
+<a href="#20.7-陷阱与限制">20.7 陷阱与限制</a>
+<a href="#20.8-生产守卫">20.8 生产守卫</a>
+<a href="#20.9-测试护栏">20.9 测试护栏</a>
+<a href="#20.10-源码深潜与本章要点">20.10 源码深潜与本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 20 章 · SQL 解析器</h1>
+<p class="subtitle">v7 图解版 · 自动从 v6 markdown 生成 · Mermaid 图原样保留</p>
+<div class="chapter-intro"><p>jOOQ 不只是查询构建器,它内置覆盖常见 DML / DDL 的 SQL 解析器,能把受支持的 SQL 字符串解析为类型安全的 <code>QueryPart</code> 表达式树,然后用任意目标方言重新渲染。这意味着可以把 MySQL 写的 SQL 自动翻译成 PostgreSQL、Oracle、SQLite,甚至在不修改应用代码的情况下实现透明的方言转换。</p>
+<p>本章覆盖三件事:Parser API 的入口与解析管线、方言翻译引擎的工作流程、<code>ParsingConnection</code> 的透明拦截。前置:第 12 章(方言渲染)与第 19 章(QOM)。</p>
+</div>
+<h2 id="20.0-章首速览">20.0 章首速览</h2>
+<h3>图 20-0:本章地图</h3>
+<div class="diagram">
+  <div class="diagram-title">图 20-0 · 本章地图 — SQL 解析器 9 大主题</div>
+  <svg viewBox="0 0 920 340" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+    <rect x="320" y="20" width="280" height="55" rx="12" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="45" text-anchor="middle" fill="#c9d1d9" font-size="14" font-weight="bold">SQL 解析器</text>
+    <text x="460" y="63" text-anchor="middle" fill="#8b949e" font-size="11">Parser + Renderer</text>
+
+    <rect x="20"  y="120" width="200" height="58" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="120" y="144" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">§20.1 定位</text>
+    <text x="120" y="163" text-anchor="middle" fill="#8b949e" font-size="11">为何需要解析器</text>
+
+    <rect x="240" y="120" width="200" height="58" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="340" y="144" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">§20.2 Parser API</text>
+    <text x="340" y="163" text-anchor="middle" fill="#8b949e" font-size="11">parse / parseSelect ...</text>
+
+    <rect x="460" y="120" width="200" height="58" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="560" y="144" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">§20.3 方言翻译</text>
+    <text x="560" y="163" text-anchor="middle" fill="#8b949e" font-size="11">解析 + 重新渲染</text>
+
+    <rect x="680" y="120" width="220" height="58" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="790" y="144" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">§20.4 ParsingConnection</text>
+    <text x="790" y="163" text-anchor="middle" fill="#8b949e" font-size="11">JDBC 透明拦截</text>
+
+    <rect x="20"  y="200" width="200" height="58" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="120" y="224" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">§20.5 CLI</text>
+    <text x="120" y="243" text-anchor="middle" fill="#8b949e" font-size="11">批量翻译命令行</text>
+
+    <rect x="240" y="200" width="200" height="58" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="340" y="224" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">§20.6 内部机制</text>
+    <text x="340" y="243" text-anchor="middle" fill="#8b949e" font-size="11">Lexer + 递归下降</text>
+
+    <rect x="460" y="200" width="200" height="58" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="560" y="224" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">§20.7 陷阱与限制</text>
+    <text x="560" y="243" text-anchor="middle" fill="#8b949e" font-size="11">语法 vs 语义</text>
+
+    <rect x="680" y="200" width="220" height="58" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="790" y="224" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">§20.8-20.10</text>
+    <text x="790" y="243" text-anchor="middle" fill="#8b949e" font-size="11">守卫 / 测试 / 源码</text>
+
+    <path d="M 460 75 L 120 120" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 75 L 340 120" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 75 L 560 120" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 75 L 790 120" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+<h3>图 20-0a:解析管线主线</h3>
+<div class="diagram">
+  <div class="diagram-title">图 20-0a · 解析管线主线 — SQL → Lexer → AST → Renderer → 目标 SQL</div>
+  <svg viewBox="0 0 920 180" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+    <rect x="10"  y="60" width="120" height="60" rx="10" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="70"  y="86" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">SQL 字符串</text>
+    <text x="70"  y="104" text-anchor="middle" fill="#8b949e" font-size="10">原始输入</text>
+
+    <rect x="140" y="60" width="120" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="200" y="86" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Lexer</text>
+    <text x="200" y="104" text-anchor="middle" fill="#8b949e" font-size="10">词法分析</text>
+
+    <rect x="270" y="60" width="120" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="330" y="86" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Token 流</text>
+    <text x="330" y="104" text-anchor="middle" fill="#8b949e" font-size="10">关键字 / 字面量</text>
+
+    <rect x="400" y="60" width="120" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="460" y="86" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">递归下降</text>
+    <text x="460" y="104" text-anchor="middle" fill="#8b949e" font-size="10">parseStatement</text>
+
+    <rect x="530" y="60" width="140" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="600" y="86" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">QueryPart 树</text>
+    <text x="600" y="104" text-anchor="middle" fill="#8b949e" font-size="10">方言无关 AST</text>
+
+    <rect x="680" y="60" width="120" height="60" rx="10" fill="url(#g-green)"  stroke="#3fb950" stroke-width="1.5"/>
+    <text x="740" y="86" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Renderer</text>
+    <text x="740" y="104" text-anchor="middle" fill="#8b949e" font-size="10">目标方言</text>
+
+    <rect x="810" y="60" width="100" height="60" rx="10" fill="url(#g-green)"  stroke="#3fb950" stroke-width="1.5"/>
+    <text x="860" y="86" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">译出 SQL</text>
+    <text x="860" y="104" text-anchor="middle" fill="#8b949e" font-size="10">PG / Oracle ...</text>
+
+    <path d="M 130 90 L 140 90" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 260 90 L 270 90" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 390 90 L 400 90" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 520 90 L 530 90" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 670 90 L 680 90" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 800 90 L 810 90" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+<h2 id="20.1-sql-解析器的定位">20.1 SQL 解析器的定位</h2>
+<h3>图 20-1:在架构中的位置</h3>
+<div class="diagram">
+  <div class="diagram-title">图 20-1 · 在架构中的位置 — 双入口汇聚到 QueryPart 树</div>
+  <svg viewBox="0 0 920 260" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+    <rect x="20"  y="40"  width="200" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="120" y="66"  text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">DSL API</text>
+    <text x="120" y="84"  text-anchor="middle" fill="#8b949e" font-size="11">类型安全构建</text>
+
+    <rect x="20"  y="160" width="200" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="120" y="186" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">SQL 字符串</text>
+    <text x="120" y="204" text-anchor="middle" fill="#8b949e" font-size="11">原始 / 遗留代码</text>
+
+    <rect x="280" y="160" width="200" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="380" y="186" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">Parser</text>
+    <text x="380" y="204" text-anchor="middle" fill="#8b949e" font-size="11">Lexer + 递归下降</text>
+
+    <rect x="540" y="100" width="200" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="640" y="126" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">QueryPart 树</text>
+    <text x="640" y="144" text-anchor="middle" fill="#8b949e" font-size="11">方言无关 AST</text>
+
+    <rect x="780" y="100" width="120" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="840" y="126" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">30+ 方言</text>
+    <text x="840" y="144" text-anchor="middle" fill="#8b949e" font-size="11">PG / Oracle ...</text>
+
+    <path d="M 220 70  L 540 130" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 220 190 L 280 190" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 480 190 L 540 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 740 130 L 780 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+<p>无论 SQL 来自 DSL API 还是 Parser,最终都汇聚到同一棵 <code>QueryPart</code> 树。这棵树方言无关,可用任意目标方言重新渲染。这是 jOOQ 方言翻译能力的基础。</p>
+<h3>表 20-1:三大核心使用场景</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>典型需求</th>
+<th>关键 API</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>方言迁移</td>
+<td>MySQL <code>LIMIT</code> → Oracle <code>FETCH FIRST</code></td>
+<td><code>parser.parse()</code> + <code>renderInlined()</code></td>
+</tr>
+<tr>
+<td>遗留代码包装</td>
+<td>几百个 <code>@Query</code> 注解中的原生 SQL</td>
+<td><code>parser.parseSelect()</code></td>
+</tr>
+<tr>
+<td>SQL 分析</td>
+<td>CI 中扫描是否含 <code>SELECT *</code></td>
+<td><code>parser.parse()</code> + QOM 遍历</td>
+</tr>
+</tbody>
+</table>
+<h3>图 20-1a:三大场景关系</h3>
+<div class="diagram">
+  <div class="diagram-title">图 20-1a · 三大场景关系 — 一个解析器,三类下游</div>
+  <svg viewBox="0 0 920 260" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+    <rect x="20"  y="100" width="180" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="110" y="126" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">SQL 解析器</text>
+    <text x="110" y="144" text-anchor="middle" fill="#8b949e" font-size="11">parser.parse()</text>
+
+    <rect x="280" y="20"  width="180" height="55" rx="10" fill="url(#g-green)"  stroke="#3fb950" stroke-width="1.5"/>
+    <text x="370" y="44"  text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">方言迁移</text>
+    <text x="370" y="62"  text-anchor="middle" fill="#8b949e" font-size="11">renderInlined</text>
+
+    <rect x="280" y="100" width="180" height="60" rx="10" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="370" y="126" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">遗留代码包装</text>
+    <text x="370" y="144" text-anchor="middle" fill="#8b949e" font-size="11">parseSelect</text>
+
+    <rect x="280" y="185" width="180" height="55" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="370" y="209" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">SQL 分析</text>
+    <text x="370" y="227" text-anchor="middle" fill="#8b949e" font-size="11">QOM 遍历</text>
+
+    <rect x="540" y="20"  width="360" height="55" rx="8"  fill="#161b22" stroke="#3fb950" stroke-width="1"/>
+    <text x="720" y="44"  text-anchor="middle" fill="#c9d1d9" font-size="11">MySQL → PG / Oracle / 测试方言</text>
+    <text x="720" y="62"  text-anchor="middle" fill="#8b949e" font-size="10">输出多种目标方言 SQL</text>
+
+    <rect x="540" y="100" width="360" height="60" rx="8"  fill="#161b22" stroke="#58a6ff" stroke-width="1"/>
+    <text x="720" y="126" text-anchor="middle" fill="#c9d1d9" font-size="11">原生 SQL → QueryPart → 渐进重构</text>
+    <text x="720" y="144" text-anchor="middle" fill="#8b949e" font-size="10">@Query 注解中遗留 SQL 类型化</text>
+
+    <rect x="540" y="185" width="360" height="55" rx="8"  fill="#161b22" stroke="#d29922" stroke-width="1"/>
+    <text x="720" y="209" text-anchor="middle" fill="#c9d1d9" font-size="11">提取表名 / 列名 / 检测危险模式</text>
+    <text x="720" y="227" text-anchor="middle" fill="#8b949e" font-size="10">CI 扫描 SELECT * / 缺索引</text>
+
+    <path d="M 200 120 L 280 47"  stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 200 130 L 280 130" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 200 140 L 280 213" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 460 47  L 540 47"  stroke="#3fb950" stroke-width="1.2" fill="none"/>
+    <path d="M 460 130 L 540 130" stroke="#58a6ff" stroke-width="1.2" fill="none"/>
+    <path d="M 460 213 L 540 213" stroke="#d29922" stroke-width="1.2" fill="none"/>
+  </svg>
+</div>
+<h2 id="20.2-parser-api">20.2 Parser API</h2>
+<h3>图 20-2:入口方法</h3>
+<div class="diagram">
+  <div class="diagram-title">图 20-2 · 入口方法 — Parser 7 个解析入口</div>
+  <svg viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+    <rect x="200" y="20" width="200" height="50" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="300" y="42" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">DSLContext</text>
+    <text x="300" y="60" text-anchor="middle" fill="#8b949e" font-size="11">.parser()</text>
+
+    <rect x="520" y="20" width="200" height="50" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="620" y="42" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">Parser</text>
+    <text x="620" y="60" text-anchor="middle" fill="#8b949e" font-size="11">7 个解析入口</text>
+
+    <path d="M 400 45 L 520 45" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="20"  y="120" width="220" height="55" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.2"/>
+    <text x="130" y="143" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">parse(sql)</text>
+    <text x="130" y="161" text-anchor="middle" fill="#8b949e" font-size="10">→ Queries · 多语句</text>
+
+    <rect x="260" y="120" width="220" height="55" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.2"/>
+    <text x="370" y="143" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">parseQuery(sql)</text>
+    <text x="370" y="161" text-anchor="middle" fill="#8b949e" font-size="10">→ Query · 单条 DML/DDL</text>
+
+    <rect x="500" y="120" width="220" height="55" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.2"/>
+    <text x="610" y="143" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">parseSelect(sql)</text>
+    <text x="610" y="161" text-anchor="middle" fill="#8b949e" font-size="10">→ ResultQuery · 可执行</text>
+
+    <rect x="740" y="120" width="160" height="55" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.2"/>
+    <text x="820" y="143" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">parseTable</text>
+    <text x="820" y="161" text-anchor="middle" fill="#8b949e" font-size="10">→ Table&lt;?&gt;</text>
+
+    <rect x="20"  y="200" width="220" height="55" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.2"/>
+    <text x="130" y="223" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">parseField(sql)</text>
+    <text x="130" y="241" text-anchor="middle" fill="#8b949e" font-size="10">→ Field · 列 / 表达式</text>
+
+    <rect x="260" y="200" width="220" height="55" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.2"/>
+    <text x="370" y="223" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">parseCondition</text>
+    <text x="370" y="241" text-anchor="middle" fill="#8b949e" font-size="10">→ Condition · WHERE 片段</text>
+
+    <rect x="500" y="200" width="220" height="55" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.2"/>
+    <text x="610" y="223" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">parseName(sql)</text>
+    <text x="610" y="241" text-anchor="middle" fill="#8b949e" font-size="10">→ Name · 标识符</text>
+
+    <path d="M 620 70  L 130 120" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 620 70  L 370 120" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 620 70  L 610 120" stroke="#3fb950" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 620 70  L 820 120" stroke="#3fb950" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 620 70  L 130 200" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 620 70  L 370 200" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 620 70  L 610 200" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+
+    <text x="460" y="310" text-anchor="middle" fill="#8b949e" font-size="11">蓝 = 多语句/通用 · 绿 = 完整查询 · 橙 = 片段 / 标识符</text>
+  </svg>
+</div>
+<h3>表 20-2:方法签名</h3>
+<table>
+<thead>
+<tr>
+<th>方法</th>
+<th>输入</th>
+<th>返回</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>parse(sql)</code></td>
+<td>多条 SQL</td>
+<td><code>Queries</code></td>
+<td>批量解析脚本</td>
+</tr>
+<tr>
+<td><code>parseQuery(sql)</code></td>
+<td>单条 DML / DDL</td>
+<td><code>Query</code></td>
+<td>单条语句</td>
+</tr>
+<tr>
+<td><code>parseSelect(sql)</code></td>
+<td>SELECT</td>
+<td><code>Select&lt;?&gt;</code></td>
+<td>可执行或重新渲染</td>
+</tr>
+<tr>
+<td><code>parseTable(sql)</code></td>
+<td>表表达式</td>
+<td><code>Table&lt;?&gt;</code></td>
+<td>子查询 / 表引用</td>
+</tr>
+<tr>
+<td><code>parseField(sql)</code></td>
+<td>列 / 表达式</td>
+<td><code>Field&lt;?&gt;</code></td>
+<td>动态列引用</td>
+</tr>
+<tr>
+<td><code>parseCondition(sql)</code></td>
+<td>布尔条件</td>
+<td><code>Condition</code></td>
+<td>动态 WHERE</td>
+</tr>
+<tr>
+<td><code>parseName(sql)</code></td>
+<td>标识符</td>
+<td><code>Name</code></td>
+<td>动态对象名</td>
+</tr>
+</tbody>
+</table>
+<h3>20.2.1 解析时序</h3>
+<div class="diagram">
+  <div class="diagram-title">图 20-2-1 · 解析时序 — App → Parser → Lexer → 递归下降 → AST</div>
+  <svg viewBox="0 0 920 420" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+    <rect x="40"  y="20" width="120" height="40" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="100" y="44" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">App</text>
+    <rect x="220" y="20" width="120" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="280" y="44" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Parser</text>
+    <rect x="400" y="20" width="120" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="460" y="44" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Lexer</text>
+    <rect x="580" y="20" width="140" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="650" y="44" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">递归下降</text>
+    <rect x="760" y="20" width="140" height="40" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="1.5"/>
+    <text x="830" y="44" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">QueryPart 树</text>
+
+    <line x1="100" y1="60" x2="100" y2="400" stroke="#8b949e" stroke-width="1" stroke-dasharray="4 3"/>
+    <line x1="280" y1="60" x2="280" y2="400" stroke="#8b949e" stroke-width="1" stroke-dasharray="4 3"/>
+    <line x1="460" y1="60" x2="460" y2="400" stroke="#8b949e" stroke-width="1" stroke-dasharray="4 3"/>
+    <line x1="650" y1="60" x2="650" y2="400" stroke="#8b949e" stroke-width="1" stroke-dasharray="4 3"/>
+    <line x1="830" y1="60" x2="830" y2="400" stroke="#8b949e" stroke-width="1" stroke-dasharray="4 3"/>
+
+    <text x="190" y="92"  text-anchor="middle" fill="#c9d1d9" font-size="10">① parser.parseSelect(sql)</text>
+    <path d="M 100 100 L 280 100" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <text x="370" y="132" text-anchor="middle" fill="#c9d1d9" font-size="10">② tokenize(sql)</text>
+    <path d="M 280 140 L 460 140" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <text x="555" y="172" text-anchor="middle" fill="#8b949e" font-size="10">③ Token 流</text>
+    <path d="M 460 180 L 650 180" stroke="#8b949e" stroke-width="1.5" fill="none" stroke-dasharray="5 3" marker-end="url(#arr)"/>
+
+    <text x="650" y="212" text-anchor="middle" fill="#c9d1d9" font-size="10">④ SELECT → FROM → WHERE → ...</text>
+    <path d="M 650 220 C 740 220, 740 250, 650 250" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <text x="740" y="282" text-anchor="middle" fill="#8b949e" font-size="10">⑤ 完整 QueryPart 树</text>
+    <path d="M 650 290 L 830 290" stroke="#8b949e" stroke-width="1.5" fill="none" stroke-dasharray="5 3" marker-end="url(#arr)"/>
+
+    <text x="555" y="322" text-anchor="middle" fill="#8b949e" font-size="10">⑥ ResultQuery&lt;Record&gt;</text>
+    <path d="M 830 330 L 280 330" stroke="#8b949e" stroke-width="1.5" fill="none" stroke-dasharray="5 3" marker-end="url(#arr)"/>
+
+    <text x="190" y="362" text-anchor="middle" fill="#8b949e" font-size="10">⑦ 可执行查询</text>
+    <path d="M 280 370 L 100 370" stroke="#8b949e" stroke-width="1.5" fill="none" stroke-dasharray="5 3" marker-end="url(#arr)"/>
+  </svg>
+</div>
+<h3>20.2.2 代码示例</h3>
+<pre><code class="language-java">Settings settings = new Settings()
+    .withParseDialect(ParseDialect.MYSQL);
+
+DSLContext mysql = DSL.using(SQLDialect.MYSQL, settings);
+Parser parser = mysql.parser();
+
+ResultQuery&lt;?&gt; query = parser.parseSelect(
+    &quot;SELECT id, name, price FROM product &quot; +
+    &quot;WHERE price &gt; 100 ORDER BY name LIMIT 10&quot;
+);
+
+DSLContext postgres = DSL.using(SQLDialect.POSTGRES);
+String pgSql = postgres.renderInlined(query);
+System.out.println(pgSql);
+</code></pre>
+<p>输出:</p>
+<pre><code class="language-sql">SELECT id, name, price
+FROM product
+WHERE price &gt; 100
+ORDER BY name
+LIMIT 10
+</code></pre>
+<h3>20.2.3 条件片段嵌入 DSL</h3>
+<pre><code class="language-java">Condition cond = parser.parseCondition(
+    &quot;status = 'ACTIVE' AND created_at &gt; DATE '2024-01-01'&quot;);
+
+var result = postgres
+    .select(PRODUCT.ID, PRODUCT.NAME)
+    .from(PRODUCT)
+    .where(cond)
+    .fetch();
+</code></pre>
+<h3>20.2.4 多语句脚本</h3>
+<pre><code class="language-java">Queries ddl = parser.parse(
+    &quot;CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(100));&quot; +
+    &quot;CREATE INDEX idx_name ON t (name);&quot;);
+</code></pre>
+<pre><code class="language-text">ddl.queries().length = 2
+ddl.queries()[0]     = CreateTable
+ddl.queries()[1]     = CreateIndex
+</code></pre>
+<h2 id="20.3-方言翻译引擎">20.3 方言翻译引擎</h2>
+<h3>图 20-3:翻译流程</h3>
+<div class="diagram">
+  <div class="diagram-title">图 20-3 · 翻译流程 — MySQL SQL → AST → PostgreSQL SQL</div>
+  <svg viewBox="0 0 920 220" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+    <rect x="20"  y="60" width="180" height="80" rx="10" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="110" y="84" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">MySQL SQL</text>
+    <text x="110" y="105" text-anchor="middle" fill="#8b949e" font-size="10">SELECT * FROM t</text>
+    <text x="110" y="122" text-anchor="middle" fill="#8b949e" font-size="10">LIMIT 10, 20</text>
+
+    <rect x="220" y="70" width="140" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="290" y="96" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Parser MySQL</text>
+    <text x="290" y="114" text-anchor="middle" fill="#8b949e" font-size="10">parseSelect</text>
+
+    <rect x="380" y="70" width="160" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="460" y="96" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">QueryPart 树</text>
+    <text x="460" y="114" text-anchor="middle" fill="#8b949e" font-size="10">方言无关</text>
+
+    <rect x="560" y="70" width="160" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="640" y="96" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Renderer PG</text>
+    <text x="640" y="114" text-anchor="middle" fill="#8b949e" font-size="10">renderInlined</text>
+
+    <rect x="740" y="60" width="160" height="80" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="820" y="84" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">PostgreSQL SQL</text>
+    <text x="820" y="105" text-anchor="middle" fill="#8b949e" font-size="10">SELECT * FROM t</text>
+    <text x="820" y="122" text-anchor="middle" fill="#8b949e" font-size="10">LIMIT 20 OFFSET 10</text>
+
+    <path d="M 200 100 L 220 100" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 360 100 L 380 100" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 540 100 L 560 100" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 720 100 L 740 100" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <text x="460" y="180" text-anchor="middle" fill="#8b949e" font-size="11">同一棵树,可重新渲染为任意 30+ 目标方言</text>
+  </svg>
+</div>
+<h3>20.3.1 三行代码翻译</h3>
+<pre><code class="language-java">Settings sourceSettings = new Settings()
+    .withParseDialect(ParseDialect.MYSQL);
+
+DSLContext source = DSL.using(SQLDialect.MYSQL, sourceSettings);
+DSLContext target = DSL.using(SQLDialect.POSTGRES);
+
+String mysqlSql = &quot;SELECT * FROM product LIMIT 10, 20&quot;;
+String pgSql    = target.renderInlined(source.parser().parseSelect(mysqlSql));
+</code></pre>
+<p>输入:</p>
+<pre><code class="language-sql">SELECT * FROM product LIMIT 10, 20
+</code></pre>
+<p>输出:</p>
+<pre><code class="language-sql">SELECT * FROM product LIMIT 20 OFFSET 10
+</code></pre>
+<h3>20.3.2 LIMIT / OFFSET 翻译细节</h3>
+<div class="diagram">
+  <div class="diagram-title">图 20-3-2 · LIMIT/OFFSET 翻译细节 — MySQL → AST → Oracle</div>
+  <svg viewBox="0 0 920 480" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20" y="20" width="280" height="120" rx="12" fill="#0d1117" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="160" y="42" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">MySQL 源</text>
+    <text x="35" y="64"  fill="#c9d1d9" font-size="10">SELECT name, price FROM product</text>
+    <text x="35" y="82"  fill="#c9d1d9" font-size="10">WHERE price &gt; 100</text>
+    <text x="35" y="100" fill="#c9d1d9" font-size="10">ORDER BY price DESC</text>
+    <text x="35" y="118" fill="#d29922" font-size="10" font-weight="bold">LIMIT 20 OFFSET 40</text>
+
+    <rect x="320" y="20" width="280" height="440" rx="12" fill="#0d1117" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="460" y="42" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">表达式树</text>
+    <rect x="380" y="60" width="160" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.2"/>
+    <text x="460" y="84" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">SelectQuery</text>
+
+    <rect x="340" y="130" width="240" height="32" rx="6" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1"/>
+    <text x="460" y="151" text-anchor="middle" fill="#c9d1d9" font-size="10">fields: [name, price]</text>
+    <rect x="340" y="170" width="240" height="32" rx="6" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1"/>
+    <text x="460" y="191" text-anchor="middle" fill="#c9d1d9" font-size="10">from: product</text>
+    <rect x="340" y="210" width="240" height="32" rx="6" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1"/>
+    <text x="460" y="231" text-anchor="middle" fill="#c9d1d9" font-size="10">where: price &gt; 100</text>
+    <rect x="340" y="250" width="240" height="32" rx="6" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1"/>
+    <text x="460" y="271" text-anchor="middle" fill="#c9d1d9" font-size="10">orderBy: price DESC</text>
+    <rect x="340" y="290" width="240" height="32" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="1"/>
+    <text x="460" y="311" text-anchor="middle" fill="#c9d1d9" font-size="10">limit: 20</text>
+    <rect x="340" y="330" width="240" height="32" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="1"/>
+    <text x="460" y="351" text-anchor="middle" fill="#c9d1d9" font-size="10">offset: 40</text>
+
+    <path d="M 460 100 L 460 130" stroke="#bc8cff" stroke-width="1.2" fill="none"/>
+    <path d="M 460 100 L 460 170" stroke="#bc8cff" stroke-width="1" fill="none"/>
+    <path d="M 460 100 L 460 210" stroke="#bc8cff" stroke-width="1" fill="none"/>
+    <path d="M 460 100 L 460 250" stroke="#bc8cff" stroke-width="1" fill="none"/>
+    <path d="M 460 100 L 460 290" stroke="#bc8cff" stroke-width="1" fill="none"/>
+    <path d="M 460 100 L 460 330" stroke="#bc8cff" stroke-width="1" fill="none"/>
+
+    <rect x="620" y="20" width="280" height="140" rx="12" fill="#0d1117" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="760" y="42" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">Oracle 目标</text>
+    <text x="635" y="64"  fill="#c9d1d9" font-size="10">SELECT name, price FROM product</text>
+    <text x="635" y="82"  fill="#c9d1d9" font-size="10">WHERE price &gt; 100</text>
+    <text x="635" y="100" fill="#c9d1d9" font-size="10">ORDER BY price DESC</text>
+    <text x="635" y="118" fill="#3fb950" font-size="10" font-weight="bold">OFFSET 40 ROWS</text>
+    <text x="635" y="136" fill="#3fb950" font-size="10" font-weight="bold">FETCH NEXT 20 ROWS ONLY</text>
+
+    <path d="M 300 80 L 320 80" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 600 80 L 620 80" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <text x="460" y="420" text-anchor="middle" fill="#8b949e" font-size="11">解析 → 同一 AST → 用目标方言渲染分页语法</text>
+  </svg>
+</div>
+<h3>表 20-3:常见特性翻译对照</h3>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th>MySQL</th>
+<th>PostgreSQL</th>
+<th>Oracle</th>
+<th>SQL Server</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>分页</td>
+<td><code>LIMIT n OFFSET m</code></td>
+<td><code>LIMIT n OFFSET m</code></td>
+<td><code>OFFSET m ROWS FETCH NEXT n ROWS ONLY</code></td>
+<td>同 Oracle</td>
+</tr>
+<tr>
+<td>字符串拼接</td>
+<td><code>CONCAT(a,b)</code></td>
+<td><code>a \|\| b</code></td>
+<td><code>a \|\| b</code></td>
+<td><code>a + b</code></td>
+</tr>
+<tr>
+<td>空值合并</td>
+<td><code>IFNULL(a,b)</code></td>
+<td><code>COALESCE(a,b)</code></td>
+<td><code>NVL(a,b)</code></td>
+<td><code>ISNULL(a,b)</code></td>
+</tr>
+<tr>
+<td>当前时间</td>
+<td><code>NOW()</code></td>
+<td><code>NOW()</code></td>
+<td><code>SYSDATE</code></td>
+<td><code>GETDATE()</code></td>
+</tr>
+<tr>
+<td>标识符</td>
+<td><code>`name`</code></td>
+<td><code>"name"</code></td>
+<td><code>"name"</code></td>
+<td><code>[name]</code></td>
+</tr>
+</tbody>
+</table>
+<h3>20.3.3 复合迁移示例</h3>
+<pre><code class="language-java">String mysqlSource = &quot;&quot;&quot;
+    SELECT IFNULL(`nickname`, CONCAT(`first_name`, ' ', `last_name`)) AS `display_name`
+    FROM `customers`
+    WHERE `deleted` = 0
+    LIMIT 5
+    &quot;&quot;&quot;;
+
+Query query = mysql.parser().parseSelect(mysqlSource);
+
+String postgresSql  = DSL.using(SQLDialect.POSTGRES).renderInlined(query);
+String sqlServerSql = DSL.using(SQLDialect.SQLSERVER).renderInlined(query);
+</code></pre>
+<p>PostgreSQL 输出:</p>
+<pre><code class="language-sql">SELECT COALESCE(&quot;nickname&quot;, &quot;first_name&quot; || ' ' || &quot;last_name&quot;) AS &quot;display_name&quot;
+FROM &quot;customers&quot;
+WHERE &quot;deleted&quot; = 0
+LIMIT 5
+</code></pre>
+<p>SQL Server 输出:</p>
+<pre><code class="language-sql">SELECT TOP 5 ISNULL([nickname], [first_name] + ' ' + [last_name]) [display_name]
+FROM [customers]
+WHERE [deleted] = 0
+</code></pre>
+<h2 id="20.4-parsingconnection-透明翻译">20.4 ParsingConnection — 透明翻译</h2>
+<p><code>ParsingConnection</code> 是一个 JDBC <code>Connection</code> 包装器,拦截所有通过它执行的 SQL,自动解析并用目标方言重新渲染后再发送给底层数据库。应用代码无需修改。</p>
+<h3>图 20-4:透明翻译时序</h3>
+<div class="diagram">
+  <div class="diagram-title">图 20-4 · 透明翻译时序 — ParsingConnection 在 JDBC 层拦截 / 翻译 / 透传</div>
+  <svg viewBox="0 0 920 520" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+    <rect x="20"  y="20" width="120" height="40" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="80"  y="44" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">App (MySQL)</text>
+    <rect x="170" y="20" width="140" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="240" y="44" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">ParsingConnection</text>
+    <rect x="340" y="20" width="100" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="390" y="44" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">Parser</text>
+    <rect x="470" y="20" width="120" height="40" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="1.5"/>
+    <text x="530" y="44" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">Renderer (PG)</text>
+    <rect x="620" y="20" width="140" height="40" rx="8" fill="url(#g-blue)"   stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="690" y="44" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">原生 Connection</text>
+    <rect x="790" y="20" width="120" height="40" rx="8" fill="url(#g-green)"  stroke="#3fb950" stroke-width="1.5"/>
+    <text x="850" y="44" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">PostgreSQL</text>
+
+    <line x1="80"  y1="60" x2="80"  y2="500" stroke="#8b949e" stroke-width="1" stroke-dasharray="4 3"/>
+    <line x1="240" y1="60" x2="240" y2="500" stroke="#8b949e" stroke-width="1" stroke-dasharray="4 3"/>
+    <line x1="390" y1="60" x2="390" y2="500" stroke="#8b949e" stroke-width="1" stroke-dasharray="4 3"/>
+    <line x1="530" y1="60" x2="530" y2="500" stroke="#8b949e" stroke-width="1" stroke-dasharray="4 3"/>
+    <line x1="690" y1="60" x2="690" y2="500" stroke="#8b949e" stroke-width="1" stroke-dasharray="4 3"/>
+    <line x1="850" y1="60" x2="850" y2="500" stroke="#8b949e" stroke-width="1" stroke-dasharray="4 3"/>
+
+    <text x="160" y="92" text-anchor="middle" fill="#c9d1d9" font-size="10">① executeQuery(LIMIT 10, 20)</text>
+    <path d="M 80 100 L 240 100" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <text x="315" y="132" text-anchor="middle" fill="#c9d1d9" font-size="10">② parse(sql, MYSQL)</text>
+    <path d="M 240 140 L 390 140" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <text x="315" y="172" text-anchor="middle" fill="#8b949e" font-size="10">③ QueryPart 树</text>
+    <path d="M 390 180 L 240 180" stroke="#8b949e" stroke-width="1.5" fill="none" stroke-dasharray="5 3" marker-end="url(#arr)"/>
+
+    <text x="385" y="212" text-anchor="middle" fill="#c9d1d9" font-size="10">④ render(tree, POSTGRES)</text>
+    <path d="M 240 220 L 530 220" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <text x="385" y="252" text-anchor="middle" fill="#8b949e" font-size="10">⑤ "SELECT ... LIMIT 20 OFFSET 10"</text>
+    <path d="M 530 260 L 240 260" stroke="#8b949e" stroke-width="1.5" fill="none" stroke-dasharray="5 3" marker-end="url(#arr)"/>
+
+    <text x="465" y="292" text-anchor="middle" fill="#c9d1d9" font-size="10">⑥ executeQuery(translated)</text>
+    <path d="M 240 300 L 690 300" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <text x="770" y="332" text-anchor="middle" fill="#c9d1d9" font-size="10">⑦ 执行</text>
+    <path d="M 690 340 L 850 340" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <text x="770" y="372" text-anchor="middle" fill="#8b949e" font-size="10">⑧ ResultSet</text>
+    <path d="M 850 380 L 690 380" stroke="#8b949e" stroke-width="1.5" fill="none" stroke-dasharray="5 3" marker-end="url(#arr)"/>
+
+    <text x="465" y="412" text-anchor="middle" fill="#8b949e" font-size="10">⑨ ResultSet</text>
+    <path d="M 690 420 L 240 420" stroke="#8b949e" stroke-width="1.5" fill="none" stroke-dasharray="5 3" marker-end="url(#arr)"/>
+
+    <text x="160" y="452" text-anchor="middle" fill="#8b949e" font-size="10">⑩ ResultSet 透明传递</text>
+    <path d="M 240 460 L 80 460" stroke="#8b949e" stroke-width="1.5" fill="none" stroke-dasharray="5 3" marker-end="url(#arr)"/>
+  </svg>
+</div>
+<h3>20.4.1 配置</h3>
+<pre><code class="language-java">DataSource pgDataSource = ...;
+
+Settings settings = new Settings()
+    .withParseDialect(ParseDialect.MYSQL);
+
+DSLContext dsl = DSL.using(pgDataSource, SQLDialect.POSTGRES, settings);
+Connection parsingConn = dsl.parsingConnection();
+
+try (Statement stmt = parsingConn.createStatement()) {
+    ResultSet rs = stmt.executeQuery(
+        &quot;SELECT id, name FROM product LIMIT 10, 20&quot;);
+}
+</code></pre>
+<p>实际发送到 PostgreSQL 的 SQL:</p>
+<pre><code class="language-sql">SELECT id, name FROM product LIMIT 20 OFFSET 10
+</code></pre>
+<h3>20.4.2 Spring Boot 包装</h3>
+<pre><code class="language-java">@Configuration
+public class ParsingDataSourceConfig {
+    @Bean
+    public DataSource parsingDataSource(DataSource original) {
+        Settings settings = new Settings()
+            .withParseDialect(ParseDialect.MYSQL);
+        DSLContext dsl = DSL.using(original, SQLDialect.POSTGRES, settings);
+        return new DataSource() {
+            @Override
+            public Connection getConnection() { return dsl.parsingConnection(); }
+        };
+    }
+}
+</code></pre>
+<div class="key-insight"><p>注意:<code>ParsingConnection</code> 拦截所有 SQL,包括 ORM 框架(如 Hibernate)生成的 SQL。如果 Hibernate 已针对目标方言生成正确 SQL,再次翻译可能引入二次转换错误。建议仅在纯原生 SQL 或 JDBC 直连场景使用。</p></div>
+<h2 id="20.5-cli-翻译工具">20.5 CLI 翻译工具</h2>
+<h3>图 20-5:CLI 工作流</h3>
+<div class="diagram">
+  <div class="diagram-title">图 20-5 · CLI 工作流 — 输入选项 / 核心参数 / 翻译输出</div>
+  <svg viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20" y="20" width="200" height="180" rx="12" fill="#0d1117" stroke="#58a6ff" stroke-width="1.2" stroke-dasharray="4 3"/>
+    <text x="120" y="42" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">输入选项</text>
+    <rect x="40"  y="60"  width="160" height="36" rx="6" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1"/>
+    <text x="120" y="83"  text-anchor="middle" fill="#c9d1d9" font-size="11">--sql 内联</text>
+    <rect x="40"  y="106" width="160" height="36" rx="6" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1"/>
+    <text x="120" y="129" text-anchor="middle" fill="#c9d1d9" font-size="11">--file 文件</text>
+    <rect x="40"  y="152" width="160" height="36" rx="6" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1"/>
+    <text x="120" y="175" text-anchor="middle" fill="#c9d1d9" font-size="11">stdin 管道</text>
+
+    <rect x="260" y="120" width="120" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="320" y="146" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">输入</text>
+    <text x="320" y="164" text-anchor="middle" fill="#8b949e" font-size="10">SQL 文本</text>
+
+    <rect x="420" y="120" width="200" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="520" y="146" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">jOOQ CLI Translator</text>
+    <text x="520" y="164" text-anchor="middle" fill="#8b949e" font-size="10">org.jooq.ParserCLI</text>
+
+    <rect x="660" y="120" width="120" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="720" y="146" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">输出</text>
+    <text x="720" y="164" text-anchor="middle" fill="#8b949e" font-size="10">译出 SQL</text>
+
+    <rect x="280" y="220" width="500" height="100" rx="12" fill="#0d1117" stroke="#d29922" stroke-width="1.2" stroke-dasharray="4 3"/>
+    <text x="530" y="242" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">核心参数</text>
+    <rect x="300" y="258" width="110" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="1"/>
+    <text x="355" y="280" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">--from</text>
+    <text x="355" y="298" text-anchor="middle" fill="#8b949e" font-size="10">MYSQL</text>
+    <rect x="425" y="258" width="110" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="1"/>
+    <text x="480" y="280" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">--to</text>
+    <text x="480" y="298" text-anchor="middle" fill="#8b949e" font-size="10">POSTGRES</text>
+    <rect x="550" y="258" width="110" height="50" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="1"/>
+    <text x="605" y="280" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">--formatted</text>
+    <text x="605" y="298" text-anchor="middle" fill="#8b949e" font-size="10">格式化</text>
+    <rect x="675" y="258" width="90"  height="50" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="1"/>
+    <text x="720" y="280" text-anchor="middle" fill="#c9d1d9" font-size="11" font-weight="bold">--keyword</text>
+    <text x="720" y="298" text-anchor="middle" fill="#8b949e" font-size="10">UPPER</text>
+
+    <path d="M 220 150 L 260 150" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 380 150 L 420 150" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 620 150 L 660 150" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 530 220 L 520 180" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+<h3>表 20-5:CLI 参数</h3>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>说明</th>
+<th>示例</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>-F</code> / <code>--from-dialect</code></td>
+<td>源方言</td>
+<td><code>MYSQL</code></td>
+</tr>
+<tr>
+<td><code>-T</code> / <code>--to-dialect</code></td>
+<td>目标方言</td>
+<td><code>POSTGRES</code></td>
+</tr>
+<tr>
+<td><code>-s</code> / <code>--sql</code></td>
+<td>输入 SQL</td>
+<td><code>"SELECT ..."</code></td>
+</tr>
+<tr>
+<td><code>-f</code> / <code>--formatted</code></td>
+<td>启用格式化</td>
+<td>(无参)</td>
+</tr>
+<tr>
+<td><code>-k</code> / <code>--keyword</code></td>
+<td>关键字大小写</td>
+<td><code>UPPER</code></td>
+</tr>
+<tr>
+<td><code>-I</code> / <code>--interactive</code></td>
+<td>交互模式</td>
+<td>(无参)</td>
+</tr>
+</tbody>
+</table>
+<h3>20.5.1 命令示例</h3>
+<pre><code class="language-bash">java -cp &quot;jooq-&lt;version&gt;.jar&quot; org.jooq.ParserCLI \
+    -F MYSQL -T POSTGRES \
+    -s &quot;SELECT * FROM t LIMIT 10, 20&quot;
+</code></pre>
+<p>输出:</p>
+<pre><code class="language-sql">SELECT * FROM t LIMIT 20 OFFSET 10
+</code></pre>
+<pre><code class="language-bash">java -cp &quot;jooq-&lt;version&gt;.jar&quot; org.jooq.ParserCLI \
+    -F MYSQL -T ORACLE -f -k UPPER \
+    -s &quot;$(cat legacy-queries.sql)&quot; &gt; oracle-queries.sql
+</code></pre>
+<p><code>oracle-queries.sql</code> 片段:</p>
+<pre><code class="language-sql">SELECT id, name
+FROM customer
+ORDER BY created_at DESC
+OFFSET 20 ROWS FETCH NEXT 10 ROWS ONLY;
+</code></pre>
+<h3>20.5.2 批量翻译</h3>
+<pre><code class="language-bash">for f in sql/*.sql; do
+    java -cp &quot;jooq-&lt;version&gt;.jar&quot; org.jooq.ParserCLI \
+        -F MYSQL -T POSTGRES \
+        -s &quot;$(cat &quot;$f&quot;)&quot; &gt; &quot;pg_$(basename &quot;$f&quot;)&quot;
+done
+</code></pre>
+<pre><code class="language-text">sql/customer.sql -&gt; pg_customer.sql OK
+sql/order.sql    -&gt; pg_order.sql    OK
+sql/report.sql   -&gt; pg_report.sql   REVIEW_REQUIRED
+</code></pre>
+<h2 id="20.6-解析器内部机制">20.6 解析器内部机制</h2>
+<h3>图 20-6:内部五阶段管线</h3>
+<div class="diagram">
+  <div class="diagram-title">图 20-6 · 内部五阶段管线 — Lexer → 递归下降 → AST → QueryPart</div>
+  <svg viewBox="0 0 920 180" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+    <rect x="10"  y="60" width="130" height="60" rx="10" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.5"/>
+    <text x="75"  y="86"  text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">SQL 字符串</text>
+    <text x="75"  y="104" text-anchor="middle" fill="#8b949e" font-size="10">输入</text>
+
+    <rect x="160" y="60" width="130" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="225" y="80"  text-anchor="middle" fill="#d29922" font-size="10" font-weight="bold">① 词法分析</text>
+    <text x="225" y="100" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">Lexer</text>
+
+    <rect x="310" y="60" width="130" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="375" y="80"  text-anchor="middle" fill="#d29922" font-size="10" font-weight="bold">② Token 流</text>
+    <text x="375" y="100" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">tokens</text>
+
+    <rect x="460" y="60" width="130" height="60" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="525" y="80"  text-anchor="middle" fill="#d29922" font-size="10" font-weight="bold">③ 递归下降</text>
+    <text x="525" y="100" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">parseStatement</text>
+
+    <rect x="610" y="60" width="130" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1.5"/>
+    <text x="675" y="80"  text-anchor="middle" fill="#bc8cff" font-size="10" font-weight="bold">④ AST 构建</text>
+    <text x="675" y="100" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">build</text>
+
+    <rect x="760" y="60" width="150" height="60" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="835" y="80"  text-anchor="middle" fill="#bc8cff" font-size="10" font-weight="bold">⑤ QueryPart</text>
+    <text x="835" y="100" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">表达式树</text>
+
+    <path d="M 140 90 L 160 90" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 290 90 L 310 90" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 440 90 L 460 90" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 590 90 L 610 90" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 740 90 L 760 90" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+<h3>图 20-6a:递归下降匹配</h3>
+<div class="diagram">
+  <div class="diagram-title">图 20-6a · 递归下降匹配 — 顶层语句分发 + SELECT 子句深入</div>
+  <svg viewBox="0 0 920 580" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="360" y="20" width="200" height="50" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="42" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">parseStatement()</text>
+    <text x="460" y="60" text-anchor="middle" fill="#8b949e" font-size="11">顶层入口</text>
+
+    <polygon points="180,120 280,100 380,120 280,140" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="280" y="124" text-anchor="middle" fill="#c9d1d9" font-size="11">peek SELECT?</text>
+    <polygon points="180,200 280,180 380,200 280,220" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="280" y="204" text-anchor="middle" fill="#c9d1d9" font-size="11">peek INSERT?</text>
+    <polygon points="180,280 280,260 380,280 280,300" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="280" y="284" text-anchor="middle" fill="#c9d1d9" font-size="11">peek UPDATE?</text>
+
+    <rect x="500" y="100" width="160" height="40" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="580" y="124" text-anchor="middle" fill="#c9d1d9" font-size="11">parseSelect()</text>
+    <rect x="500" y="180" width="160" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.2"/>
+    <text x="580" y="204" text-anchor="middle" fill="#c9d1d9" font-size="11">parseInsert()</text>
+    <rect x="500" y="260" width="160" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1.2"/>
+    <text x="580" y="284" text-anchor="middle" fill="#c9d1d9" font-size="11">parseUpdate()</text>
+    <rect x="500" y="340" width="160" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.2"/>
+    <text x="580" y="364" text-anchor="middle" fill="#c9d1d9" font-size="11">parseDDL()</text>
+
+    <path d="M 460 70  L 280 100" stroke="#58a6ff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 380 120 L 500 120" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="430" y="115" text-anchor="middle" fill="#3fb950" font-size="10">是</text>
+    <path d="M 280 140 L 280 180" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <text x="295" y="165" fill="#f85149" font-size="10">否</text>
+    <path d="M 380 200 L 500 200" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="430" y="195" text-anchor="middle" fill="#3fb950" font-size="10">是</text>
+    <path d="M 280 220 L 280 260" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <text x="295" y="245" fill="#f85149" font-size="10">否</text>
+    <path d="M 380 280 L 500 280" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="430" y="275" text-anchor="middle" fill="#3fb950" font-size="10">是</text>
+    <path d="M 280 300 L 280 340 L 500 360" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <text x="295" y="325" fill="#f85149" font-size="10">否</text>
+
+    <rect x="40"  y="430" width="150" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1"/>
+    <text x="115" y="454" text-anchor="middle" fill="#c9d1d9" font-size="11">parseFields</text>
+    <rect x="200" y="430" width="150" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1"/>
+    <text x="275" y="454" text-anchor="middle" fill="#c9d1d9" font-size="11">parseFrom</text>
+    <rect x="360" y="430" width="150" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1"/>
+    <text x="435" y="454" text-anchor="middle" fill="#c9d1d9" font-size="11">parseWhere</text>
+    <rect x="520" y="430" width="150" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1"/>
+    <text x="595" y="454" text-anchor="middle" fill="#c9d1d9" font-size="11">parseOrderBy</text>
+    <rect x="680" y="430" width="150" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1"/>
+    <text x="755" y="454" text-anchor="middle" fill="#c9d1d9" font-size="11">parseLimit</text>
+
+    <path d="M 580 140 L 115 430" stroke="#3fb950" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 580 140 L 275 430" stroke="#3fb950" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 580 140 L 435 430" stroke="#3fb950" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 580 140 L 595 430" stroke="#3fb950" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 580 140 L 755 430" stroke="#3fb950" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="320" y="500" width="170" height="40" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="1"/>
+    <text x="405" y="524" text-anchor="middle" fill="#c9d1d9" font-size="11">parseCondition</text>
+    <rect x="540" y="500" width="170" height="40" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="1"/>
+    <text x="625" y="524" text-anchor="middle" fill="#c9d1d9" font-size="11">parseExpression</text>
+
+    <path d="M 435 470 L 405 500" stroke="#d29922" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 490 520 L 540 520" stroke="#bc8cff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M 710 520 C 800 460, 700 100, 660 120" stroke="#bc8cff" stroke-width="1" stroke-dasharray="5 3" fill="none" marker-end="url(#arr)"/>
+    <text x="800" y="370" fill="#bc8cff" font-size="10">子查询 → SELECT</text>
+  </svg>
+</div>
+<h3>表 20-6:递归下降 vs 解析器生成器</h3>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th>递归下降(jOOQ)</th>
+<th>解析器生成器(ANTLR)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>错误恢复</td>
+<td>灵活,可精确控制</td>
+<td>依赖框架</td>
+</tr>
+<tr>
+<td>方言差异</td>
+<td>解析中动态切换</td>
+<td>维护多套语法文件</td>
+</tr>
+<tr>
+<td>性能</td>
+<td>零分配 / 内联</td>
+<td>受生成代码限制</td>
+</tr>
+<tr>
+<td>可调试</td>
+<td>普通 Java 调用栈</td>
+<td>生成代码难调试</td>
+</tr>
+<tr>
+<td>维护成本</td>
+<td>手写代码量大</td>
+<td>语法文件简洁</td>
+</tr>
+</tbody>
+</table>
+<h3>20.6.1 错误处理模式</h3>
+<div class="diagram">
+  <div class="diagram-title">图 20-6-1 · 错误处理模式 — parseUnknownFunctions + 其它解析设置</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1e5c"/><stop offset="100%" stop-color="#240d3a"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="40"  y="20" width="220" height="50" rx="10" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="150" y="42" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">遇到无法识别语法</text>
+    <text x="150" y="60" text-anchor="middle" fill="#8b949e" font-size="11">未知函数 / 关键字</text>
+
+    <polygon points="40,140 150,110 260,140 150,170" fill="url(#g-orange)" stroke="#d29922" stroke-width="1.5"/>
+    <text x="150" y="138" text-anchor="middle" fill="#c9d1d9" font-size="11">Settings.parseUnknown</text>
+    <text x="150" y="155" text-anchor="middle" fill="#c9d1d9" font-size="11">Functions</text>
+
+    <rect x="320" y="100" width="220" height="60" rx="10" fill="url(#g-red)" stroke="#f85149" stroke-width="1.5"/>
+    <text x="430" y="124" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">FAIL · 默认</text>
+    <text x="430" y="142" text-anchor="middle" fill="#8b949e" font-size="10">抛 ParserException [line:col]</text>
+
+    <rect x="600" y="100" width="220" height="60" rx="10" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.5"/>
+    <text x="710" y="124" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">IGNORE</text>
+    <text x="710" y="142" text-anchor="middle" fill="#8b949e" font-size="10">保留原函数调用透传</text>
+
+    <path d="M 150 70  L 150 110" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 260 140 L 320 130" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M 260 145 L 600 130" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+    <rect x="320" y="220" width="220" height="50" rx="10" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="430" y="242" text-anchor="middle" fill="#c9d1d9" font-size="13" font-weight="bold">其它解析设置</text>
+    <text x="430" y="260" text-anchor="middle" fill="#8b949e" font-size="11">Settings · 一致性配置</text>
+
+    <rect x="40"  y="310" width="200" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1"/>
+    <text x="140" y="334" text-anchor="middle" fill="#c9d1d9" font-size="11">parseDialect 源方言</text>
+    <rect x="260" y="310" width="200" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1"/>
+    <text x="360" y="334" text-anchor="middle" fill="#c9d1d9" font-size="11">parseIgnoreComments</text>
+    <rect x="480" y="310" width="200" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1"/>
+    <text x="580" y="334" text-anchor="middle" fill="#c9d1d9" font-size="11">parseNameCase</text>
+    <rect x="700" y="310" width="200" height="40" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="1"/>
+    <text x="800" y="334" text-anchor="middle" fill="#c9d1d9" font-size="11">parseWithMetaLookups</text>
+
+    <path d="M 430 270 L 140 310" stroke="#bc8cff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 430 270 L 360 310" stroke="#bc8cff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 430 270 L 580 310" stroke="#bc8cff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+    <path d="M 430 270 L 800 310" stroke="#bc8cff" stroke-width="1" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+<pre><code class="language-java">Settings failSettings = new Settings().withParseDialect(ParseDialect.MYSQL);
+DSLContext failDsl = DSL.using(SQLDialect.POSTGRES, failSettings);
+
+try {
+    failDsl.parser().parseSelect(&quot;SELECT id, name FROM product WHERE&quot;);
+} catch (ParserException e) {
+    System.err.println(&quot;解析失败: &quot; + e.getMessage());
+}
+</code></pre>
+<p>异常输出:</p>
+<pre><code class="language-text">解析失败: Token ')' expected: [1:24] SELECT id, name FROM product WHERE
+</code></pre>
+<pre><code class="language-java">Settings ignoreSettings = new Settings()
+    .withParseDialect(ParseDialect.MYSQL)
+    .withParseUnknownFunctions(ParseUnknownFunctions.IGNORE);
+
+DSLContext ignoreDsl = DSL.using(SQLDialect.POSTGRES, ignoreSettings);
+var query = ignoreDsl.parser().parseSelect(&quot;SELECT CUSTOM_FUNC(id) FROM t&quot;);
+System.out.println(ignoreDsl.renderInlined(query));
+</code></pre>
+<p>输出:</p>
+<pre><code class="language-sql">SELECT CUSTOM_FUNC(id) FROM t
+</code></pre>
+<div class="warning"><p>性能提示:jOOQ 解析器针对生产 SQL 做了优化,普通 SELECT 解析开销远低于一次数据库往返。但不要把 SQL 解析放进逐行热路径,迁移工具、启动期 SQL 校验、CI 批量扫描更适合它。</p></div>
+<h2 id="20.7-陷阱与限制">20.7 陷阱与限制</h2>
+<h3>表 20-7:解析器支持覆盖度</h3>
+<table>
+<thead>
+<tr>
+<th>覆盖度</th>
+<th>内容</th>
+<th>迁移处理</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>高</td>
+<td>标准 DML、常见 SELECT 子句、通用表达式、窗口函数</td>
+<td>自动翻译 + golden SQL 校验</td>
+</tr>
+<tr>
+<td>中</td>
+<td>CTE、MERGE / UPSERT、简单 DDL、部分 ALTER TABLE</td>
+<td>翻译初稿 + 人工审查</td>
+</tr>
+<tr>
+<td>低 / 不适合</td>
+<td>存储过程体、脚本控制流、<code>LOAD DATA</code>、方言专属管理命令</td>
+<td>不放进自动翻译链路</td>
+</tr>
+</tbody>
+</table>
+<h3>图 20-7:语法 vs 语义边界</h3>
+<div class="diagram">
+  <div class="diagram-title">图 20-7 · 语法 vs 语义边界 — 解析器止步于语法,语义需 schema 校验</div>
+  <svg viewBox="0 0 920 320" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a1e"/><stop offset="100%" stop-color="#3a230d"/></linearGradient>
+      <marker id="arr" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto"><polygon points="0,0 11,6 0,12" fill="#58a6ff"/></marker>
+    </defs>
+
+    <rect x="20" y="20" width="420" height="280" rx="14" fill="#0d1117" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="4 3"/>
+    <text x="230" y="46" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">解析器能做(语法层)</text>
+
+    <rect x="50"  y="80"  width="360" height="44" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.2"/>
+    <text x="230" y="107" text-anchor="middle" fill="#c9d1d9" font-size="12">检测语法错误</text>
+    <rect x="50"  y="134" width="360" height="44" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.2"/>
+    <text x="230" y="161" text-anchor="middle" fill="#c9d1d9" font-size="12">识别关键字 / 结构</text>
+    <rect x="50"  y="188" width="360" height="44" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.2"/>
+    <text x="230" y="215" text-anchor="middle" fill="#c9d1d9" font-size="12">构建 AST</text>
+    <rect x="50"  y="242" width="360" height="44" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="1.2"/>
+    <text x="230" y="269" text-anchor="middle" fill="#c9d1d9" font-size="12">类型字面量推断</text>
+
+    <rect x="480" y="20" width="420" height="280" rx="14" fill="#0d1117" stroke="#f85149" stroke-width="1.5" stroke-dasharray="4 3"/>
+    <text x="690" y="46" text-anchor="middle" fill="#f85149" font-size="13" font-weight="bold">解析器做不到(语义层)</text>
+
+    <rect x="510" y="80"  width="360" height="44" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="1.2"/>
+    <text x="690" y="107" text-anchor="middle" fill="#c9d1d9" font-size="12">表是否存在</text>
+    <rect x="510" y="134" width="360" height="44" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="1.2"/>
+    <text x="690" y="161" text-anchor="middle" fill="#c9d1d9" font-size="12">列是否属于该表</text>
+    <rect x="510" y="188" width="360" height="44" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="1.2"/>
+    <text x="690" y="215" text-anchor="middle" fill="#c9d1d9" font-size="12">类型是否兼容</text>
+    <rect x="510" y="242" width="360" height="44" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="1.2"/>
+    <text x="690" y="269" text-anchor="middle" fill="#c9d1d9" font-size="12">权限是否足够</text>
+
+    <path d="M 440 160 L 480 160" stroke="#8b949e" stroke-width="1.5" fill="none" stroke-dasharray="6 4"/>
+    <text x="460" y="155" text-anchor="middle" fill="#8b949e" font-size="10">边界</text>
+  </svg>
+</div>
+<pre><code class="language-java">// 语法正确,语义可能错误
+var query = parser.parseSelect(
+    &quot;SELECT unicorn_column FROM nonexistent_table WHERE 1 = 'text'&quot;);
+
+Settings strict = new Settings()
+    .withParseWithMetaLookups(ParseWithMetaLookups.THROW_ON_FAILURE);
+DSLContext dsl = DSL.using(connection, SQLDialect.POSTGRES, strict);
+</code></pre>
+<h3>20.7.1 DDL 保真度</h3>
+<p>DDL 翻译保真度显著低于 DML。MySQL 的 <code>AUTO_INCREMENT</code>、PostgreSQL 的 <code>SERIAL</code>、Oracle 的 <code>SEQUENCE + TRIGGER</code> 在概念上等价,但所有约束、注释、存储选项无法保证完整保留。</p>
+<pre><code class="language-java">String mysqlDdl = &quot;&quot;&quot;
+    CREATE TABLE product (
+      id BIGINT AUTO_INCREMENT PRIMARY KEY,
+      name VARCHAR(100) NOT NULL,
+      price DECIMAL(10, 2),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    &quot;&quot;&quot;;
+
+Queries parsed = mysql.parser().parse(mysqlDdl);
+String pgDdl   = postgres.renderInlined(parsed);
+System.out.println(pgDdl);
+</code></pre>
+<p>PostgreSQL 初稿:</p>
+<pre><code class="language-sql">CREATE TABLE product (
+  id bigint GENERATED BY DEFAULT AS IDENTITY,
+  name varchar(100) NOT NULL,
+  price decimal(10, 2),
+  created_at timestamp DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT product_pkey PRIMARY KEY (id)
+);
+</code></pre>
+<p>DDL 审查输出:</p>
+<pre><code class="language-log">[OK]     AUTO_INCREMENT -&gt; GENERATED BY DEFAULT AS IDENTITY
+[OK]     PRIMARY KEY / NOT NULL / DECIMAL precision preserved
+[REVIEW] ENGINE=InnoDB removed, PostgreSQL has no engine clause
+[REVIEW] DEFAULT CHARSET=utf8mb4 removed, set at database encoding instead
+</code></pre>
+<h3>20.7.2 CI 批量分流</h3>
+<pre><code class="language-java">record CheckResult(String file, String status, String detail) {}
+
+List&lt;String&gt; scripts = List.of(
+    &quot;001-products.sql::SELECT * FROM product LIMIT 10, 20&quot;,
+    &quot;002-ddl.sql::CREATE TABLE product (id BIGINT AUTO_INCREMENT PRIMARY KEY)&quot;,
+    &quot;003-load.sql::LOAD DATA INFILE 'product.csv' INTO TABLE product&quot;
+);
+
+for (String item : scripts) {
+    String[] parts = item.split(&quot;::&quot;, 2);
+    String file = parts[0];
+    String sql = parts[1];
+
+    try {
+        Queries parsed = mysql.parser().parse(sql);
+        String translated = postgres.renderInlined(parsed);
+        if (sql.contains(&quot;AUTO_INCREMENT&quot;)) {
+            System.out.printf(&quot;[REVIEW] %s -&gt; DDL translated, storage options need review%n&quot;, file);
+        } else {
+            System.out.printf(&quot;[OK]     %s -&gt; %s%n&quot;, file, translated);
+        }
+    } catch (ParserException e) {
+        System.out.printf(&quot;[FAIL]   %s -&gt; %s%n&quot;, file, e.getMessage());
+    }
+}
+</code></pre>
+<p>输出:</p>
+<pre><code class="language-log">[OK]     001-products.sql -&gt; SELECT * FROM product LIMIT 20 OFFSET 10
+[REVIEW] 002-ddl.sql -&gt; DDL translated, storage options need review
+[FAIL]   003-load.sql -&gt; Unsupported query type: LOAD DATA
+</code></pre>
+<h3>表 20-7a:错误处理最佳实践</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>推荐做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DML 翻译</td>
+<td>直接使用,保真度高</td>
+</tr>
+<tr>
+<td>简单 DDL</td>
+<td>翻译 + 手动审查存储选项</td>
+</tr>
+<tr>
+<td>复杂 DDL</td>
+<td>解析作为初稿 + DBA 调整</td>
+</tr>
+<tr>
+<td>存储过程体</td>
+<td>不要使用解析器,手动翻译</td>
+</tr>
+<tr>
+<td>未知标量函数</td>
+<td><code>parseUnknownFunctions=IGNORE</code> 保留</td>
+</tr>
+<tr>
+<td>数据库特有扩展</td>
+<td>单独迁移,不掩盖差异</td>
+</tr>
+</tbody>
+</table>
+<h2 id="20.8-生产守卫">20.8 生产守卫</h2>
+<h3>上线检查表</h3>
+<table>
+<thead>
+<tr>
+<th>检查项</th>
+<th>验证</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>源 / 目标方言显式配置</td>
+<td><code>withParseDialect</code> 设置</td>
+</tr>
+<tr>
+<td>ParsingConnection 不与 ORM 组合</td>
+<td>静态依赖检查</td>
+</tr>
+<tr>
+<td>关键 SQL 有 golden 输出</td>
+<td>单元 / 集成测试</td>
+</tr>
+<tr>
+<td>DDL 翻译附加人工审查</td>
+<td>CI 标签 REVIEW</td>
+</tr>
+<tr>
+<td>LOAD DATA 等不支持类型不进入自动链路</td>
+<td>黑名单过滤</td>
+</tr>
+<tr>
+<td>解析失败抛错而非吞掉</td>
+<td>日志告警</td>
+</tr>
+</tbody>
+</table>
+<h3>20.8.1 启动期 SQL 校验</h3>
+<pre><code class="language-java">@PostConstruct
+void verifySqlScripts() {
+    Path dir = Paths.get(&quot;src/main/resources/db/sql&quot;);
+    try (var stream = Files.walk(dir)) {
+        stream.filter(p -&gt; p.toString().endsWith(&quot;.sql&quot;))
+              .forEach(this::verifyOne);
+    }
+}
+
+private void verifyOne(Path path) {
+    String sql = Files.readString(path);
+    try {
+        mysqlParser.parse(sql);
+    } catch (ParserException e) {
+        throw new IllegalStateException(
+            &quot;SQL parse failed at &quot; + path + &quot;: &quot; + e.getMessage(), e);
+    }
+}
+</code></pre>
+<h2 id="20.9-测试护栏">20.9 测试护栏</h2>
+<h3>20.9.1 LIMIT / OFFSET 翻译</h3>
+<pre><code class="language-java">@Test
+void mysql_limit_offset_translates_to_postgres() {
+    String src = &quot;SELECT id FROM t LIMIT 10, 20&quot;;
+    String pg  = pg().renderInlined(mysql().parser().parseSelect(src));
+    assertThat(pg).isEqualToIgnoringWhitespace(
+        &quot;SELECT id FROM t LIMIT 20 OFFSET 10&quot;);
+}
+</code></pre>
+<h3>20.9.2 IFNULL → COALESCE</h3>
+<pre><code class="language-java">@Test
+void mysql_ifnull_translates_to_postgres_coalesce() {
+    String src = &quot;SELECT IFNULL(name, 'N/A') FROM t&quot;;
+    String pg  = pg().renderInlined(mysql().parser().parseSelect(src));
+    assertThat(pg).contains(&quot;COALESCE&quot;);
+}
+</code></pre>
+<h3>20.9.3 不支持语句产生 ParserException</h3>
+<pre><code class="language-java">@Test
+void load_data_throws_parser_exception() {
+    assertThatThrownBy(() -&gt;
+        mysql().parser().parse(&quot;LOAD DATA INFILE 'a.csv' INTO TABLE t&quot;))
+        .isInstanceOf(ParserException.class)
+        .hasMessageContaining(&quot;LOAD DATA&quot;);
+}
+</code></pre>
+<div class="chapter-summary">
+<h2>20.10 源码深潜与本章要点</h2>
+
+<h3>表 20-10:源码入口</h3>
+<table>
+<thead>
+<tr>
+<th>入口</th>
+<th>路径</th>
+<th>关注点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Parser</code></td>
+<td><code>org/jooq/Parser.java</code></td>
+<td>公开方法</td>
+</tr>
+<tr>
+<td><code>ParserException</code></td>
+<td><code>org/jooq/ParserException.java</code></td>
+<td>异常</td>
+</tr>
+<tr>
+<td><code>Settings</code></td>
+<td><code>org/jooq/conf/Settings.java</code></td>
+<td>解析配置</td>
+</tr>
+<tr>
+<td><code>DefaultDSLContext</code></td>
+<td><code>org/jooq/impl/DefaultDSLContext.java</code></td>
+<td><code>parser()</code> 工厂</td>
+</tr>
+<tr>
+<td><code>ParserImpl</code></td>
+<td><code>org/jooq/impl/ParserImpl.java</code></td>
+<td>递归下降实现</td>
+</tr>
+<tr>
+<td><code>ParserContext</code></td>
+<td><code>org/jooq/impl/ParserContext.java</code></td>
+<td>解析状态</td>
+</tr>
+<tr>
+<td><code>ParsingConnection</code></td>
+<td><code>org/jooq/impl/ParsingConnection.java</code></td>
+<td>JDBC 拦截</td>
+</tr>
+</tbody>
+</table>
+<h3>设计取舍</h3>
+<p><strong>取舍 1:手写递归下降</strong></p>
+<p>不使用 ANTLR / JavaCC。代价是手写代码量大,收益是与 jOOQ AST 紧密贴合,易做方言分支与精细错误恢复。</p>
+<p><strong>取舍 2:解析与渲染解耦</strong></p>
+<p>一次解析可以输出多种目标方言。代价是方言边界要靠 golden SQL 覆盖,收益是迁移工具可以复用同一棵树渲染多个目标。</p>
+<p><strong>取舍 3:<code>ParsingConnection</code> 透明拦截</strong></p>
+<p>JDBC 层包装,业务代码无感。代价是运行时翻译增加延迟,收益是迁移过渡期可以无侵入地把旧 SQL 适配到新数据库。</p>
+<p><strong>取舍 4:不做语义验证</strong></p>
+<p>解析器只关心语法,不验证表 / 列存在。代价是可写出语法对、语义错的 SQL,收益是不依赖 schema 也能解析,方便离线工具链。</p>
+<p><strong>取舍 5:存储过程不在范围内</strong></p>
+<p>只覆盖 DML 与基本 DDL。代价是涉及存储过程的迁移要靠手工或第三方工具,收益是核心范围保持小而稳定。</p>
+<h3>20.10.1 本章要点</h3>
+<table>
+<thead>
+<tr>
+<th>要点</th>
+<th>验证依据</th>
+<th>易错点</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>解析器把 SQL 反向变结构</td>
+<td><code>parseSelect</code> 返回 <code>Select</code></td>
+<td>当作执行器</td>
+</tr>
+<tr>
+<td>入口一致 <code>dsl.parser()</code></td>
+<td>唯一工厂</td>
+<td>自建 Parser</td>
+</tr>
+<tr>
+<td>方言翻译 = 解析 + 渲染</td>
+<td>三行代码</td>
+<td>漏配 <code>parseDialect</code></td>
+</tr>
+<tr>
+<td><code>ParsingConnection</code> 透明</td>
+<td>JDBC 拦截</td>
+<td>与 ORM 二次翻译</td>
+</tr>
+<tr>
+<td>CLI 适合批量 / DBA</td>
+<td>shell 脚本</td>
+<td>在热路径反复调用</td>
+</tr>
+<tr>
+<td>内部递归下降</td>
+<td>调用栈</td>
+<td>期待 ANTLR 行为</td>
+</tr>
+<tr>
+<td>不验证语义</td>
+<td>meta lookups 关闭</td>
+<td>把解析当 schema 校验</td>
+</tr>
+<tr>
+<td>DDL 保真度低</td>
+<td>输出标 REVIEW</td>
+<td>直接执行 DDL 输出</td>
+</tr>
+<tr>
+<td>存储过程不支持</td>
+<td><code>Unsupported query type</code></td>
+<td>自动翻译过程代码</td>
+</tr>
+</tbody>
+</table>
+<p>最小回归:</p>
+<pre><code class="language-text">mvn -B test -Dtest=*ParserTest,*TranslationTest
+</code></pre>
+<pre><code class="language-log">[INFO] Tests run: 17, Failures: 0
+</code></pre>
+<hr>
+<p>下一章探索 jOOQ 与响应式编程的结合:第 21 章 · R2DBC 响应式查询。</p>
+</div>
+
+
+<div class="chapter-nav">
+  <a href="ch19-qom.html">&larr; ch19-qom · 第 19 章 · Query Object Model (QOM)</a>
+  <a href="ch21-r2dbc.html">ch21-r2dbc · 第 21 章 · R2DBC 响应式查询 &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 jOOQ &middot; 第 20 章 · SQL 解析器</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/java.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/sql.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){setTimeout(function(){document.querySelectorAll('.mermaid svg,.diagram svg').forEach(function(svg){var h=parseInt(svg.getAttribute('height')||svg.getBoundingClientRect().height);if(h>500){svg.style.maxHeight='500px';svg.style.width='auto';var p=svg.closest('.diagram');if(p)p.style.overflowX='auto';}});},1500);});</script>
+</body>
+</html>

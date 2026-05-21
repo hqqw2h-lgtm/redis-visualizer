@@ -1,0 +1,902 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-book="blaze">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>第 9 章 · 窗口函数与高级表达式 — 图解 Blaze-Persistence</title>
+<link rel="stylesheet" href="books.css">
+</head>
+<body>
+<div class="container">
+
+<nav class="topnav">
+  <a class="brand" href="index.html">📖 图解 Blaze-Persistence</a>
+  <span class="sep">|</span>
+  <a href="ch08-cte.html">← 第 8 章 CTE</a>
+  <span class="sep">|</span>
+  <a href="ch10-pagination.html">第 10 章 分页 →</a>
+</nav>
+
+<aside class="toc">
+  <a href="#intro">章节概览</a>
+  <a href="#s1" class="depth-2">9.1 窗口函数概念</a>
+  <a href="#s2" class="depth-2">9.2 排名函数</a>
+  <a href="#s3" class="depth-2">9.3 聚合窗口函数</a>
+  <a href="#s4" class="depth-2">9.4 偏移函数</a>
+  <a href="#s5" class="depth-2">9.5 自定义函数注册</a>
+  <a href="#s6" class="depth-2">9.6 CASE 表达式</a>
+  <a href="#s7" class="depth-2">9.7 陷阱与限制</a>
+  <a href="#summary">本章小结</a>
+</aside>
+
+<article class="article">
+
+<h1>第 9 章 · 窗口函数与高级表达式</h1>
+<p class="subtitle">ROW_NUMBER · RANK · LAG/LEAD · PARTITION BY · 自定义函数 · CASE</p>
+
+<div class="chapter-intro" id="intro">
+  <p class="lead">
+    窗口函数是 SQL 中最强大的分析工具——它允许你在不折叠行的前提下执行跨行计算。
+    Blaze-Persistence 将这一能力引入 JPA 世界，并提供了自定义函数注册机制和类型安全的 CASE 表达式构建器。
+  </p>
+  <ul class="will-learn">
+    <li>理解窗口函数的三层结构：PARTITION BY / ORDER BY / FRAME</li>
+    <li>掌握 ROW_NUMBER、RANK、DENSE_RANK、NTILE 排名函数</li>
+    <li>使用 SUM/AVG OVER 实现累计与滑动窗口计算</li>
+    <li>通过 LAG / LEAD 进行前后行比较</li>
+    <li>注册自定义 SQL 函数并在 JPQL 中调用</li>
+    <li>用 CaseWhenBuilder 构建复杂条件表达式</li>
+  </ul>
+  <p class="prereq">前置知识：<a href="ch03-criteria.html">第 3 章 CriteriaBuilder 查询引擎</a></p>
+</div>
+
+<!-- ============================================================ -->
+<!-- 9.1 窗口函数概念 -->
+<!-- ============================================================ -->
+<h2 id="s1">9.1 窗口函数概念</h2>
+
+<p>
+  普通聚合函数（<code>GROUP BY</code>）将多行折叠为一行；而窗口函数在保留每一行的同时，
+  在一个逻辑"窗口"上执行计算。这意味着你可以在同一行中同时看到明细数据和聚合结果。
+</p>
+
+<div class="diagram">
+<div class="diagram-title">窗口函数 vs 普通聚合：数据保留差异</div>
+<div class="mermaid">
+flowchart LR
+    subgraph INPUT["原始数据 (5 行)"]
+        R1["Alice · 销售部 · ¥8000"]
+        R2["Bob · 销售部 · ¥6000"]
+        R3["Carol · 技术部 · ¥9000"]
+        R4["Dave · 技术部 · ¥7500"]
+        R5["Eve · 技术部 · ¥8500"]
+    end
+
+    subgraph AGG["GROUP BY 聚合 (2 行)"]
+        A1["销售部 · SUM=¥14000"]
+        A2["技术部 · SUM=¥25000"]
+    end
+
+    subgraph WIN["窗口函数 (5 行全保留)"]
+        W1["Alice · ¥8000 · 部门合计=¥14000"]
+        W2["Bob · ¥6000 · 部门合计=¥14000"]
+        W3["Carol · ¥9000 · 部门合计=¥25000"]
+        W4["Dave · ¥7500 · 部门合计=¥25000"]
+        W5["Eve · ¥8500 · 部门合计=¥25000"]
+    end
+
+    INPUT -->|"GROUP BY dept"| AGG
+    INPUT -->|"SUM() OVER(PARTITION BY dept)"| WIN
+
+    style INPUT fill:#1e3a5f,stroke:#2563eb
+    style AGG fill:#3a1a1a,stroke:#f85149
+    style WIN fill:#1a3a2a,stroke:#3fb950
+</div>
+</div>
+
+<p>窗口函数的完整语法由三个子句组成：</p>
+
+<div class="diagram">
+<div class="diagram-title">窗口函数三层解剖：PARTITION · ORDER · FRAME</div>
+<div class="mermaid">
+flowchart TD
+    FN["聚合/排名/偏移 函数<br/>SUM(salary)"] --> OVER["OVER ( ... )"]
+    OVER --> PB["PARTITION BY department<br/>────────────────<br/>将数据分成独立分区<br/>每个分区独立计算"]
+    OVER --> OB["ORDER BY hire_date<br/>────────────────<br/>分区内的行排序<br/>决定计算顺序"]
+    OVER --> FR["ROWS BETWEEN ... AND ...<br/>────────────────<br/>当前行的计算范围<br/>滑动窗口边界"]
+
+    PB --> P1["分区 1: 销售部"]
+    PB --> P2["分区 2: 技术部"]
+    OB --> S1["排序后确定行号"]
+    FR --> F1["UNBOUNDED PRECEDING → 累计"]
+    FR --> F2["N PRECEDING → 滑动"]
+
+    style FN fill:#2d1f4e,stroke:#bc8cff
+    style OVER fill:#1e3a5f,stroke:#58a6ff
+    style PB fill:#1a3a2a,stroke:#3fb950
+    style OB fill:#3a2a1a,stroke:#d29922
+    style FR fill:#3a1a2a,stroke:#f778ba
+</div>
+</div>
+
+<p>在 Blaze-Persistence 中，窗口函数通过 <code>FUNCTION()</code> 表达式或 <code>WINDOW_*</code> 系列函数暴露给 JPA 查询。框架会在 JPQL → SQL 转换阶段将其渲染为目标数据库的原生窗口函数语法。</p>
+
+<div class="diagram">
+<div class="diagram-title">Blaze-Persistence 窗口函数渲染管线</div>
+<div class="mermaid">
+sequenceDiagram
+    participant App as 应用代码
+    participant CB as CriteriaBuilder
+    participant JPQL as JPQL 生成器
+    participant DBF as DbmsDialect
+    participant DB as 数据库
+
+    App->>CB: .select("FUNCTION('ROW_NUMBER')")
+    CB->>JPQL: 解析 FUNCTION 表达式
+    JPQL->>DBF: 查询目标数据库方言
+    DBF-->>JPQL: 返回 ROW_NUMBER() OVER(...) 语法
+    JPQL->>DB: 生成原生 SQL
+    DB-->>App: 返回带排名的结果集
+</div>
+</div>
+
+<div class="key-insight">
+  <strong>💡 核心要点：</strong>Blaze-Persistence 的窗口函数支持建立在其自定义函数注册机制之上——
+  框架预注册了 <code>ROW_NUMBER</code>、<code>RANK</code>、<code>DENSE_RANK</code>、<code>NTILE</code>
+  等标准窗口函数，同时允许用户注册自定义函数。
+</div>
+
+<!-- ============================================================ -->
+<!-- 9.2 排名函数 -->
+<!-- ============================================================ -->
+<h2 id="s2">9.2 排名函数</h2>
+
+<p>
+  排名函数为分区内的每一行分配一个序号。四种排名函数在遇到相同值（<em>tie</em>）时行为不同。
+</p>
+
+<div class="diagram">
+<div class="diagram-title">四种排名函数的差异 — 相同薪资时的行为对比</div>
+<div style="display:flex;flex-wrap:wrap;gap:16px;justify-content:center;padding:16px 0;">
+  <div style="border:1px solid #2563eb;border-radius:8px;padding:14px 16px;min-width:140px;background:rgba(30,58,95,.15);text-align:left;">
+    <div style="font-weight:bold;color:#58a6ff;margin-bottom:8px;text-align:center;">示例数据 (按薪资降序)</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.7;">Alice ¥9000<br/>Bob ¥8000<br/>Carol ¥8000<br/>Dave ¥7000<br/>Eve ¥6000</div>
+  </div>
+  <div style="display:flex;align-items:center;color:#8b949e;font-size:20px;">→</div>
+  <div style="border:1px solid #bc8cff;border-radius:8px;padding:14px 16px;min-width:140px;background:rgba(45,31,78,.15);text-align:left;">
+    <div style="font-weight:bold;color:#bc8cff;margin-bottom:8px;text-align:center;">ROW_NUMBER()</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.7;">Alice → 1<br/>Bob → 2<br/>Carol → 3<br/>Dave → 4<br/>Eve → 5</div>
+  </div>
+  <div style="border:1px solid #d29922;border-radius:8px;padding:14px 16px;min-width:140px;background:rgba(58,42,26,.15);text-align:left;">
+    <div style="font-weight:bold;color:#d29922;margin-bottom:8px;text-align:center;">RANK()</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.7;">Alice → 1<br/>Bob → 2<br/>Carol → 2<br/>Dave → 4 <span style="color:#d29922;">⚠️ 跳过3</span><br/>Eve → 5</div>
+  </div>
+  <div style="border:1px solid #3fb950;border-radius:8px;padding:14px 16px;min-width:140px;background:rgba(26,58,42,.15);text-align:left;">
+    <div style="font-weight:bold;color:#3fb950;margin-bottom:8px;text-align:center;">DENSE_RANK()</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.7;">Alice → 1<br/>Bob → 2<br/>Carol → 2<br/>Dave → 3 <span style="color:#3fb950;">✅ 不跳</span><br/>Eve → 4</div>
+  </div>
+</div>
+</div>
+
+<table>
+<thead>
+<tr><th>函数</th><th>并列处理</th><th>值域</th><th>典型场景</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ROW_NUMBER()</code></td><td>强制唯一，相同值按不确定顺序编号</td><td>连续 1..N</td><td>分页、去重、Top-N</td></tr>
+<tr><td><code>RANK()</code></td><td>并列同号，后续跳号</td><td>可能有间隙</td><td>竞赛排名</td></tr>
+<tr><td><code>DENSE_RANK()</code></td><td>并列同号，后续不跳号</td><td>连续无间隙</td><td>分层、分桶</td></tr>
+<tr><td><code>NTILE(n)</code></td><td>均匀分成 n 组</td><td>1..n</td><td>百分位、四分位</td></tr>
+</tbody>
+</table>
+
+<h3>在 Blaze-Persistence 中使用排名函数</h3>
+
+<p>以"按部门对员工薪资排名"为例，下面展示 <code>ROW_NUMBER()</code> 的用法：</p>
+
+<pre><code>CriteriaBuilder&lt;Tuple&gt; cb = cbf.create(em, Tuple.class)
+    .from(Employee.class, "e")
+    .select("e.name")
+    .select("e.department.name")
+    .select("e.salary")
+    .selectWindow("ROW_NUMBER")
+        .partitionBy("e.department.name")
+        .orderBy("e.salary", false)  // DESC
+    .end()
+    .orderByAsc("e.department.name")
+    .orderByAsc("e.salary");</code></pre>
+
+<p>生成的 SQL：</p>
+
+<pre><code>SELECT e.name,
+       d.name,
+       e.salary,
+       ROW_NUMBER() OVER (
+           PARTITION BY d.name
+           ORDER BY e.salary DESC
+       ) AS rank_col
+FROM Employee e
+JOIN Department d ON e.department_id = d.id
+ORDER BY d.name, e.salary</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">NTILE(4) — 将 12 名员工均分为 4 组（四分位）</div>
+<div style="display:flex;flex-wrap:wrap;gap:16px;justify-content:center;padding:16px 0;">
+  <div style="border:1px solid #3fb950;border-radius:8px;padding:14px 18px;min-width:180px;max-width:240px;background:rgba(63,185,80,.06);">
+    <div style="font-weight:bold;color:#3fb950;margin-bottom:8px;text-align:center;">第 1 组 (Top 25%)</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.7;">员工 1 · ¥12000<br/>员工 2 · ¥11500<br/>员工 3 · ¥11000</div>
+  </div>
+  <div style="border:1px solid #58a6ff;border-radius:8px;padding:14px 18px;min-width:180px;max-width:240px;background:rgba(88,166,255,.06);">
+    <div style="font-weight:bold;color:#58a6ff;margin-bottom:8px;text-align:center;">第 2 组 (25%-50%)</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.7;">员工 4 · ¥10000<br/>员工 5 · ¥9500<br/>员工 6 · ¥9000</div>
+  </div>
+  <div style="border:1px solid #d29922;border-radius:8px;padding:14px 18px;min-width:180px;max-width:240px;background:rgba(210,153,34,.06);">
+    <div style="font-weight:bold;color:#d29922;margin-bottom:8px;text-align:center;">第 3 组 (50%-75%)</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.7;">员工 7 · ¥8500<br/>员工 8 · ¥8000<br/>员工 9 · ¥7500</div>
+  </div>
+  <div style="border:1px solid #f85149;border-radius:8px;padding:14px 18px;min-width:180px;max-width:240px;background:rgba(248,81,73,.06);">
+    <div style="font-weight:bold;color:#f85149;margin-bottom:8px;text-align:center;">第 4 组 (Bottom 25%)</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.7;">员工 10 · ¥7000<br/>员工 11 · ¥6500<br/>员工 12 · ¥6000</div>
+  </div>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<!-- 9.3 聚合窗口函数 -->
+<!-- ============================================================ -->
+<h2 id="s3">9.3 聚合窗口函数</h2>
+
+<p>
+  任何标准聚合函数（<code>SUM</code>、<code>COUNT</code>、<code>AVG</code>、<code>MIN</code>、<code>MAX</code>）
+  都可以配合 <code>OVER</code> 子句变成窗口函数。最常见的场景是<strong>累计合计</strong>和<strong>滑动平均</strong>。
+</p>
+
+<div class="diagram">
+<div class="diagram-title">累计合计（Running Total）计算过程逐行图解</div>
+<div class="mermaid">
+flowchart TD
+    subgraph FRAME["ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"]
+        direction TB
+        R1["1月 · 销售 ¥100<br/>────────────<br/>窗口: [¥100]<br/><strong>累计 = ¥100</strong>"]
+        R2["2月 · 销售 ¥200<br/>────────────<br/>窗口: [¥100, ¥200]<br/><strong>累计 = ¥300</strong>"]
+        R3["3月 · 销售 ¥150<br/>────────────<br/>窗口: [¥100, ¥200, ¥150]<br/><strong>累计 = ¥450</strong>"]
+        R4["4月 · 销售 ¥300<br/>────────────<br/>窗口: [¥100 .. ¥300]<br/><strong>累计 = ¥750</strong>"]
+        R5["5月 · 销售 ¥250<br/>────────────<br/>窗口: [¥100 .. ¥250]<br/><strong>累计 = ¥1000</strong>"]
+    end
+
+    R1 --> R2 --> R3 --> R4 --> R5
+
+    style FRAME fill:#1e3a5f,stroke:#2563eb
+</div>
+</div>
+
+<h3>累计合计代码示例</h3>
+
+<pre><code>CriteriaBuilder&lt;Tuple&gt; cb = cbf.create(em, Tuple.class)
+    .from(Order.class, "o")
+    .select("o.orderDate")
+    .select("o.amount")
+    // 累计合计: SUM(amount) OVER (ORDER BY orderDate)
+    .selectWindow("SUM", "o.amount")
+        .orderBy("o.orderDate", true)
+        .rows().betweenUnboundedPreceding().andCurrentRow()
+    .end()
+    .orderByAsc("o.orderDate");</code></pre>
+
+<p>生成 SQL：</p>
+
+<pre><code>SELECT o.order_date,
+       o.amount,
+       SUM(o.amount) OVER (
+           ORDER BY o.order_date
+           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+       ) AS running_total
+FROM orders o
+ORDER BY o.order_date</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">滑动窗口（3 行移动平均）与累计窗口的帧范围对比</div>
+<div style="display:flex;flex-wrap:wrap;gap:16px;justify-content:center;padding:16px 0;">
+  <div style="border:1px solid #3fb950;border-radius:8px;padding:14px 18px;min-width:200px;max-width:280px;background:rgba(26,58,42,.12);">
+    <div style="font-weight:bold;color:#3fb950;margin-bottom:8px;text-align:center;">累计窗口 (Running)</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.7;">帧起点: <code>UNBOUNDED PRECEDING</code><br/>帧终点: <code>CURRENT ROW</code><br/>每行的窗口随行号增长</div>
+    <div style="margin-top:10px;padding:8px;background:rgba(30,58,95,.2);border-radius:4px;color:#58a6ff;font-size:12px;text-align:center;font-family:monospace;">ROWS BETWEEN<br/>UNBOUNDED PRECEDING<br/>AND CURRENT ROW</div>
+  </div>
+  <div style="border:1px solid #bc8cff;border-radius:8px;padding:14px 18px;min-width:200px;max-width:280px;background:rgba(45,31,78,.12);">
+    <div style="font-weight:bold;color:#bc8cff;margin-bottom:8px;text-align:center;">滑动窗口 (Moving Avg)</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.7;">帧起点: <code>2 PRECEDING</code><br/>帧终点: <code>CURRENT ROW</code><br/>每行固定看前 2 行 + 当前行</div>
+    <div style="margin-top:10px;padding:8px;background:rgba(30,58,95,.2);border-radius:4px;color:#58a6ff;font-size:12px;text-align:center;font-family:monospace;">ROWS BETWEEN<br/>2 PRECEDING<br/>AND CURRENT ROW</div>
+  </div>
+</div>
+</div>
+
+<h3>3 行滑动平均代码</h3>
+
+<pre><code>CriteriaBuilder&lt;Tuple&gt; cb = cbf.create(em, Tuple.class)
+    .from(StockPrice.class, "s")
+    .select("s.tradeDate")
+    .select("s.closePrice")
+    .selectWindow("AVG", "s.closePrice")
+        .orderBy("s.tradeDate", true)
+        .rows().between(2, WindowFrameExclusionType.NO_OTHERS)
+              .andCurrentRow()
+    .end()
+    .orderByAsc("s.tradeDate");</code></pre>
+
+<div class="os-note">
+  <strong>⚡ 帧类型提示：</strong><code>ROWS</code> 按物理行号计算帧边界，
+  <code>RANGE</code> 按值的逻辑范围计算。绝大多数场景使用 <code>ROWS</code> 即可；
+  <code>RANGE</code> 适合处理日期间隔不均匀的时序数据。
+</div>
+
+<!-- ============================================================ -->
+<!-- 9.4 偏移函数 -->
+<!-- ============================================================ -->
+<h2 id="s4">9.4 偏移函数</h2>
+
+<p>
+  偏移函数可以在当前行中引用<strong>前一行</strong>或<strong>后一行</strong>的值，
+  无需自连接，是同比/环比分析的利器。
+</p>
+
+<div class="diagram">
+<div class="diagram-title">LAG / LEAD 行引用方向图解</div>
+<div class="mermaid">
+flowchart TD
+    subgraph ROWS["有序数据行"]
+        direction TB
+        R1["行 1 · 1月 · ¥100"]
+        R2["行 2 · 2月 · ¥200"]
+        R3["行 3 · 3月 · ¥150 ← 当前行"]
+        R4["行 4 · 4月 · ¥300"]
+        R5["行 5 · 5月 · ¥250"]
+    end
+
+    R3 -.->|"LAG(amount, 1)<br/>回看 1 行 = ¥200"| R2
+    R3 -.->|"LAG(amount, 2)<br/>回看 2 行 = ¥100"| R1
+    R3 -.->|"LEAD(amount, 1)<br/>前看 1 行 = ¥300"| R4
+    R3 -.->|"LEAD(amount, 2)<br/>前看 2 行 = ¥250"| R5
+
+    style R3 fill:#2d1f4e,stroke:#bc8cff,stroke-width:3px
+    style ROWS fill:#1e3a5f,stroke:#2563eb
+</div>
+</div>
+
+<table>
+<thead>
+<tr><th>函数</th><th>用途</th><th>默认值</th></tr>
+</thead>
+<tbody>
+<tr><td><code>LAG(expr, n, default)</code></td><td>取前 n 行的值</td><td>NULL（可指定默认值）</td></tr>
+<tr><td><code>LEAD(expr, n, default)</code></td><td>取后 n 行的值</td><td>NULL（可指定默认值）</td></tr>
+<tr><td><code>FIRST_VALUE(expr)</code></td><td>分区/帧内的第一行值</td><td>—</td></tr>
+<tr><td><code>LAST_VALUE(expr)</code></td><td>分区/帧内的最后一行值</td><td>—</td></tr>
+</tbody>
+</table>
+
+<h3>环比增长率计算</h3>
+
+<pre><code>CriteriaBuilder&lt;Tuple&gt; cb = cbf.create(em, Tuple.class)
+    .from(MonthlySales.class, "ms")
+    .select("ms.month")
+    .select("ms.revenue")
+    // 上月营收
+    .selectWindow("LAG", "ms.revenue", "1")
+        .orderBy("ms.month", true)
+    .end()
+    .orderByAsc("ms.month");</code></pre>
+
+<p>生成的 SQL：</p>
+
+<pre><code>SELECT ms.month,
+       ms.revenue,
+       LAG(ms.revenue, 1) OVER (ORDER BY ms.month) AS prev_revenue
+FROM monthly_sales ms
+ORDER BY ms.month</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">FIRST_VALUE / LAST_VALUE 在分区中的取值位置</div>
+<div class="mermaid">
+flowchart TD
+    subgraph PART["分区: 销售部 (按月排序)"]
+        direction TB
+        P1["1月 · ¥100 ← FIRST_VALUE"]
+        P2["2月 · ¥200"]
+        P3["3月 · ¥150"]
+        P4["4月 · ¥300"]
+        P5["5月 · ¥250 ← LAST_VALUE"]
+    end
+
+    FV["FIRST_VALUE(revenue)<br/>= ¥100<br/>分区起始行"]
+    LV["LAST_VALUE(revenue)<br/>= ¥250<br/>分区结束行"]
+
+    P1 -.-> FV
+    P5 -.-> LV
+
+    style PART fill:#1e3a5f,stroke:#2563eb
+    style FV fill:#1a3a2a,stroke:#3fb950
+    style LV fill:#3a2a1a,stroke:#d29922
+</div>
+</div>
+
+<div class="warning">
+  <strong>⚠️ LAST_VALUE 陷阱：</strong>默认帧是 <code>ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code>，
+  因此 <code>LAST_VALUE()</code> 的结果就是当前行本身！要获取分区的真正最后一行，
+  必须显式指定 <code>ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING</code>。
+</div>
+
+<!-- ============================================================ -->
+<!-- 9.5 自定义函数注册 -->
+<!-- ============================================================ -->
+<h2 id="s5">9.5 自定义函数注册</h2>
+
+<p>
+  当内置函数无法满足需求时，Blaze-Persistence 允许你注册自定义 SQL 函数。
+  注册后，你可以在 JPQL 查询中像使用内置函数一样调用它们。
+</p>
+
+<div class="diagram">
+<div class="diagram-title">自定义函数注册 → JPQL 调用 → SQL 渲染 完整流程</div>
+<div class="mermaid">
+flowchart TD
+    DEF["① 实现 JpqlFunction 接口<br/>────────────────<br/>定义函数名、参数、渲染逻辑"] --> REG["② 注册到 CriteriaBuilderConfiguration<br/>────────────────<br/>config.registerFunction(fn)"]
+    REG --> INIT["③ 构建 CriteriaBuilderFactory<br/>────────────────<br/>config.createCriteriaBuilderFactory(em)"]
+    INIT --> USE["④ 在 JPQL 中调用<br/>────────────────<br/>FUNCTION('my_func', arg1, arg2)"]
+    USE --> RENDER["⑤ SQL 渲染阶段<br/>────────────────<br/>JpqlFunction.render()<br/>生成目标数据库 SQL"]
+    RENDER --> SQL["⑥ 发送原生 SQL 到数据库"]
+
+    DEF -.->|"实现 hasArguments()<br/>hasParenthesesIfNoArguments()<br/>render()"| API["JpqlFunction 接口"]
+
+    style DEF fill:#2d1f4e,stroke:#bc8cff
+    style REG fill:#1e3a5f,stroke:#58a6ff
+    style INIT fill:#1e3a5f,stroke:#58a6ff
+    style USE fill:#1a3a2a,stroke:#3fb950
+    style RENDER fill:#3a2a1a,stroke:#d29922
+    style SQL fill:#1a3a2a,stroke:#3fb950
+    style API fill:#3a1a2a,stroke:#f778ba
+</div>
+</div>
+
+<h3>JpqlFunction 接口</h3>
+
+<pre><code>public interface JpqlFunction {
+    // 函数是否需要参数
+    boolean hasArguments();
+
+    // 无参数时是否保留括号（如 CURRENT_TIMESTAMP vs NOW()）
+    boolean hasParenthesesIfNoArguments();
+
+    // 渲染 SQL 片段
+    void render(FunctionRenderContext context);
+}</code></pre>
+
+<h3>示例：注册 PostgreSQL 的 array_agg 函数</h3>
+
+<pre><code>public class ArrayAggFunction implements JpqlFunction {
+
+    @Override
+    public boolean hasArguments() {
+        return true;
+    }
+
+    @Override
+    public boolean hasParenthesesIfNoArguments() {
+        return true;
+    }
+
+    @Override
+    public void render(FunctionRenderContext context) {
+        context.addChunk("array_agg(");
+        context.addArgument(0);  // 渲染第一个参数
+        if (context.getArgumentsSize() > 1) {
+            context.addChunk(" ORDER BY ");
+            context.addArgument(1);
+        }
+        context.addChunk(")");
+    }
+}</code></pre>
+
+<h3>注册与使用</h3>
+
+<pre><code>// 注册
+CriteriaBuilderConfiguration config = Criteria.getDefault();
+config.registerFunction(
+    new JpqlFunctionGroup("array_agg", new ArrayAggFunction())
+);
+CriteriaBuilderFactory cbf = config.createCriteriaBuilderFactory(emf);
+
+// 使用
+CriteriaBuilder&lt;Tuple&gt; cb = cbf.create(em, Tuple.class)
+    .from(Employee.class, "e")
+    .select("e.department.name")
+    .select("FUNCTION('array_agg', e.name)")
+    .groupBy("e.department.name");</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">FunctionRenderContext — 自定义函数可访问的渲染 API</div>
+<div class="mermaid">
+classDiagram
+    class FunctionRenderContext {
+        +int getArgumentsSize()
+        +void addArgument(int index)
+        +void addChunk(String chunk)
+        +String getArgument(int index)
+    }
+    class JpqlFunction {
+        &lt;&lt;interface&gt;&gt;
+        +boolean hasArguments()
+        +boolean hasParenthesesIfNoArguments()
+        +void render(FunctionRenderContext ctx)
+    }
+    class JpqlFunctionGroup {
+        -String name
+        -Map~String, JpqlFunction~ functions
+        +JpqlFunction get(String dbms)
+    }
+
+    JpqlFunction ..> FunctionRenderContext : 使用
+    JpqlFunctionGroup o-- JpqlFunction : 按数据库方言分组
+</div>
+</div>
+
+<div class="key-insight">
+  <strong>💡 多数据库适配：</strong><code>JpqlFunctionGroup</code> 允许你为同一个逻辑函数注册不同数据库的实现。
+  例如 <code>"array_agg"</code> 在 PostgreSQL 中直接调用 <code>array_agg()</code>，
+  在 MySQL 中渲染为 <code>GROUP_CONCAT()</code>，在 Oracle 中渲染为 <code>LISTAGG()</code>。
+</div>
+
+<h3>数据库特定实现注册</h3>
+
+<pre><code>JpqlFunctionGroup group = new JpqlFunctionGroup("array_agg");
+group.add("postgresql", new PostgresArrayAggFunction());
+group.add("mysql",      new MysqlGroupConcatFunction());
+group.add("oracle",     new OracleListaggFunction());
+group.add(null,         new DefaultArrayAggFunction()); // 兜底
+
+config.registerFunction(group);</code></pre>
+
+<!-- ============================================================ -->
+<!-- 9.6 CASE 表达式 -->
+<!-- ============================================================ -->
+<h2 id="s6">9.6 CASE 表达式</h2>
+
+<p>
+  CASE 表达式是 SQL 中的条件分支，等价于编程语言中的 <code>if-else</code> 或 <code>switch</code>。
+  Blaze-Persistence 提供了类型安全的 <code>CaseWhenBuilder</code> API 来构建复杂条件。
+</p>
+
+<div class="diagram">
+<div class="diagram-title">CASE 表达式决策树 — 员工绩效等级判定</div>
+<div class="mermaid">
+flowchart TD
+    START["CASE 表达式开始<br/>输入: employee.score"] --> C1{"score >= 90?"}
+    C1 -->|"是"| V1["'S 级 · 卓越'"]
+    C1 -->|"否"| C2{"score >= 80?"}
+    C2 -->|"是"| V2["'A 级 · 优秀'"]
+    C2 -->|"否"| C3{"score >= 70?"}
+    C3 -->|"是"| V3["'B 级 · 良好'"]
+    C3 -->|"否"| C4{"score >= 60?"}
+    C4 -->|"是"| V4["'C 级 · 合格'"]
+    C4 -->|"否"| V5["'D 级 · 不合格'<br/>(ELSE 分支)"]
+
+    style START fill:#2d1f4e,stroke:#bc8cff
+    style C1 fill:#1e3a5f,stroke:#58a6ff
+    style C2 fill:#1e3a5f,stroke:#58a6ff
+    style C3 fill:#1e3a5f,stroke:#58a6ff
+    style C4 fill:#1e3a5f,stroke:#58a6ff
+    style V1 fill:#1a3a2a,stroke:#3fb950
+    style V2 fill:#1a3a2a,stroke:#3fb950
+    style V3 fill:#3a2a1a,stroke:#d29922
+    style V4 fill:#3a2a1a,stroke:#d29922
+    style V5 fill:#3a1a2a,stroke:#f85149
+</div>
+</div>
+
+<h3>Simple CASE vs Searched CASE</h3>
+
+<table>
+<thead>
+<tr><th>类型</th><th>SQL 语法</th><th>特点</th></tr>
+</thead>
+<tbody>
+<tr>
+  <td>Simple CASE</td>
+  <td><code>CASE status WHEN 'A' THEN ... WHEN 'B' THEN ... END</code></td>
+  <td>比较单个表达式的多个值（类似 switch）</td>
+</tr>
+<tr>
+  <td>Searched CASE</td>
+  <td><code>CASE WHEN score >= 90 THEN ... WHEN score >= 80 THEN ... END</code></td>
+  <td>每个分支独立布尔条件（类似 if-else if）</td>
+</tr>
+</tbody>
+</table>
+
+<h3>CaseWhenBuilder API</h3>
+
+<pre><code>CriteriaBuilder&lt;Tuple&gt; cb = cbf.create(em, Tuple.class)
+    .from(Employee.class, "e")
+    .select("e.name")
+    .select("e.score")
+    .selectCase()
+        .when("e.score").geExpression("90").thenExpression("'S级'")
+        .when("e.score").geExpression("80").thenExpression("'A级'")
+        .when("e.score").geExpression("70").thenExpression("'B级'")
+        .when("e.score").geExpression("60").thenExpression("'C级'")
+        .otherwiseExpression("'D级'")
+    .end();</code></pre>
+
+<div class="diagram">
+<div class="diagram-title">CaseWhenBuilder 链式 API 调用流程</div>
+<div class="mermaid">
+flowchart LR
+    SEL[".selectCase()"] --> W1[".when('e.score')"]
+    W1 --> GE1[".geExpression('90')"]
+    GE1 --> T1[".thenExpression(...)"]
+    T1 --> W2[".when('e.score')"]
+    W2 --> GE2[".geExpression('80')"]
+    GE2 --> T2[".thenExpression(...)"]
+    T2 --> MORE["...更多分支..."]
+    MORE --> OTH[".otherwiseExpression(...)"]
+    OTH --> END[".end()"]
+
+    style SEL fill:#2d1f4e,stroke:#bc8cff
+    style W1 fill:#1e3a5f,stroke:#58a6ff
+    style GE1 fill:#1e3a5f,stroke:#58a6ff
+    style T1 fill:#1a3a2a,stroke:#3fb950
+    style OTH fill:#3a2a1a,stroke:#d29922
+    style END fill:#1a3a2a,stroke:#3fb950
+</div>
+</div>
+
+<h3>Simple CASE 示例</h3>
+
+<pre><code>CriteriaBuilder&lt;Tuple&gt; cb = cbf.create(em, Tuple.class)
+    .from(Order.class, "o")
+    .select("o.id")
+    .selectSimpleCase("o.status")
+        .when("'PENDING'",   "'待处理'")
+        .when("'SHIPPED'",   "'已发货'")
+        .when("'DELIVERED'", "'已送达'")
+        .when("'CANCELLED'", "'已取消'")
+        .otherwise("'未知'")
+    .end();</code></pre>
+
+<h3>NULLIF 与 COALESCE</h3>
+
+<p>
+  <code>NULLIF</code> 和 <code>COALESCE</code> 是 CASE 的特殊简化形式，
+  在 Blaze-Persistence 中可以直接作为表达式使用。
+</p>
+
+<div class="diagram">
+<div class="diagram-title">NULLIF 与 COALESCE 的等价 CASE 展开</div>
+<div class="mermaid">
+flowchart TD
+    subgraph NULLIF["NULLIF(a, b)"]
+        NI["CASE<br/>WHEN a = b THEN NULL<br/>ELSE a<br/>END"]
+    end
+    subgraph COALESCE["COALESCE(a, b, c)"]
+        CO["CASE<br/>WHEN a IS NOT NULL THEN a<br/>WHEN b IS NOT NULL THEN b<br/>ELSE c<br/>END"]
+    end
+
+    U1["避免除零：<br/>x / NULLIF(y, 0)"] -.-> NULLIF
+    U2["空值替换：<br/>COALESCE(nickname, name, 'N/A')"] -.-> COALESCE
+
+    style NULLIF fill:#2d1f4e,stroke:#bc8cff
+    style COALESCE fill:#1e3a5f,stroke:#58a6ff
+    style U1 fill:#1a3a2a,stroke:#3fb950
+    style U2 fill:#1a3a2a,stroke:#3fb950
+</div>
+</div>
+
+<pre><code>// COALESCE: 优先显示昵称，其次姓名，兜底"匿名"
+cb.select("COALESCE(e.nickname, e.name, '匿名')");
+
+// NULLIF: 避免除零错误
+cb.select("e.totalRevenue / NULLIF(e.orderCount, 0)");</code></pre>
+
+<!-- ============================================================ -->
+<!-- 9.7 陷阱与限制 -->
+<!-- ============================================================ -->
+<h2 id="s7">9.7 陷阱与限制</h2>
+
+<p>
+  窗口函数和自定义函数虽然强大，但在实际使用中有诸多需要注意的陷阱。
+</p>
+
+<div class="diagram">
+<div class="diagram-title">各数据库窗口函数支持矩阵</div>
+<div style="display:flex;flex-wrap:wrap;gap:16px;justify-content:center;padding:16px 0;">
+  <div style="border:1px solid #3fb950;border-radius:8px;padding:14px 18px;min-width:180px;max-width:240px;background:rgba(26,58,42,.12);">
+    <div style="font-weight:bold;color:#3fb950;margin-bottom:8px;text-align:center;">✅ 完整支持</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.8;text-align:center;">PostgreSQL 9.4+<br/>Oracle 11g+<br/>SQL Server 2012+</div>
+  </div>
+  <div style="border:1px solid #d29922;border-radius:8px;padding:14px 18px;min-width:180px;max-width:240px;background:rgba(58,42,26,.12);">
+    <div style="font-weight:bold;color:#d29922;margin-bottom:8px;text-align:center;">⚠️ 部分支持</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.8;text-align:center;">MySQL 8.0+<br/><span style="color:#8b949e;">(8.0 之前无窗口函数！)</span><br/>MariaDB 10.2+</div>
+  </div>
+  <div style="border:1px solid #f85149;border-radius:8px;padding:14px 18px;min-width:180px;max-width:240px;background:rgba(58,26,26,.12);">
+    <div style="font-weight:bold;color:#f85149;margin-bottom:8px;text-align:center;">❌ 受限</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.8;text-align:center;">H2 Database<br/><span style="color:#8b949e;">基础排名函数可用，高级帧子句受限</span><br/>HSQLDB<br/><span style="color:#8b949e;">窗口函数支持有限</span></div>
+  </div>
+</div>
+</div>
+
+<h3>常见陷阱清单</h3>
+
+<div class="warning">
+  <strong>⚠️ 陷阱 1：WHERE 中不能使用窗口函数</strong><br/>
+  窗口函数在 SQL 执行顺序中位于 <code>WHERE</code> 之后计算，
+  因此不能在 <code>WHERE</code> 子句中直接引用窗口函数。
+  解决方案：使用子查询或 CTE 包裹。
+</div>
+
+<div class="diagram">
+<div class="diagram-title">SQL 执行顺序 — 窗口函数的计算时机</div>
+<div class="mermaid">
+flowchart LR
+    FROM["① FROM<br/>确定数据源"] --> WHERE["② WHERE<br/>行级过滤"]
+    WHERE --> GB["③ GROUP BY<br/>分组"]
+    GB --> HAVING["④ HAVING<br/>组级过滤"]
+    HAVING --> SELECT["⑤ SELECT<br/>计算表达式"]
+    SELECT --> WINDOW["⑥ 窗口函数<br/>计算排名/聚合"]
+    WINDOW --> ORDER["⑦ ORDER BY<br/>排序"]
+    ORDER --> LIMIT["⑧ LIMIT<br/>截断"]
+
+    WINDOW -.->|"❌ 无法回溯"| WHERE
+
+    style FROM fill:#1e3a5f,stroke:#58a6ff
+    style WHERE fill:#3a1a2a,stroke:#f85149
+    style WINDOW fill:#2d1f4e,stroke:#bc8cff,stroke-width:3px
+</div>
+</div>
+
+<pre><code>// ❌ 错误：WHERE 中直接用窗口函数
+cb.where("ROW_NUMBER() OVER (...)").le(10);  // 编译报错或运行时异常
+
+// ✅ 正确：用子查询包裹
+CriteriaBuilder&lt;Tuple&gt; sub = cbf.create(em, Tuple.class)
+    .from(Employee.class, "e")
+    .select("e.id")
+    .select("e.name")
+    .selectWindow("ROW_NUMBER")
+        .orderBy("e.salary", false)
+    .end();
+
+// 外层查询过滤排名
+CriteriaBuilder&lt;Tuple&gt; outer = cbf.create(em, Tuple.class)
+    .fromSubquery(sub, "ranked")
+    .select("ranked.name")
+    .where("ranked.row_number").le(10);</code></pre>
+
+<div class="warning">
+  <strong>⚠️ 陷阱 2：自定义函数须匹配 JPA Provider</strong><br/>
+  Hibernate 和 EclipseLink 处理 <code>FUNCTION()</code> 表达式的方式不同。
+  确保你的 <code>JpqlFunction</code> 实现与实际使用的 JPA 提供者兼容。
+</div>
+
+<div class="warning">
+  <strong>⚠️ 陷阱 3：大分区性能问题</strong><br/>
+  窗口函数在每个分区内进行计算。如果 <code>PARTITION BY</code> 产生的分区过大
+  （例如不分区时全表作为一个分区），数据库需要在内存中缓存大量行，可能导致严重性能问题。
+</div>
+
+<div class="diagram">
+<div class="diagram-title">窗口函数性能优化策略</div>
+<div style="display:flex;flex-wrap:wrap;gap:14px;justify-content:center;padding:16px 0;">
+  <div style="border:1px solid #3fb950;border-radius:8px;padding:14px 16px;min-width:170px;max-width:220px;background:rgba(26,58,42,.10);">
+    <div style="font-weight:bold;color:#3fb950;margin-bottom:6px;">① 索引优化</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">为 PARTITION BY 和 ORDER BY 列创建复合索引</div>
+    <div style="margin-top:8px;color:#8b949e;font-size:11px;font-family:monospace;">CREATE INDEX idx_dept_salary ON employee(dept_id, salary)</div>
+  </div>
+  <div style="border:1px solid #3fb950;border-radius:8px;padding:14px 16px;min-width:170px;max-width:220px;background:rgba(26,58,42,.10);">
+    <div style="font-weight:bold;color:#3fb950;margin-bottom:6px;">② 控制分区大小</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">先 WHERE 过滤缩小数据集，再应用窗口函数</div>
+  </div>
+  <div style="border:1px solid #3fb950;border-radius:8px;padding:14px 16px;min-width:170px;max-width:220px;background:rgba(26,58,42,.10);">
+    <div style="font-weight:bold;color:#3fb950;margin-bottom:6px;">③ 限制帧范围</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">N PRECEDING 比 UNBOUNDED PRECEDING 高效</div>
+  </div>
+  <div style="border:1px solid #3fb950;border-radius:8px;padding:14px 16px;min-width:170px;max-width:220px;background:rgba(26,58,42,.10);">
+    <div style="font-weight:bold;color:#3fb950;margin-bottom:6px;">④ CTE 物化</div>
+    <div style="color:#e6edf3;font-size:13px;line-height:1.6;">复杂窗口计算用 CTE 分步执行</div>
+  </div>
+</div>
+</div>
+
+<h3>陷阱速查表</h3>
+
+<table>
+<thead>
+<tr><th>陷阱</th><th>症状</th><th>解决方案</th></tr>
+</thead>
+<tbody>
+<tr>
+  <td>WHERE 中用窗口函数</td>
+  <td>SQL 语法错误或运行时异常</td>
+  <td>子查询 / CTE 包裹后在外层过滤</td>
+</tr>
+<tr>
+  <td>MySQL &lt; 8.0 使用窗口函数</td>
+  <td>SQL 解析失败</td>
+  <td>升级 MySQL 或用变量模拟排名</td>
+</tr>
+<tr>
+  <td>LAST_VALUE 返回当前行</td>
+  <td>每行结果不同，不是分区末尾值</td>
+  <td>显式指定 UNBOUNDED FOLLOWING</td>
+</tr>
+<tr>
+  <td>大分区内存溢出</td>
+  <td>OOM 或查询超时</td>
+  <td>缩小分区、限制帧范围、添加索引</td>
+</tr>
+<tr>
+  <td>自定义函数不生效</td>
+  <td>JPQL 解析报"函数未知"</td>
+  <td>确认注册时机在 CBF 创建之前</td>
+</tr>
+<tr>
+  <td>窗口函数返回类型不匹配</td>
+  <td>ClassCastException</td>
+  <td>使用 Tuple 接收或显式类型转换</td>
+</tr>
+</tbody>
+</table>
+
+<div class="paper-ref">
+  <strong>📄 参考文档：</strong>
+  <a href="https://persistence.blazebit.com/documentation/core/manual/en_US/#window-functions" target="_blank">
+    Blaze-Persistence Core Manual — Window Functions
+  </a>
+  · 官方窗口函数与自定义函数注册完整 API 参考。
+</div>
+
+<!-- ============================================================ -->
+<!-- 本章小结 -->
+<!-- ============================================================ -->
+<div class="chapter-summary" id="summary">
+  <h2>📋 本章小结</h2>
+  <ul>
+    <li><strong>窗口函数三要素</strong>：PARTITION BY（分区）、ORDER BY（排序）、FRAME（帧范围）共同定义每行的计算窗口</li>
+    <li><strong>排名函数</strong>：ROW_NUMBER 强制唯一、RANK 跳号、DENSE_RANK 不跳号、NTILE 均匀分组</li>
+    <li><strong>聚合窗口</strong>：SUM/AVG OVER 实现累计合计和滑动平均，FRAME 子句决定计算范围</li>
+    <li><strong>偏移函数</strong>：LAG/LEAD 引用前后行数据，FIRST_VALUE/LAST_VALUE 取分区边界值</li>
+    <li><strong>自定义函数</strong>：实现 JpqlFunction 接口，通过 JpqlFunctionGroup 按数据库方言注册不同实现</li>
+    <li><strong>CASE 表达式</strong>：CaseWhenBuilder 提供类型安全的条件分支，NULLIF/COALESCE 是常用简化形式</li>
+    <li><strong>关键限制</strong>：窗口函数不能在 WHERE 中使用；大分区需注意性能；MySQL 8.0+ 才支持</li>
+  </ul>
+  <p class="next-hint">
+    下一章 → <a href="ch10-pagination.html">第 10 章 · 分页</a>：
+    Offset 分页的 O(n) 问题、Keyset 分页的数学原理、COUNT 查询优化，以及与 Entity View 结合的分页 API。
+  </p>
+</div>
+
+<nav class="chapter-nav">
+  <a href="ch08-cte.html">← 第 8 章 · CTE 与集合操作</a>
+  <a href="ch10-pagination.html">第 10 章 · 分页 →</a>
+</nav>
+
+<p class="footer">&copy; 2026 图解 Blaze-Persistence &middot; 第 9 章 · 窗口函数与高级表达式</p>
+
+</article>
+</div><!-- /container -->
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+mermaid.initialize({
+  theme: 'dark',
+  themeVariables: {
+    primaryColor: '#58a6ff', primaryTextColor: '#e6edf3', primaryBorderColor: '#30363d',
+    lineColor: '#8b949e', secondaryColor: '#161b22', tertiaryColor: '#0d1117',
+    background: '#161b22', mainBkg: '#161b22', nodeBorder: '#30363d',
+    clusterBkg: 'rgba(22,27,34,.5)', clusterBorder: '#30363d', titleColor: '#e6edf3',
+    edgeLabelBackground: '#161b22',
+  },
+  flowchart: { curve: 'basis', padding: 15 },
+  sequence: { actorMargin: 50, messageMargin: 30 },
+});
+</script>
+</body>
+</html>

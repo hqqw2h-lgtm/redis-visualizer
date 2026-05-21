@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.19 连接池与 HikariCP — 图解 JPA &amp; Hibernate</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📘 图解 JPA &amp; Hibernate</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="18-sql-generation.html">上一章</a>
+  <a href="20-spring-data-jpa.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s19-0">19.0 端到端管线</a>
+  <a href="#s19-2">19.2 建连代价</a>
+  <a href="#s19-3">19.3 HikariCP 内部</a>
+  <a href="#s19-4">19.4 关键参数</a>
+  <a href="#s19-5">19.5 池容量计算</a>
+  <a href="#s19-6">19.6 监控指标</a>
+  <a href="#s19-7">19.7 泄漏检测</a>
+  <a href="#s19-8">19.8 OSIV</a>
+  <a href="#s19-9">19.9 性能场景</a>
+  <a href="#s19-10">19.10 多数据源</a>
+  <a href="#s19-12">19.12 陷阱</a>
+  <a href="#s19-13">19.13 设计取舍</a>
+  <a href="#s19-summary">19.14 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 19 章 · 连接池与 HikariCP</h1>
+<p class="subtitle">ConcurrentBag · FastList · 字节码代理 · 利特尔法则 · 泄漏检测 · OSIV · 多数据源</p>
+
+<div class="chapter-intro">
+  <p class="lead">每一条 SQL 的执行始于一次数据库连接。从零建立连接需要 TCP 三次握手、TLS 协商与数据库认证三层开销,典型耗时同机房 5 至 15 毫秒、跨区域 100 至 500 毫秒。<strong>一次普通 OLTP 查询本身只需 0.5 至 2 毫秒,建连成本远超查询本身</strong>。</p>
+  <p>HikariCP 是 Spring Boot 2.x 起的默认连接池,以 <code>ConcurrentBag</code> 无锁结构、字节码代理、固定池策略三项设计把连接池自身开销压到<strong>纳秒级</strong>。本章按工作原理、关键参数、监控指标、泄漏检测、性能量化五维展开。</p>
+  <ul class="will-learn">
+    <li>建连 3 阶段(TCP + TLS + Auth)的耗时分布,以及池复用如何把毫秒级开销降到纳秒</li>
+    <li>HikariCP 5 大组件:HikariPool / ConcurrentBag / PoolEntry / ProxyConnection / HouseKeeper</li>
+    <li>ConcurrentBag 三级查找:ThreadLocal → sharedList → SynchronousQueue 阻塞等待</li>
+    <li>PoolEntry 4 态状态机:NOT_IN_USE / IN_USE / RESERVED / REMOVED</li>
+    <li>FastList 去边界检查 + 字节码代理 close 拦截的微观优化</li>
+    <li>12 个核心参数:maxPoolSize / minIdle / connectionTimeout / maxLifetime / idleTimeout / keepaliveTime / leakDetectionThreshold</li>
+    <li>3 种池容量公式:PostgreSQL 经典公式 / 利特尔法则 / 监控驱动法</li>
+    <li>Micrometer + Prometheus 7 大指标 + 告警阈值</li>
+    <li>leakDetectionThreshold + 堆栈定位的连接泄漏排查</li>
+    <li>OSIV 对连接持有时间的影响:从 service 层延长到整个请求</li>
+    <li>多数据源(主写从读)+ AbstractRoutingDataSource 主从路由</li>
+    <li>HikariCP 选择 ConcurrentBag 而非 BlockingQueue 的设计取舍</li>
+  </ul>
+  <p class="prereq">前置知识:第 15 章事务管理;TCP / TLS 握手基础;JDBC DataSource API;Spring Boot Actuator 与 Micrometer;PostgreSQL / MySQL 连接进程模型。</p>
+</div>
+
+<h2 id="s19-0">19.0 端到端管线</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 19-0-1 · 连接借还时序 — App → Tx → Pool → ConcurrentBag → DB</div>
+  <svg viewBox="0 0 920 470" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1f4f8b"/><stop offset="100%" stop-color="#0d2c4d"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a0e"/><stop offset="100%" stop-color="#3a230a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="20"  y="20" width="110" height="40" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="75"  y="45" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">App</text>
+    <rect x="170" y="20" width="110" height="40" rx="6" fill="url(#g-blue)"   stroke="#58a6ff"/>
+    <text x="225" y="45" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">Tx Mgr</text>
+    <rect x="320" y="20" width="110" height="40" rx="6" fill="url(#g-blue)"   stroke="#58a6ff"/>
+    <text x="375" y="45" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">HikariPool</text>
+    <rect x="470" y="20" width="120" height="40" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="530" y="45" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">ConcurrentBag</text>
+    <rect x="630" y="20" width="120" height="40" rx="6" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="690" y="45" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">ProxyConn</text>
+    <rect x="790" y="20" width="110" height="40" rx="6" fill="url(#g-green)"  stroke="#3fb950"/>
+    <text x="845" y="45" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">DB</text>
+
+    <line x1="75"  y1="60" x2="75"  y2="460" stroke="#8b949e" stroke-width="1" stroke-dasharray="3,3"/>
+    <line x1="225" y1="60" x2="225" y2="460" stroke="#8b949e" stroke-width="1" stroke-dasharray="3,3"/>
+    <line x1="375" y1="60" x2="375" y2="460" stroke="#8b949e" stroke-width="1" stroke-dasharray="3,3"/>
+    <line x1="530" y1="60" x2="530" y2="460" stroke="#8b949e" stroke-width="1" stroke-dasharray="3,3"/>
+    <line x1="690" y1="60" x2="690" y2="460" stroke="#8b949e" stroke-width="1" stroke-dasharray="3,3"/>
+    <line x1="845" y1="60" x2="845" y2="460" stroke="#8b949e" stroke-width="1" stroke-dasharray="3,3"/>
+
+    <path d="M75,90  L225,90"  stroke="#bc8cff" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <text x="150" y="84" text-anchor="middle" fill="#bc8cff" font-size="11">@Transactional 入口</text>
+
+    <path d="M225,120 L375,120" stroke="#58a6ff" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <text x="300" y="114" text-anchor="middle" fill="#58a6ff" font-size="11">getConnection()</text>
+
+    <path d="M375,150 L530,150" stroke="#58a6ff" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <text x="452" y="144" text-anchor="middle" fill="#58a6ff" font-size="11">borrow(timeout)</text>
+
+    <rect x="450" y="165" width="160" height="22" rx="4" fill="#0d3a22" stroke="#3fb950"/>
+    <text x="530" y="181" text-anchor="middle" fill="#3fb950" font-size="11">命中 ThreadLocal</text>
+    <path d="M530,200 L845,200" stroke="#d29922" stroke-width="1.6" stroke-dasharray="4,4" fill="none" marker-end="url(#arr)"/>
+    <text x="688" y="194" text-anchor="middle" fill="#d29922" font-size="11">未命中 → 新建物理连接</text>
+
+    <path d="M530,235 L690,235" stroke="#3fb950" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <text x="610" y="229" text-anchor="middle" fill="#3fb950" font-size="11">CAS NOT_IN_USE → IN_USE</text>
+    <path d="M690,265 L75,265" stroke="#3fb950" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <text x="382" y="259" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">返回 ProxyConnection</text>
+
+    <path d="M75,300 L690,300" stroke="#bc8cff" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <text x="382" y="294" text-anchor="middle" fill="#bc8cff" font-size="11">PreparedStatement.execute</text>
+    <path d="M690,325 L845,325" stroke="#bc8cff" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <text x="768" y="319" text-anchor="middle" fill="#bc8cff" font-size="11">SQL</text>
+
+    <path d="M75,365 L690,365" stroke="#f85149" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <text x="382" y="359" text-anchor="middle" fill="#f85149" font-size="11">close() → 实为归还</text>
+    <path d="M690,395 L530,395" stroke="#f85149" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <text x="610" y="389" text-anchor="middle" fill="#f85149" font-size="11">recycle PoolEntry</text>
+    <path d="M530,425 L530,450" stroke="#3fb950" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <text x="540" y="445" fill="#3fb950" font-size="11" font-weight="bold">requite(entry) → NOT_IN_USE</text>
+  </svg>
+</div>
+
+<table>
+<thead><tr><th>组件</th><th>职责</th><th>核心字段</th></tr></thead>
+<tbody>
+<tr><td>HikariDataSource</td><td>DataSource 入口</td><td>poolName / config</td></tr>
+<tr><td>HikariPool</td><td>池控制器</td><td>connectionBag / housekeeper</td></tr>
+<tr><td>ConcurrentBag</td><td>高并发借还容器</td><td>sharedList / threadLocal / waiters</td></tr>
+<tr><td>PoolEntry</td><td>物理连接封装</td><td>state(AtomicInteger)</td></tr>
+<tr><td>ProxyConnection</td><td>拦截 close,归还代替关闭</td><td>delegate / leakTask</td></tr>
+<tr><td>HouseKeeper</td><td>后台维护线程</td><td>idle / lifetime 检查</td></tr>
+<tr><td>ProxyLeakTask</td><td>借出超阈值打印堆栈</td><td>leakDetectionThreshold</td></tr>
+</tbody>
+</table>
+
+<h2 id="s19-2">19.2 建立连接的代价</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 19-2-1 · 三阶段建连模型 — TCP + TLS + Auth + Init</div>
+  <svg viewBox="0 0 920 150" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1f4f8b"/><stop offset="100%" stop-color="#0d2c4d"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a0e"/><stop offset="100%" stop-color="#3a230a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="20"  y="50" width="150" height="60" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="95"  y="76" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">TCP 握手</text>
+    <text x="95"  y="94" text-anchor="middle" fill="#c9d1d9" font-size="11">3 RTT</text>
+
+    <rect x="200" y="50" width="150" height="60" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="275" y="76" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">TLS 协商</text>
+    <text x="275" y="94" text-anchor="middle" fill="#c9d1d9" font-size="11">证书 + 密钥</text>
+
+    <rect x="380" y="50" width="150" height="60" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="455" y="76" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">数据库认证</text>
+    <text x="455" y="94" text-anchor="middle" fill="#c9d1d9" font-size="11">SCRAM / 角色</text>
+
+    <rect x="560" y="50" width="150" height="60" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="635" y="76" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">会话初始化</text>
+    <text x="635" y="94" text-anchor="middle" fill="#c9d1d9" font-size="11">timezone / search_path</text>
+
+    <rect x="740" y="50" width="160" height="60" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="820" y="84" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">Connection 可用</text>
+
+    <path d="M170,80 L200,80" stroke="#bc8cff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M350,80 L380,80" stroke="#58a6ff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M530,80 L560,80" stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M710,80 L740,80" stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<table>
+<thead><tr><th>阶段</th><th>同机房</th><th>跨可用区</th><th>跨地域</th></tr></thead>
+<tbody>
+<tr><td>TCP 三次握手</td><td>0.3 ms</td><td>1 ms</td><td>50 ms</td></tr>
+<tr><td>TLS 1.3 协商</td><td>1 ms</td><td>3 ms</td><td>100 ms</td></tr>
+<tr><td>TLS 1.2 协商</td><td>2 ms</td><td>5 ms</td><td>200 ms</td></tr>
+<tr><td>数据库认证</td><td>2 ms</td><td>4 ms</td><td>6 ms</td></tr>
+<tr><td>会话初始化</td><td>0.5 ms</td><td>1 ms</td><td>2 ms</td></tr>
+<tr><td><strong>合计</strong></td><td><strong>6 ms</strong></td><td><strong>14 ms</strong></td><td><strong>358 ms</strong></td></tr>
+</tbody>
+</table>
+
+<table>
+<thead><tr><th>数据库</th><th>单连接内存</th><th>进程模型</th><th>推荐应用池总和</th></tr></thead>
+<tbody>
+<tr><td>PostgreSQL 14</td><td>5-10 MiB</td><td>每连接独立 backend 进程</td><td>&lt; max_connections × 0.6</td></tr>
+<tr><td>MySQL 8</td><td>256 KiB - 2 MiB</td><td>每连接线程</td><td>&lt; max_connections × 0.7</td></tr>
+<tr><td>Oracle 19c</td><td>4-8 MiB</td><td>进程或共享服务器</td><td>由 DBA 集中规划</td></tr>
+<tr><td>SQL Server 2022</td><td>较低</td><td>线程池</td><td>&lt; max worker × 0.8</td></tr>
+</tbody>
+</table>
+
+<div class="key-insight"><p>连接池的核心价值在于把<strong>每请求承担的毫秒级建连成本</strong>摊薄到应用启动期的固定开销,运行期借还路径只剩下纳秒级 CAS 操作。</p></div>
+
+<h2 id="s19-3">19.3 HikariCP 内部架构</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 19-3-1 · ConcurrentBag 三级查找 — L1 ThreadLocal → L2 sharedList → L3 阻塞</div>
+  <svg viewBox="0 0 920 270" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1f4f8b"/><stop offset="100%" stop-color="#0d2c4d"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a0e"/><stop offset="100%" stop-color="#3a230a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="20"  y="100" width="180" height="60" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="110" y="135" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">borrow(timeout)</text>
+
+    <rect x="240" y="20"  width="220" height="60" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="350" y="46" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">L1 ThreadLocal FastList</text>
+    <text x="350" y="64" text-anchor="middle" fill="#c9d1d9" font-size="11">后向遍历,~10 ns</text>
+
+    <rect x="240" y="100" width="220" height="60" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="350" y="126" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">L2 sharedList</text>
+    <text x="350" y="144" text-anchor="middle" fill="#c9d1d9" font-size="11">CAS 抢占 NOT_IN_USE,~100 ns</text>
+
+    <rect x="240" y="180" width="220" height="60" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="350" y="206" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">L3 SynchronousQueue</text>
+    <text x="350" y="224" text-anchor="middle" fill="#c9d1d9" font-size="11">阻塞等待,毫秒级</text>
+
+    <rect x="500" y="20"  width="180" height="60" rx="6" fill="#0d3a22" stroke="#3fb950"/>
+    <text x="590" y="54" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">命中 → 返回</text>
+
+    <rect x="500" y="100" width="180" height="60" rx="6" fill="#3a230a" stroke="#d29922"/>
+    <text x="590" y="134" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">CAS 成功 → 返回</text>
+
+    <rect x="500" y="180" width="180" height="60" rx="6" fill="#3a0e0e" stroke="#f85149"/>
+    <text x="590" y="206" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">命中 → 返回</text>
+    <text x="590" y="224" text-anchor="middle" fill="#c9d1d9" font-size="11">超时 → SQLException</text>
+
+    <rect x="720" y="100" width="180" height="60" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="810" y="126" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">addConnectionExecutor</text>
+    <text x="810" y="144" text-anchor="middle" fill="#c9d1d9" font-size="11">异步建连</text>
+
+    <path d="M200,125 L240,50"  stroke="#bc8cff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M200,130 L240,130" stroke="#bc8cff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M200,135 L240,210" stroke="#bc8cff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,50  L500,50"  stroke="#3fb950" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,130 L500,130" stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,210 L500,210" stroke="#f85149" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,160 L720,130" stroke="#58a6ff" stroke-width="1.2" stroke-dasharray="4,4" fill="none" marker-end="url(#arr)"/>
+    <text x="580" y="170" fill="#58a6ff" font-size="11">触发异步建连</text>
+  </svg>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">图 19-3-2 · PoolEntry 4 态状态机</div>
+  <svg viewBox="0 0 920 210" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1f4f8b"/><stop offset="100%" stop-color="#0d2c4d"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a0e"/><stop offset="100%" stop-color="#3a230a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="40"  y="75" width="180" height="60" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="130" y="100" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">NOT_IN_USE</text>
+    <text x="130" y="118" text-anchor="middle" fill="#c9d1d9" font-size="11">state=0 空闲可借</text>
+
+    <rect x="370" y="75" width="180" height="60" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="460" y="100" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">IN_USE</text>
+    <text x="460" y="118" text-anchor="middle" fill="#c9d1d9" font-size="11">state=1 已借出</text>
+
+    <rect x="700" y="20"  width="180" height="60" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="790" y="46" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">RESERVED</text>
+    <text x="790" y="64" text-anchor="middle" fill="#c9d1d9" font-size="11">state=-2 待 evict</text>
+
+    <rect x="700" y="130" width="180" height="60" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="790" y="156" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">REMOVED</text>
+    <text x="790" y="174" text-anchor="middle" fill="#c9d1d9" font-size="11">state=-1 即将移除</text>
+
+    <path d="M220,98  L370,98"  stroke="#3fb950" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <text x="295" y="92" text-anchor="middle" fill="#3fb950" font-size="11">CAS borrow</text>
+    <path d="M370,116 L220,116" stroke="#58a6ff" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+    <text x="295" y="132" text-anchor="middle" fill="#58a6ff" font-size="11">CAS requite</text>
+    <path d="M550,88  L700,50"  stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <text x="640" y="74" fill="#d29922" font-size="11">softEvict</text>
+    <path d="M790,80  L790,130" stroke="#f85149" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <text x="800" y="110" fill="#f85149" font-size="11">close</text>
+  </svg>
+</div>
+
+<pre><code class="language-java">// FastList: ArrayList 去边界检查 + 尾部反向 remove
+public T get(int index) {
+    return (T) elementData[index];
+}
+
+public boolean remove(Object element) {
+    for (int index = size - 1; index &gt;= 0; index--) {
+        if (element == elementData[index]) {
+            int numMoved = size - index - 1;
+            if (numMoved &gt; 0) {
+                System.arraycopy(elementData, index + 1, elementData, index, numMoved);
+            }
+            elementData[--size] = null;
+            return true;
+        }
+    }
+    return false;
+}</code></pre>
+
+<div class="key-insight"><p>HikariCP 的 ConnectionProxy / StatementProxy / ResultSetProxy 在构建期由 <strong>JavassistProxyFactory 生成</strong>,部署时已经是直接调用的 final 子类,运行期不再触发反射。代理的核心职责是把 <code>close()</code> 重定向为归还池。</p></div>
+
+<h2 id="s19-4">19.4 关键参数</h2>
+
+<pre><code class="language-yaml">spring:
+  datasource:
+    url: jdbc:postgresql://db.internal:5432/shop
+    username: shop_app
+    password: ${DB_PASSWORD}
+    hikari:
+      pool-name: shop-write-pool
+      maximum-pool-size: 20
+      minimum-idle: 20
+      connection-timeout: 5000
+      validation-timeout: 5000
+      max-lifetime: 1740000
+      idle-timeout: 600000
+      keepalive-time: 600000
+      leak-detection-threshold: 30000
+      auto-commit: false
+      data-source-properties:
+        ApplicationName: shop-service
+        reWriteBatchedInserts: true</code></pre>
+
+<table>
+<thead><tr><th>参数</th><th>默认</th><th>推荐</th><th>备注</th></tr></thead>
+<tbody>
+<tr><td>maximumPoolSize</td><td>10</td><td>业务侧定</td><td>与数据库容量协调</td></tr>
+<tr><td>minimumIdle</td><td>= maxPoolSize</td><td>= maxPoolSize</td><td>固定池更可预测</td></tr>
+<tr><td>connectionTimeout (ms)</td><td>30000</td><td>5000</td><td>与 SLA 对齐</td></tr>
+<tr><td>validationTimeout (ms)</td><td>5000</td><td>5000</td><td>&lt; connectionTimeout</td></tr>
+<tr><td>maxLifetime (ms)</td><td>1800000</td><td>1740000</td><td>&lt; 数据库 wait_timeout - 60s</td></tr>
+<tr><td>idleTimeout (ms)</td><td>600000</td><td>600000</td><td>仅 minIdle &lt; maxPoolSize 生效</td></tr>
+<tr><td>keepaliveTime (ms)</td><td>0</td><td>600000</td><td>防 NAT / LB 静默断开</td></tr>
+<tr><td>leakDetectionThreshold (ms)</td><td>0</td><td>30000</td><td>生产环境必开</td></tr>
+<tr><td>autoCommit</td><td>true</td><td>false</td><td>Spring 事务接管</td></tr>
+<tr><td>poolName</td><td>自动</td><td>显式命名</td><td>多数据源必配</td></tr>
+</tbody>
+</table>
+
+<table>
+<thead><tr><th>路径上的超时</th><th>典型值</th><th>与 maxLifetime 关系</th></tr></thead>
+<tbody>
+<tr><td>MySQL wait_timeout</td><td>28800 s</td><td>maxLifetime &lt; 该值 - 60s</td></tr>
+<tr><td>MySQL 云托管默认</td><td>1800 s</td><td>maxLifetime ≤ 1740s</td></tr>
+<tr><td>AWS NLB 空闲超时</td><td>350 s</td><td>maxLifetime ≤ 300s 或开 keepalive</td></tr>
+<tr><td>防火墙 NAT 老化</td><td>300-7200 s</td><td>同上</td></tr>
+</tbody>
+</table>
+
+<h2 id="s19-5">19.5 池容量计算</h2>
+
+<pre><code>[PostgreSQL 经典公式]
+pool = (core_count × 2) + effective_spindle_count
+
+4 核 + SSD:  pool = 8 + 1 = 9        → maxPoolSize = 10
+16 核 + NVMe: pool = 32 + 2 = 34     → maxPoolSize = 32-36
+32 核 + 读副本: pool = 64 + 4 = 68    → 主库 32 + 副本 32
+
+[利特尔法则]
+L = λ × W
+L = 池大小, λ = 请求到达率(/s), W = 单请求平均连接持有时长(s)</code></pre>
+
+<table>
+<thead><tr><th>服务画像</th><th>RPS</th><th>平均持有</th><th>安全因子</th><th>推荐池</th></tr></thead>
+<tbody>
+<tr><td>轻读取(高缓存命中)</td><td>200</td><td>5 ms</td><td>1.5</td><td>5(下限)</td></tr>
+<tr><td>标准 OLTP</td><td>500</td><td>50 ms</td><td>1.5</td><td>40</td></tr>
+<tr><td>复杂 join 报表</td><td>50</td><td>300 ms</td><td>2.0</td><td>30</td></tr>
+<tr><td>写密集订单</td><td>800</td><td>80 ms</td><td>1.5</td><td>96(需读写分离)</td></tr>
+<tr><td>后台批处理</td><td>5</td><td>2000 ms</td><td>1.2</td><td>12</td></tr>
+</tbody>
+</table>
+
+<pre><code>[监控驱动法 - 一周观测]
+hikaricp_connections_active{pool="shop-write-pool"}
+  P50 = 6, P95 = 14, P99 = 18, max = 22, stddev = 4
+
+[修正]
+maxPoolSize = ceil(P95 + 2 × stddev) = ceil(14 + 8) = 22</code></pre>
+
+<h2 id="s19-6">19.6 监控与告警</h2>
+
+<pre><code class="language-yaml">management:
+  endpoints:
+    web:
+      exposure:
+        include: prometheus, health, metrics
+  metrics:
+    enable:
+      hikaricp: true
+    tags:
+      application: shop-service
+      pool: shop-write-pool</code></pre>
+
+<table>
+<thead><tr><th>指标</th><th>含义</th><th>健康阈值</th><th>异常含义</th></tr></thead>
+<tbody>
+<tr><td>hikaricp_connections</td><td>总连接数</td><td>= maximumPoolSize</td><td>长期偏低暗示动态池抖动</td></tr>
+<tr><td>hikaricp_connections_active</td><td>使用中</td><td>&lt; 80% maxPoolSize</td><td>持续逼近上限暗示池小或慢 SQL</td></tr>
+<tr><td>hikaricp_connections_idle</td><td>空闲</td><td>&gt; 20% maxPoolSize</td><td>持续 0 暗示压力过大</td></tr>
+<tr><td>hikaricp_connections_pending</td><td>等待中线程</td><td>&lt; 5</td><td>&gt; 0 持续 1 分钟告警</td></tr>
+<tr><td>hikaricp_connections_acquire_seconds</td><td>借连接耗时</td><td>P95 &lt; 5 ms</td><td>突增暗示池满或网络异常</td></tr>
+<tr><td>hikaricp_connections_usage_seconds</td><td>持有时长</td><td>P95 &lt; 200 ms</td><td>突增暗示长事务或慢查询</td></tr>
+<tr><td>hikaricp_connections_creation_seconds_max</td><td>建连最大耗时</td><td>&lt; 500 ms</td><td>暗示 DNS / TLS / 数据库认证慢</td></tr>
+</tbody>
+</table>
+
+<h2 id="s19-7">19.7 泄漏检测</h2>
+
+<pre><code class="language-yaml">spring.datasource.hikari.leak-detection-threshold: 30000</code></pre>
+
+<pre><code>WARN com.zaxxer.hikari.pool.ProxyLeakTask -
+Connection leak detection triggered for
+  com.mysql.cj.jdbc.ConnectionImpl@1a2b3c4d,
+  stack trace follows:
+java.lang.Exception: Apparent connection leak detected
+    at com.acme.LegacyReportJob.runReport(LegacyReportJob.java:142)
+    at com.acme.LegacyReportJob.lambda$run$0(LegacyReportJob.java:88)
+    ...</code></pre>
+
+<table>
+<thead><tr><th>泄漏症状</th><th>常见根因</th><th>修复</th></tr></thead>
+<tbody>
+<tr><td>WARN Apparent connection leak</td><td>未关闭 PreparedStatement / ResultSet</td><td>try-with-resources</td></tr>
+<tr><td>事务超时但连接不归还</td><td>@Transactional 方法异常被吞</td><td>rollbackFor + 重抛</td></tr>
+<tr><td>OSIV 渲染期持有</td><td>open-in-view=true</td><td>关闭或 DTO 投影</td></tr>
+<tr><td>异步任务获取池外连接</td><td>EM.unwrap + 手动操作</td><td>统一走 Spring 事务</td></tr>
+</tbody>
+</table>
+
+<h2 id="s19-8">19.8 OSIV 与连接持有</h2>
+
+<pre><code>[OSIV = true 时序]
+T+0  ms   Controller 入口,从池获取 connection
+T+10 ms   Service 层查询订单 (SELECT)
+T+15 ms   Controller 返回 ResponseEntity
+T+25 ms   Jackson 序列化触发 order.getCustomer().getName()
+          → 懒加载触发 SELECT,占用 connection
+T+45 ms   Jackson 序列化结束
+T+46 ms   归还连接
+
+[连接持有] 15 ms → 46 ms,池有效容量降 67%</code></pre>
+
+<table>
+<thead><tr><th>指标</th><th>OSIV 开</th><th>OSIV 关 + DTO</th></tr></thead>
+<tbody>
+<tr><td>连接持有时间</td><td>整个请求</td><td>仅 service 层</td></tr>
+<tr><td>序列化期 SQL</td><td>100 (N+1)</td><td>0</td></tr>
+<tr><td>池有效容量</td><td>显著下降</td><td>充分利用</td></tr>
+<tr><td>LazyInitializationException</td><td>低风险</td><td>中(强制显式 fetch)</td></tr>
+<tr><td>推荐生产配置</td><td>×</td><td>✓</td></tr>
+</tbody>
+</table>
+
+<h2 id="s19-9">19.9 性能场景</h2>
+
+<table>
+<thead><tr><th>场景</th><th>反例</th><th>修复</th><th>量化收益</th></tr></thead>
+<tbody>
+<tr><td>池过大</td><td>maxPoolSize=200 → DB 上下文切换爆炸</td><td>maxPoolSize=20 + 利特尔法则</td><td>P99 600ms → 80ms</td></tr>
+<tr><td>慢 SQL</td><td>无索引 + 全表扫描占用连接 5s</td><td>加索引 + statement_timeout</td><td>持有 5000ms → 5ms</td></tr>
+<tr><td>长事务</td><td>事务中调 HTTP API 800ms</td><td>事务外调用 + 重试</td><td>持有 850ms → 50ms</td></tr>
+<tr><td>OSIV</td><td>序列化期触发 N+1</td><td>open-in-view=false + DTO</td><td>持有 46ms → 15ms</td></tr>
+</tbody>
+</table>
+
+<h2 id="s19-10">19.10 多数据源</h2>
+
+<pre><code class="language-java">@Configuration
+public class DataSourceConfig {
+
+    @Primary
+    @Bean
+    @ConfigurationProperties("spring.datasource.write.hikari")
+    DataSource writeDataSource() {
+        return new HikariDataSource();
+    }
+
+    @Bean
+    @ConfigurationProperties("spring.datasource.read.hikari")
+    DataSource readDataSource() {
+        return new HikariDataSource();
+    }
+
+    @Bean
+    DataSource routingDataSource(DataSource writeDataSource,
+                                  DataSource readDataSource) {
+        Map&lt;Object, Object&gt; targets = Map.of(
+            "write", writeDataSource,
+            "read", readDataSource);
+
+        AbstractRoutingDataSource routing = new AbstractRoutingDataSource() {
+            @Override
+            protected Object determineCurrentLookupKey() {
+                return TransactionSynchronizationManager.isCurrentTransactionReadOnly()
+                    ? "read" : "write";
+            }
+        };
+        routing.setTargetDataSources(targets);
+        routing.setDefaultTargetDataSource(writeDataSource);
+        return routing;
+    }
+}</code></pre>
+
+<h2 id="s19-12">19.12 陷阱与限制</h2>
+
+<table>
+<thead><tr><th>#</th><th>陷阱</th><th>现象</th><th>修复</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>池过大</td><td>DB CPU 高 + 上下文切换</td><td>利特尔法则 + 监控</td></tr>
+<tr><td>2</td><td>maxLifetime &gt; wait_timeout</td><td>Communications link failure</td><td>maxLifetime &lt; wait - 60s</td></tr>
+<tr><td>3</td><td>OSIV 默认开</td><td>连接持有翻倍</td><td>open-in-view=false</td></tr>
+<tr><td>4</td><td>长事务调外部 API</td><td>连接被持有数秒</td><td>事务外调用</td></tr>
+<tr><td>5</td><td>leak-detection 未开</td><td>泄漏积累</td><td>30000 ms 阈值</td></tr>
+<tr><td>6</td><td>connectionTimeout 30s</td><td>P99 SLA 超标</td><td>3000-5000 ms</td></tr>
+<tr><td>7</td><td>无 keepalive</td><td>NAT 老化连接</td><td>keepaliveTime=600000</td></tr>
+<tr><td>8</td><td>动态 minIdle</td><td>抖动 + 冷启动慢</td><td>固定池 min=max</td></tr>
+<tr><td>9</td><td>autoCommit=true</td><td>Spring 事务异常</td><td>autoCommit=false</td></tr>
+<tr><td>10</td><td>无 poolName</td><td>多数据源监控难辨</td><td>显式命名</td></tr>
+</tbody>
+</table>
+
+<h2 id="s19-13">19.13 设计取舍</h2>
+
+<table>
+<thead><tr><th>设计选择</th><th>HikariCP</th><th>替代方案</th></tr></thead>
+<tbody>
+<tr><td>借还容器</td><td>ConcurrentBag(线程亲和)</td><td>BlockingQueue(严格 FIFO)</td></tr>
+<tr><td>代理生成</td><td>Javassist 静态代理</td><td>JDK 动态代理(反射)</td></tr>
+<tr><td>池容量策略</td><td>固定池(min=max)</td><td>动态扩容(C3P0)</td></tr>
+<tr><td>List 实现</td><td>FastList 去检查</td><td>ArrayList 带边界检查</td></tr>
+<tr><td>状态同步</td><td>AtomicInteger CAS</td><td>synchronized 锁</td></tr>
+</tbody>
+</table>
+
+<p><strong>为什么 ConcurrentBag 而非 BlockingQueue?</strong> 标准 BlockingQueue 保证 FIFO,但每次 take 都要竞争同一把锁。ConcurrentBag 牺牲 FIFO 公平性,改用 ThreadLocal 缓存 + CAS 抢占,允许同一线程优先复用上次借的连接。代价是某些连接可能长时间不被借出,需要 HouseKeeper 兜底回收。</p>
+
+<h2 id="s19-summary">19.14 本章要点</h2>
+
+<div class="chapter-summary">
+<table>
+<thead><tr><th>要点</th><th>源码 / 配置</th><th>易错点</th></tr></thead>
+<tbody>
+<tr><td>建连成本远超查询</td><td>TCP + TLS + Auth 6-358 ms</td><td>不用池</td></tr>
+<tr><td>ConcurrentBag 三级</td><td>L1 TL → L2 shared → L3 阻塞</td><td>误用大池伤 DB</td></tr>
+<tr><td>固定池策略</td><td>min=max,无抖动</td><td>动态池冷启动慢</td></tr>
+<tr><td>maxLifetime 短于 wait_timeout</td><td>1740000 ms</td><td>持有死连接</td></tr>
+<tr><td>leakDetection 必开</td><td>30000 ms</td><td>无堆栈难定位</td></tr>
+<tr><td>OSIV 关闭</td><td>open-in-view=false</td><td>序列化期持有</td></tr>
+<tr><td>事务外调外部 API</td><td>不要在 @Transactional 中</td><td>长持有阻塞</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>下一章讨论 Spring Data JPA。本章覆盖连接池,下一章进入 Repository、查询派生、Specification 与 Pageable 的 Spring Data 抽象。</p>
+
+<div class="chapter-nav">
+  <a href="18-sql-generation.html">&larr; 第 18 章 &middot; SQL 生成</a>
+  <a href="20-spring-data-jpa.html">第 20 章 &middot; Spring Data JPA &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 JPA &amp; Hibernate &middot; 第 19 章 &middot; 连接池与 HikariCP</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

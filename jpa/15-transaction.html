@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.15 事务管理与传播行为 — 图解 JPA &amp; Hibernate</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📘 图解 JPA &amp; Hibernate</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="14-batch-processing.html">上一章</a>
+  <a href="16-locking.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s15-0">15.0 章首速览</a>
+  <a href="#s15-1">15.1 RESOURCE_LOCAL</a>
+  <a href="#s15-2">15.2 @Transactional 链</a>
+  <a href="#s15-3">15.3 传播行为</a>
+  <a href="#s15-4">15.4 隔离级别</a>
+  <a href="#s15-5">15.5 异常回滚</a>
+  <a href="#s15-6">15.6 PC 与事务边界</a>
+  <a href="#s15-7">15.7 编程式事务</a>
+  <a href="#s15-8">15.8 源码深潜</a>
+  <a href="#s15-9">15.9 陷阱</a>
+  <a href="#s15-10">15.10 回归护栏</a>
+  <a href="#s15-summary">15.11 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 15 章 · 事务管理与传播行为</h1>
+<p class="subtitle">RESOURCE_LOCAL vs JTA · @Transactional 代理 · 七种传播行为 · 四种隔离 · 异常回滚 · PersistenceContext 边界</p>
+
+<div class="chapter-intro">
+  <p class="lead">事务是 JPA 的核心控制单元。<code>@Transactional</code> 不仅决定 commit / rollback,还决定 <strong>PersistenceContext 的生命周期、flush 时机、异常回滚规则、传播行为对外层事务的影响</strong>。</p>
+  <p>事务边界与 PersistenceContext 边界、JDBC 连接占用、Spring AOP 代理、同类内部调用<strong>四个层次</strong>共同决定行为。本章按事务模型、传播行为、隔离级别、异常回滚、PersistenceContext 关系五维讨论,并附 6 条事务调试 checklist。</p>
+  <ul class="will-learn">
+    <li>RESOURCE_LOCAL 与 JTA 两种事务模型的对比,以及"何时该上 JTA"</li>
+    <li>Spring <code>@Transactional</code> 的完整调用链:Proxy → TransactionInterceptor → JpaTM → EM → DB</li>
+    <li>七种传播行为决策树:REQUIRED / REQUIRES_NEW / NESTED / MANDATORY / NEVER / SUPPORTS / NOT_SUPPORTED</li>
+    <li>NESTED 的 SAVEPOINT 实现 + 为何 <code>JpaTransactionManager</code> 不支持 NESTED</li>
+    <li>四种隔离级别 + 五个主流数据库的默认值;何时该用 SERIALIZABLE 何时该用乐观锁</li>
+    <li>Spring 回滚规则:RuntimeException + Error 自动 rollback;受检异常默认 commit;<code>rollbackFor</code> 显式控制</li>
+    <li>try-catch 吞异常的隐藏陷阱:rollback-only 标记 + 方法返回时仍 rollback</li>
+    <li>PC 与事务的两种范围:Transaction-scoped(默认)vs Extended(Stateful Bean)</li>
+    <li>同类内部调用绕过代理的根因,以及三种修复(独立 Service / AopContext / 编程式)</li>
+    <li>TransactionTemplate 编程式事务在"循环内单条事务"的应用</li>
+    <li>核心源码:TransactionInterceptor / JpaTM / TransactionSynchronizationManager / EntityManagerHolder</li>
+    <li>事务调试 6 条 checklist + 三种取舍(AOP 而非字节码 / 默认 Runtime rollback / PC 默认 Tx-scoped)</li>
+  </ul>
+  <p class="prereq">前置知识:Spring AOP 基础;JDBC commit/rollback/SAVEPOINT 语义;数据库隔离级别基础;受检异常 vs 运行时异常的 Java 语义;第 3 章 PersistenceContext;第 13 章 L2 失效。</p>
+</div>
+
+<h3>本章全景图</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 15-0-1 · 事务执行流程 — Proxy 到 DB 的完整链路</div>
+  <svg viewBox="0 0 920 320" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="20"  y="30"  width="160" height="56" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="100" y="56"  text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">Controller / Job</text>
+    <text x="100" y="74"  text-anchor="middle" fill="#c9d1d9" font-size="11">业务入口</text>
+
+    <rect x="210" y="30"  width="180" height="56" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="300" y="50"  text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">@Transactional 代理</text>
+    <text x="300" y="70"  text-anchor="middle" fill="#c9d1d9" font-size="11">TransactionInterceptor</text>
+
+    <rect x="420" y="30"  width="200" height="56" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="520" y="50"  text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">事务边界</text>
+    <text x="520" y="70"  text-anchor="middle" fill="#c9d1d9" font-size="11">begin / suspend / resume</text>
+
+    <rect x="650" y="30"  width="240" height="56" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="770" y="50"  text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">PersistenceContext</text>
+    <text x="770" y="70"  text-anchor="middle" fill="#c9d1d9" font-size="11">L1 + 快照 + 写队列</text>
+
+    <polygon points="350,170 450,140 550,170 450,200" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="450" y="176" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">方法结束?</text>
+
+    <rect x="100" y="240" width="200" height="50" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="200" y="270" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">正常 → flush + commit</text>
+
+    <rect x="370" y="240" width="160" height="50" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="450" y="270" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">异常 → rollback</text>
+
+    <rect x="620" y="240" width="200" height="50" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="720" y="270" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">数据库可见</text>
+
+    <path d="M180,58 L210,58" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M390,58 L420,58" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M620,58 L650,58" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M770,86  L450,140" stroke="#3fb950" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M400,200 L200,240" stroke="#3fb950" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <text x="270" y="222" fill="#3fb950" font-size="10">正常</text>
+    <path d="M450,200 L450,240" stroke="#f85149" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <text x="468" y="225" fill="#f85149" font-size="10">异常</text>
+    <path d="M300,265 L620,265" stroke="#3fb950" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M530,265 L620,265" stroke="#f85149" stroke-width="1.3" stroke-dasharray="4,4" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<table>
+<thead><tr><th>维度</th><th>RESOURCE_LOCAL</th><th>JTA</th></tr></thead>
+<tbody>
+<tr><td>控制</td><td>EntityTransaction</td><td>UserTransaction</td></tr>
+<tr><td>资源</td><td>单数据源</td><td>多数据源 / JMS / XA</td></tr>
+<tr><td>提交</td><td>单 JDBC commit</td><td>2PC 两阶段</td></tr>
+<tr><td>Spring Boot</td><td>默认</td><td>需 Narayana / Atomikos</td></tr>
+<tr><td>推荐</td><td>单库优先</td><td>跨资源强一致</td></tr>
+</tbody>
+</table>
+
+<h2 id="s15-0">15.0 章首速览</h2>
+
+<div class="key-insight">
+  <p><strong>一句话总览</strong>。<code>@Transactional</code> 不只是"加事务",它是一个 AOP 代理切面,定义了"事务边界 = PC 边界 = 异常回滚边界"三合一。同类内部调用会绕过代理,受检异常默认 commit,这两件事是 90% 事务 bug 的根因。</p>
+</div>
+
+<h2 id="s15-1">15.1 RESOURCE_LOCAL</h2>
+
+<pre><code class="language-java">EntityManager em = emf.createEntityManager();
+EntityTransaction tx = em.getTransaction();
+
+try {
+    tx.begin();
+    Order order = new Order("TX-1001", new BigDecimal("99.00"));
+    em.persist(order);
+    tx.commit();
+} catch (RuntimeException ex) {
+    if (tx.isActive()) {
+        tx.rollback();
+    }
+    throw ex;
+} finally {
+    em.close();
+}</code></pre>
+
+<pre><code>[begin]
+[SQL]    insert into orders (amount, order_no, id) values (?, ?, ?)
+[bind]   [99.00, TX-1001, 1]
+[commit]</code></pre>
+
+<table>
+<thead><tr><th>操作</th><th>时机</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>begin</td><td>显式调用</td><td>启动事务,获取连接</td></tr>
+<tr><td>persist</td><td>业务代码</td><td>加入 PC,SQL 暂未发</td></tr>
+<tr><td>flush</td><td>commit / 显式</td><td>触发 SQL</td></tr>
+<tr><td>commit</td><td>显式调用</td><td>JDBC COMMIT</td></tr>
+<tr><td>rollback</td><td>异常</td><td>撤销</td></tr>
+<tr><td>close</td><td>显式 / try-with</td><td>释放 EM</td></tr>
+</tbody>
+</table>
+
+<h2 id="s15-2">15.2 Spring @Transactional 调用链</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 15-2-1 · 声明式事务时序 — Proxy → Interceptor → TM → EM → DB</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="20"  y="20" width="100" height="40" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="70"  y="46" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">Caller</text>
+
+    <rect x="160" y="20" width="130" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="225" y="46" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">Proxy</text>
+
+    <rect x="330" y="20" width="160" height="40" rx="6" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="410" y="46" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">TransactionInterceptor</text>
+
+    <rect x="530" y="20" width="160" height="40" rx="6" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="610" y="46" text-anchor="middle" fill="#d29922" font-size="11" font-weight="bold">JpaTransactionManager</text>
+
+    <rect x="730" y="20" width="100" height="40" rx="6" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="780" y="46" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">EM</text>
+
+    <rect x="850" y="20" width="60"  height="40" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="880" y="46" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">DB</text>
+
+    <line x1="70"  y1="60" x2="70"  y2="360" stroke="#30363d" stroke-width="1" stroke-dasharray="3,3"/>
+    <line x1="225" y1="60" x2="225" y2="360" stroke="#30363d" stroke-width="1" stroke-dasharray="3,3"/>
+    <line x1="410" y1="60" x2="410" y2="360" stroke="#30363d" stroke-width="1" stroke-dasharray="3,3"/>
+    <line x1="610" y1="60" x2="610" y2="360" stroke="#30363d" stroke-width="1" stroke-dasharray="3,3"/>
+    <line x1="780" y1="60" x2="780" y2="360" stroke="#30363d" stroke-width="1" stroke-dasharray="3,3"/>
+    <line x1="880" y1="60" x2="880" y2="360" stroke="#30363d" stroke-width="1" stroke-dasharray="3,3"/>
+
+    <path d="M70,84 L225,84" stroke="#bc8cff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="148" y="78" text-anchor="middle" fill="#bc8cff" font-size="11" font-weight="bold">createOrder(...)</text>
+
+    <path d="M225,114 L410,114" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="318" y="108" text-anchor="middle" fill="#58a6ff" font-size="11">invoke()</text>
+
+    <path d="M410,144 L610,144" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="510" y="138" text-anchor="middle" fill="#58a6ff" font-size="11">getTransaction()</text>
+
+    <path d="M610,174 L780,174" stroke="#d29922" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="695" y="168" text-anchor="middle" fill="#d29922" font-size="11">createEM + BEGIN</text>
+
+    <path d="M410,214 L780,214" stroke="#58a6ff" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="595" y="208" text-anchor="middle" fill="#58a6ff" font-size="11">persist(order)</text>
+
+    <rect x="320" y="234" width="220" height="22" rx="4" fill="#1a3d5c" opacity="0.55"/>
+    <text x="430" y="250" text-anchor="middle" fill="#58a6ff" font-size="11" font-weight="bold">— 业务方法返回 —</text>
+
+    <path d="M410,274 L610,274" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="510" y="268" text-anchor="middle" fill="#3fb950" font-size="11">commit()</text>
+
+    <path d="M610,304 L780,304" stroke="#3fb950" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <text x="695" y="298" text-anchor="middle" fill="#3fb950" font-size="11">flush → INSERT</text>
+
+    <path d="M610,334 L880,334" stroke="#3fb950" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+    <text x="745" y="328" text-anchor="middle" fill="#3fb950" font-size="11" font-weight="bold">COMMIT</text>
+  </svg>
+</div>
+
+<table>
+<thead><tr><th>组件</th><th>职责</th></tr></thead>
+<tbody>
+<tr><td>TransactionInterceptor</td><td>拦截 @Transactional 方法</td></tr>
+<tr><td>JpaTransactionManager</td><td>JPA 事务管理</td></tr>
+<tr><td>TransactionDefinition</td><td>传播 / 隔离 / 超时配置</td></tr>
+<tr><td>TransactionStatus</td><td>当前事务状态</td></tr>
+<tr><td>TransactionSynchronizationManager</td><td>ThreadLocal 资源绑定</td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-java">@Service
+public class OrderService {
+    @Autowired private OrderRepository repository;
+
+    public void importOrders(List&lt;Order&gt; orders) {
+        for (Order o : orders) {
+            saveOne(o);  // ⚠ this. 调用,绕过代理!
+        }
+    }
+
+    @Transactional
+    public void saveOne(Order o) {
+        repository.save(o);
+    }
+}</code></pre>
+
+<div class="warning">
+  <p><strong>同类内部调用陷阱</strong>。<code>saveOne</code> 的 <code>@Transactional</code> 不生效——<code>importOrders</code> 直接以 <code>this</code> 调用 <code>saveOne</code>,绕过了 AOP 代理。修复:① 抽到独立 Service;② 注入自身代理(<code>AopContext.currentProxy()</code>);③ 使用 <code>TransactionTemplate</code> 编程式。</p>
+</div>
+
+<h2 id="s15-3">15.3 传播行为</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 15-3-1 · 七种传播行为 — 决策树</div>
+  <svg viewBox="0 0 920 470" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="360" y="14" width="200" height="46" rx="8" fill="url(#g-purple)" stroke="#bc8cff" stroke-width="2"/>
+    <text x="460" y="42" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">外层事务存在?</text>
+
+    <rect x="20"  y="90" width="180" height="68" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="110" y="116" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">REQUIRED(默认)</text>
+    <text x="110" y="138" text-anchor="middle" fill="#c9d1d9" font-size="11">有 → 加入</text>
+    <text x="110" y="152" text-anchor="middle" fill="#c9d1d9" font-size="11">无 → 新建</text>
+
+    <rect x="220" y="90" width="180" height="68" rx="8" fill="url(#g-blue)" stroke="#58a6ff" stroke-width="2"/>
+    <text x="310" y="116" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">REQUIRES_NEW</text>
+    <text x="310" y="138" text-anchor="middle" fill="#c9d1d9" font-size="11">挂起外层</text>
+    <text x="310" y="152" text-anchor="middle" fill="#c9d1d9" font-size="11">+ 新建独立</text>
+
+    <rect x="420" y="90" width="180" height="68" rx="8" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="510" y="116" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">NESTED</text>
+    <text x="510" y="138" text-anchor="middle" fill="#c9d1d9" font-size="11">外层创建</text>
+    <text x="510" y="152" text-anchor="middle" fill="#c9d1d9" font-size="11">SAVEPOINT</text>
+
+    <rect x="620" y="90" width="180" height="68" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="710" y="116" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">MANDATORY</text>
+    <text x="710" y="138" text-anchor="middle" fill="#c9d1d9" font-size="11">无外层</text>
+    <text x="710" y="152" text-anchor="middle" fill="#c9d1d9" font-size="11">→ 抛异常</text>
+
+    <rect x="20"  y="190" width="180" height="68" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="110" y="216" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">NEVER</text>
+    <text x="110" y="238" text-anchor="middle" fill="#c9d1d9" font-size="11">有外层</text>
+    <text x="110" y="252" text-anchor="middle" fill="#c9d1d9" font-size="11">→ 抛异常</text>
+
+    <rect x="220" y="190" width="180" height="68" rx="8" fill="#1f2630" stroke="#8b949e"/>
+    <text x="310" y="216" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">SUPPORTS</text>
+    <text x="310" y="238" text-anchor="middle" fill="#8b949e" font-size="11">有 → 加入</text>
+    <text x="310" y="252" text-anchor="middle" fill="#8b949e" font-size="11">无 → 无事务</text>
+
+    <rect x="420" y="190" width="180" height="68" rx="8" fill="#1f2630" stroke="#8b949e"/>
+    <text x="510" y="216" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">NOT_SUPPORTED</text>
+    <text x="510" y="238" text-anchor="middle" fill="#8b949e" font-size="11">有 → 挂起</text>
+    <text x="510" y="252" text-anchor="middle" fill="#8b949e" font-size="11">无 → 无事务</text>
+
+    <rect x="100" y="300" width="720" height="40" rx="6" fill="#161b22" stroke="#30363d"/>
+    <text x="460" y="324" text-anchor="middle" fill="#c9d1d9" font-size="12" font-weight="bold">REQUIRED 覆盖 90% 场景 · REQUIRES_NEW 用于审计日志 · NESTED 用于部分回滚</text>
+
+    <rect x="20"  y="360" width="880" height="100" rx="6" fill="#0f2438" stroke="#58a6ff"/>
+    <text x="40"  y="386" fill="#58a6ff" font-size="12" font-weight="bold">NESTED 实现:外层 commit / SAVEPOINT,在 catch 中 ROLLBACK TO SAVEPOINT,允许"局部失败,整体继续"</text>
+    <text x="40"  y="412" fill="#c9d1d9" font-size="11">注意:<tspan font-weight="bold" fill="#f85149">JpaTransactionManager 不支持 NESTED</tspan>,需要 DataSourceTransactionManager + 支持 SAVEPOINT 的 JDBC 驱动</text>
+    <text x="40"  y="436" fill="#c9d1d9" font-size="11">PostgreSQL / MySQL / Oracle / SQL Server 均支持 SAVEPOINT;H2 默认不支持(需 MODE=PostgreSQL)</text>
+
+    <path d="M420,60 L130,90"  stroke="#3fb950" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M440,60 L320,90"  stroke="#58a6ff" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M480,60 L500,90"  stroke="#d29922" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M500,60 L700,90"  stroke="#f85149" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M400,60 L130,190" stroke="#f85149" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M430,60 L320,190" stroke="#8b949e" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M470,60 L500,190" stroke="#8b949e" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<table>
+<thead><tr><th>传播</th><th>外层存在</th><th>行为</th><th>适用</th></tr></thead>
+<tbody>
+<tr><td>REQUIRED</td><td>加入</td><td>默认</td><td>大多数业务</td></tr>
+<tr><td>REQUIRES_NEW</td><td>挂起 + 新建</td><td>独立</td><td>审计 / 日志</td></tr>
+<tr><td>NESTED</td><td>SAVEPOINT</td><td>外层 rollback 不影响</td><td>部分回滚</td></tr>
+<tr><td>MANDATORY</td><td>必须有</td><td>否则异常</td><td>仅供子调用</td></tr>
+<tr><td>NEVER</td><td>必须无</td><td>否则异常</td><td>强制无事务</td></tr>
+<tr><td>SUPPORTS</td><td>加入 / 无事务</td><td>灵活</td><td>只读查询</td></tr>
+<tr><td>NOT_SUPPORTED</td><td>挂起 / 无事务</td><td>显式跳过</td><td>长任务</td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-java">@Service
+public class OrderService {
+    @Transactional
+    public void createOrder(Order order) {
+        em.persist(order);
+        auditService.logCreate(order.getId());
+        throw new BusinessException("回滚但日志保留");
+    }
+}
+
+@Service
+public class AuditService {
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void logCreate(Long orderId) {
+        em.persist(new AuditLog("CREATE", orderId));
+    }
+}</code></pre>
+
+<pre><code>[执行]
+1. createOrder 启动事务 1
+2. logCreate 挂起事务 1, 启动事务 2
+3. 事务 2 commit (审计日志保留)
+4. createOrder 抛异常, 事务 1 rollback (订单未保存)
+
+[结果]
+- order 表: 无新增行
+- audit_log 表: 有 CREATE 记录</code></pre>
+
+<pre><code class="language-sql">[NESTED 示例]
+SAVEPOINT SP_xxx;       -- nestedSave 开始
+INSERT into orders ...; -- 失败 (唯一约束)
+ROLLBACK TO SAVEPOINT SP_xxx;
+
+SAVEPOINT SP_yyy;       -- 重试
+INSERT into orders ...; -- 成功
+RELEASE SAVEPOINT SP_yyy;
+COMMIT;                 -- 外层 commit</code></pre>
+
+<h2 id="s15-4">15.4 隔离级别</h2>
+
+<table>
+<thead><tr><th>级别</th><th>脏读</th><th>不可重复读</th><th>幻读</th><th>性能</th></tr></thead>
+<tbody>
+<tr><td>READ_UNCOMMITTED</td><td>可能</td><td>可能</td><td>可能</td><td>最高</td></tr>
+<tr><td>READ_COMMITTED</td><td>否</td><td>可能</td><td>可能</td><td>高</td></tr>
+<tr><td>REPEATABLE_READ</td><td>否</td><td>否</td><td>可能</td><td>中</td></tr>
+<tr><td>SERIALIZABLE</td><td>否</td><td>否</td><td>否</td><td>低</td></tr>
+</tbody>
+</table>
+
+<pre><code>PostgreSQL:    READ_COMMITTED
+MySQL InnoDB:  REPEATABLE_READ
+Oracle:        READ_COMMITTED
+SQL Server:    READ_COMMITTED
+H2:            READ_COMMITTED</code></pre>
+
+<pre><code class="language-java">@Transactional(isolation = Isolation.SERIALIZABLE)
+public void transferMoney(Long fromId, Long toId, BigDecimal amount) {
+    Account from = em.find(Account.class, fromId);
+    Account to = em.find(Account.class, toId);
+    from.debit(amount);
+    to.credit(amount);
+}</code></pre>
+
+<table>
+<thead><tr><th>场景</th><th>推荐</th><th>理由</th></tr></thead>
+<tbody>
+<tr><td>多数业务读</td><td>READ_COMMITTED</td><td>平衡</td></tr>
+<tr><td>报表统计</td><td>REPEATABLE_READ</td><td>同事务一致快照</td></tr>
+<tr><td>资金 / 库存</td><td>SERIALIZABLE 或乐观锁</td><td>严格一致</td></tr>
+<tr><td>高并发只读</td><td>READ_COMMITTED</td><td>最少锁</td></tr>
+<tr><td>长事务批处理</td><td>READ_COMMITTED + 乐观锁</td><td>避免阻塞</td></tr>
+</tbody>
+</table>
+
+<h2 id="s15-5">15.5 异常回滚规则</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 15-5-1 · 回滚决策 — RuntimeException 自动,受检异常默认 commit</div>
+  <svg viewBox="0 0 920 290" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="370" y="14" width="180" height="44" rx="6" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="460" y="42" text-anchor="middle" fill="#f85149" font-size="13" font-weight="bold">方法抛异常</text>
+
+    <polygon points="380,90 540,90 560,115 540,140 380,140 360,115" fill="url(#g-orange)" stroke="#d29922" stroke-width="2"/>
+    <text x="460" y="120" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">异常类型?</text>
+
+    <rect x="20"  y="170" width="220" height="60" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="130" y="196" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">RuntimeException</text>
+    <text x="130" y="216" text-anchor="middle" fill="#c9d1d9" font-size="11">默认 rollback ✓</text>
+
+    <rect x="270" y="170" width="220" height="60" rx="8" fill="url(#g-red)" stroke="#f85149" stroke-width="2"/>
+    <text x="380" y="196" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">Error</text>
+    <text x="380" y="216" text-anchor="middle" fill="#c9d1d9" font-size="11">默认 rollback ✓</text>
+
+    <rect x="520" y="170" width="380" height="60" rx="8" fill="url(#g-green)" stroke="#3fb950" stroke-width="2"/>
+    <text x="710" y="196" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">Checked Exception</text>
+    <text x="710" y="216" text-anchor="middle" fill="#c9d1d9" font-size="11">默认 commit ⚠ 需 rollbackFor</text>
+
+    <rect x="120" y="248" width="680" height="36" rx="6" fill="#3a0e0e" stroke="#f85149"/>
+    <text x="460" y="270" text-anchor="middle" fill="#f85149" font-size="11" font-weight="bold">陷阱:try-catch 吞 PersistenceException → rollback-only 标记 → 方法返回时仍 rollback</text>
+
+    <path d="M460,58 L460,90" stroke="#f85149" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+    <path d="M390,140 L130,170" stroke="#f85149" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M450,140 L380,170" stroke="#f85149" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+    <path d="M530,140 L710,170" stroke="#3fb950" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<table>
+<thead><tr><th>异常类型</th><th>默认行为</th></tr></thead>
+<tbody>
+<tr><td>RuntimeException + 子类</td><td>rollback</td></tr>
+<tr><td>Error + 子类</td><td>rollback</td></tr>
+<tr><td>受检异常(IOException 等)</td><td><strong>commit</strong></td></tr>
+<tr><td>自定义业务异常(extends Exception)</td><td>commit(除非配置)</td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-java">@Transactional(rollbackFor = {Exception.class})
+public void process(Order order) throws BusinessException {
+    em.persist(order);
+    if (order.isInvalid()) {
+        throw new BusinessException("invalid");
+    }
+}
+
+@Transactional(rollbackFor = {SQLException.class},
+               noRollbackFor = {OptionalException.class})
+public void complex() throws SQLException, OptionalException {
+    // ...
+}</code></pre>
+
+<pre><code class="language-java">// ⚠ try-catch 吞异常的陷阱
+@Transactional
+public void importBatch(List&lt;Order&gt; orders) {
+    for (Order o : orders) {
+        try {
+            em.persist(o);
+        } catch (Exception ex) {
+            log.error("import failed", ex);
+        }
+    }
+}
+// 现象: 异常被吞,但事务已标记 rollback-only,方法返回仍 rollback
+// 修复: 单条事务隔离 (REQUIRES_NEW) 或预校验</code></pre>
+
+<h2 id="s15-6">15.6 PersistenceContext 与事务边界</h2>
+
+<table>
+<thead><tr><th>PC 范围</th><th>创建</th><th>销毁</th><th>适用</th></tr></thead>
+<tbody>
+<tr><td>Transaction-scoped(默认)</td><td>事务开始</td><td>事务结束</td><td>普通业务</td></tr>
+<tr><td>Extended(<code>type=EXTENDED</code>)</td><td>bean 创建</td><td>bean 销毁</td><td>Stateful Bean</td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-java">@Service
+public class OrderService {
+    @Transactional
+    public Order load(Long id) {
+        return em.find(Order.class, id);
+    }
+}
+
+Order order = orderService.load(1L);
+// 事务结束,order 已 detached
+order.setStatus("PAID");  // 修改不会自动同步!
+// 需要 em.merge(order) 或重新加载</code></pre>
+
+<h2 id="s15-7">15.7 编程式事务</h2>
+
+<pre><code class="language-java">@Autowired
+private TransactionTemplate txTemplate;
+
+public void importBatch(List&lt;Order&gt; orders) {
+    for (Order order : orders) {
+        try {
+            txTemplate.executeWithoutResult(status -&gt; {
+                em.persist(order);
+            });
+        } catch (Exception ex) {
+            log.error("import failed for {}", order.getOrderNo(), ex);
+        }
+    }
+}</code></pre>
+
+<table>
+<thead><tr><th>维度</th><th>声明式</th><th>编程式</th></tr></thead>
+<tbody>
+<tr><td>语法</td><td><code>@Transactional</code></td><td>TransactionTemplate</td></tr>
+<tr><td>边界粒度</td><td>方法</td><td>任意代码块</td></tr>
+<tr><td>同类调用</td><td>受代理限制</td><td>不受限</td></tr>
+<tr><td>异常处理</td><td>注解配置</td><td>try-catch</td></tr>
+<tr><td>适用</td><td>大多数场景</td><td>细粒度 / 循环内</td></tr>
+</tbody>
+</table>
+
+<h2 id="s15-8">15.8 源码深潜</h2>
+
+<table>
+<thead><tr><th>类</th><th>职责</th></tr></thead>
+<tbody>
+<tr><td>TransactionInterceptor</td><td>AOP 拦截</td></tr>
+<tr><td>TransactionAspectSupport</td><td>通用模板</td></tr>
+<tr><td>JpaTransactionManager</td><td>JPA 实现</td></tr>
+<tr><td>AbstractPlatformTransactionManager</td><td>平台抽象</td></tr>
+<tr><td>TransactionSynchronizationManager</td><td>ThreadLocal 资源绑定</td></tr>
+<tr><td>EntityManagerHolder</td><td>EM 与事务绑定</td></tr>
+</tbody>
+</table>
+
+<h3>15.8.1 设计取舍</h3>
+
+<p><strong>取舍 1:AOP 代理而非字节码增强</strong>。Spring 选择 JDK 动态代理 / CGLIB 实现声明式事务,而非编译期字节码增强。代价是同类内部调用绕过代理。优势是配置灵活,无需修改字节码,可与 IoC 容器无缝集成。</p>
+
+<p><strong>取舍 2:RuntimeException 默认 rollback</strong>。JPA 抛出的多数异常(<code>PersistenceException</code>)是运行时异常,默认 rollback 符合业务期望。受检异常默认 commit 是为了兼容 EJB 规范,但实际多数场景须显式 <code>rollbackFor=Exception.class</code>。</p>
+
+<p><strong>取舍 3:PC 默认 transaction-scoped</strong>。PC 与事务同生命周期是默认(无状态会话 bean / Spring Service)。Extended PC 仅用于 Stateful Bean(JSF / 长会话),Spring 中较少使用。</p>
+
+<h2 id="s15-9">15.9 陷阱与限制</h2>
+
+<table>
+<thead><tr><th>#</th><th>陷阱</th><th>现象</th><th>修复</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>同类内部调用</td><td>@Transactional 不生效</td><td>抽到独立 Service</td></tr>
+<tr><td>2</td><td>受检异常 commit</td><td>业务异常未回滚</td><td><code>rollbackFor=Exception</code></td></tr>
+<tr><td>3</td><td>catch 吞异常</td><td>rollback-only 状态</td><td>REQUIRES_NEW</td></tr>
+<tr><td>4</td><td>OSIV + 事务外修改</td><td>LIE / 无效修改</td><td>关闭 OSIV</td></tr>
+<tr><td>5</td><td>NESTED 不工作</td><td>JpaTM 不支持</td><td>DataSourceTM</td></tr>
+<tr><td>6</td><td>REQUIRES_NEW 误用</td><td>过多新连接</td><td>仅审计场景</td></tr>
+<tr><td>7</td><td>长事务持有锁</td><td>阻塞其他事务</td><td>短事务</td></tr>
+<tr><td>8</td><td>默认隔离与数据库不符</td><td>业务行为差异</td><td>显式声明</td></tr>
+</tbody>
+</table>
+
+<h2 id="s15-10">15.10 回归护栏</h2>
+
+<pre><code class="language-java">@Test
+void shouldRollbackOnCheckedException() {
+    Long orderId = orderService.createOrderWithCheckedException();
+    boolean exists = repository.findById(orderId).isPresent();
+    assertThat(exists).isFalse();
+}
+
+@Test
+void shouldRollbackOnRuntimeException() {
+    assertThatThrownBy(() -&gt; orderService.createOrderWithRuntime())
+        .isInstanceOf(BusinessException.class);
+    long count = repository.count();
+    assertThat(count).isZero();
+}
+
+@Test
+void requiresNewShouldCommitIndependently() {
+    try {
+        orderService.createWithFailingAudit();
+    } catch (Exception ignored) {}
+
+    long orderCount = orderRepo.count();
+    long auditCount = auditRepo.count();
+    assertThat(orderCount).isZero();
+    assertThat(auditCount).isEqualTo(1L);
+}</code></pre>
+
+<h2 id="s15-summary">15.11 本章要点</h2>
+
+<div class="chapter-summary">
+<table>
+<thead><tr><th>要点</th><th>源码依据</th><th>易错点</th></tr></thead>
+<tbody>
+<tr><td>@Transactional 是 AOP 代理</td><td>TransactionInterceptor</td><td>同类内部调用失效</td></tr>
+<tr><td>RuntimeException 默认 rollback</td><td>TransactionAttribute</td><td>受检异常默认 commit</td></tr>
+<tr><td>REQUIRED 是默认传播</td><td>Propagation.REQUIRED</td><td>大多数场景</td></tr>
+<tr><td>REQUIRES_NEW 挂起外层</td><td>TransactionStatus</td><td>过多连接</td></tr>
+<tr><td>NESTED 用 SAVEPOINT</td><td>DataSourceTM</td><td>JpaTM 不支持</td></tr>
+<tr><td>PC 与事务同期</td><td>EntityManagerHolder</td><td>事务外 detached</td></tr>
+<tr><td>try-catch 吞异常</td><td>rollback-only 标记</td><td>仍 rollback</td></tr>
+</tbody>
+</table>
+</div>
+
+<table>
+<thead><tr><th>#</th><th>调试检查项</th><th>命令 / 工具</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>代理是否生效</td><td>启动日志 AOP 信息</td></tr>
+<tr><td>2</td><td>事务是否启动</td><td>TRACE 日志 begin</td></tr>
+<tr><td>3</td><td>flush 是否触发</td><td>hibernate.SQL DEBUG</td></tr>
+<tr><td>4</td><td>rollback 是否执行</td><td>TransactionInterceptor TRACE</td></tr>
+<tr><td>5</td><td>隔离级别</td><td>SHOW TRANSACTION ISOLATION</td></tr>
+<tr><td>6</td><td>连接持有时长</td><td>HikariCP metrics</td></tr>
+</tbody>
+</table>
+
+<p>下一章讨论锁。本章覆盖了事务管理,下一章进入并发控制:乐观锁(<code>@Version</code>)、悲观锁(<code>PESSIMISTIC_READ</code> / <code>PESSIMISTIC_WRITE</code>)、死锁与重试。</p>
+
+<div class="chapter-nav">
+  <a href="14-batch-processing.html">&larr; 第 14 章 &middot; 批量处理</a>
+  <a href="16-locking.html">第 16 章 &middot; 锁机制 &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 JPA &amp; Hibernate &middot; 第 15 章 &middot; 事务管理与传播行为</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

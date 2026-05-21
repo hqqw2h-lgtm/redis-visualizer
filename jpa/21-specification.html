@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.21 动态查询与 Specification — 图解 JPA &amp; Hibernate</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📘 图解 JPA &amp; Hibernate</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="20-spring-data-jpa.html">上一章</a>
+  <a href="22-pagination-auditing.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s21-0">21.0 翻译链</a>
+  <a href="#s21-1">21.1 Repository 集成</a>
+  <a href="#s21-2">21.2 Specification 工厂</a>
+  <a href="#s21-3">21.3 组合模式</a>
+  <a href="#s21-4">21.4 复杂关联</a>
+  <a href="#s21-5">21.5 Metamodel</a>
+  <a href="#s21-6">21.6 回归测试</a>
+  <a href="#s21-7">21.7 性能</a>
+  <a href="#s21-8">21.8 陷阱</a>
+  <a href="#s21-summary">21.9 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 21 章 · 动态查询与 Specification</h1>
+<p class="subtitle">null-safe 工厂 · AND/OR/NOT 组合 · Metamodel · Predicate 树 · 回归保护</p>
+
+<div class="chapter-intro">
+  <p class="lead">业务搜索的过滤条件不会按固定顺序出现:品牌可能为空,价格区间可能只给一端,关键词可能与分类一起过滤。<strong>Specification 的价值不在于让 Criteria API 更短,而在于把请求过滤条件稳定翻译成可组合、可测试、可回归保护的 Predicate 树</strong>。</p>
+  <p>本章按概念、Spring Data 集成、Predicate 工厂、组合模式、回归测试、源码六维展开。</p>
+  <ul class="will-learn">
+    <li>Specification 翻译链:Request filter → 工厂 → Predicate 树 → CriteriaQuery → SQM → SQL</li>
+    <li>JpaSpecificationExecutor 7 个核心方法(findAll / findOne / count / exists / delete)</li>
+    <li>null-safe 工厂方法的 5 条约定(null 返 null / Trim / IgnoreCase / between 三分支 / join 复用)</li>
+    <li>Specification 组合操作:where / and / or / not 嵌套形成 Predicate 树</li>
+    <li>jpamodelgen 编译期 Metamodel(<code>Customer_.email</code>)消除字符串字段名</li>
+    <li>Specification 单元测试 + 集成测试 + SQL 快照三层守护</li>
+    <li>OR 条件 + count 查询的小坑(distinct 自动加 vs 不加)</li>
+    <li>动态查询的性能取舍:Specification vs @Query vs Querydsl vs Native</li>
+  </ul>
+  <p class="prereq">前置知识:第 9 章 Criteria API;第 18 章 SQL 生成;第 20 章 Spring Data Repository;函数式接口(三参 lambda)。</p>
+</div>
+
+<h2 id="s21-0">21.0 Specification 翻译链</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 21-0-1 · Request filter → Predicate 树 → SQL</div>
+  <svg viewBox="0 0 920 190" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1f4f8b"/><stop offset="100%" stop-color="#0d2c4d"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a0e"/><stop offset="100%" stop-color="#3a230a"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="20"  y="60" width="160" height="70" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="100" y="92" text-anchor="middle" fill="#bc8cff" font-size="12" font-weight="bold">Request filter</text>
+    <text x="100" y="112" text-anchor="middle" fill="#c9d1d9" font-size="11">brand/price/keyword</text>
+
+    <rect x="200" y="60" width="160" height="70" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="280" y="92" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">Specification 工厂</text>
+    <text x="280" y="112" text-anchor="middle" fill="#c9d1d9" font-size="11">null-safe 方法</text>
+
+    <rect x="380" y="60" width="160" height="70" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="460" y="92" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">Predicate 树</text>
+    <text x="460" y="112" text-anchor="middle" fill="#c9d1d9" font-size="11">AND/OR/NOT</text>
+
+    <rect x="560" y="60" width="160" height="70" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="640" y="92" text-anchor="middle" fill="#d29922" font-size="12" font-weight="bold">CriteriaQuery</text>
+    <text x="640" y="112" text-anchor="middle" fill="#c9d1d9" font-size="11">Root + Builder</text>
+
+    <rect x="740" y="60" width="160" height="70" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="820" y="92" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">SQL</text>
+    <text x="820" y="112" text-anchor="middle" fill="#c9d1d9" font-size="11">SQM → AST → DB</text>
+
+    <path d="M180,95 L200,95" stroke="#bc8cff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M360,95 L380,95" stroke="#58a6ff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M540,95 L560,95" stroke="#58a6ff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M720,95 L740,95" stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<table>
+<thead><tr><th>组件</th><th>来源</th><th>作用</th></tr></thead>
+<tbody>
+<tr><td>Specification&lt;T&gt;</td><td>Spring Data</td><td>函数式 Predicate 工厂</td></tr>
+<tr><td>JpaSpecificationExecutor</td><td>Spring Data</td><td>Repository 入口</td></tr>
+<tr><td>Predicate</td><td>JPA Criteria</td><td>谓词节点</td></tr>
+<tr><td>CriteriaBuilder</td><td>JPA Criteria</td><td>节点构造</td></tr>
+<tr><td>Root&lt;T&gt;</td><td>JPA Criteria</td><td>from 主体</td></tr>
+<tr><td>Metamodel (Customer_)</td><td>jpamodelgen</td><td>编译期校验</td></tr>
+</tbody>
+</table>
+
+<h2 id="s21-1">21.1 Repository 集成</h2>
+
+<pre><code class="language-java">public interface ProductRepository
+    extends JpaRepository&lt;Product, Long&gt;,
+            JpaSpecificationExecutor&lt;Product&gt; {
+}</code></pre>
+
+<table>
+<thead><tr><th>方法</th><th>返回</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>findAll(Spec)</td><td>List</td><td>基本查询</td></tr>
+<tr><td>findAll(Spec, Sort)</td><td>List</td><td>带排序</td></tr>
+<tr><td>findAll(Spec, Pageable)</td><td>Page</td><td>分页 + count</td></tr>
+<tr><td>findOne(Spec)</td><td>Optional</td><td>单结果</td></tr>
+<tr><td>count(Spec)</td><td>long</td><td>统计</td></tr>
+<tr><td>exists(Spec)</td><td>boolean</td><td>存在判断</td></tr>
+<tr><td>delete(Spec)</td><td>long</td><td>删除符合条件</td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-java">@Service
+public class ProductSearchService {
+
+    @Autowired
+    private ProductRepository repo;
+
+    public Page&lt;Product&gt; search(ProductSearchForm form, Pageable pageable) {
+        Specification&lt;Product&gt; spec = Specification
+            .where(ProductSpecs.hasBrand(form.getBrand()))
+            .and(ProductSpecs.priceBetween(form.getMinPrice(), form.getMaxPrice()))
+            .and(ProductSpecs.keywordLike(form.getKeyword()));
+
+        return repo.findAll(spec, pageable);
+    }
+}</code></pre>
+
+<h2 id="s21-2">21.2 Specification 工厂</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 21-2-1 · 工厂模式 — null 入参返 null,Spring Data 自动忽略</div>
+  <svg viewBox="0 0 920 250" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1f4f8b"/><stop offset="100%" stop-color="#0d2c4d"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="370" y="14" width="180" height="44" rx="6" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="460" y="42" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">SearchForm</text>
+
+    <rect x="20"  y="90" width="180" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="110" y="120" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">hasBrand(brand)</text>
+
+    <rect x="220" y="90" width="200" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="320" y="120" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">priceBetween(min, max)</text>
+
+    <rect x="440" y="90" width="200" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="540" y="120" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">keywordLike(kw)</text>
+
+    <rect x="660" y="90" width="200" height="50" rx="6" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="760" y="120" text-anchor="middle" fill="#58a6ff" font-size="12" font-weight="bold">inCategory(catId)</text>
+
+    <rect x="20"  y="180" width="380" height="60" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="210" y="206" text-anchor="middle" fill="#f85149" font-size="12" font-weight="bold">null/空 → 返回 null</text>
+    <text x="210" y="226" text-anchor="middle" fill="#c9d1d9" font-size="11">Spring Data 自动跳过该条件</text>
+
+    <rect x="440" y="180" width="380" height="60" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="630" y="206" text-anchor="middle" fill="#3fb950" font-size="12" font-weight="bold">非 null → 返回 cb.equal/between/like</text>
+    <text x="630" y="226" text-anchor="middle" fill="#c9d1d9" font-size="11">参与 AND 树</text>
+
+    <path d="M460,58 L110,90" stroke="#bc8cff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,58 L320,90" stroke="#bc8cff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,58 L540,90" stroke="#bc8cff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M460,58 L760,90" stroke="#bc8cff" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+    <path d="M110,140 L210,180" stroke="#f85149" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M540,140 L630,180" stroke="#3fb950" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<pre><code class="language-java">public final class ProductSpecs {
+
+    private ProductSpecs() {}
+
+    public static Specification&lt;Product&gt; hasBrand(String brand) {
+        return (root, query, cb) -&gt; {
+            if (brand == null || brand.isBlank()) return null;
+            return cb.equal(root.get(Product_.brand), brand);
+        };
+    }
+
+    public static Specification&lt;Product&gt; priceBetween(BigDecimal min, BigDecimal max) {
+        return (root, query, cb) -&gt; {
+            if (Objects.isNull(min) && Objects.isNull(max)) return null;
+            if (Objects.nonNull(min) && Objects.nonNull(max))
+                return cb.between(root.get(Product_.price), min, max);
+            if (Objects.nonNull(min))
+                return cb.ge(root.get(Product_.price), min);
+            return cb.le(root.get(Product_.price), max);
+        };
+    }
+
+    public static Specification&lt;Product&gt; keywordLike(String keyword) {
+        return (root, query, cb) -&gt; {
+            if (keyword == null || keyword.isBlank()) return null;
+            String like = "%" + keyword.toLowerCase() + "%";
+            return cb.or(
+                cb.like(cb.lower(root.get(Product_.name)), like),
+                cb.like(cb.lower(root.get(Product_.description)), like));
+        };
+    }
+
+    public static Specification&lt;Product&gt; inCategory(Long categoryId) {
+        return (root, query, cb) -&gt; {
+            if (categoryId == null) return null;
+            Join&lt;Product, Category&gt; cat = root.join(Product_.category);
+            return cb.equal(cat.get(Category_.id), categoryId);
+        };
+    }
+}</code></pre>
+
+<table>
+<thead><tr><th>约定</th><th>实现</th></tr></thead>
+<tbody>
+<tr><td>入参为 null</td><td>返回 null(Spring Data 自动忽略)</td></tr>
+<tr><td>入参列表为空</td><td>返回 null</td></tr>
+<tr><td>字符串忽略大小写</td><td>cb.lower(...) + .toLowerCase()</td></tr>
+<tr><td>范围查询</td><td>between / ge / le 三分支</td></tr>
+<tr><td>关联条件</td><td>root.join(Product_.category)</td></tr>
+</tbody>
+</table>
+
+<h2 id="s21-3">21.3 组合模式</h2>
+
+<div class="diagram">
+  <div class="diagram-title">图 21-3-1 · 组合树 — where → and → or → not</div>
+  <svg viewBox="0 0 920 190" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
+    <defs>
+      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1f4f8b"/><stop offset="100%" stop-color="#0d2c4d"/></linearGradient>
+      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+      <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c3a0e"/><stop offset="100%" stop-color="#3a230a"/></linearGradient>
+      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+      <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#8b949e"/></marker>
+    </defs>
+
+    <rect x="20"  y="60" width="160" height="70" rx="8" fill="url(#g-purple)" stroke="#bc8cff"/>
+    <text x="100" y="92" text-anchor="middle" fill="#bc8cff" font-size="13" font-weight="bold">where(spec1)</text>
+    <text x="100" y="112" text-anchor="middle" fill="#c9d1d9" font-size="11">起点</text>
+
+    <rect x="200" y="60" width="160" height="70" rx="8" fill="url(#g-blue)" stroke="#58a6ff"/>
+    <text x="280" y="92" text-anchor="middle" fill="#58a6ff" font-size="13" font-weight="bold">and(spec2)</text>
+    <text x="280" y="112" text-anchor="middle" fill="#c9d1d9" font-size="11">AND</text>
+
+    <rect x="380" y="60" width="160" height="70" rx="8" fill="url(#g-orange)" stroke="#d29922"/>
+    <text x="460" y="92" text-anchor="middle" fill="#d29922" font-size="13" font-weight="bold">or(spec3)</text>
+    <text x="460" y="112" text-anchor="middle" fill="#c9d1d9" font-size="11">OR</text>
+
+    <rect x="560" y="60" width="160" height="70" rx="8" fill="url(#g-red)" stroke="#f85149"/>
+    <text x="640" y="92" text-anchor="middle" fill="#f85149" font-size="13" font-weight="bold">not(spec4)</text>
+    <text x="640" y="112" text-anchor="middle" fill="#c9d1d9" font-size="11">NOT</text>
+
+    <rect x="740" y="60" width="160" height="70" rx="8" fill="url(#g-green)" stroke="#3fb950"/>
+    <text x="820" y="92" text-anchor="middle" fill="#3fb950" font-size="13" font-weight="bold">最终</text>
+    <text x="820" y="112" text-anchor="middle" fill="#c9d1d9" font-size="11">Predicate 树</text>
+
+    <path d="M180,95 L200,95" stroke="#bc8cff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M360,95 L380,95" stroke="#58a6ff" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M540,95 L560,95" stroke="#d29922" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+    <path d="M720,95 L740,95" stroke="#f85149" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  </svg>
+</div>
+
+<table>
+<thead><tr><th>操作</th><th>等价 SQL</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>where(s)</td><td>s</td><td>起点</td></tr>
+<tr><td>and(s2)</td><td>s AND s2</td><td>与</td></tr>
+<tr><td>or(s2)</td><td>s OR s2</td><td>或</td></tr>
+<tr><td>not()</td><td>NOT s</td><td>非</td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-java">Specification&lt;Product&gt; active = ProductSpecs.statusEqual(ProductStatus.ACTIVE);
+
+Specification&lt;Product&gt; recentPaid = ProductSpecs.statusEqual(ProductStatus.PAID)
+    .and(ProductSpecs.createdAfter(LocalDateTime.now().minusDays(7)));
+
+Specification&lt;Product&gt; spec = Specification.where(active.or(recentPaid));</code></pre>
+
+<h2 id="s21-4">21.4 复杂关联</h2>
+
+<pre><code class="language-java">public static Specification&lt;Order&gt; customerEmailLike(String pattern) {
+    return (root, query, cb) -&gt; {
+        if (pattern == null || pattern.isBlank()) return null;
+        Join&lt;Order, Customer&gt; c = root.join(Order_.customer, JoinType.INNER);
+        return cb.like(cb.lower(c.get(Customer_.email)),
+                       "%" + pattern.toLowerCase() + "%");
+    };
+}
+
+public static Specification&lt;Order&gt; hasItemQuantityAbove(int threshold) {
+    return (root, query, cb) -&gt; {
+        Subquery&lt;Long&gt; sub = query.subquery(Long.class);
+        Root&lt;OrderItem&gt; item = sub.from(OrderItem.class);
+        sub.select(item.get(OrderItem_.order).get(Order_.id))
+           .where(cb.gt(item.get(OrderItem_.quantity), threshold));
+        return cb.in(root.get(Order_.id)).value(sub);
+    };
+}</code></pre>
+
+<table>
+<thead><tr><th>场景</th><th>API</th></tr></thead>
+<tbody>
+<tr><td>关联条件</td><td>root.join(Entity_.assoc)</td></tr>
+<tr><td>子查询</td><td>query.subquery(Long.class)</td></tr>
+<tr><td>聚合</td><td>query.groupBy + having</td></tr>
+<tr><td>distinct</td><td>query.distinct(true)</td></tr>
+<tr><td>fetch join</td><td>root.fetch(Entity_.assoc) (仅 select 阶段)</td></tr>
+</tbody>
+</table>
+
+<div class="warning"><p><strong>子查询 vs Join 的取舍</strong>。子查询(IN)对优化器更友好,适合一对多 EXISTS 语义;Join 适合需要取关联字段。Specification 中应优先用子查询避免行膨胀。</p></div>
+
+<h2 id="s21-5">21.5 Metamodel(jpamodelgen)</h2>
+
+<pre><code class="language-xml">&lt;!-- pom.xml --&gt;
+&lt;dependency&gt;
+    &lt;groupId&gt;org.hibernate.orm&lt;/groupId&gt;
+    &lt;artifactId&gt;hibernate-jpamodelgen&lt;/artifactId&gt;
+    &lt;scope&gt;provided&lt;/scope&gt;
+&lt;/dependency&gt;</code></pre>
+
+<pre><code class="language-java">// 自动生成的 Product_.java
+@StaticMetamodel(Product.class)
+public abstract class Product_ {
+    public static volatile SingularAttribute&lt;Product, Long&gt; id;
+    public static volatile SingularAttribute&lt;Product, String&gt; name;
+    public static volatile SingularAttribute&lt;Product, BigDecimal&gt; price;
+    public static volatile SingularAttribute&lt;Product, String&gt; brand;
+    public static volatile SingularAttribute&lt;Product, Category&gt; category;
+
+    public static final String ID = "id";
+    public static final String NAME = "name";
+    public static final String PRICE = "price";
+}
+
+// 使用
+root.get(Product_.brand)  // 编译期校验,IDE 补全
+// vs
+root.get("brand")  // 字符串,运行期才发现拼写错</code></pre>
+
+<h2 id="s21-6">21.6 回归测试</h2>
+
+<pre><code class="language-java">@Test
+void hasBrandShouldGenerateEqualPredicate() {
+    SqlCapture capture = sqlCapture.clear();
+
+    Specification&lt;Product&gt; spec = ProductSpecs.hasBrand("Sony");
+    repo.findAll(spec);
+
+    assertThat(capture.normalizedSql())
+        .contains("where p1_0.brand = ?");
+    assertThat(capture.binds()).hasSize(1)
+        .extracting(Bind::value).containsExactly("Sony");
+}
+
+@Test
+void allNullsShouldGenerateNoWhereClause() {
+    SqlCapture capture = sqlCapture.clear();
+
+    Specification&lt;Product&gt; spec = Specification
+        .where(ProductSpecs.hasBrand(null))
+        .and(ProductSpecs.priceBetween(null, null))
+        .and(ProductSpecs.keywordLike(""));
+
+    repo.findAll(spec);
+
+    assertThat(capture.normalizedSql()).doesNotContain("where");
+}
+
+@Test
+void searchShouldExecuteTwoSqlForPage() {
+    long before = stats.getPrepareStatementCount();
+
+    Page&lt;Product&gt; page = service.search(
+        new ProductSearchForm("Sony", new BigDecimal("100"), null, "wireless"),
+        PageRequest.of(0, 20));
+
+    long after = stats.getPrepareStatementCount();
+    assertThat(after - before).isEqualTo(2L); // 1 主查 + 1 count
+}</code></pre>
+
+<h2 id="s21-7">21.7 性能与取舍</h2>
+
+<table>
+<thead><tr><th>方案</th><th>类型安全</th><th>动态条件</th><th>可测试</th><th>性能</th></tr></thead>
+<tbody>
+<tr><td>Specification</td><td>高(Metamodel)</td><td>极佳</td><td>高</td><td>中</td></tr>
+<tr><td>@Query 静态</td><td>中(JPQL 字符串)</td><td>低</td><td>中</td><td>高</td></tr>
+<tr><td>@Query SpEL</td><td>低</td><td>中</td><td>低</td><td>中</td></tr>
+<tr><td>Querydsl</td><td>极高</td><td>极佳</td><td>极高</td><td>中</td></tr>
+<tr><td>Native SQL 拼接</td><td>无</td><td>极佳</td><td>低</td><td>极高</td></tr>
+</tbody>
+</table>
+
+<h2 id="s21-8">21.8 陷阱与限制</h2>
+
+<table>
+<thead><tr><th>#</th><th>陷阱</th><th>现象</th><th>修复</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>用字符串字段名</td><td>运行期拼写错</td><td>用 jpamodelgen Metamodel</td></tr>
+<tr><td>2</td><td>Specification 内多次 join 同一实体</td><td>SQL 多余 join</td><td>缓存 join 引用</td></tr>
+<tr><td>3</td><td>OR 条件 + Page</td><td>count distinct 行数不准</td><td>用子查询代替</td></tr>
+<tr><td>4</td><td>动态 fetch join + 分页</td><td>HHH90003004 警告</td><td>两步分页</td></tr>
+<tr><td>5</td><td>非空判断遗漏</td><td>所有条件加入,空字符串误匹配</td><td>StringUtils.hasText</td></tr>
+<tr><td>6</td><td>未在工厂内 null 处理</td><td>外层判断散落</td><td>统一工厂层 null-safe</td></tr>
+<tr><td>7</td><td>Specification.where(null)</td><td>NPE</td><td>用 Specification.unrestricted()</td></tr>
+<tr><td>8</td><td>大 IN 列表</td><td>SQL plan cache 爆炸</td><td>启用 in_clause_padding</td></tr>
+</tbody>
+</table>
+
+<h2 id="s21-summary">21.9 本章要点</h2>
+
+<div class="chapter-summary">
+<table>
+<thead><tr><th>要点</th><th>API</th><th>易错点</th></tr></thead>
+<tbody>
+<tr><td>Specification 工厂模式</td><td>(root, query, cb) -&gt; Predicate</td><td>null 处理散落</td></tr>
+<tr><td>null 入参返 null</td><td>Spring Data 自动忽略</td><td>条件污染</td></tr>
+<tr><td>组合操作链式</td><td>where().and().or().not()</td><td>NPE 起点</td></tr>
+<tr><td>Metamodel 编译期校验</td><td>Product_.brand</td><td>字符串拼写错</td></tr>
+<tr><td>关联 join 复用</td><td>root.join 缓存</td><td>多余 join</td></tr>
+<tr><td>子查询 vs Join</td><td>query.subquery</td><td>OR + Page count 不准</td></tr>
+<tr><td>回归测试 3 层</td><td>单元 / 集成 / SQL 快照</td><td>动态条件回归</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>下一章讨论分页与审计。本章覆盖动态查询,下一章进入 Pageable / Slice / Window 的分页深入,以及 @CreatedDate / @LastModifiedDate / @CreatedBy 的 JPA Auditing。</p>
+
+<div class="chapter-nav">
+  <a href="20-spring-data-jpa.html">&larr; 第 20 章 &middot; Spring Data JPA</a>
+  <a href="22-pagination-auditing.html">第 22 章 &middot; 分页与审计 &rarr;</a>
+</div>
+<p class="footer">&copy; 2026 图解 JPA &amp; Hibernate &middot; 第 21 章 &middot; 动态查询与 Specification</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

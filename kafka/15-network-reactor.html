@@ -1,0 +1,718 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.15 网络层 Reactor — 图解 Kafka</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Kafka</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="14-timing-wheel.html">上一章</a>
+  <a href="16-tiered-storage.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s15-0">15.0 章首速览</a>
+  <a href="#s15-1">15.1 生产视角:看流水线再调参</a>
+  <a href="#s15-2">15.2 SocketServer 装配</a>
+  <a href="#s15-3">15.3 Acceptor 连接接入</a>
+  <a href="#s15-4">15.4 Processor 读写流</a>
+  <a href="#s15-5">15.5 RequestChannel 边界</a>
+  <a href="#s15-6">15.6 Handler 与 KafkaApis</a>
+  <a href="#s15-7">15.7 协议帧与请求时间分解</a>
+  <a href="#s15-8">15.8 安全握手 SSL/SASL</a>
+  <a href="#s15-9">15.9 监控指标速查</a>
+  <a href="#s15-10">15.10 设计取舍</a>
+  <a href="#s15-11">15.11 陷阱与限制</a>
+  <a href="#s15-summary">15.12 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 15 章 · 网络层 Reactor 模型</h1>
+<p class="subtitle">SocketServer · Acceptor · Processor · RequestChannel · KafkaRequestHandler · KafkaApis · NetworkClient</p>
+
+<div class="chapter-intro">
+  <p class="lead">如果一个 Kafka broker 同时挂着 5k 个长连接(Producer/Consumer/Follower 都算上),它内部并不是"一个连接一个线程"那种古典模型。Kafka 的网络层是经典的 <strong>主从 Reactor</strong> 流水线:<code>Acceptor</code> 单线程负责 <code>accept()</code> 新连接,N 个 <code>Processor</code> 各自跑一个 <code>java.nio.channels.Selector</code> 处理 TCP 读写,所有 <code>Processor</code> 共用一个 <code>RequestChannel</code> 把帧化好的请求扔给后端,M 个 <code>KafkaRequestHandler</code> 才进入 <code>KafkaApis</code> 这条业务路径。</p>
+  <p>这套流水线的好处是清晰:任何延迟现象都能映射到某一段线程或队列。坏处是参数多 — <code>num.network.threads</code>、<code>num.io.threads</code>、<code>queued.max.requests</code>、<code>socket.*.buffer.bytes</code>、SSL 配置…… 不理解流水线就调参,只会"调一个东西好了一阵又坏了"。本章按"流水线 → 各段细节 → 协议帧 → 时间分解 → 监控 → 取舍 → 陷阱"组织,目标是看完后你能<em>不用启动 broker</em> 就预测一次 ProduceRequest 在网络层的完整路径。</p>
+  <ul class="will-learn">
+    <li>主从 Reactor 模型:Acceptor 一个,Processor 多个,Handler 池更多</li>
+    <li>"为什么响应必须回到原 Processor" 的 Selector 状态约束</li>
+    <li>RequestChannel 共享请求队列 + 按 Processor 独立响应队列</li>
+    <li>mute/unmute:Kafka 在 Processor 层做的"per-connection 单飞行"</li>
+    <li>请求时间六段拆分:Queue/Local/Remote/Throttle/Response/Total</li>
+    <li>SSL/SASL 握手在哪个线程发生,为什么会"<em>把 Processor 吃光</em>"</li>
+    <li>5 个核心指标的健康基线 + 常见瓶颈的<em>段</em>到<em>动作</em>映射</li>
+  </ul>
+  <p class="prereq">前置知识:Java NIO Selector / Channel;TCP backlog;TLS 握手;第 6 章 Producer NetworkClient;第 9 章 acks=all 与 DelayedProduce;第 14 章 Purgatory。</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s15-0">15.0 章首速览</h2>
+<!-- ============================================================ -->
+
+<div class="diagram">
+  <div class="diagram-title">图 15-0 · Reactor 流水线全景</div>
+<svg viewBox="0 0 900 520" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="520" fill="#0f172a" rx="8"/>
+
+  <!-- Clients on the left -->
+  <g transform="translate(20, 60)">
+    <rect x="0" y="0" width="120" height="40" rx="6" fill="url(#g-purple)"/>
+    <text x="60" y="25" text-anchor="middle" fill="#fff" font-size="11">Producer × N</text>
+    <rect x="0" y="55" width="120" height="40" rx="6" fill="url(#g-blue)"/>
+    <text x="60" y="80" text-anchor="middle" fill="#fff" font-size="11">Consumer × N</text>
+    <rect x="0" y="110" width="120" height="40" rx="6" fill="url(#g-green)"/>
+    <text x="60" y="135" text-anchor="middle" fill="#fff" font-size="11">Follower × N</text>
+  </g>
+  <text x="80" y="200" text-anchor="middle" fill="#cbd5e1" font-size="11">TCP / TLS</text>
+
+  <!-- Acceptor -->
+  <rect x="180" y="50" width="170" height="60" rx="10" fill="url(#g-orange)" stroke="#f59e0b"/>
+  <text x="265" y="74" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">Acceptor</text>
+  <text x="265" y="92" text-anchor="middle" fill="#fef3c7" font-size="11">single thread, accept()</text>
+  <text x="265" y="106" text-anchor="middle" fill="#fde68a" font-size="10">round-robin to Processors</text>
+
+  <path d="M140 80 L180 80" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M140 135 L180 95" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M140 185 L180 110" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+  <!-- Processors (3 columns) -->
+  <g transform="translate(180, 140)">
+    <rect x="0" y="0" width="170" height="70" rx="10" fill="url(#g-blue)" stroke="#60a5fa"/>
+    <text x="85" y="22" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">Processor-0</text>
+    <text x="85" y="40" text-anchor="middle" fill="#dbeafe" font-size="10">Selector + read/write</text>
+    <text x="85" y="55" text-anchor="middle" fill="#dbeafe" font-size="10">SSL/SASL 在此线程</text>
+
+    <rect x="0" y="80" width="170" height="70" rx="10" fill="url(#g-blue)" stroke="#60a5fa"/>
+    <text x="85" y="102" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">Processor-1</text>
+    <text x="85" y="120" text-anchor="middle" fill="#dbeafe" font-size="10">Selector + read/write</text>
+    <text x="85" y="135" text-anchor="middle" fill="#dbeafe" font-size="10">mute / unmute / completedReceives</text>
+
+    <rect x="0" y="160" width="170" height="70" rx="10" fill="url(#g-blue)" stroke="#60a5fa"/>
+    <text x="85" y="182" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">Processor-N</text>
+    <text x="85" y="200" text-anchor="middle" fill="#dbeafe" font-size="10">num.network.threads = N+1</text>
+  </g>
+
+  <path d="M265 110 L265 140" stroke="#f59e0b" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+  <!-- RequestChannel -->
+  <rect x="430" y="170" width="180" height="100" rx="10" fill="#0d1117" stroke="#94a3b8" stroke-width="2"/>
+  <text x="520" y="198" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">RequestChannel</text>
+  <text x="520" y="218" text-anchor="middle" fill="#cbd5e1" font-size="10">requestQueue (shared)</text>
+  <text x="520" y="235" text-anchor="middle" fill="#cbd5e1" font-size="10">responseQueue[0..N]</text>
+  <text x="520" y="252" text-anchor="middle" fill="#fbbf24" font-size="10">queued.max.requests = 500</text>
+
+  <path d="M350 200 L430 220" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+  <!-- Handlers -->
+  <rect x="680" y="170" width="200" height="100" rx="10" fill="url(#g-green)" stroke="#22c55e" stroke-width="2"/>
+  <text x="780" y="198" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">KafkaRequestHandler × M</text>
+  <text x="780" y="216" text-anchor="middle" fill="#dcfce7" font-size="10">KafkaApis.handle()</text>
+  <text x="780" y="232" text-anchor="middle" fill="#dcfce7" font-size="10">ReplicaManager / GroupCoord ...</text>
+  <text x="780" y="252" text-anchor="middle" fill="#86efac" font-size="10">num.io.threads = 8</text>
+
+  <path d="M610 220 L680 220" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+  <!-- Response back to original Processor -->
+  <path d="M780 270 Q780 410 350 410 Q300 410 265 230" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)" stroke-dasharray="6 4"/>
+  <text x="600" y="430" text-anchor="middle" fill="#86efac" font-size="11">响应必须回到原 Processor</text>
+
+  <!-- legend -->
+  <rect x="20" y="450" width="860" height="50" rx="8" fill="#1e293b" stroke="#475569"/>
+  <text x="30" y="470" fill="#fbbf24" font-size="11" font-weight="700">三段线程角色:</text>
+  <text x="30" y="488" fill="#cbd5e1" font-size="11">Acceptor × 1/listener · Processor × num.network.threads · Handler × num.io.threads</text>
+</svg>
+</div>
+
+<table>
+  <thead><tr><th>线程</th><th>数量</th><th>职责</th><th>关键瓶颈信号</th></tr></thead>
+  <tbody>
+    <tr><td>Acceptor</td><td>1 / listener</td><td>accept() + round-robin 分配</td><td>accept backlog 增长</td></tr>
+    <tr><td>Processor (kafka-network-thread-*)</td><td>num.network.threads</td><td>TLS, frame 读写, mute/unmute</td><td>NetworkProcessorAvgIdlePercent 低</td></tr>
+    <tr><td>Handler (kafka-request-handler-*)</td><td>num.io.threads</td><td>KafkaApis.handle, 业务路由</td><td>RequestHandlerAvgIdlePercent 低</td></tr>
+    <tr><td>Reaper / Background</td><td>多个</td><td>Purgatory expire, log clean</td><td>各自独立</td></tr>
+  </tbody>
+</table>
+
+<div class="diagram">
+  <div class="diagram-title">图 15-0-1 · 本章核心结论(三句话)</div>
+<pre><code>本章三句话:
+
+  1 Reactor 把"连接管理"与"业务处理"解耦
+    Acceptor 接连接, Processor 网络读写
+    Handler 才进入业务逻辑
+
+  2 RequestChannel 是跨线程硬边界
+    请求队列共享, 响应队列按 Processor 独立
+    响应必须回到原 Processor
+
+  3 看到延迟先看时间拆分
+    Queue / Local / Remote / Send 各段
+    不要直接调 num.io.threads</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s15-1">15.1 生产视角 — 看流水线再调参</h2>
+<!-- ============================================================ -->
+
+<p>大多数"<em>Kafka 慢</em>"的 ticket 最后都不是 broker 自己的问题。但找到根因的前提是<strong>按段定位</strong>:先看是哪一段瓶颈,再考虑该段的调参。盲调 <code>num.io.threads</code> 是最常见的错误 — 它只调"Handler 池",对 SSL CPU 或 Follower fetch 慢都没用。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 15-1 · 症状 → 瓶颈段 → 动作</div>
+<svg viewBox="0 0 900 380" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="380" fill="#0f172a" rx="8"/>
+
+  <rect x="370" y="30" width="160" height="50" rx="25" fill="url(#g-orange)" stroke="#f59e0b"/>
+  <text x="450" y="60" text-anchor="middle" fill="#fff" font-size="13" font-weight="700">观察到的症状</text>
+
+  <!-- 4 paths -->
+  <g font-size="11">
+    <rect x="20" y="130" width="180" height="60" rx="8" fill="url(#g-red)" stroke="#ef4444"/>
+    <text x="110" y="153" text-anchor="middle" fill="#fff" font-weight="700">新连接超时</text>
+    <text x="110" y="172" text-anchor="middle" fill="#fecaca">accept / backlog</text>
+
+    <rect x="220" y="130" width="180" height="60" rx="8" fill="url(#g-purple)" stroke="#a78bfa"/>
+    <text x="310" y="153" text-anchor="middle" fill="#fff" font-weight="700">Processor idle 低</text>
+    <text x="310" y="172" text-anchor="middle" fill="#e9d5ff">SSL / 大量连接</text>
+
+    <rect x="420" y="130" width="180" height="60" rx="8" fill="url(#g-blue)" stroke="#60a5fa"/>
+    <text x="510" y="153" text-anchor="middle" fill="#fff" font-weight="700">RequestQueueSize 高</text>
+    <text x="510" y="172" text-anchor="middle" fill="#dbeafe">Handler 追不上</text>
+
+    <rect x="620" y="130" width="180" height="60" rx="8" fill="url(#g-green)" stroke="#22c55e"/>
+    <text x="710" y="153" text-anchor="middle" fill="#fff" font-weight="700">LocalTime/RemoteTime 高</text>
+    <text x="710" y="172" text-anchor="middle" fill="#dcfce7">业务路径慢</text>
+  </g>
+
+  <path d="M430 80 L110 130" stroke="#ef4444" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M450 80 L310 130" stroke="#a78bfa" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M470 80 L510 130" stroke="#60a5fa" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M490 80 L710 130" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+  <g font-size="11">
+    <rect x="20" y="240" width="180" height="80" rx="8" fill="#1e293b" stroke="#ef4444"/>
+    <text x="110" y="263" text-anchor="middle" fill="#fecaca" font-weight="700">动作</text>
+    <text x="30" y="284" fill="#fff">- listener 拆分</text>
+    <text x="30" y="302" fill="#fff">- SSL 拆 listener</text>
+    <text x="30" y="318" fill="#fff">- 看 OS backlog</text>
+
+    <rect x="220" y="240" width="180" height="80" rx="8" fill="#1e293b" stroke="#a78bfa"/>
+    <text x="310" y="263" text-anchor="middle" fill="#e9d5ff" font-weight="700">动作</text>
+    <text x="230" y="284" fill="#fff">- num.network.threads ↑</text>
+    <text x="230" y="302" fill="#fff">- SSL 卸载到 LB</text>
+
+    <rect x="420" y="240" width="180" height="80" rx="8" fill="#1e293b" stroke="#60a5fa"/>
+    <text x="510" y="263" text-anchor="middle" fill="#dbeafe" font-weight="700">动作</text>
+    <text x="430" y="284" fill="#fff">- num.io.threads ↑</text>
+    <text x="430" y="302" fill="#fff">- 修下游(磁盘/GC)</text>
+
+    <rect x="620" y="240" width="180" height="80" rx="8" fill="#1e293b" stroke="#22c55e"/>
+    <text x="710" y="263" text-anchor="middle" fill="#dcfce7" font-weight="700">动作</text>
+    <text x="630" y="284" fill="#fff">- 看 ReplicaManager</text>
+    <text x="630" y="302" fill="#fff">- 看 ISR 滞后</text>
+  </g>
+
+  <path d="M110 190 L110 240" stroke="#ef4444" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M310 190 L310 240" stroke="#a78bfa" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M510 190 L510 240" stroke="#60a5fa" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M710 190 L710 240" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+</svg>
+</div>
+
+<table>
+  <thead><tr><th>配置</th><th>默认</th><th>生产推荐</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td><code>num.network.threads</code></td><td>3</td><td>5-8(高吞吐/SSL)</td><td>Processor 数,瓶颈在 TLS</td></tr>
+    <tr><td><code>num.io.threads</code></td><td>8</td><td>8-16</td><td>Handler 数,按 CPU 核</td></tr>
+    <tr><td><code>queued.max.requests</code></td><td>500</td><td>500-1000</td><td>requestQueue 上限</td></tr>
+    <tr><td><code>socket.send.buffer.bytes</code></td><td>102400</td><td>1048576(高吞吐)</td><td>TCP SO_SNDBUF</td></tr>
+    <tr><td><code>socket.receive.buffer.bytes</code></td><td>102400</td><td>1048576</td><td>TCP SO_RCVBUF</td></tr>
+    <tr><td><code>socket.request.max.bytes</code></td><td>100 MiB</td><td>默认</td><td>单请求上限</td></tr>
+    <tr><td><code>connections.max.idle.ms</code></td><td>10 min</td><td>默认</td><td>空闲连接回收</td></tr>
+  </tbody>
+</table>
+
+<div class="key-insight">
+<strong>生产健康基线</strong>:<code>NetworkProcessorAvgIdlePercent &gt; 0.5</code>(Processor 仍有余量),<code>RequestHandlerAvgIdlePercent &gt; 0.3</code>(Handler 还能扛),<code>RequestQueueSize &lt; queued.max.requests/2</code>(队列不堆),<code>TotalTime P99 &lt; 100ms</code>(端到端可控)。任何一个持续突破阈值都意味着瓶颈段已经出现。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s15-2">15.2 SocketServer 装配</h2>
+<!-- ============================================================ -->
+
+<p><code>SocketServer</code> 是 broker 启动时第一个起来的网络组件。它读取 <code>listeners</code>(可能是多个 listener,如 <code>PLAINTEXT://broker1:9092, SSL://broker1:9093</code>),为每个 listener 创建一个 <code>Acceptor</code> 和 N 个 <code>Processor</code>,并构建一个全局 <code>RequestChannel</code>。</p>
+
+<pre><code class="language-scala">// SocketServer 启动伪代码
+class SocketServer(config: KafkaConfig) {
+  val requestChannel = new RequestChannel(queueSize = config.queuedMaxRequests)
+  val acceptors = mutable.Map.empty[EndPoint, Acceptor]
+
+  def startup(): Unit = {
+    config.listeners.foreach { ep =&gt;
+      val acceptor = new Acceptor(ep, requestChannel, ...)
+      // 每个 listener 起 num.network.threads 个 Processor
+      (0 until config.numNetworkThreads).foreach { i =&gt;
+        val processor = new Processor(id = nextId(), requestChannel, ...)
+        acceptor.addProcessor(processor)
+        processor.start()
+      }
+      acceptor.start()
+      acceptors(ep) = acceptor
+    }
+  }
+}</code></pre>
+
+<p>注意:<strong>每个 listener 都有独立的 Processor 池</strong>。这是 Kafka 给 SSL/PLAINTEXT 资源隔离的方式 — 你可以让控制面走 PLAINTEXT,数据面走 SSL,SSL 握手吃 CPU 不影响控制面的延迟。</p>
+
+<h3>多 listener 的典型用法</h3>
+
+<div class="compare-grid">
+  <div>
+    <h4>仅一个 listener</h4>
+    <pre><code class="language-bash">listeners=PLAINTEXT://:9092
+num.network.threads=8</code></pre>
+    <p>简单。如果 SSL 握手洪峰,会卡住数据面。</p>
+  </div>
+  <div>
+    <h4>多 listener 分离</h4>
+    <pre><code class="language-bash">listeners=INTERNAL://:9092,EXTERNAL://:9093
+listener.security.protocol.map=INTERNAL:PLAINTEXT,EXTERNAL:SSL
+num.network.threads=8  # 每个 listener 都 8 个</code></pre>
+    <p>SSL CPU 飙也不影响 INTERNAL listener。Follower 走 INTERNAL,Producer 走 EXTERNAL。</p>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s15-3">15.3 Acceptor 连接接入</h2>
+<!-- ============================================================ -->
+
+<p>Acceptor 单线程,只做一件事:<code>accept()</code> 拿到新 socket → 选一个 Processor 把 socket 塞过去。"选哪个 Processor"用 round-robin。"塞过去"通过 Processor 内部的 <code>newConnections: ConcurrentLinkedQueue&lt;SocketChannel&gt;</code>,Processor 在下次 <code>poll()</code> 后处理。</p>
+
+<pre><code class="language-scala">// Acceptor.run 伪代码
+def run(): Unit = {
+  val nioSelector = NSelector.open()
+  serverChannel.register(nioSelector, SelectionKey.OP_ACCEPT)
+  var index = 0
+  while (isRunning) {
+    val ready = nioSelector.select(500)
+    if (ready &gt; 0) {
+      val keys = nioSelector.selectedKeys().iterator()
+      while (keys.hasNext) {
+        val key = keys.next(); keys.remove()
+        if (key.isAcceptable) {
+          val socket = serverSocketChannel.accept()
+          configure(socket) // SO_LINGER, TCP_NODELAY, ...
+          // round-robin 选一个 Processor
+          val processor = processors(index % processors.size)
+          processor.accept(socket) // 放入 processor.newConnections
+          index += 1
+        }
+      }
+    }
+  }
+}</code></pre>
+
+<div class="warning">
+<strong>常见误解</strong>:Acceptor 不参与读写、不持有 <code>SelectionKey</code>。它只是"<em>分包员</em>"。即使你跑 100k 连接,Acceptor 也基本不忙。所以 <code>num.network.threads</code> 调的是 Processor,不是 Acceptor。Acceptor 数等于 listener 数。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s15-4">15.4 Processor 读写流</h2>
+<!-- ============================================================ -->
+
+<p>Processor 是网络层<strong>实际干活</strong>的线程。它一个循环里做四件事:</p>
+
+<ol>
+  <li><strong>处理新连接</strong>:从 <code>newConnections</code> 取 SocketChannel,注册到自己的 Selector 上(<code>OP_READ</code>),建立 KafkaChannel 包装。</li>
+  <li><strong>处理出站响应</strong>:从 <code>responseQueue</code> 取响应,挂到对应连接的 <code>send</code> 槽位上,enable <code>OP_WRITE</code>。</li>
+  <li><strong>poll Selector</strong>:阻塞最多 300ms,把 ready 的连接收/发各跑一次。</li>
+  <li><strong>处理 completed</strong>:每个完整收到的请求扔进 <code>RequestChannel.requestQueue</code>。每个发完的响应回调 <code>callback()</code>。每个掉线/超时的连接,把它的"in-flight 请求"标记 disposed。</li>
+</ol>
+
+<div class="diagram">
+  <div class="diagram-title">图 15-4 · Processor 一次 poll 循环</div>
+<svg viewBox="0 0 900 360" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="360" fill="#0f172a" rx="8"/>
+
+  <!-- center -->
+  <rect x="350" y="140" width="200" height="80" rx="40" fill="url(#g-blue)" stroke="#60a5fa"/>
+  <text x="450" y="170" text-anchor="middle" fill="#fff" font-size="14" font-weight="700">Processor.run()</text>
+  <text x="450" y="195" text-anchor="middle" fill="#dbeafe" font-size="11">无限循环 (300ms poll)</text>
+
+  <!-- 4 steps around -->
+  <g font-size="11">
+    <rect x="30" y="40" width="220" height="70" rx="8" fill="url(#g-green)" stroke="#22c55e"/>
+    <text x="140" y="65" text-anchor="middle" fill="#fff" font-weight="700">① 处理新连接</text>
+    <text x="140" y="85" text-anchor="middle" fill="#dcfce7">accept → register OP_READ</text>
+    <text x="140" y="100" text-anchor="middle" fill="#dcfce7">new KafkaChannel(...)</text>
+
+    <rect x="650" y="40" width="220" height="70" rx="8" fill="url(#g-orange)" stroke="#f59e0b"/>
+    <text x="760" y="65" text-anchor="middle" fill="#fff" font-weight="700">② 出站响应</text>
+    <text x="760" y="85" text-anchor="middle" fill="#fef3c7">responseQueue.poll()</text>
+    <text x="760" y="100" text-anchor="middle" fill="#fef3c7">channel.setSend + OP_WRITE</text>
+
+    <rect x="650" y="250" width="220" height="70" rx="8" fill="url(#g-purple)" stroke="#a78bfa"/>
+    <text x="760" y="275" text-anchor="middle" fill="#fff" font-weight="700">③ Selector.poll()</text>
+    <text x="760" y="295" text-anchor="middle" fill="#e9d5ff">read/write per channel</text>
+    <text x="760" y="310" text-anchor="middle" fill="#e9d5ff">最多 300ms</text>
+
+    <rect x="30" y="250" width="220" height="70" rx="8" fill="url(#g-red)" stroke="#ef4444"/>
+    <text x="140" y="275" text-anchor="middle" fill="#fff" font-weight="700">④ 处理 completed</text>
+    <text x="140" y="295" text-anchor="middle" fill="#fecaca">completedReceives → requestQueue</text>
+    <text x="140" y="310" text-anchor="middle" fill="#fecaca">completedSends → callback</text>
+  </g>
+
+  <path d="M250 75 Q300 110 350 150" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M650 75 Q600 110 550 150" stroke="#f59e0b" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M550 220 Q600 240 650 285" stroke="#a78bfa" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <path d="M350 220 Q300 240 250 285" stroke="#ef4444" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+</svg>
+</div>
+
+<h3>mute / unmute — Kafka 在 Processor 层做的"per-connection 单飞行"</h3>
+
+<p>Kafka 一个连接同时只能有一个<em>正在被 broker 处理</em>的请求(producer 端的 idempotent producer 有 <code>max.in.flight.requests.per.connection</code> 但那是 producer 自己的事;broker 这边的行为更严格)。Processor 在请求完成接收后会 <strong>mute</strong> 这个连接(取消 <code>OP_READ</code>),直到该请求的响应发完才 <strong>unmute</strong>(重新启用 <code>OP_READ</code>)。这样保证一个连接同时不会读到第二个请求。</p>
+
+<pre><code class="language-scala">// Processor.processCompletedReceives 简化
+def processCompletedReceives(): Unit = {
+  selector.completedReceives.forEach { receive =&gt;
+    val channelId = receive.source
+    selector.mute(channelId)              // 暂停读
+    val req = parseRequest(receive)
+    requestChannel.sendRequest(req)
+  }
+}
+
+// Processor.processCompletedSends 简化
+def processCompletedSends(): Unit = {
+  selector.completedSends.forEach { send =&gt;
+    selector.unmute(send.destination)     // 响应发完恢复读
+  }
+}</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s15-5">15.5 RequestChannel — 跨线程边界</h2>
+<!-- ============================================================ -->
+
+<p><code>RequestChannel</code> 是 Processor(N 个)和 Handler(M 个)之间唯一的传递点。它结构是<strong>一个</strong>共享 <code>requestQueue</code> + <strong>多个</strong>按 Processor 独立的 <code>responseQueue</code>。</p>
+
+<pre><code class="language-scala">class RequestChannel(queueSize: Int) {
+  // 所有 Processor 共享
+  val requestQueue: ArrayBlockingQueue[Request] =
+    new ArrayBlockingQueue[Request](queueSize)
+
+  // 每个 Processor 一个响应队列
+  val responseQueues: ConcurrentHashMap[Int, BlockingQueue[Response]] =
+    new ConcurrentHashMap()
+
+  def sendRequest(req: Request): Unit = requestQueue.put(req)
+  def receiveRequest(timeoutMs: Long): Request = requestQueue.poll(timeoutMs)
+
+  def sendResponse(resp: Response): Unit = {
+    val q = responseQueues.get(resp.processorId)
+    q.put(resp)
+  }
+}</code></pre>
+
+<div class="key-insight">
+<strong>为什么响应队列要按 Processor 分</strong>:因为每个 Processor 持有自己的 Selector + 自己注册的 channel。响应只能在<em>注册该 channel 的</em> Selector 上写。把响应发到错的 Processor 就找不到 channel,响应就丢了。所以 KafkaApis 在 sendResponse 时必须知道 <code>processorId</code>,这是 Request 对象一直携带的属性。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s15-6">15.6 Handler 与 KafkaApis</h2>
+<!-- ============================================================ -->
+
+<p>Handler 池(<code>kafka-request-handler-*</code>)做的事很简单 — 从 <code>requestQueue</code> 取一个请求,调 <code>KafkaApis.handle(req)</code>,处理完调 <code>sendResponse</code>。<code>KafkaApis</code> 是 broker 业务路由表 — 它根据 <code>apiKey</code>(Produce / Fetch / JoinGroup / Metadata 等)分发到对应处理函数。</p>
+
+<pre><code class="language-scala">class KafkaRequestHandler(...) extends Runnable {
+  def run(): Unit = while (running) {
+    val req = requestChannel.receiveRequest(timeoutMs = 300)
+    if (req != null) {
+      apis.handle(req)
+    }
+  }
+}
+
+class KafkaApis(...) {
+  def handle(req: RequestChannel.Request): Unit = req.header.apiKey match {
+    case ApiKeys.PRODUCE        =&gt; handleProduceRequest(req)
+    case ApiKeys.FETCH          =&gt; handleFetchRequest(req)
+    case ApiKeys.JOIN_GROUP     =&gt; handleJoinGroupRequest(req)
+    case ApiKeys.OFFSET_FETCH   =&gt; handleOffsetFetchRequest(req)
+    case ApiKeys.METADATA       =&gt; handleTopicMetadataRequest(req)
+    // ... 70+ apiKey
+  }
+}</code></pre>
+
+<h3>典型 Produce 请求路径</h3>
+
+<pre><code>Client → TCP → Acceptor → Processor-3 → RequestChannel.requestQueue
+                                ↓
+                          Handler-7 (KafkaApis.handleProduceRequest)
+                                ↓
+                          ReplicaManager.appendRecords
+                                ↓
+                          每个 partition 写 log + 等 ISR
+                                ↓
+                          DelayedProduce 入 Purgatory
+                                ↓ (等 ACK)
+                          callback → RequestChannel.sendResponse(processorId=3)
+                                ↓
+                          Processor-3.responseQueue.put(resp)
+                                ↓ (Processor-3 下次 poll)
+                          OP_WRITE → 客户端</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s15-7">15.7 协议帧与请求时间分解</h2>
+<!-- ============================================================ -->
+
+<p>Kafka 协议是<strong>带长度前缀的二进制帧</strong>:<code>4-byte int (length)</code> + <code>length bytes (header+body)</code>。Processor 用 <code>NetworkReceive</code> 累积 byte buffer 直到一帧完整,再交给上游解码。</p>
+
+<table>
+  <thead><tr><th>字段</th><th>大小</th><th>含义</th></tr></thead>
+  <tbody>
+    <tr><td>Length</td><td>4 byte</td><td>整个帧(不含 length 本身)字节数</td></tr>
+    <tr><td>ApiKey</td><td>2 byte</td><td>请求类型(Produce=0, Fetch=1, ...)</td></tr>
+    <tr><td>ApiVersion</td><td>2 byte</td><td>请求版本</td></tr>
+    <tr><td>CorrelationId</td><td>4 byte</td><td>客户端关联 ID</td></tr>
+    <tr><td>ClientId</td><td>variable</td><td>客户端标识</td></tr>
+    <tr><td>Body</td><td>variable</td><td>请求特定 payload</td></tr>
+  </tbody>
+</table>
+
+<h3>请求时间六段分解</h3>
+
+<p>broker 上每个请求都会被打 6 个时间戳。这 6 个段是定位延迟的<strong>金标准</strong>:</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 15-7 · 请求时间六段拆分</div>
+<svg viewBox="0 0 900 280" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="280" fill="#0f172a" rx="8"/>
+
+  <text x="450" y="30" text-anchor="middle" fill="#fff" font-size="14" font-weight="700">从 receive 到 send 的六段时间</text>
+
+  <g transform="translate(40, 60)">
+    <rect x="0" y="0" width="120" height="60" rx="6" fill="url(#g-purple)"/>
+    <text x="60" y="25" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Request</text>
+    <text x="60" y="42" text-anchor="middle" fill="#e9d5ff" font-size="10">Queue Time</text>
+    <text x="60" y="56" text-anchor="middle" fill="#e9d5ff" font-size="9">Processor → Handler</text>
+
+    <rect x="130" y="0" width="120" height="60" rx="6" fill="url(#g-blue)"/>
+    <text x="190" y="25" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Local</text>
+    <text x="190" y="42" text-anchor="middle" fill="#dbeafe" font-size="10">本机处理</text>
+    <text x="190" y="56" text-anchor="middle" fill="#dbeafe" font-size="9">log append / index</text>
+
+    <rect x="260" y="0" width="120" height="60" rx="6" fill="url(#g-orange)"/>
+    <text x="320" y="25" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Remote</text>
+    <text x="320" y="42" text-anchor="middle" fill="#fef3c7" font-size="10">等待 follower / 远端</text>
+    <text x="320" y="56" text-anchor="middle" fill="#fef3c7" font-size="9">Purgatory wait</text>
+
+    <rect x="390" y="0" width="120" height="60" rx="6" fill="url(#g-red)"/>
+    <text x="450" y="25" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Throttle</text>
+    <text x="450" y="42" text-anchor="middle" fill="#fecaca" font-size="10">配额限流</text>
+    <text x="450" y="56" text-anchor="middle" fill="#fecaca" font-size="9">QuotaManager delay</text>
+
+    <rect x="520" y="0" width="120" height="60" rx="6" fill="url(#g-green)"/>
+    <text x="580" y="25" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Response Queue</text>
+    <text x="580" y="42" text-anchor="middle" fill="#dcfce7" font-size="10">Handler → Processor</text>
+    <text x="580" y="56" text-anchor="middle" fill="#dcfce7" font-size="9">resp 放入队列</text>
+
+    <rect x="650" y="0" width="160" height="60" rx="6" fill="#0d1117"/>
+    <text x="730" y="25" text-anchor="middle" fill="#fff" font-size="11" font-weight="700">Response Send</text>
+    <text x="730" y="42" text-anchor="middle" fill="#cbd5e1" font-size="10">Processor write</text>
+    <text x="730" y="56" text-anchor="middle" fill="#cbd5e1" font-size="9">socket send</text>
+  </g>
+
+  <text x="450" y="155" text-anchor="middle" fill="#fbbf24" font-size="13" font-weight="700">TotalTime = Queue + Local + Remote + Throttle + ResponseQueue + ResponseSend</text>
+
+  <text x="40" y="195" fill="#cbd5e1" font-size="11">- Queue 高 → Handler 不够 (num.io.threads ↑) 或 队列上限低</text>
+  <text x="40" y="215" fill="#cbd5e1" font-size="11">- Local 高 → 磁盘/GC/锁 (ReplicaManager.appendRecords)</text>
+  <text x="40" y="235" fill="#cbd5e1" font-size="11">- Remote 高 → ISR 滞后 (Follower 慢)</text>
+  <text x="40" y="255" fill="#cbd5e1" font-size="11">- ResponseSend 高 → TLS / 客户端慢 / Mute 没及时 unmute</text>
+</svg>
+</div>
+
+<table>
+  <thead><tr><th>JMX 指标</th><th>含义</th><th>异常阈值</th></tr></thead>
+  <tbody>
+    <tr><td>RequestQueueTimeMs</td><td>requestQueue 排队时间</td><td>P99 &gt; 50ms 持续</td></tr>
+    <tr><td>LocalTimeMs</td><td>本机业务处理</td><td>P99 &gt; 30ms 持续</td></tr>
+    <tr><td>RemoteTimeMs</td><td>Purgatory wait</td><td>不固定,看业务</td></tr>
+    <tr><td>ThrottleTimeMs</td><td>配额延迟</td><td>持续 &gt; 0 → 看 quota</td></tr>
+    <tr><td>ResponseQueueTimeMs</td><td>响应排队</td><td>P99 &gt; 10ms</td></tr>
+    <tr><td>ResponseSendTimeMs</td><td>响应发送</td><td>P99 &gt; 20ms → 客户端慢</td></tr>
+    <tr><td>TotalTimeMs</td><td>合计</td><td>P99 &gt; 100ms</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s15-8">15.8 安全握手 SSL/SASL — 为什么会把 Processor 吃光</h2>
+<!-- ============================================================ -->
+
+<p>SSL/SASL 握手在 Kafka 的设计里<strong>跑在 Processor 线程</strong>。这是为了简化:Processor 持有 KafkaChannel,KafkaChannel 内部状态机包含 <code>NOT_AUTHENTICATED / AUTHENTICATION_IN_PROGRESS / READY</code>。握手字节流从 Selector 读出后,直接由 SslTransportLayer / SaslServerAuthenticator 推进状态机。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 15-8 · SSL 握手在 Processor 上的状态机</div>
+<svg viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1a3d5c"/><stop offset="100%" stop-color="#0f2438"/></linearGradient>
+    <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#1e5f3a"/><stop offset="100%" stop-color="#0d3a22"/></linearGradient>
+    <linearGradient id="g-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c4117"/><stop offset="100%" stop-color="#3a280a"/></linearGradient>
+    <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5c1f1f"/><stop offset="100%" stop-color="#3a0e0e"/></linearGradient>
+    <linearGradient id="g-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#3d1f5c"/><stop offset="100%" stop-color="#260f38"/></linearGradient>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="#58a6ff"/></marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="300" fill="#0f172a" rx="8"/>
+
+  <rect x="40" y="120" width="170" height="50" rx="25" fill="#0d1117" stroke="#94a3b8"/>
+  <text x="125" y="150" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">NOT_AUTHENTICATED</text>
+
+  <rect x="290" y="120" width="220" height="50" rx="25" fill="url(#g-orange)" stroke="#f59e0b"/>
+  <text x="400" y="150" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">HANDSHAKE_IN_PROGRESS</text>
+
+  <rect x="600" y="120" width="170" height="50" rx="25" fill="url(#g-green)" stroke="#22c55e"/>
+  <text x="685" y="150" text-anchor="middle" fill="#fff" font-size="12" font-weight="700">READY</text>
+
+  <path d="M210 145 L290 145" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="250" y="138" text-anchor="middle" fill="#fef3c7" font-size="10">ClientHello</text>
+
+  <path d="M510 145 L600 145" stroke="#22c55e" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="555" y="138" text-anchor="middle" fill="#86efac" font-size="10">Finished</text>
+
+  <text x="450" y="220" text-anchor="middle" fill="#fbbf24" font-size="13" font-weight="700">握手期间 Processor 阻塞在该 channel 上做 CPU 计算</text>
+  <text x="450" y="245" text-anchor="middle" fill="#cbd5e1" font-size="11">RSA 密钥协商 + 证书验证 + AES 协商,单握手 5-20ms</text>
+  <text x="450" y="268" text-anchor="middle" fill="#cbd5e1" font-size="11">100 个并发握手 = 单 Processor 卡 0.5-2 秒</text>
+</svg>
+</div>
+
+<div class="warning">
+<strong>生产惨案案例</strong>:某客户端集群滚动重启,5k 实例同时建连。<code>num.network.threads=3</code>,瞬时 5k 个 SSL 握手分到 3 个 Processor 上排队。这段时间内已建立的 Producer 连接全部 stall(因为 Processor 都在算 RSA)。Producer 端看到 <code>request.timeout.ms</code> 全部触发,大量重试,雪崩。<br><br>
+<strong>修复</strong>:① 把 <code>num.network.threads</code> 调到 8;② 拆 listener,业务数据走 PLAINTEXT,控制 / 跨 DC 走 SSL;③ 在 LB 层卸载 TLS;④ 客户端避免同时滚动重启。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s15-9">15.9 监控指标速查</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>指标</th><th>正常</th><th>异常</th><th>动作</th></tr></thead>
+  <tbody>
+    <tr><td>NetworkProcessorAvgIdlePercent</td><td>&gt; 0.5</td><td>&lt; 0.2</td><td>↑ num.network.threads / SSL 拆 listener</td></tr>
+    <tr><td>RequestHandlerAvgIdlePercent</td><td>&gt; 0.3</td><td>&lt; 0.1</td><td>↑ num.io.threads / 修 ReplicaManager</td></tr>
+    <tr><td>RequestQueueSize</td><td>&lt; queued.max.requests/2</td><td>持续接近上限</td><td>↑ Handler / 修业务</td></tr>
+    <tr><td>NetworkProcessorAvgIdlePercent + RequestHandlerAvgIdlePercent</td><td>都 &gt; 0.5</td><td>都 &lt; 0.2</td><td>整体过载,扩容</td></tr>
+    <tr><td>BrokerTopicMetrics.BytesInPerSec / OutPerSec</td><td>稳定</td><td>突降</td><td>看上面 4 个指标定位</td></tr>
+    <tr><td>connection-creation-rate</td><td>稳定</td><td>突升</td><td>客户端连接风暴</td></tr>
+    <tr><td>connection-close-rate</td><td>≈ creation-rate</td><td>远低于</td><td>连接泄露</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s15-10">15.10 设计取舍</h2>
+<!-- ============================================================ -->
+
+<div class="compare-grid">
+  <div>
+    <h4>① 主从 Reactor vs 单 Reactor</h4>
+    <p>单 Reactor 一个线程做 accept + 读写,简单但 SSL 重时会卡 accept。Kafka 把 Acceptor 单独拆出,即使所有 Processor 都在做 SSL 握手,新连接的 accept 仍能完成,后端排队最多丢握手不丢 accept。</p>
+  </div>
+  <div>
+    <h4>② Processor 持有 Selector</h4>
+    <p>每个 Processor 自带 Selector,channel 一旦注册到某 Selector,所有读写都必须在该线程做。代价是响应必须按 ID 路由回原 Processor,收益是无锁。</p>
+  </div>
+  <div>
+    <h4>③ 共享 requestQueue vs per-Processor queue</h4>
+    <p>requestQueue 共享有<em>动态负载均衡</em>效果 — Handler 谁有空谁取。代价是 ArrayBlockingQueue 是有锁的。Kafka 没用 Disruptor,因为 broker 是 IO bound 不是 CPU bound。</p>
+  </div>
+  <div>
+    <h4>④ mute / unmute per-connection</h4>
+    <p>同一连接同时只允许一个 in-flight 请求,简化了响应路由(响应一到就 unmute)和顺序语义(同连接的请求按序处理)。代价是单连接的吞吐受 RTT 限制,需要客户端建多连接才能并行。</p>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s15-11">15.11 陷阱与限制</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>#</th><th>陷阱</th><th>现象</th><th>修复</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>SSL 重时 Processor 不够</td><td>新连接超时 + 已建连接 stall</td><td>↑ num.network.threads / 拆 listener / LB 卸载 TLS</td></tr>
+    <tr><td>2</td><td>盲调 num.io.threads</td><td>调了也不见效</td><td>先看 RequestQueueSize 是否真满</td></tr>
+    <tr><td>3</td><td>socket buffer 太小</td><td>跨 DC 吞吐被 BDP 限制</td><td>↑ socket.send/receive.buffer.bytes 到 1MiB</td></tr>
+    <tr><td>4</td><td>客户端不复用连接</td><td>connection-creation-rate 飙</td><td>客户端 SDK 检查</td></tr>
+    <tr><td>5</td><td>queued.max.requests 太小</td><td>requestQueue 满拒新</td><td>↑ 到 1000-2000</td></tr>
+    <tr><td>6</td><td>大请求(超过 socket.request.max.bytes)</td><td>broker 拒绝</td><td>↑ 该上限 或 客户端拆分</td></tr>
+    <tr><td>7</td><td>connections.max.idle.ms 太短</td><td>长尾连接被回收,客户端重连风暴</td><td>调大或客户端开 keepalive</td></tr>
+  </tbody>
+</table>
+
+<!-- ============================================================ -->
+<h2 id="s15-summary">15.12 本章要点</h2>
+<!-- ============================================================ -->
+
+<table>
+  <thead><tr><th>要点</th><th>依据</th><th>易错</th></tr></thead>
+  <tbody>
+    <tr><td>三段线程职责</td><td>Acceptor / Processor / Handler</td><td>盲调 num.io.threads</td></tr>
+    <tr><td>响应必须回到原 Processor</td><td>Selector 注册</td><td>误以为响应可走任意 Processor</td></tr>
+    <tr><td>RequestChannel 一共享一独立</td><td>queueSize</td><td>修改 queue 类型</td></tr>
+    <tr><td>mute/unmute per-connection</td><td>processCompletedReceives</td><td>误以为可并发</td></tr>
+    <tr><td>SSL 握手在 Processor</td><td>SslTransportLayer</td><td>不知道为什么 Processor idle 低</td></tr>
+    <tr><td>请求时间六段</td><td>TotalTime 拆分</td><td>只看 TotalTime</td></tr>
+    <tr><td>多 listener 资源隔离</td><td>listeners 配置</td><td>所有流量挤一个 listener</td></tr>
+  </tbody>
+</table>
+
+<div class="chapter-summary">
+  <h3>本章小结</h3>
+  <p>Kafka 的网络层是一个教科书级的<strong>主从 Reactor</strong>实现:Acceptor 接连接,Processor 跑 Selector 做 TLS 和帧读写,RequestChannel 跨线程交付,Handler 调 KafkaApis。整条流水线的关键设计是"<em>响应必须回到原 Processor</em>"(因为 Selector 是 thread-confined)和"<em>per-connection mute/unmute</em>"(保证单连接请求顺序)。</p>
+  <p>定位生产延迟的最佳起点是<strong>请求时间六段拆分</strong>(Queue/Local/Remote/Throttle/ResponseQueue/ResponseSend)— 知道哪一段长了,才能针对性调参或修 bug。最常见的两个生产惨案是"<em>SSL 握手把 Processor 吃光</em>"和"<em>盲调 num.io.threads</em>"。下一章我们看 Kafka 3.6 之后的重磅特性:<strong>Tiered Storage 分层存储</strong>,即把冷数据自动卸载到 S3 / HDFS 等远端对象存储。</p>
+</div>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script>hljs.highlightAll();</script>
+
+</body>
+</html>

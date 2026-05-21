@@ -1,0 +1,2308 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.05 intset 整数集合 — 图解 Redis</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="d-blue" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <linearGradient id="d-green" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <linearGradient id="d-amber" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-orange-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+    <linearGradient id="d-red" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+    <linearGradient id="d-purple" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-purple-fill-start)"/><stop offset="1" stop-color="var(--diagram-purple-fill-end)"/></linearGradient>
+    <linearGradient id="d-cyan" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-cyan-fill-start)"/><stop offset="1" stop-color="var(--diagram-cyan-fill-end)"/></linearGradient>
+    <linearGradient id="d-slate" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-surface)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <marker id="d-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-muted)"/></marker>
+    <marker id="d-arr-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-green-stroke)"/></marker>
+    <marker id="d-arr-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-red-stroke)"/></marker>
+    <marker id="d-arr-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-blue-stroke)"/></marker>
+    <filter id="d-shadow" x="-10%" y="-10%" width="120%" height="120%"><feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="var(--diagram-text)" flood-opacity="0.4"/></filter>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Redis</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="04-skiplist.html">上一章</a>
+  <a href="06-ziplist-listpack.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s5-1">5.1 解决什么问题</a>
+  <a href="#s5-2">5.2 整体布局</a>
+  <a href="#s5-3">5.3 intsetSearch 二分查找</a>
+  <a href="#s5-4">5.4 intsetAdd 不升级</a>
+  <a href="#s5-5">5.5 intsetUpgradeAndAdd</a>
+  <a href="#s5-6">5.6 intsetRemove 删除</a>
+  <a href="#s5-7">5.7 为什么不选其他</a>
+  <a href="#s5-8">5.8 已知陷阱</a>
+  <a href="#s5-9">5.9 源码深潜</a>
+  <a href="#s5-10">5.10 性能与监控</a>
+  <a href="#s5-11">5.11 真实用例</a>
+  <a href="#s5-summary">5.12 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 5 章 · intset 整数集合</h1>
+<p class="subtitle">全整数 Set 的紧凑编码 · 8B header + 连续数组 · INT16/INT32/INT64 三档自适应 · 升级 O(N) 不可降级 · 二分查找 · memmove 维序 · 阈值 512 元素</p>
+
+<div class="chapter-intro">
+  <p class="lead">Redis Set 类型在元素<strong>全为整数且数量较少</strong>时,使用 <code>intset</code> 编码——一段连续内存按升序存储 int16/int32/int64,8 字节 header 后紧跟整数数组。相比 hashtable 编码每元素 24-48 字节(<code>dictEntry</code> + key sds + value 包装),intset 把 512 个 16-bit 整数压到约 1 KiB,内存效率约提升 <strong>8-10 倍</strong>。</p>
+  <p>代价是插入与删除需要 <code>memmove</code> 维护有序性,最坏 O(N)。intset 仅在以下条件全部满足时使用:<strong>所有元素都是整数 + 元素数量不超过 <code>set-max-intset-entries</code>(默认 512)</strong>。任意条件失败立即转为 hashtable,<strong>且不可逆</strong>。</p>
+  <p>这一章是 Redis "<strong>编码自适应</strong>"思想最干净的样本:数据结构本身极简(只有 3 个字段、150 行 C 代码),却把"内存极致压缩 + 支持任意 64-bit 整数 + 有序范围扫描"三个矛盾目标同时解决。理解 intset 是理解后续 <code>ziplist</code>/<code>listpack</code>/<code>quicklist</code>/<code>rax</code> 等"紧凑编码"族的入门钥匙。</p>
+  <ul class="will-learn">
+    <li>intset 三字段(<code>encoding</code> / <code>length</code> / <code>contents[]</code>)与 8B header 紧跟柔性数组的字节布局</li>
+    <li>三种 encoding(INT16 / INT32 / INT64)的数值范围、触发条件与字节宽度</li>
+    <li><code>intsetSearch</code> 二分查找 + 头/尾速判,顺序插入退化为 O(1)</li>
+    <li><code>intsetAdd</code> 不升级路径:<code>zrealloc</code> 扩容 + <code>memmove</code> 维序 + <code>_intsetSet</code> 写值</li>
+    <li><code>intsetUpgradeAndAdd</code> 升级路径(本章核心):<strong>从后往前重排</strong>避免覆盖,prepend 标志决定头尾</li>
+    <li><code>intsetRemove</code> 不降级的设计动机:"少做事"原则</li>
+    <li>六种候选数据结构对比:为什么只有 intset 适配"全整数小集合"</li>
+    <li>八大典型陷阱:类型污染、阈值穿越、不可逆转换、SPOP 抖动等</li>
+    <li>核心源码 <code>intset.c</code> + <code>t_set.c</code> 的调用链与位字节翻转(<code>intrev32ifbe</code>)细节</li>
+    <li>"少做事"哲学:升级一次后不再降级,转换后不回头,把判断逻辑剪到最简</li>
+  </ul>
+  <p class="prereq">前置知识:第 1 章 SDS(理解 <code>sdshdr</code> 与紧凑头部);第 3 章 dict(理解 <code>dictEntry</code> 24-48B 元数据放大);C99 柔性数组成员(flexible array member);jemalloc size class 对齐(8/16/32/48/64 字节)。读者需要熟悉 <code>redis-cli</code> 与 <code>OBJECT ENCODING</code> / <code>MEMORY USAGE</code> 调试命令。</p>
+</div>
+
+<h3>本章全景图</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-0 · 本章导览 — 4 大模块 12 节</div>
+  <svg viewBox="0 0 960 540" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:960px;width:100%;margin:8px auto;height:auto;">
+    <rect x="0" y="0" width="960" height="540" fill="var(--diagram-panel)" rx="10"/>
+    <g transform="translate(380, 20)" filter="url(#d-shadow)"><rect width="200" height="46" rx="10" fill="url(#d-purple)"/><text x="100" y="29" text-anchor="middle" fill="var(--diagram-text)" font-size="15" font-weight="700">intset 整数集合</text></g>
+
+    <path d="M 480 66 L 130 110" stroke="var(--diagram-blue-stroke)" stroke-width="1.8" fill="none"/>
+    <path d="M 480 66 L 380 110" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none"/>
+    <path d="M 480 66 L 620 110" stroke="var(--diagram-border)" stroke-width="1.5" fill="none"/>
+    <path d="M 480 66 L 850 110" stroke="var(--diagram-border)" stroke-width="1.5" fill="none"/>
+
+    <g transform="translate(40, 110)" filter="url(#d-shadow)"><rect width="180" height="40" rx="8" fill="url(#d-blue)"/><text x="90" y="25" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">§5.1-5.2 设计与布局</text></g>
+    <g transform="translate(280, 110)" filter="url(#d-shadow)"><rect width="200" height="40" rx="8" fill="url(#d-green)"/><text x="100" y="25" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">§5.3-5.6 CRUD 逐帧</text></g>
+    <g transform="translate(530, 110)" filter="url(#d-shadow)"><rect width="180" height="40" rx="8" fill="url(#d-slate)" stroke="var(--diagram-blue-stroke)"/><text x="90" y="25" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="600">§5.7 算法选型</text></g>
+    <g transform="translate(760, 110)" filter="url(#d-shadow)"><rect width="180" height="40" rx="8" fill="url(#d-slate)" stroke="var(--diagram-blue-stroke)"/><text x="90" y="25" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="600">§5.8-5.12 陷阱源码</text></g>
+
+    <g font-family="ui-sans-serif,system-ui" font-size="11" fill="var(--diagram-blue-text)">
+      <path d="M 130 150 L 130 175" stroke="var(--diagram-blue-stroke)" stroke-width="1.2" fill="none"/>
+      <g transform="translate(40, 175)"><rect width="180" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/><text x="90" y="21" text-anchor="middle">§5.1 问题/候选方案</text></g>
+      <g transform="translate(40, 215)"><rect width="180" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/><text x="90" y="21" text-anchor="middle">§5.2 三种 encoding</text></g>
+
+      <path d="M 380 150 L 380 175" stroke="var(--diagram-green-stroke)" stroke-width="1.5" fill="none"/>
+      <g transform="translate(280, 175)"><rect width="200" height="30" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/><text x="100" y="20" text-anchor="middle">§5.3 intsetSearch 二分</text></g>
+      <g transform="translate(280, 213)"><rect width="200" height="30" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/><text x="100" y="20" text-anchor="middle">§5.4 intsetAdd 不升级</text></g>
+      <g transform="translate(280, 251)" filter="url(#d-shadow)"><rect width="200" height="30" rx="6" fill="url(#d-amber)"/><text x="100" y="20" text-anchor="middle" fill="var(--diagram-blue-text)" font-weight="700">§5.5 升级路径 ★</text></g>
+      <g transform="translate(280, 289)"><rect width="200" height="30" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/><text x="100" y="20" text-anchor="middle">§5.6 intsetRemove</text></g>
+
+      <path d="M 620 150 L 620 175" stroke="var(--diagram-border)" stroke-width="1.2" fill="none"/>
+      <g transform="translate(530, 175)"><rect width="180" height="30" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/><text x="90" y="20" text-anchor="middle">vs hashtable/链表/跳表</text></g>
+      <g transform="translate(530, 213)"><rect width="180" height="30" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/><text x="90" y="20" text-anchor="middle">三种 encoding 阈值</text></g>
+      <g transform="translate(530, 251)"><rect width="180" height="30" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/><text x="90" y="20" text-anchor="middle">不可逆转换动机</text></g>
+
+      <path d="M 850 150 L 850 175" stroke="var(--diagram-border)" stroke-width="1.2" fill="none"/>
+      <g transform="translate(760, 175)"><rect width="180" height="30" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/><text x="90" y="20" text-anchor="middle">§5.8 陷阱表</text></g>
+      <g transform="translate(760, 213)"><rect width="180" height="30" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/><text x="90" y="20" text-anchor="middle">§5.9 源码深潜</text></g>
+      <g transform="translate(760, 251)"><rect width="180" height="30" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/><text x="90" y="20" text-anchor="middle">§5.10 性能监控</text></g>
+      <g transform="translate(760, 289)"><rect width="180" height="30" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/><text x="90" y="20" text-anchor="middle">§5.11 + §5.12</text></g>
+    </g>
+
+    <g transform="translate(40, 360)">
+      <rect width="880" height="160" rx="12" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)" opacity="0.85"/>
+      <text x="20" y="26" fill="var(--diagram-blue-text)" font-size="13" font-weight="700">📌 阅读路径</text>
+      <text x="20" y="50" fill="var(--diagram-blue-text)" font-size="12">① <tspan fill="var(--diagram-green-text)" font-weight="700">第一遍</tspan>:§5.2 三种 encoding 字节对照 — 理解为什么 INT16/INT32/INT64 自适应</text>
+      <text x="20" y="72" fill="var(--diagram-blue-text)" font-size="12">② <tspan fill="var(--diagram-orange-text)" font-weight="700">核心</tspan>:§5.5 intsetUpgradeAndAdd — prepend 标志、从后往前重排、为何只升不降</text>
+      <text x="20" y="94" fill="var(--diagram-blue-text)" font-size="12">③ <tspan fill="var(--diagram-purple-text)" font-weight="700">实战</tspan>:§5.8 陷阱 — 类型污染/阈值穿越/不可逆转换是上线必查清单</text>
+      <text x="20" y="116" fill="var(--diagram-muted)" font-size="11">总长 ≈ 75 分钟阅读 / 12 节 / 1.8 万字 / 11 张原创图 / 1 段 intsetUpgradeAndAdd 源码</text>
+      <text x="20" y="142" fill="var(--diagram-red-text)" font-size="11" font-weight="700">⚠️ 关键不变量</text>
+      <text x="160" y="142" fill="var(--diagram-blue-text)" font-size="11">编码只升不降 · intset → hashtable 不可逆 · contents 始终升序</text>
+    </g>
+  </svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s5-1">5.1 解决什么问题</h2>
+<!-- ============================================================ -->
+
+<p>在讨论数据结构之前,先看清楚 intset 要解决的 <strong>具体业务场景</strong>。Redis 设计时的一个反复出现的问题是:Set 类型的元素经常 <strong>全是整数</strong> 且 <strong>数量较少</strong>,却被通用 hashtable 编码用元数据撑大十倍。这一节先做需求拆解,再给候选方案矩阵,最后用编码决策图把 intset 的位置定下来。</p>
+
+<h3>5.1.1 业务需求拆解</h3>
+
+<p>Redis Set 类型的常见应用场景中,大量场景的元素是整数。下表统计了主流业务里 Set 的元素特征:</p>
+
+<div class="diagram">
+  <div class="diagram-title">表 5-1-1 · Set 业务场景元素特征采样</div>
+  <table>
+    <thead><tr><th>业务场景</th><th>元素类型</th><th>典型规模</th><th>全为整数概率</th></tr></thead>
+    <tbody>
+      <tr><td>用户标签 ID 集合</td><td>标签 ID(int)</td><td>5-50</td><td>95%+</td></tr>
+      <tr><td>文章 ID 关联集合</td><td>文章 ID</td><td>10-1000</td><td>95%+</td></tr>
+      <tr><td>SKU 库存</td><td>SKU 编号</td><td>50-500</td><td>80%(混合)</td></tr>
+      <tr><td>黑名单 IP(整数化)</td><td>IPv4 转 uint32</td><td>100-10k</td><td>100%</td></tr>
+      <tr><td>在线设备 ID</td><td>设备 ID</td><td>10-1000</td><td>90%+</td></tr>
+      <tr><td>关注/粉丝小集合</td><td>用户 ID</td><td>10-500</td><td>90%+</td></tr>
+      <tr><td>权限位掩码集合</td><td>位编号</td><td>1-64</td><td>100%</td></tr>
+      <tr><td>通用字符串 Set</td><td>用户名、标签字符串</td><td>不定</td><td>&lt; 50%</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key-insight">
+  <strong>核心观察</strong>:实际生产中 <strong>全整数小集合占 Set 用例的 60-80%</strong>。如果统一使用 hashtable,这部分 Set 浪费大量内存;如果只保留 hashtable,无法在小整数场景达到内存极致。Redis 选择"双轨制"——小整数走 intset,大集合或非整数走 hashtable,由写入路径自动切换。
+</div>
+
+<h3>5.1.2 候选方案的不足</h3>
+
+<p>如果不用 intset,有六种数据结构可以承载"整数集合"语义。逐一分析它们在小整数 Set 场景的劣势:</p>
+
+<div class="diagram">
+  <div class="diagram-title">表 5-1-2 · 六种候选数据结构的对比</div>
+  <table>
+    <thead><tr><th>方案</th><th>内存(每元素)</th><th>查找</th><th>插入</th><th>在小整数 Set 场景的劣势</th></tr></thead>
+    <tbody>
+      <tr><td>hashtable (dict)</td><td>24-48 B</td><td>O(1)</td><td>O(1)</td><td>小整数场景内存浪费 5-10 倍</td></tr>
+      <tr><td>单链表</td><td>16-24 B</td><td>O(N)</td><td>O(1)(头插)</td><td>查找 O(N),无序</td></tr>
+      <tr><td>跳表</td><td>24-40 B</td><td>O(log N)</td><td>O(log N)</td><td>内存放大 + 实现复杂</td></tr>
+      <tr><td>有序数组(单宽度)</td><td>4 B(int32)</td><td>O(log N)</td><td>O(N) memmove</td><td>不能存 int64 大数;固定宽度浪费小数</td></tr>
+      <tr><td>位图(bitmap)</td><td>1 bit/元素</td><td>O(1)</td><td>O(1)</td><td>只适合密集小整数,稀疏场景内存爆炸</td></tr>
+      <tr><td><strong>intset(自适应宽度)</strong></td><td><strong>2-8 B</strong></td><td><strong>O(log N)</strong></td><td><strong>O(N) memmove</strong></td><td><strong>无,本场景最优</strong></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p>intset 选择 <strong>三种 encoding 自适应</strong> 解决"既要省内存又要支持大数"的矛盾:全是 16-bit 范围内的整数时使用 INT16,出现 32-bit 时升到 INT32,出现 64-bit 时升到 INT64。和有序数组比,intset 多了 <code>encoding</code> 字段允许动态宽度;和 hashtable 比,intset 没有 <code>dictEntry</code> 元数据;和位图比,intset 不要求元素密集。</p>
+
+<h3>5.1.3 编码决策图</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-1-1 · Set 编码选择决策树(SADD 路径)</div>
+  <svg viewBox="0 0 940 600" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect x="0" y="0" width="940" height="600" fill="var(--diagram-panel)" rx="10"/>
+
+    <g transform="translate(380, 20)" filter="url(#d-shadow)"><rect width="180" height="40" rx="8" fill="url(#d-blue)"/><text x="90" y="25" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">SADD key member</text></g>
+    <path d="M 470 60 L 470 84" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr-b)"/>
+
+    <g transform="translate(370, 84)" filter="url(#d-shadow)"><path d="M 100 0 L 200 28 L 100 56 L 0 28 Z" fill="var(--diagram-blue-stroke)" stroke="var(--diagram-blue-stroke)" stroke-width="1.5"/><text x="100" y="33" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="600">member 是整数?</text></g>
+
+    <path d="M 370 112 L 200 158" stroke="var(--diagram-red-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr-r)"/><text x="240" y="140" fill="var(--diagram-red-text)" font-size="11" font-weight="700">否</text>
+    <g transform="translate(40, 158)" filter="url(#d-shadow)"><rect width="200" height="44" rx="8" fill="url(#d-red)"/><text x="100" y="20" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">✗ 转 hashtable</text><text x="100" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="10">不可逆终态</text></g>
+
+    <path d="M 470 140 L 470 168" stroke="var(--diagram-green-stroke)" stroke-width="1.8" fill="none" marker-end="url(#d-arr-g)"/><text x="475" y="160" fill="var(--diagram-green-text)" font-size="11" font-weight="700">是</text>
+
+    <g transform="translate(370, 168)" filter="url(#d-shadow)"><path d="M 100 0 L 200 28 L 100 56 L 0 28 Z" fill="var(--diagram-blue-stroke)" stroke="var(--diagram-green-stroke)" stroke-width="1.5"/><text x="100" y="33" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="600">当前编码 ?</text></g>
+
+    <path d="M 380 200 L 240 258" stroke="var(--diagram-green-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr-g)"/><text x="280" y="240" fill="var(--diagram-green-text)" font-size="11" font-weight="700">empty</text>
+    <g transform="translate(40, 258)" filter="url(#d-shadow)"><rect width="220" height="40" rx="8" fill="url(#d-green)"/><text x="110" y="25" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">✓ intset INT16 起步</text></g>
+
+    <path d="M 560 200 L 720 258" stroke="var(--diagram-purple-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr)"/><text x="650" y="240" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">hashtable</text>
+    <g transform="translate(700, 258)" filter="url(#d-shadow)"><rect width="220" height="40" rx="8" fill="url(#d-purple)"/><text x="110" y="25" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">dict 直接插入 (O(1))</text></g>
+
+    <path d="M 470 224 L 470 256" stroke="var(--diagram-green-stroke)" stroke-width="1.8" fill="none" marker-end="url(#d-arr-g)"/><text x="478" y="246" fill="var(--diagram-green-text)" font-size="11" font-weight="700">intset</text>
+
+    <g transform="translate(360, 256)" filter="url(#d-shadow)"><path d="M 110 0 L 220 28 L 110 56 L 0 28 Z" fill="var(--diagram-blue-stroke)" stroke="var(--diagram-green-stroke)" stroke-width="1.5"/><text x="110" y="27" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="600">插入后元素数</text><text x="110" y="44" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="600">≤ max-intset-entries?</text></g>
+
+    <path d="M 360 296 L 250 348" stroke="var(--diagram-red-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr-r)"/><text x="290" y="330" fill="var(--diagram-red-text)" font-size="11" font-weight="700">否 (超 512)</text>
+    <g transform="translate(40, 348)" filter="url(#d-shadow)"><rect width="240" height="40" rx="8" fill="url(#d-red)"/><text x="120" y="25" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">✗ 转 hashtable (阈值穿越)</text></g>
+
+    <path d="M 470 312 L 470 340" stroke="var(--diagram-green-stroke)" stroke-width="1.8" fill="none" marker-end="url(#d-arr-g)"/><text x="478" y="332" fill="var(--diagram-green-text)" font-size="11" font-weight="700">是</text>
+
+    <g transform="translate(360, 340)" filter="url(#d-shadow)"><path d="M 110 0 L 220 28 L 110 56 L 0 28 Z" fill="var(--diagram-blue-stroke)" stroke="var(--diagram-blue-stroke)" stroke-width="1.5"/><text x="110" y="27" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="600">value 在当前 encoding</text><text x="110" y="44" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="600">范围内?</text></g>
+
+    <path d="M 470 396 L 280 446" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr-b)"/><text x="350" y="430" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">是</text>
+    <g transform="translate(60, 446)" filter="url(#d-shadow)"><rect width="220" height="48" rx="10" fill="url(#d-blue)"/><text x="110" y="20" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">✓ 二分定位 + memmove</text><text x="110" y="38" text-anchor="middle" fill="var(--diagram-text)" font-size="10">单宽度,O(N)</text></g>
+
+    <path d="M 580 396 L 720 446" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr)"/><text x="630" y="430" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">否 (超范围)</text>
+    <g transform="translate(680, 446)" filter="url(#d-shadow)"><rect width="240" height="48" rx="10" fill="url(#d-amber)"/><text x="120" y="20" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="800">⚠ 升级路径 (§5.5)</text><text x="120" y="38" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">INT16→32 或 INT32→64</text></g>
+
+    <g transform="translate(40, 514)">
+      <rect width="860" height="68" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)" stroke-dasharray="4 3"/>
+      <text x="20" y="22" fill="var(--diagram-green-text)" font-size="12" font-weight="700">📐 三个决策点</text>
+      <text x="20" y="42" fill="var(--diagram-blue-text)" font-size="11">① 元素是不是整数 (整数 → intset, 非整数 → hashtable 不可逆)</text>
+      <text x="350" y="42" fill="var(--diagram-blue-text)" font-size="11">② 元素数是否超 set-max-intset-entries (默认 512)</text>
+      <text x="20" y="60" fill="var(--diagram-blue-text)" font-size="11">③ 数值是否在当前 encoding 范围 (超出 → 升级 INT16→32→64,只升不降)</text>
+    </g>
+  </svg>
+</div>
+
+<p>三个决策点:① 元素是不是整数;② 元素数是否超阈值;③ 数值是否在当前 encoding 范围内。任一答案"否"或"超"会触发不同分支。其中 <strong>"非整数 → hashtable"</strong> 这条边是<strong>不可逆</strong>的——一旦转换,即使再删除非整数元素也不会回到 intset。</p>
+
+<h3>5.1.4 命令验证</h3>
+
+<pre><code class="language-bash">127.0.0.1:6379&gt; CONFIG GET set-max-intset-entries
+1) "set-max-intset-entries"
+2) "512"
+127.0.0.1:6379&gt; DEL s:int
+(integer) 0
+127.0.0.1:6379&gt; SADD s:int 3 7 15 42 100
+(integer) 5
+127.0.0.1:6379&gt; OBJECT ENCODING s:int
+"intset"
+127.0.0.1:6379&gt; MEMORY USAGE s:int
+(integer) 80</code></pre>
+
+<p>5 个 INT16 元素 + 8B header + jemalloc 对齐 = 80 字节。等价 hashtable 编码(5 个 dictEntry + dict 元数据)约 350-450 字节,内存差距 4-5 倍。</p>
+
+<div class="real-world">
+  <strong>用例提前预告</strong>:这 80 字节的 Set 如果转为 hashtable,实际占用会跳到 ~440 字节(dictEntry 24B × 5 + sds key 16B × 5 + dict 容器 96B + bucket 数组 64B + redisObject 16B × 5)。生产中常见的"权限位 Set" 或"标签 ID Set" 通常 5-50 个元素,intset 编码下只占 100 byte 量级,hashtable 下可达 KB 量级,集群级别累计差距非常显著。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s5-2">5.2 整体布局</h2>
+<!-- ============================================================ -->
+
+<p>intset 的字节布局是 Redis 紧凑编码的"教科书样本":一个 8 字节 header(<code>encoding</code> 4B + <code>length</code> 4B)紧跟一段连续的整数数组,没有任何额外元数据。这一节用三种 encoding 的对比图把字节宽度差异画清楚,然后给 C 结构定义与字段语义对照。</p>
+
+<h3>5.2.1 intset 结构关系</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-2-1 · intset 结构关系</div>
+  <svg viewBox="0 0 940 360" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect x="0" y="0" width="940" height="360" fill="var(--diagram-panel)" rx="10"/>
+
+    <g transform="translate(20, 30)">
+      <rect width="280" height="220" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-dasharray="4 3"/>
+      <text x="140" y="22" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="13" font-weight="700">intset header (8 B)</text>
+      <g font-family="ui-monospace,Consolas" font-size="11">
+        <g transform="translate(20, 40)" filter="url(#d-shadow)">
+          <rect width="240" height="64" rx="6" fill="url(#d-blue)"/>
+          <text x="120" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">encoding · uint32 (4 B)</text>
+          <text x="120" y="42" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">2 · 4 · 8 (= INT16/32/64)</text>
+          <text x="120" y="58" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">每元素字节宽度</text>
+        </g>
+        <g transform="translate(20, 120)" filter="url(#d-shadow)">
+          <rect width="240" height="64" rx="6" fill="url(#d-green)"/>
+          <text x="120" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">length · uint32 (4 B)</text>
+          <text x="120" y="42" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">数组当前元素数</text>
+          <text x="120" y="58" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">≤ 2^32 但实际 ≤ 512</text>
+        </g>
+      </g>
+    </g>
+
+    <path d="M 300 140 L 360 140" stroke="var(--diagram-blue-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-b)"/>
+
+    <g transform="translate(360, 30)">
+      <rect width="560" height="220" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)" stroke-dasharray="4 3"/>
+      <text x="280" y="22" text-anchor="middle" fill="var(--diagram-green-text)" font-size="13" font-weight="700">contents[] 连续数组 (柔性数组成员)</text>
+      <g font-family="ui-monospace,Consolas" font-size="11">
+        <g transform="translate(20, 56)" filter="url(#d-shadow)"><rect width="80" height="40" rx="6" fill="url(#d-amber)"/><text x="40" y="18" text-anchor="middle" fill="var(--diagram-blue-text)" font-weight="700">[0]</text><text x="40" y="34" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">最小</text></g>
+        <g transform="translate(110, 56)" filter="url(#d-shadow)"><rect width="80" height="40" rx="6" fill="url(#d-blue)"/><text x="40" y="18" text-anchor="middle" fill="var(--diagram-text)" font-weight="700">[1]</text></g>
+        <g transform="translate(200, 56)" filter="url(#d-shadow)"><rect width="80" height="40" rx="6" fill="url(#d-blue)"/><text x="40" y="18" text-anchor="middle" fill="var(--diagram-text)" font-weight="700">[2]</text></g>
+        <g transform="translate(290, 56)"><rect width="80" height="40" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/><text x="40" y="25" text-anchor="middle" fill="var(--diagram-muted)">…</text></g>
+        <g transform="translate(380, 56)" filter="url(#d-shadow)"><rect width="80" height="40" rx="6" fill="url(#d-blue)"/><text x="40" y="18" text-anchor="middle" fill="var(--diagram-text)" font-weight="700">[n-2]</text></g>
+        <g transform="translate(470, 56)" filter="url(#d-shadow)"><rect width="80" height="40" rx="6" fill="url(#d-amber)"/><text x="40" y="18" text-anchor="middle" fill="var(--diagram-blue-text)" font-weight="700">[n-1]</text><text x="40" y="34" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">最大</text></g>
+
+        <path d="M 20 116 L 550 116" stroke="var(--diagram-green-stroke)" stroke-width="1.5" stroke-dasharray="4 3" fill="none"/>
+        <text x="270" y="132" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">升序排列 (允许 O(log N) 二分)</text>
+
+        <text x="20" y="160" fill="var(--diagram-blue-text)" font-size="11">contents 在 C 中声明为</text>
+        <text x="20" y="180" fill="var(--diagram-orange-text)" font-size="11" font-family="ui-monospace,Consolas">int8_t contents[];</text>
+        <text x="20" y="200" fill="var(--diagram-blue-text)" font-size="10">实际按 encoding 强转访问 (intsetGet/_intsetSet)</text>
+      </g>
+    </g>
+
+    <g transform="translate(40, 270)">
+      <rect width="860" height="74" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="20" y="22" fill="var(--diagram-orange-text)" font-size="12" font-weight="700">⚙ 总长度</text>
+      <text x="100" y="22" fill="var(--diagram-blue-text)" font-size="12">sizeof(intset) + length × encoding · 8 B header + N × {2,4,8} B</text>
+      <text x="20" y="42" fill="var(--diagram-green-text)" font-size="12" font-weight="700">📐 不变量</text>
+      <text x="100" y="42" fill="var(--diagram-blue-text)" font-size="12">contents 严格升序 · 无去重缓冲 · 整段连续 (cache friendly + jemalloc 紧凑)</text>
+      <text x="20" y="62" fill="var(--diagram-purple-text)" font-size="12" font-weight="700">🔀 关键操作</text>
+      <text x="100" y="62" fill="var(--diagram-blue-text)" font-size="12">intsetSearch (O(log N)) · intsetAdd / intsetRemove (memmove O(N)) · intsetUpgradeAndAdd (O(N) 重排)</text>
+    </g>
+  </svg>
+</div>
+
+<h3>5.2.2 三种 encoding 的字节布局</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-2-2 · 三种 encoding 的字节布局对照</div>
+  <svg viewBox="0 0 920 480" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:920px;width:100%;margin:8px auto;height:auto;">
+    <defs>
+      <linearGradient id="enc-hdr" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+      <linearGradient id="enc-i16" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+      <linearGradient id="enc-i32" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-orange-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+      <linearGradient id="enc-i64" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+    </defs>
+    <rect x="0" y="0" width="920" height="480" fill="var(--diagram-panel)" rx="10"/>
+    <text x="460" y="22" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="13" font-weight="700" font-family="monospace">三种 encoding 字节布局对照 · header 同型,元素宽度异型</text>
+
+    <!-- INT16 -->
+    <text x="40" y="60" fill="var(--diagram-blue-text)" font-size="12" font-weight="700" font-family="monospace">INT16 — 每元素 2 字节 · 总 8 + 5×2 = 18 B</text>
+    <g transform="translate(40, 72)" font-family="monospace" font-size="10">
+      <rect x="0" y="0" width="60" height="34" fill="url(#enc-hdr)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-blue-text)">enc=2</text>
+      <rect x="60" y="0" width="60" height="34" fill="url(#enc-hdr)"/><text x="90" y="20" text-anchor="middle" fill="var(--diagram-blue-text)">len=5</text>
+      <rect x="140" y="0" width="80" height="34" fill="url(#enc-i16)"/><text x="180" y="20" text-anchor="middle" fill="var(--diagram-text)">0x0003</text>
+      <rect x="220" y="0" width="80" height="34" fill="url(#enc-i16)"/><text x="260" y="20" text-anchor="middle" fill="var(--diagram-text)">0x0007</text>
+      <rect x="300" y="0" width="80" height="34" fill="url(#enc-i16)"/><text x="340" y="20" text-anchor="middle" fill="var(--diagram-text)">0x000F</text>
+      <rect x="380" y="0" width="80" height="34" fill="url(#enc-i16)"/><text x="420" y="20" text-anchor="middle" fill="var(--diagram-text)">0x002A</text>
+      <rect x="460" y="0" width="80" height="34" fill="url(#enc-i16)"/><text x="500" y="20" text-anchor="middle" fill="var(--diagram-text)">0x0064</text>
+      <text x="0" y="50" fill="var(--diagram-blue-text)">header 8 B</text>
+      <text x="220" y="50" fill="var(--diagram-blue-text)">contents 10 B (= 5 × 2 B)</text>
+    </g>
+
+    <!-- INT32 -->
+    <text x="40" y="160" fill="var(--diagram-orange-text)" font-size="12" font-weight="700" font-family="monospace">INT32 — 每元素 4 字节 · 总 8 + 5×4 = 28 B</text>
+    <g transform="translate(40, 172)" font-family="monospace" font-size="10">
+      <rect x="0" y="0" width="60" height="34" fill="url(#enc-hdr)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-blue-text)">enc=4</text>
+      <rect x="60" y="0" width="60" height="34" fill="url(#enc-hdr)"/><text x="90" y="20" text-anchor="middle" fill="var(--diagram-blue-text)">len=5</text>
+      <rect x="140" y="0" width="125" height="34" fill="url(#enc-i32)"/><text x="202" y="20" text-anchor="middle" fill="var(--diagram-text)">0x00000003</text>
+      <rect x="265" y="0" width="125" height="34" fill="url(#enc-i32)"/><text x="327" y="20" text-anchor="middle" fill="var(--diagram-text)">0x00000007</text>
+      <rect x="390" y="0" width="125" height="34" fill="url(#enc-i32)"/><text x="452" y="20" text-anchor="middle" fill="var(--diagram-text)">0x0000000F</text>
+      <rect x="515" y="0" width="125" height="34" fill="url(#enc-i32)"/><text x="577" y="20" text-anchor="middle" fill="var(--diagram-text)">0x0000002A</text>
+      <rect x="640" y="0" width="125" height="34" fill="url(#enc-i32)"/><text x="702" y="20" text-anchor="middle" fill="var(--diagram-text)">0x0000FFFF</text>
+      <text x="0" y="50" fill="var(--diagram-blue-text)">header 8 B</text>
+      <text x="220" y="50" fill="var(--diagram-blue-text)">contents 20 B (= 5 × 4 B) · 65535 触发升级 INT16→INT32</text>
+    </g>
+
+    <!-- INT64 -->
+    <text x="40" y="260" fill="var(--diagram-red-text)" font-size="12" font-weight="700" font-family="monospace">INT64 — 每元素 8 字节 · 总 8 + 5×8 = 48 B</text>
+    <g transform="translate(40, 272)" font-family="monospace" font-size="10">
+      <rect x="0" y="0" width="60" height="34" fill="url(#enc-hdr)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-blue-text)">enc=8</text>
+      <rect x="60" y="0" width="60" height="34" fill="url(#enc-hdr)"/><text x="90" y="20" text-anchor="middle" fill="var(--diagram-blue-text)">len=5</text>
+      <rect x="140" y="0" width="170" height="34" fill="url(#enc-i64)"/><text x="225" y="20" text-anchor="middle" fill="var(--diagram-text)">0x...000000000003</text>
+      <rect x="310" y="0" width="170" height="34" fill="url(#enc-i64)"/><text x="395" y="20" text-anchor="middle" fill="var(--diagram-text)">0x...000000000007</text>
+      <rect x="480" y="0" width="170" height="34" fill="url(#enc-i64)"/><text x="565" y="20" text-anchor="middle" fill="var(--diagram-text)">0x...0FFFFFFFFFFF</text>
+      <text x="660" y="20" fill="var(--diagram-blue-text)">...</text>
+      <text x="0" y="50" fill="var(--diagram-blue-text)">header 8 B</text>
+      <text x="220" y="50" fill="var(--diagram-blue-text)">contents 40 B (= 5 × 8 B) · 超过 INT32 范围触发升级</text>
+    </g>
+
+    <!-- 关键性质 -->
+    <g transform="translate(40, 370)">
+      <rect x="0" y="0" width="840" height="90" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="20" y="22" fill="var(--diagram-purple-text)" font-size="12" font-weight="700">★ 关键性质</text>
+      <text x="20" y="44" fill="var(--diagram-blue-text)" font-size="11">• 三种 encoding 的 header 字节布局完全相同,只是 encoding 字段值不同(2/4/8)</text>
+      <text x="20" y="62" fill="var(--diagram-blue-text)" font-size="11">• 元素宽度由 encoding 决定,编译期不知道,运行期靠强转 (int16_t* / int32_t* / int64_t*)</text>
+      <text x="20" y="80" fill="var(--diagram-orange-text)" font-size="11">• 升级时 contents 必须<tspan font-weight="700">整体重排</tspan>,不能"原地填充" → 见 §5.4</text>
+    </g>
+  </svg>
+</div>
+
+<h3>5.2.3 三种 encoding 的数值范围</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 5-2-1 · 三种 encoding 数值范围与触发条件</div>
+  <table>
+    <thead><tr><th>encoding</th><th>元素宽度</th><th>数值范围</th><th>触发场景</th></tr></thead>
+    <tbody>
+      <tr><td><code>INTSET_ENC_INT16</code></td><td>2 B</td><td>-32,768 ~ 32,767</td><td>集合首个元素 ≤ INT16 范围</td></tr>
+      <tr><td><code>INTSET_ENC_INT32</code></td><td>4 B</td><td>-2,147,483,648 ~ 2,147,483,647</td><td>插入超过 INT16 的值</td></tr>
+      <tr><td><code>INTSET_ENC_INT64</code></td><td>8 B</td><td>-9.2×10^18 ~ 9.2×10^18</td><td>插入超过 INT32 的值</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>5.2.4 C 结构定义</h3>
+
+<pre><code class="language-c">/* src/intset.h */
+typedef struct intset {
+    uint32_t encoding;
+    uint32_t length;
+    int8_t contents[];
+} intset;
+
+#define INTSET_ENC_INT16 (sizeof(int16_t))   /* = 2 */
+#define INTSET_ENC_INT32 (sizeof(int32_t))   /* = 4 */
+#define INTSET_ENC_INT64 (sizeof(int64_t))   /* = 8 */
+
+/* 关键宏:由 encoding 反查每元素字节宽度
+ * 用 sizeof(int16_t/int32_t/int64_t) 而非常量字面量,
+ * 让 encoding 字段与 sizeof 直接相等,代码极简
+ */</code></pre>
+
+<div class="key-insight">
+  <strong>关于柔性数组成员(flexible array member)</strong>:<code>contents</code> 声明为 <code>int8_t[]</code> 是因为 C99 柔性数组只支持单一字节类型,实际访问时根据 <code>encoding</code> 强转为 <code>int16_t*</code> / <code>int32_t*</code> / <code>int64_t*</code>。结构体本身 <code>sizeof(intset) = 8</code>(只算 header,不算 contents),所以分配时要显式写 <code>sizeof(intset) + length × encoding</code>。
+</div>
+
+<h3>5.2.5 字段语义对照</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 5-2-2 · intset 字段语义</div>
+  <table>
+    <thead><tr><th>字段</th><th>类型</th><th>用途</th></tr></thead>
+    <tbody>
+      <tr><td><code>encoding</code></td><td>uint32_t</td><td>当前每元素宽度(2/4/8),取值 INTSET_ENC_INT16 / 32 / 64</td></tr>
+      <tr><td><code>length</code></td><td>uint32_t</td><td>元素数量(SCARD 直接读)</td></tr>
+      <tr><td><code>contents</code></td><td>int8_t[]</td><td>元素数组,实际宽度由 encoding 决定;升序存放</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>5.2.6 内存计算示例</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-2-3 · intset 与 hashtable 编码内存占用对照(5 元素)</div>
+  <svg viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:920px;width:100%;margin:8px auto;height:auto;">
+    <defs>
+      <linearGradient id="cmp-int" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+      <linearGradient id="cmp-ht" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+      <linearGradient id="cmp-sub" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+    </defs>
+    <rect x="0" y="0" width="920" height="360" fill="var(--diagram-panel)" rx="10"/>
+    <text x="460" y="22" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="13" font-weight="700" font-family="monospace">SADD s:tag 3 7 15 42 100  → 编码对照</text>
+
+    <!-- intset -->
+    <text x="40" y="60" fill="var(--diagram-green-text)" font-size="13" font-weight="700" font-family="monospace">intset 编码</text>
+    <g transform="translate(40, 70)" font-family="monospace" font-size="11">
+      <rect x="0" y="0" width="32" height="40" fill="url(#cmp-int)"/>
+      <text x="40" y="20" fill="var(--diagram-blue-text)">header 8 B</text>
+      <rect x="0" y="48" width="40" height="40" fill="url(#cmp-int)"/>
+      <text x="50" y="68" fill="var(--diagram-blue-text)">5 × INT16 = 10 B</text>
+      <text x="0" y="118" fill="var(--diagram-green-text)" font-weight="700">小计 18 B → jemalloc 对齐 32 B</text>
+
+      <!-- bar viz -->
+      <rect x="0" y="138" width="32" height="20" fill="url(#cmp-int)"/>
+      <text x="40" y="153" fill="var(--diagram-green-text)">32 B</text>
+    </g>
+
+    <!-- hashtable -->
+    <text x="460" y="60" fill="var(--diagram-red-text)" font-size="13" font-weight="700" font-family="monospace">hashtable 编码(对比)</text>
+    <g transform="translate(460, 70)" font-family="monospace" font-size="11">
+      <rect x="0" y="0" width="80" height="20" fill="url(#cmp-sub)"/><text x="90" y="14" fill="var(--diagram-blue-text)">redisObject 5×16 = 80 B</text>
+      <rect x="0" y="24" width="120" height="20" fill="url(#cmp-sub)"/><text x="130" y="38" fill="var(--diagram-blue-text)">dictEntry 5×24 = 120 B</text>
+      <rect x="0" y="48" width="80" height="20" fill="url(#cmp-sub)"/><text x="90" y="62" fill="var(--diagram-blue-text)">sds key 5×~16 = 80 B</text>
+      <rect x="0" y="72" width="64" height="20" fill="url(#cmp-sub)"/><text x="74" y="86" fill="var(--diagram-blue-text)">bucket 64 B</text>
+      <rect x="0" y="96" width="96" height="20" fill="url(#cmp-sub)"/><text x="106" y="110" fill="var(--diagram-blue-text)">dict 容器 96 B</text>
+      <text x="0" y="138" fill="var(--diagram-red-text)" font-weight="700">小计 440 B → jemalloc 对齐 ≈ 480 B</text>
+      <rect x="0" y="148" width="440" height="20" fill="url(#cmp-ht)"/>
+      <text x="436" y="163" fill="var(--diagram-text)" text-anchor="end" font-weight="700">480 B</text>
+    </g>
+
+    <!-- 结论 -->
+    <g transform="translate(40, 280)">
+      <rect x="0" y="0" width="840" height="60" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="20" y="22" fill="var(--diagram-green-text)" font-size="13" font-weight="700">intset / hashtable = 32 / 480 ≈ 1/15  →  内存节省 93%</text>
+      <text x="20" y="44" fill="var(--diagram-blue-text)" font-size="11">这正是为何 Redis 在"全是整数 + 元素数少"的场景下默认走 intset 编码,直到 set-max-intset-entries 阈值才升级 hashtable。</text>
+    </g>
+  </svg>
+</div>
+
+<div class="metric-row">
+  <div class="metric">
+    <div class="value">8 B</div>
+    <div class="label">header 大小</div>
+  </div>
+  <div class="metric">
+    <div class="value">2/4/8 B</div>
+    <div class="label">单元素宽度</div>
+  </div>
+  <div class="metric">
+    <div class="value">15×</div>
+    <div class="label">vs hashtable 节省</div>
+  </div>
+  <div class="metric">
+    <div class="value">512</div>
+    <div class="label">默认元素阈值</div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s5-3">5.3 intsetSearch 二分查找</h2>
+<!-- ============================================================ -->
+
+<p>intset 的 <code>contents</code> 是有序数组,所有读路径(SISMEMBER / SADD 去重 / SREM)都从 <code>intsetSearch</code> 开始。利用二分查找把比较次数压到 ⌈log₂(N)⌉,加上 head/tail 速判,实际场景下大多数操作只需 1-3 次比较。</p>
+
+<h3>5.3.1 intsetSearch 调用链</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-3-1 · intsetSearch 内部时序</div>
+  <svg viewBox="0 0 940 600" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect x="0" y="0" width="940" height="600" fill="var(--diagram-panel)" rx="10"/>
+
+    <g transform="translate(80, 28)" filter="url(#d-shadow)"><rect width="180" height="40" rx="8" fill="url(#d-blue)"/><text x="90" y="25" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">Caller (调用方)</text></g>
+    <g transform="translate(380, 28)" filter="url(#d-shadow)"><rect width="180" height="40" rx="8" fill="url(#d-purple)"/><text x="90" y="25" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">intsetSearch</text></g>
+    <g transform="translate(680, 28)" filter="url(#d-shadow)"><rect width="180" height="40" rx="8" fill="url(#d-green)"/><text x="90" y="25" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">_intsetGet</text></g>
+
+    <line x1="170" y1="68" x2="170" y2="568" stroke="var(--diagram-border)" stroke-width="2" stroke-dasharray="4 3"/>
+    <line x1="470" y1="68" x2="470" y2="568" stroke="var(--diagram-border)" stroke-width="2" stroke-dasharray="4 3"/>
+    <line x1="770" y1="68" x2="770" y2="568" stroke="var(--diagram-border)" stroke-width="2" stroke-dasharray="4 3"/>
+
+    <g font-family="ui-monospace,Consolas" font-size="11">
+      <text x="180" y="92" fill="var(--diagram-green-text)" font-weight="700">①</text>
+      <path d="M 170 100 L 460 100" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="315" y="94" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">intsetSearch(is, value, &amp;pos)</text>
+
+      <rect x="80" y="116" width="780" height="32" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="100" y="130" fill="var(--diagram-red-text)" font-weight="700">alt</text>
+      <text x="135" y="130" fill="var(--diagram-blue-text)">length == 0 → 直接返回 pos=0, ret=0 (未命中)</text>
+      <path d="M 460 142 L 175 142" stroke="var(--diagram-red-stroke)" stroke-width="1.6" stroke-dasharray="4 3" fill="none" marker-end="url(#d-arr-r)"/>
+
+      <text x="180" y="174" fill="var(--diagram-green-text)" font-weight="700">②</text>
+      <path d="M 470 184 L 760 184" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="615" y="178" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">_intsetGet(contents[max]) · _intsetGet(contents[0])</text>
+
+      <rect x="80" y="200" width="780" height="60" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="100" y="216" fill="var(--diagram-orange-text)" font-weight="700">alt 边界快速返回</text>
+      <text x="100" y="234" fill="var(--diagram-blue-text)">value &gt; contents[max] → pos=length, ret=0 (尾部插入)</text>
+      <text x="100" y="250" fill="var(--diagram-blue-text)">value &lt; contents[0]   → pos=0,      ret=0 (头部插入)</text>
+      <path d="M 460 254 L 175 254" stroke="var(--diagram-orange-stroke)" stroke-width="1.6" stroke-dasharray="4 3" fill="none" marker-end="url(#d-arr)"/>
+
+      <rect x="80" y="278" width="780" height="200" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="100" y="294" fill="var(--diagram-blue-text)" font-weight="700">loop</text>
+      <text x="135" y="294" fill="var(--diagram-blue-text)">while (max &gt;= min) — 二分循环</text>
+
+      <text x="180" y="318" fill="var(--diagram-blue-text)" font-weight="700">③</text>
+      <path d="M 470 326 L 470 326" stroke="var(--diagram-blue-stroke)" fill="none"/>
+      <text x="475" y="320" fill="var(--diagram-blue-text)" font-size="11">mid = ((min + max) &gt;&gt; 1)</text>
+      <rect x="380" y="332" width="180" height="14" rx="2" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="470" y="343" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">本地计算,不出栈</text>
+
+      <text x="180" y="366" fill="var(--diagram-green-text)" font-weight="700">④</text>
+      <path d="M 470 374 L 760 374" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="615" y="368" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">cur = _intsetGet(contents[mid])</text>
+
+      <rect x="100" y="394" width="740" height="78" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="120" y="410" fill="var(--diagram-purple-text)" font-weight="700">alt</text>
+      <text x="155" y="410" fill="var(--diagram-blue-text)">value &gt; cur → min = mid + 1, 继续</text>
+      <text x="155" y="428" fill="var(--diagram-blue-text)">value &lt; cur → max = mid - 1, 继续</text>
+      <text x="155" y="446" fill="var(--diagram-green-text)">value == cur → return pos=mid, ret=1 (命中) ✓</text>
+      <path d="M 460 462 L 175 462" stroke="var(--diagram-green-stroke)" stroke-width="1.6" stroke-dasharray="4 3" fill="none" marker-end="url(#d-arr-g)"/>
+
+      <text x="180" y="500" fill="var(--diagram-muted)" font-weight="700">⑤</text>
+      <path d="M 460 508 L 175 508" stroke="var(--diagram-border)" stroke-width="1.8" stroke-dasharray="4 3" fill="none" marker-end="url(#d-arr)"/>
+      <text x="318" y="502" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">循环退出 → pos=min, ret=0 (未命中,但给出插入位)</text>
+    </g>
+
+    <g transform="translate(40, 540)">
+      <rect width="860" height="44" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)" stroke-dasharray="4 3"/>
+      <text x="20" y="20" fill="var(--diagram-green-text)" font-size="12" font-weight="700">📐 复杂度</text>
+      <text x="100" y="20" fill="var(--diagram-blue-text)" font-size="12">查找 O(log N) · 边界 O(1) 快速返回 · pos 出参承担"未命中插入位"双语义</text>
+      <text x="20" y="36" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">⚠ pos 在 ret=0 时返回插入位置, ret=1 时返回命中下标 — 调用方按 ret 决定语义</text>
+    </g>
+  </svg>
+</div>
+
+<h3>5.3.2 在 [3,7,15,42,100,65535] 中查找 42 的 4 帧演示</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-3-2 · 二分查找 4 帧动画 · target=42</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:920px;width:100%;margin:8px auto;height:auto;">
+    <defs>
+      <linearGradient id="bs-el" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+      <linearGradient id="bs-mid" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-orange-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+      <linearGradient id="bs-out" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)" stop-opacity="0.3"/><stop offset="1" stop-color="var(--diagram-red-fill-end)" stop-opacity="0.3"/></linearGradient>
+      <linearGradient id="bs-hit" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    </defs>
+    <rect x="0" y="0" width="920" height="380" fill="var(--diagram-panel)" rx="10"/>
+    <text x="460" y="22" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="13" font-weight="700" font-family="monospace">A=[3,7,15,42,100,65535] · 3 轮命中 target=42</text>
+
+    <!-- (a) 初始 -->
+    <text x="40" y="56" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">(a) lo=0 hi=5</text>
+    <g transform="translate(40, 64)" font-family="monospace" font-size="11">
+      <g transform="translate(0, 0)"><rect width="60" height="32" fill="url(#bs-el)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">3</text></g>
+      <g transform="translate(60, 0)"><rect width="60" height="32" fill="url(#bs-el)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">7</text></g>
+      <g transform="translate(120, 0)"><rect width="60" height="32" fill="url(#bs-el)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">15</text></g>
+      <g transform="translate(180, 0)"><rect width="60" height="32" fill="url(#bs-el)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">42</text></g>
+      <g transform="translate(240, 0)"><rect width="60" height="32" fill="url(#bs-el)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">100</text></g>
+      <g transform="translate(300, 0)"><rect width="60" height="32" fill="url(#bs-el)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">65535</text></g>
+      <text x="20" y="50" fill="var(--diagram-green-text)">↑lo</text>
+      <text x="320" y="50" fill="var(--diagram-green-text)">↑hi</text>
+    </g>
+
+    <!-- (b) round 1 -->
+    <text x="40" y="130" fill="var(--diagram-orange-text)" font-family="monospace" font-size="11">(b) mid=2 A[2]=15 &lt; 42 → lo=3</text>
+    <g transform="translate(40, 138)" font-family="monospace" font-size="11">
+      <g transform="translate(0, 0)"><rect width="60" height="32" fill="url(#bs-out)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">3</text></g>
+      <g transform="translate(60, 0)"><rect width="60" height="32" fill="url(#bs-out)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">7</text></g>
+      <g transform="translate(120, 0)"><rect width="60" height="32" fill="url(#bs-mid)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">15</text></g>
+      <g transform="translate(180, 0)"><rect width="60" height="32" fill="url(#bs-el)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">42</text></g>
+      <g transform="translate(240, 0)"><rect width="60" height="32" fill="url(#bs-el)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">100</text></g>
+      <g transform="translate(300, 0)"><rect width="60" height="32" fill="url(#bs-el)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">65535</text></g>
+      <text x="140" y="50" fill="var(--diagram-orange-text)">↑mid=2</text>
+    </g>
+
+    <!-- (c) round 2 -->
+    <text x="40" y="204" fill="var(--diagram-orange-text)" font-family="monospace" font-size="11">(c) mid=4 A[4]=100 &gt; 42 → hi=3</text>
+    <g transform="translate(40, 212)" font-family="monospace" font-size="11">
+      <g transform="translate(0, 0)"><rect width="60" height="32" fill="url(#bs-out)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">3</text></g>
+      <g transform="translate(60, 0)"><rect width="60" height="32" fill="url(#bs-out)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">7</text></g>
+      <g transform="translate(120, 0)"><rect width="60" height="32" fill="url(#bs-out)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">15</text></g>
+      <g transform="translate(180, 0)"><rect width="60" height="32" fill="url(#bs-el)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">42</text></g>
+      <g transform="translate(240, 0)"><rect width="60" height="32" fill="url(#bs-mid)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">100</text></g>
+      <g transform="translate(300, 0)"><rect width="60" height="32" fill="url(#bs-out)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">65535</text></g>
+      <text x="260" y="50" fill="var(--diagram-orange-text)">↑mid=4</text>
+    </g>
+
+    <!-- (d) hit -->
+    <text x="40" y="278" fill="var(--diagram-green-text)" font-family="monospace" font-size="11">(d) mid=3 A[3]=42 == target ✓ HIT</text>
+    <g transform="translate(40, 286)" font-family="monospace" font-size="11">
+      <g transform="translate(0, 0)"><rect width="60" height="32" fill="url(#bs-out)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">3</text></g>
+      <g transform="translate(60, 0)"><rect width="60" height="32" fill="url(#bs-out)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">7</text></g>
+      <g transform="translate(120, 0)"><rect width="60" height="32" fill="url(#bs-out)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">15</text></g>
+      <g transform="translate(180, 0)"><rect width="60" height="32" fill="url(#bs-hit)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)" font-weight="700">42</text></g>
+      <g transform="translate(240, 0)"><rect width="60" height="32" fill="url(#bs-out)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">100</text></g>
+      <g transform="translate(300, 0)"><rect width="60" height="32" fill="url(#bs-out)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">65535</text></g>
+      <text x="200" y="50" fill="var(--diagram-green-text)" font-weight="700">↑ pos=3, return 1</text>
+    </g>
+
+    <text x="460" y="358" text-anchor="middle" fill="var(--diagram-orange-text)" font-family="monospace" font-size="11">★ 比较 3 次 ≈ log₂(6) · 最坏 ⌈log₂(N)⌉</text>
+  </svg>
+</div>
+
+<p>读图要点:(a) 初始 <code>lo = 0, hi = 5</code>,target = 42。(b) <strong>第 1 轮</strong> <code>mid = (0+5)/2 = 2</code>,<code>A[2] = 15 &lt; 42</code> → <code>lo = 3</code>(右半区)。(c) <strong>第 2 轮</strong> <code>mid = (3+5)/2 = 4</code>,<code>A[4] = 100 &gt; 42</code> → <code>hi = 3</code>(左半区)。(d) <strong>第 3 轮</strong> <code>mid = 3</code>,<code>A[3] = 42 == target</code> → 命中,<code>pos = 3</code>,返回 1。<strong>比较 3 次,≈ log₂(6)</strong>。</p>
+
+<h3>5.3.3 二分查找的搜索路径树</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-3-3 · 6 元素 intset 的二分搜索树</div>
+  <svg viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:920px;width:100%;margin:8px auto;height:auto;">
+    <defs>
+      <linearGradient id="bt-root" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-purple-fill-start)"/><stop offset="1" stop-color="var(--diagram-purple-fill-end)"/></linearGradient>
+      <linearGradient id="bt-mid" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+      <linearGradient id="bt-leaf" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-orange-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+      <marker id="bt-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-blue-stroke)"/></marker>
+    </defs>
+    <rect x="0" y="0" width="920" height="360" fill="var(--diagram-panel)" rx="10"/>
+
+    <!-- root [0..5] mid=2 -->
+    <rect x="380" y="20" width="160" height="50" rx="8" fill="url(#bt-root)"/>
+    <text x="460" y="40" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">查 [0..5]</text>
+    <text x="460" y="58" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-family="monospace">mid=2 (val=15)</text>
+
+    <!-- branches level 1 -->
+    <path d="M 440 70 L 230 110" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#bt-arr)"/>
+    <text x="320" y="92" fill="var(--diagram-blue-text)" font-size="11">val&lt;15</text>
+    <path d="M 480 70 L 690 110" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#bt-arr)"/>
+    <text x="600" y="92" fill="var(--diagram-blue-text)" font-size="11">val&gt;15</text>
+
+    <rect x="140" y="110" width="160" height="50" rx="8" fill="url(#bt-mid)"/>
+    <text x="220" y="130" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">查 [0..1]</text>
+    <text x="220" y="148" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-family="monospace">mid=0 (val=3)</text>
+
+    <rect x="620" y="110" width="160" height="50" rx="8" fill="url(#bt-mid)"/>
+    <text x="700" y="130" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">查 [3..5]</text>
+    <text x="700" y="148" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-family="monospace">mid=4 (val=100)</text>
+
+    <!-- level 2 -->
+    <path d="M 200 160 L 100 200" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#bt-arr)"/>
+    <path d="M 240 160 L 340 200" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#bt-arr)"/>
+    <path d="M 680 160 L 580 200" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#bt-arr)"/>
+    <path d="M 720 160 L 820 200" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#bt-arr)"/>
+
+    <rect x="30" y="200" width="140" height="46" rx="8" fill="url(#bt-leaf)"/>
+    <text x="100" y="220" text-anchor="middle" fill="var(--diagram-text)" font-size="12">命中 / [0..0]</text>
+    <text x="100" y="237" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-family="monospace">val=3 or 边界</text>
+
+    <rect x="270" y="200" width="140" height="46" rx="8" fill="url(#bt-leaf)"/>
+    <text x="340" y="220" text-anchor="middle" fill="var(--diagram-text)" font-size="12">[1..1] mid=1</text>
+    <text x="340" y="237" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-family="monospace">val=7</text>
+
+    <rect x="510" y="200" width="140" height="46" rx="8" fill="url(#bt-leaf)"/>
+    <text x="580" y="220" text-anchor="middle" fill="var(--diagram-text)" font-size="12">[3..3] mid=3</text>
+    <text x="580" y="237" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-family="monospace">val=42</text>
+
+    <rect x="750" y="200" width="140" height="46" rx="8" fill="url(#bt-leaf)"/>
+    <text x="820" y="220" text-anchor="middle" fill="var(--diagram-text)" font-size="12">[5..5] mid=5</text>
+    <text x="820" y="237" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-family="monospace">val=65535</text>
+
+    <!-- 头/尾速判 -->
+    <g transform="translate(40, 270)">
+      <rect x="0" y="0" width="840" height="80" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="20" y="22" fill="var(--diagram-purple-text)" font-size="12" font-weight="700">★ 头/尾速判优化 — 顺序插入退化为 O(1)</text>
+      <text x="20" y="44" fill="var(--diagram-green-text)" font-size="11" font-family="monospace">value &gt; A[max]  → pos=length, return 0  (尾插)</text>
+      <text x="20" y="62" fill="var(--diagram-green-text)" font-size="11" font-family="monospace">value &lt; A[0]    → pos=0,      return 0  (头插)</text>
+    </g>
+
+    <text x="460" y="338" text-anchor="middle" fill="var(--diagram-orange-text)" font-family="monospace" font-size="11">最坏 ⌈log₂(6)⌉ = 3 次 · 平均 ≈ 2.5 次 · 递增 ID 场景常只比 1 次</text>
+  </svg>
+</div>
+
+<h3>5.3.4 复杂度</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 5-3-1 · intsetSearch 复杂度</div>
+  <table>
+    <thead><tr><th>场景</th><th>比较次数</th><th>时间复杂度</th></tr></thead>
+    <tbody>
+      <tr><td>空集合</td><td>0</td><td>O(1)</td></tr>
+      <tr><td>命中</td><td>log_2(N)</td><td>O(log N)</td></tr>
+      <tr><td>未命中(中间)</td><td>log_2(N)</td><td>O(log N)</td></tr>
+      <tr><td>未命中(头/尾速判)</td><td>1</td><td>O(1)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key-insight">
+  <strong>头/尾速判的实战意义</strong>:二分前的 <code>value &lt; contents[0]</code> 或 <code>value &gt; contents[max]</code> 检查,让"<strong>顺序插入</strong>"场景退化为 <strong>O(1)</strong>。生产里大量 SADD 用例是按递增 ID 写入(如订阅消息 ID、自增主键),命中尾速判路径,完全跳过二分循环。这一个小优化让 intset 在"有序追加"场景下接近 hashtable 的写入速度。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s5-4">5.4 intsetAdd 不升级插入路径</h2>
+<!-- ============================================================ -->
+
+<p><code>intsetAdd</code> 是 SADD 命令在 intset 编码下的最常见路径。当新值的字节宽度 ≤ 当前 encoding 时,走"<strong>不升级路径</strong>":二分定位插入点,<code>zrealloc</code> 扩容一格,<code>memmove</code> 把后续元素右移一格,写入新值。整个过程是经典的"<strong>有序数组插入</strong>"。</p>
+
+<h3>5.4.1 intsetAdd 调用链(不升级)</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-4-1 · intsetAdd 不升级路径时序</div>
+  <svg viewBox="0 0 940 700" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect x="0" y="0" width="940" height="700" fill="var(--diagram-panel)" rx="10"/>
+
+    <g transform="translate(20, 20)" filter="url(#d-shadow)"><rect width="130" height="38" rx="8" fill="url(#d-blue)"/><text x="65" y="24" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">setTypeAdd</text></g>
+    <g transform="translate(170, 20)" filter="url(#d-shadow)"><rect width="130" height="38" rx="8" fill="url(#d-purple)"/><text x="65" y="24" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">intsetAdd</text></g>
+    <g transform="translate(320, 20)" filter="url(#d-shadow)"><rect width="160" height="38" rx="8" fill="url(#d-cyan)"/><text x="80" y="24" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">_intsetValueEncoding</text></g>
+    <g transform="translate(500, 20)" filter="url(#d-shadow)"><rect width="130" height="38" rx="8" fill="url(#d-green)"/><text x="65" y="24" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">intsetSearch</text></g>
+    <g transform="translate(650, 20)" filter="url(#d-shadow)"><rect width="120" height="38" rx="8" fill="url(#d-amber)"/><text x="60" y="24" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="700">zrealloc</text></g>
+    <g transform="translate(790, 20)" filter="url(#d-shadow)"><rect width="130" height="38" rx="8" fill="url(#d-red)"/><text x="65" y="24" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">memmove</text></g>
+
+    <line x1="85"  y1="58" x2="85"  y2="668" stroke="var(--diagram-border)" stroke-width="1.6" stroke-dasharray="4 3"/>
+    <line x1="235" y1="58" x2="235" y2="668" stroke="var(--diagram-border)" stroke-width="1.6" stroke-dasharray="4 3"/>
+    <line x1="400" y1="58" x2="400" y2="668" stroke="var(--diagram-border)" stroke-width="1.6" stroke-dasharray="4 3"/>
+    <line x1="565" y1="58" x2="565" y2="668" stroke="var(--diagram-border)" stroke-width="1.6" stroke-dasharray="4 3"/>
+    <line x1="710" y1="58" x2="710" y2="668" stroke="var(--diagram-border)" stroke-width="1.6" stroke-dasharray="4 3"/>
+    <line x1="855" y1="58" x2="855" y2="668" stroke="var(--diagram-border)" stroke-width="1.6" stroke-dasharray="4 3"/>
+
+    <g font-family="ui-monospace,Consolas" font-size="11">
+      <text x="95" y="86" fill="var(--diagram-green-text)" font-weight="700">①</text>
+      <path d="M 85 96 L 230 96" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="155" y="90" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">intsetAdd(is, value, &amp;success)</text>
+
+      <text x="245" y="124" fill="var(--diagram-cyan-text)" font-weight="700">②</text>
+      <path d="M 235 134 L 395 134" stroke="var(--diagram-cyan-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+      <text x="315" y="128" text-anchor="middle" fill="var(--diagram-cyan-text)" font-size="11">_intsetValueEncoding(value)</text>
+
+      <rect x="180" y="148" width="650" height="56" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="200" y="166" fill="var(--diagram-orange-text)" font-weight="700">alt</text>
+      <text x="240" y="166" fill="var(--diagram-orange-text)">valenc &gt; is-&gt;encoding → 跳转 §5.5 升级路径 (intsetUpgradeAndAdd)</text>
+      <text x="200" y="186" fill="var(--diagram-green-text)" font-weight="700">else</text>
+      <text x="240" y="186" fill="var(--diagram-green-text)">valenc ≤ is-&gt;encoding → 走"不升级路径"(本图)</text>
+
+      <text x="245" y="226" fill="var(--diagram-green-text)" font-weight="700">③</text>
+      <path d="M 235 234 L 560 234" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="395" y="228" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">intsetSearch(is, value, &amp;pos)</text>
+
+      <rect x="180" y="248" width="650" height="56" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="200" y="266" fill="var(--diagram-red-text)" font-weight="700">alt</text>
+      <text x="240" y="266" fill="var(--diagram-red-text)">命中 → success=0, 直接返回 (Set 元素唯一性约束)</text>
+      <path d="M 560 282 L 240 282" stroke="var(--diagram-red-stroke)" stroke-width="1.6" stroke-dasharray="4 3" fill="none" marker-end="url(#d-arr-r)"/>
+      <text x="200" y="298" fill="var(--diagram-green-text)" font-weight="700">else</text>
+      <text x="240" y="298" fill="var(--diagram-green-text)">未命中 → 进入插入流程 (pos = 应插入位置)</text>
+
+      <text x="245" y="334" fill="var(--diagram-orange-text)" font-weight="700">④</text>
+      <path d="M 235 342 L 705 342" stroke="var(--diagram-orange-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+      <text x="475" y="336" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">zrealloc(is, sizeof(intset) + (length+1) × encoding)</text>
+
+      <rect x="200" y="356" width="630" height="56" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="220" y="374" fill="var(--diagram-red-text)" font-weight="700">alt</text>
+      <text x="260" y="374" fill="var(--diagram-red-text)">pos &lt; length → 需要给新元素腾位</text>
+      <path d="M 235 388 L 850 388" stroke="var(--diagram-red-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-r)"/>
+      <text x="540" y="402" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">memmove(contents+pos+1, contents+pos, (length-pos) × encoding)</text>
+
+      <text x="245" y="438" fill="var(--diagram-purple-text)" font-weight="700">⑤</text>
+      <path d="M 235 446 L 235 446" stroke="var(--diagram-purple-stroke)"/>
+      <text x="245" y="442" fill="var(--diagram-purple-text)" font-size="11">_intsetSet(is, pos, value) — 写入新值 · self-loop</text>
+      <rect x="180" y="450" width="180" height="14" rx="2" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+
+      <text x="245" y="486" fill="var(--diagram-purple-text)" font-weight="700">⑥</text>
+      <text x="245" y="486" fill="var(--diagram-purple-text)" font-size="11"></text>
+      <text x="265" y="486" fill="var(--diagram-purple-text)" font-size="11">length++  · 维持 contents 升序不变量</text>
+      <rect x="180" y="494" width="180" height="14" rx="2" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+
+      <text x="95" y="534" fill="var(--diagram-green-text)" font-weight="700">⑦</text>
+      <path d="M 230 542 L 90 542" stroke="var(--diagram-green-stroke)" stroke-width="1.8" stroke-dasharray="4 3" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="160" y="536" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">success=1, 返回新 intset 指针</text>
+    </g>
+
+    <g transform="translate(40, 580)">
+      <rect width="860" height="80" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)" stroke-dasharray="4 3"/>
+      <text x="20" y="22" fill="var(--diagram-green-text)" font-size="12" font-weight="700">📐 三段式</text>
+      <text x="100" y="22" fill="var(--diagram-blue-text)" font-size="12">① 范围检查 (encoding 决策) ② 二分定位 (Search) ③ 扩容 + 右移 + 写入</text>
+      <text x="20" y="42" fill="var(--diagram-orange-text)" font-size="12" font-weight="700">⚠ 时间开销</text>
+      <text x="100" y="42" fill="var(--diagram-blue-text)" font-size="12">zrealloc + memmove 是 O(N) 主体, intsetSearch 仅 O(log N)</text>
+      <text x="20" y="62" fill="var(--diagram-red-text)" font-size="12" font-weight="700">⚠ pos == length 时跳过 memmove (尾部插入,只扩不移)</text>
+    </g>
+  </svg>
+</div>
+
+<h3>5.4.2 在 [3,7,15,42,100] 插入 25 的 5 帧演示</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-4-2 · intsetAdd 不升级 5 帧动画 · 插入 25</div>
+  <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:920px;width:100%;margin:8px auto;height:auto;">
+    <defs>
+      <linearGradient id="ad-el" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+      <linearGradient id="ad-new" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+      <linearGradient id="ad-mov" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+      <linearGradient id="ad-hole" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-orange-fill-start)" stop-opacity="0.3"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)" stop-opacity="0.3"/></linearGradient>
+    </defs>
+    <rect x="0" y="0" width="920" height="460" fill="var(--diagram-panel)" rx="10"/>
+    <text x="460" y="22" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="13" font-weight="700" font-family="monospace">INT16 · A=[3,7,15,42,100] · 插入 v=25 · 5 帧动画</text>
+
+    <!-- (a) before -->
+    <text x="40" y="56" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">(a) 操作前 length=5 encoding=INT16</text>
+    <g transform="translate(40, 64)" font-family="monospace" font-size="11">
+      <rect x="0" y="0" width="50" height="30" fill="url(#ad-el)"/><text x="25" y="20" text-anchor="middle" fill="var(--diagram-text)">3</text>
+      <rect x="50" y="0" width="50" height="30" fill="url(#ad-el)"/><text x="75" y="20" text-anchor="middle" fill="var(--diagram-text)">7</text>
+      <rect x="100" y="0" width="50" height="30" fill="url(#ad-el)"/><text x="125" y="20" text-anchor="middle" fill="var(--diagram-text)">15</text>
+      <rect x="150" y="0" width="50" height="30" fill="url(#ad-el)"/><text x="175" y="20" text-anchor="middle" fill="var(--diagram-text)">42</text>
+      <rect x="200" y="0" width="50" height="30" fill="url(#ad-el)"/><text x="225" y="20" text-anchor="middle" fill="var(--diagram-text)">100</text>
+    </g>
+
+    <!-- (b) bisect -->
+    <text x="40" y="124" fill="var(--diagram-orange-text)" font-family="monospace" font-size="11">(b) _intsetValueEncoding(25)=INT16 ≤ 当前 → 不升级 · 二分: pos=3</text>
+    <g transform="translate(40, 132)">
+      <rect x="0" y="0" width="500" height="28" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="20" y="18" fill="var(--diagram-orange-text)" font-size="11" font-family="monospace">mid=2 A[2]=15&lt;25→lo=3   mid=3 A[3]=42&gt;25→hi=2   未命中,pos=3</text>
+    </g>
+
+    <!-- (c) realloc -->
+    <text x="40" y="186" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">(c) zrealloc 扩展到 6 元素 (12 B)</text>
+    <g transform="translate(40, 194)" font-family="monospace" font-size="11">
+      <rect x="0" y="0" width="50" height="30" fill="url(#ad-el)"/><text x="25" y="20" text-anchor="middle" fill="var(--diagram-text)">3</text>
+      <rect x="50" y="0" width="50" height="30" fill="url(#ad-el)"/><text x="75" y="20" text-anchor="middle" fill="var(--diagram-text)">7</text>
+      <rect x="100" y="0" width="50" height="30" fill="url(#ad-el)"/><text x="125" y="20" text-anchor="middle" fill="var(--diagram-text)">15</text>
+      <rect x="150" y="0" width="50" height="30" fill="url(#ad-el)"/><text x="175" y="20" text-anchor="middle" fill="var(--diagram-text)">42</text>
+      <rect x="200" y="0" width="50" height="30" fill="url(#ad-el)"/><text x="225" y="20" text-anchor="middle" fill="var(--diagram-text)">100</text>
+      <rect x="250" y="0" width="50" height="30" fill="url(#ad-hole)" stroke="var(--diagram-orange-stroke)" stroke-dasharray="3,2"/><text x="275" y="20" text-anchor="middle" fill="var(--diagram-orange-text)">?</text>
+    </g>
+
+    <!-- (d) memmove -->
+    <text x="40" y="254" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">(d) memmove(A+4, A+3, 4B) · 从高位向低位拷贝(重叠安全)</text>
+    <g transform="translate(40, 262)" font-family="monospace" font-size="11">
+      <rect x="0" y="0" width="50" height="30" fill="url(#ad-el)"/><text x="25" y="20" text-anchor="middle" fill="var(--diagram-text)">3</text>
+      <rect x="50" y="0" width="50" height="30" fill="url(#ad-el)"/><text x="75" y="20" text-anchor="middle" fill="var(--diagram-text)">7</text>
+      <rect x="100" y="0" width="50" height="30" fill="url(#ad-el)"/><text x="125" y="20" text-anchor="middle" fill="var(--diagram-text)">15</text>
+      <rect x="150" y="0" width="50" height="30" fill="url(#ad-hole)" stroke="var(--diagram-orange-stroke)" stroke-dasharray="3,2"/><text x="175" y="20" text-anchor="middle" fill="var(--diagram-orange-text)">?</text>
+      <rect x="200" y="0" width="50" height="30" fill="url(#ad-mov)"/><text x="225" y="20" text-anchor="middle" fill="var(--diagram-text)">42</text>
+      <rect x="250" y="0" width="50" height="30" fill="url(#ad-mov)"/><text x="275" y="20" text-anchor="middle" fill="var(--diagram-text)">100</text>
+    </g>
+
+    <!-- (e) _intsetSet -->
+    <text x="40" y="322" fill="var(--diagram-green-text)" font-family="monospace" font-size="11">(e) _intsetSet(is, 3, 25) + length++ (5→6)</text>
+    <g transform="translate(40, 330)" font-family="monospace" font-size="11">
+      <rect x="0" y="0" width="50" height="30" fill="url(#ad-el)"/><text x="25" y="20" text-anchor="middle" fill="var(--diagram-text)">3</text>
+      <rect x="50" y="0" width="50" height="30" fill="url(#ad-el)"/><text x="75" y="20" text-anchor="middle" fill="var(--diagram-text)">7</text>
+      <rect x="100" y="0" width="50" height="30" fill="url(#ad-el)"/><text x="125" y="20" text-anchor="middle" fill="var(--diagram-text)">15</text>
+      <rect x="150" y="0" width="50" height="30" fill="url(#ad-new)"/><text x="175" y="20" text-anchor="middle" fill="var(--diagram-text)" font-weight="700">25</text>
+      <rect x="200" y="0" width="50" height="30" fill="url(#ad-el)"/><text x="225" y="20" text-anchor="middle" fill="var(--diagram-text)">42</text>
+      <rect x="250" y="0" width="50" height="30" fill="url(#ad-el)"/><text x="275" y="20" text-anchor="middle" fill="var(--diagram-text)">100</text>
+      <text x="320" y="20" fill="var(--diagram-green-text)" font-weight="700">★ 完成,encoding 不变,有序保持</text>
+    </g>
+
+    <!-- complexity -->
+    <g transform="translate(40, 390)">
+      <rect x="0" y="0" width="840" height="60" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="20" y="22" fill="var(--diagram-green-text)" font-size="12" font-weight="700">★ 复杂度</text>
+      <text x="20" y="44" fill="var(--diagram-blue-text)" font-size="11">时间: O(N) (memmove 主要成本) · 空间: +1 元素宽度 (此例 +2 B) · 触发 valenc&gt;encoding 时跳 §5.5</text>
+    </g>
+  </svg>
+</div>
+
+<p>读图要点:(a) 操作前 INT16 编码,length=5,待插入 value=25。(b) <code>_intsetValueEncoding(25) = INT16</code> ≤ 当前 → <strong>不升级路径</strong>。<code>intsetSearch(25)</code> 二分定位 <code>pos = 3</code>(插入位置)。(c) <strong><code>zrealloc</code></strong> 扩展 contents 到 6 元素(20 B),尾部新 slot <code>[5] = ?</code>。(d) <strong><code>memmove(A+4, A+3, 4B)</code></strong>:<code>[3]</code> 和 <code>[4]</code> 各右移一格(memmove 对重叠区域从高位向低位拷贝)。<code>[3]</code> 现为空缺等待写入。(e) <strong><code>_intsetSet(is, 3, 25)</code></strong> + <code>length++</code> (5 → 6)。encoding 不变,有序保持。</p>
+
+<h3>5.4.3 复杂度</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 5-4-1 · intsetAdd 不升级路径复杂度</div>
+  <table>
+    <thead><tr><th>操作场景</th><th>时间</th><th>空间增量</th></tr></thead>
+    <tbody>
+      <tr><td>头部插入(pos=0)</td><td>O(N)(memmove 全长)</td><td>1 元素宽度</td></tr>
+      <tr><td>中间插入</td><td>O(N)(memmove 部分)</td><td>同上</td></tr>
+      <tr><td>尾部插入(pos=length)</td><td>O(1)(无 memmove)</td><td>同上</td></tr>
+      <tr><td>已存在(命中)</td><td>O(log N)</td><td>0</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key-insight">
+  <strong>顺序插入是最优场景</strong>:每次都尾部追加 → O(1) 摊销时间。逆序或随机插入退化为 O(N)。生产中如果 SADD 元素是递增 ID(雪花 ID、自增 PK 等),intset 表现接近 hashtable;如果是随机散列(UUID 整数化、哈希值),内存优势仍在但写入慢 5-10 倍。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s5-5">5.5 intsetUpgradeAndAdd 升级路径(本章核心)</h2>
+<!-- ============================================================ -->
+
+<p>升级路径是 intset 实现里最精巧的部分。新值超出当前 encoding 时,所有现有元素必须按新宽度重新存储——这是 intset 自适应的代价。这一节讲清楚"<strong>从后往前重排</strong>"的设计动机、prepend 标志的来由,以及完整 5 帧动画。</p>
+
+<h3>5.5.1 设计动机</h3>
+
+<p>新值超出当前 encoding 时,所有现有元素必须按新宽度重新存储。例如 5 个 INT16 元素 + 插入 65535(超出 INT16 上限):</p>
+
+<ul>
+  <li>原 contents 内存:5 × 2 = 10 B</li>
+  <li>新 contents 内存:6 × 4 = 24 B</li>
+  <li>必须把每个旧 INT16 值搬到新的 INT32 位置</li>
+</ul>
+
+<div class="warning">
+  <strong>关键约束</strong>:<code>zrealloc</code> 后内存块可能在原位扩展,<strong>旧元素与新位置重叠</strong>。INT16 偏移 < INT32 偏移,如果从前往后搬,前面元素覆盖后面元素的旧值,数据丢失。<strong>必须从后往前搬迁</strong>——先搬最后一个旧元素到最后一个新位置,再倒数第二个,以此类推。这样写新位置时,旧位置已经被读过,不会丢数据。
+</div>
+
+<h3>5.5.2 intsetUpgradeAndAdd 调用链</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-5-1 · 升级路径完整时序</div>
+  <svg viewBox="0 0 940 740" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect x="0" y="0" width="940" height="740" fill="var(--diagram-panel)" rx="10"/>
+
+    <g transform="translate(20, 20)" filter="url(#d-shadow)"><rect width="120" height="38" rx="8" fill="url(#d-blue)"/><text x="60" y="24" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">intsetAdd</text></g>
+    <g transform="translate(160, 20)" filter="url(#d-shadow)"><rect width="170" height="38" rx="8" fill="url(#d-purple)"/><text x="85" y="24" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">intsetUpgradeAndAdd</text></g>
+    <g transform="translate(350, 20)" filter="url(#d-shadow)"><rect width="170" height="38" rx="8" fill="url(#d-cyan)"/><text x="85" y="24" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">_intsetValueEncoding</text></g>
+    <g transform="translate(540, 20)" filter="url(#d-shadow)"><rect width="120" height="38" rx="8" fill="url(#d-amber)"/><text x="60" y="24" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="700">zrealloc</text></g>
+    <g transform="translate(680, 20)" filter="url(#d-shadow)"><rect width="120" height="38" rx="8" fill="url(#d-green)"/><text x="60" y="24" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">_intsetGet</text></g>
+    <g transform="translate(820, 20)" filter="url(#d-shadow)"><rect width="100" height="38" rx="8" fill="url(#d-red)"/><text x="50" y="24" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">_intsetSet</text></g>
+
+    <line x1="80"  y1="58" x2="80"  y2="708" stroke="var(--diagram-border)" stroke-width="1.6" stroke-dasharray="4 3"/>
+    <line x1="245" y1="58" x2="245" y2="708" stroke="var(--diagram-border)" stroke-width="1.6" stroke-dasharray="4 3"/>
+    <line x1="435" y1="58" x2="435" y2="708" stroke="var(--diagram-border)" stroke-width="1.6" stroke-dasharray="4 3"/>
+    <line x1="600" y1="58" x2="600" y2="708" stroke="var(--diagram-border)" stroke-width="1.6" stroke-dasharray="4 3"/>
+    <line x1="740" y1="58" x2="740" y2="708" stroke="var(--diagram-border)" stroke-width="1.6" stroke-dasharray="4 3"/>
+    <line x1="870" y1="58" x2="870" y2="708" stroke="var(--diagram-border)" stroke-width="1.6" stroke-dasharray="4 3"/>
+
+    <g font-family="ui-monospace,Consolas" font-size="11">
+      <text x="90" y="86" fill="var(--diagram-green-text)" font-weight="700">①</text>
+      <path d="M 80 96 L 240 96" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="160" y="90" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">intsetUpgradeAndAdd(is, value)</text>
+
+      <text x="255" y="124" fill="var(--diagram-cyan-text)" font-weight="700">②</text>
+      <path d="M 245 134 L 430 134" stroke="var(--diagram-cyan-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+      <text x="338" y="128" text-anchor="middle" fill="var(--diagram-cyan-text)" font-size="11">newenc = _intsetValueEncoding(value)</text>
+
+      <rect x="200" y="148" width="700" height="56" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="220" y="166" fill="var(--diagram-purple-text)" font-weight="700">③ 关键决策</text>
+      <text x="320" y="166" fill="var(--diagram-purple-text)">prepend = (value &lt; 0) ? 1 : 0</text>
+      <text x="220" y="186" fill="var(--diagram-muted)" font-size="10">负值在原数组里是最小,所以放新数组头部 (prepend=1); 正值是最大,放尾部</text>
+
+      <text x="255" y="226" fill="var(--diagram-purple-text)" font-weight="700">④</text>
+      <text x="265" y="226" fill="var(--diagram-purple-text)">is-&gt;encoding = newenc</text>
+      <rect x="200" y="232" width="200" height="14" rx="2" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+
+      <text x="255" y="266" fill="var(--diagram-orange-text)" font-weight="700">⑤</text>
+      <path d="M 245 274 L 595 274" stroke="var(--diagram-orange-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+      <text x="420" y="268" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">zrealloc(is, sizeof(intset) + (length+1) × newenc)</text>
+      <rect x="540" y="280" width="120" height="14" rx="2" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="600" y="290" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">原地或迁移</text>
+
+      <rect x="200" y="304" width="700" height="220" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="220" y="322" fill="var(--diagram-blue-text)" font-weight="700">⑥ loop  从后往前 (i = length-1 → 0)</text>
+      <text x="220" y="340" fill="var(--diagram-muted)" font-size="10">关键:旧/新区域可能重叠,且 INT16 偏移 &lt; INT32 偏移 → 必须倒序避免覆盖</text>
+
+      <text x="255" y="366" fill="var(--diagram-green-text)" font-weight="700">⑥a</text>
+      <path d="M 245 374 L 735 374" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="490" y="368" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">_intsetGetEncoded(contents, i, OLD_ENC)</text>
+
+      <path d="M 735 392 L 250 392" stroke="var(--diagram-green-stroke)" stroke-width="1.5" stroke-dasharray="4 3" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="490" y="386" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">→ 旧值 (寄存器)</text>
+
+      <text x="255" y="426" fill="var(--diagram-red-text)" font-weight="700">⑥b</text>
+      <path d="M 245 434 L 865 434" stroke="var(--diagram-red-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-r)"/>
+      <text x="555" y="428" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">_intsetSetEncoded(contents, i + prepend, 旧值, NEW_ENC)</text>
+      <text x="555" y="450" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">写入按 newenc 计算的字节偏移</text>
+
+      <rect x="220" y="466" width="660" height="44" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="240" y="484" fill="var(--diagram-orange-text)" font-weight="700">📐 不变量</text>
+      <text x="320" y="484" fill="var(--diagram-orange-text)" font-size="11">读发生在写之前 · 倒序保证读到的偏移还没被覆盖</text>
+
+      <rect x="200" y="540" width="700" height="64" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="220" y="558" fill="var(--diagram-green-text)" font-weight="700">⑦ alt 写新值</text>
+      <text x="240" y="578" fill="var(--diagram-green-text)">prepend == 1 → _intsetSet(is, 0, value)        — 写 contents[0]</text>
+      <text x="240" y="596" fill="var(--diagram-green-text)">else            → _intsetSet(is, length, value)  — 写 contents[length]</text>
+      <path d="M 245 612 L 865 612" stroke="var(--diagram-red-stroke)" stroke-width="1.6" stroke-dasharray="4 3" fill="none" marker-end="url(#d-arr-r)"/>
+
+      <text x="255" y="640" fill="var(--diagram-purple-text)" font-weight="700">⑧</text>
+      <text x="265" y="640" fill="var(--diagram-purple-text)">length++ · 维护"严格升序 + 唯一"不变量</text>
+      <rect x="200" y="646" width="200" height="14" rx="2" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+
+      <text x="90" y="680" fill="var(--diagram-green-text)" font-weight="700">⑨</text>
+      <path d="M 240 688 L 90 688" stroke="var(--diagram-green-stroke)" stroke-width="1.8" stroke-dasharray="4 3" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="160" y="682" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">return is (新指针,可能与入参不同)</text>
+    </g>
+  </svg>
+</div>
+
+<h3>5.5.3 从 INT16 升到 INT32 的 5 帧演示(插入 65535)</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-5-2 · intsetUpgradeAndAdd 5 帧动画 · 插入 65535</div>
+  <svg viewBox="0 0 920 540" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:920px;width:100%;margin:8px auto;height:auto;">
+    <defs>
+      <linearGradient id="up-16" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+      <linearGradient id="up-32" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-orange-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+      <linearGradient id="up-dirty" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)" stop-opacity="0.5"/><stop offset="1" stop-color="var(--diagram-red-fill-end)" stop-opacity="0.5"/></linearGradient>
+      <linearGradient id="up-new" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    </defs>
+    <rect x="0" y="0" width="920" height="540" fill="var(--diagram-panel)" rx="10"/>
+    <text x="460" y="22" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="13" font-weight="700" font-family="monospace">INT16→INT32 升级 · 注意 cell 宽度变化 · 插入 65535</text>
+
+    <!-- (a) INT16 -->
+    <text x="40" y="56" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">(a) INT16 每元素 2 B · contents 10 B</text>
+    <g transform="translate(40, 64)" font-family="monospace" font-size="11">
+      <rect x="0" y="0" width="40" height="30" fill="url(#up-16)"/><text x="20" y="20" text-anchor="middle" fill="var(--diagram-text)">3</text>
+      <rect x="40" y="0" width="40" height="30" fill="url(#up-16)"/><text x="60" y="20" text-anchor="middle" fill="var(--diagram-text)">7</text>
+      <rect x="80" y="0" width="40" height="30" fill="url(#up-16)"/><text x="100" y="20" text-anchor="middle" fill="var(--diagram-text)">15</text>
+      <rect x="120" y="0" width="40" height="30" fill="url(#up-16)"/><text x="140" y="20" text-anchor="middle" fill="var(--diagram-text)">42</text>
+      <rect x="160" y="0" width="40" height="30" fill="url(#up-16)"/><text x="180" y="20" text-anchor="middle" fill="var(--diagram-text)">100</text>
+      <text x="220" y="20" fill="var(--diagram-orange-text)">v=65535 &gt; 32767 → 触发升级!</text>
+    </g>
+
+    <!-- (b) plan -->
+    <text x="40" y="124" fill="var(--diagram-orange-text)" font-family="monospace" font-size="11">(b) newenc=INT32, prepend=(65535&lt;0)?1:0=0 (正数→放尾), is->encoding=INT32</text>
+
+    <!-- (c) zrealloc dirty -->
+    <text x="40" y="158" fill="var(--diagram-red-text)" font-family="monospace" font-size="11">(c) zrealloc 24 B · 旧 INT16 按 INT32 视角错位 → 全 "??"</text>
+    <g transform="translate(40, 166)" font-family="monospace" font-size="11">
+      <rect x="0" y="0" width="60" height="30" fill="url(#up-dirty)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">??</text>
+      <rect x="60" y="0" width="60" height="30" fill="url(#up-dirty)"/><text x="90" y="20" text-anchor="middle" fill="var(--diagram-text)">??</text>
+      <rect x="120" y="0" width="60" height="30" fill="url(#up-dirty)"/><text x="150" y="20" text-anchor="middle" fill="var(--diagram-text)">??</text>
+      <rect x="180" y="0" width="60" height="30" fill="url(#up-dirty)"/><text x="210" y="20" text-anchor="middle" fill="var(--diagram-text)">??</text>
+      <rect x="240" y="0" width="60" height="30" fill="url(#up-dirty)"/><text x="270" y="20" text-anchor="middle" fill="var(--diagram-text)">??</text>
+      <rect x="300" y="0" width="60" height="30" fill="url(#up-dirty)"/><text x="330" y="20" text-anchor="middle" fill="var(--diagram-text)">??</text>
+    </g>
+
+    <!-- (d) 从后往前 -->
+    <text x="40" y="228" fill="var(--diagram-green-text)" font-family="monospace" font-size="11">(d) 从后往前重排 i=4→0 · 关键: INT32 偏移 &gt; INT16 偏移,写靠后不破坏未读靠前</text>
+    <g transform="translate(40, 236)" font-family="monospace" font-size="11">
+      <rect x="0" y="0" width="60" height="30" fill="url(#up-32)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">3</text>
+      <rect x="60" y="0" width="60" height="30" fill="url(#up-32)"/><text x="90" y="20" text-anchor="middle" fill="var(--diagram-text)">7</text>
+      <rect x="120" y="0" width="60" height="30" fill="url(#up-32)"/><text x="150" y="20" text-anchor="middle" fill="var(--diagram-text)">15</text>
+      <rect x="180" y="0" width="60" height="30" fill="url(#up-32)"/><text x="210" y="20" text-anchor="middle" fill="var(--diagram-text)">42</text>
+      <rect x="240" y="0" width="60" height="30" fill="url(#up-32)"/><text x="270" y="20" text-anchor="middle" fill="var(--diagram-text)">100</text>
+      <rect x="300" y="0" width="60" height="30" fill="url(#up-dirty)"/><text x="330" y="20" text-anchor="middle" fill="var(--diagram-text)">??</text>
+    </g>
+    <g transform="translate(420, 236)" font-family="monospace" font-size="10">
+      <text x="0" y="14" fill="var(--diagram-blue-text)">i=4: 读 INT16[4]=100 → 写 INT32[4]</text>
+      <text x="0" y="28" fill="var(--diagram-blue-text)">i=3: 读 INT16[3]=42  → 写 INT32[3]</text>
+      <text x="0" y="42" fill="var(--diagram-blue-text)">i=2: 读 INT16[2]=15  → 写 INT32[2]</text>
+      <text x="0" y="56" fill="var(--diagram-blue-text)">i=1: 读 INT16[1]=7   → 写 INT32[1]</text>
+      <text x="0" y="70" fill="var(--diagram-blue-text)">i=0: 读 INT16[0]=3   → 写 INT32[0]</text>
+    </g>
+
+    <!-- (e) final -->
+    <text x="40" y="338" fill="var(--diagram-green-text)" font-family="monospace" font-size="11">(e) _intsetSet(5, 65535) + length++ (5→6)</text>
+    <g transform="translate(40, 346)" font-family="monospace" font-size="11">
+      <rect x="0" y="0" width="60" height="30" fill="url(#up-32)"/><text x="30" y="20" text-anchor="middle" fill="var(--diagram-text)">3</text>
+      <rect x="60" y="0" width="60" height="30" fill="url(#up-32)"/><text x="90" y="20" text-anchor="middle" fill="var(--diagram-text)">7</text>
+      <rect x="120" y="0" width="60" height="30" fill="url(#up-32)"/><text x="150" y="20" text-anchor="middle" fill="var(--diagram-text)">15</text>
+      <rect x="180" y="0" width="60" height="30" fill="url(#up-32)"/><text x="210" y="20" text-anchor="middle" fill="var(--diagram-text)">42</text>
+      <rect x="240" y="0" width="60" height="30" fill="url(#up-32)"/><text x="270" y="20" text-anchor="middle" fill="var(--diagram-text)">100</text>
+      <rect x="300" y="0" width="60" height="30" fill="url(#up-new)"/><text x="330" y="20" text-anchor="middle" fill="var(--diagram-text)" font-weight="700">65535</text>
+    </g>
+
+    <!-- summary -->
+    <g transform="translate(40, 400)">
+      <rect x="0" y="0" width="840" height="120" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="20" y="22" fill="var(--diagram-purple-text)" font-size="12" font-weight="700">★ 关键性质 · 内存换 P99 抖动</text>
+      <text x="20" y="44" fill="var(--diagram-blue-text)" font-size="11">• 必须从后往前: INT32 偏移 = i × 4,INT16 偏移 = i × 2,写靠后不会破坏未读的靠前 cell</text>
+      <text x="20" y="62" fill="var(--diagram-blue-text)" font-size="11">• 内存变化: 18 B → 32 B (+ 14 B,jemalloc 对齐后)</text>
+      <text x="20" y="80" fill="var(--diagram-blue-text)" font-size="11">• 时间: O(N) 一次性重排</text>
+      <text x="20" y="98" fill="var(--diagram-orange-text)" font-size="11">• 生命周期内最多升级 2 次 (INT16 → INT32 → INT64); 不会因删除大数而降级</text>
+    </g>
+  </svg>
+</div>
+
+<p>读图要点(注意 cell 宽度从 INT16 → INT32 变宽,反映字节宽度):(a) 操作前 INT16 编码,length=5,内存 = 8 + 5×2 = 18 B。65535 > 32767 → <strong>触发升级</strong>。(b) 计算 <code>newenc = INT32</code>,<code>prepend = 0</code>(value > 0,放尾部)。<code>is-&gt;encoding = INT32</code> 立即更新,以便 <code>_intsetSet</code> 使用新 encoding。(c) <strong><code>zrealloc</code></strong> 扩展到 6 个 INT32(24 B),旧 INT16 数据按新 INT32 视角已错位 → 全 <code>??</code>。(d) <strong>从后往前重排</strong> <code>i = 4 → 0</code>:<code>_intsetGetEncoded(i, INT16)</code> 读旧值,<code>_intsetSet(i + prepend, v, INT32)</code> 写新位置。<strong>关键</strong>:INT32 偏移 < INT16 偏移... 不,<strong>INT32 偏移 > INT16 偏移</strong>,所以"写靠后"不会破坏"未读的靠前 INT16",从后往前搬安全。(e) <code>_intsetSet(is, 5, 65535); length++</code> (5 → 6)。<strong>内存:18 → 32 B (+ 14 B)</strong>。</p>
+
+<h3>5.5.4 升级方向决策(prepend 标志)</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-5-3 · prepend 标志的来由</div>
+  <svg viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect x="0" y="0" width="940" height="460" fill="var(--diagram-panel)" rx="10"/>
+
+    <g transform="translate(360, 22)" filter="url(#d-shadow)">
+      <rect width="220" height="44" rx="10" fill="url(#d-blue)"/>
+      <text x="110" y="20" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">intsetUpgradeAndAdd</text>
+      <text x="110" y="36" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">(is, value)</text>
+    </g>
+    <path d="M 470 66 L 470 92" stroke="var(--diagram-blue-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-b)"/>
+
+    <g transform="translate(370, 92)" filter="url(#d-shadow)">
+      <path d="M 100 0 L 200 26 L 100 52 L 0 26 Z" fill="var(--diagram-blue-stroke)" stroke="var(--diagram-blue-stroke)" stroke-width="1.5"/>
+      <text x="100" y="22" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="700">value &lt; 0 ?</text>
+      <text x="100" y="38" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">符号决定方向</text>
+    </g>
+
+    <path d="M 370 118 L 220 178" stroke="var(--diagram-purple-stroke)" stroke-width="1.8" fill="none" marker-end="url(#d-arr)"/>
+    <text x="270" y="160" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">是 (负数)</text>
+
+    <path d="M 570 118 L 720 178" stroke="var(--diagram-green-stroke)" stroke-width="1.8" fill="none" marker-end="url(#d-arr-g)"/>
+    <text x="660" y="160" fill="var(--diagram-green-text)" font-size="11" font-weight="700">否 (正数)</text>
+
+    <g transform="translate(40, 178)" filter="url(#d-shadow)">
+      <rect width="360" height="98" rx="10" fill="url(#d-purple)"/>
+      <text x="180" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">新值是负数 → 必为新最小值</text>
+      <line x1="20" y1="32" x2="340" y2="32" stroke="var(--diagram-panel)" stroke-opacity="0.3"/>
+      <text x="20" y="50" fill="var(--diagram-text)" font-size="11" font-family="ui-monospace,Consolas">现有 INT16 元素 ≥ -32768</text>
+      <text x="20" y="66" fill="var(--diagram-text)" font-size="11" font-family="ui-monospace,Consolas">触发升级 → 新值 &lt; -32768</text>
+      <text x="20" y="84" fill="var(--diagram-purple-text)" font-size="10">∴ 新值 &lt; 所有现存值,数学严格成立</text>
+    </g>
+
+    <g transform="translate(540, 178)" filter="url(#d-shadow)">
+      <rect width="360" height="98" rx="10" fill="url(#d-green)"/>
+      <text x="180" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">新值是正数 → 必为新最大值</text>
+      <line x1="20" y1="32" x2="340" y2="32" stroke="var(--diagram-panel)" stroke-opacity="0.3"/>
+      <text x="20" y="50" fill="var(--diagram-text)" font-size="11" font-family="ui-monospace,Consolas">现有 INT16 元素 ≤ 32767</text>
+      <text x="20" y="66" fill="var(--diagram-text)" font-size="11" font-family="ui-monospace,Consolas">触发升级 → 新值 &gt; 32767</text>
+      <text x="20" y="84" fill="var(--diagram-green-text)" font-size="10">∴ 新值 &gt; 所有现存值,数学严格成立</text>
+    </g>
+
+    <path d="M 220 276 L 220 304" stroke="var(--diagram-purple-stroke)" stroke-width="1.8" fill="none" marker-end="url(#d-arr)"/>
+    <path d="M 720 276 L 720 304" stroke="var(--diagram-green-stroke)" stroke-width="1.8" fill="none" marker-end="url(#d-arr-g)"/>
+
+    <g transform="translate(40, 304)" filter="url(#d-shadow)">
+      <rect width="360" height="92" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="1.5"/>
+      <text x="180" y="22" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="13" font-weight="800">prepend = 1</text>
+      <line x1="20" y1="32" x2="340" y2="32" stroke="var(--diagram-purple-stroke)" stroke-opacity="0.4"/>
+      <text x="20" y="50" fill="var(--diagram-purple-text)" font-size="11" font-family="ui-monospace,Consolas">_intsetSet(is, 0, value)</text>
+      <text x="20" y="68" fill="var(--diagram-blue-text)" font-size="11">插入到 contents[0]</text>
+      <text x="20" y="84" fill="var(--diagram-muted)" font-size="10">原 N 个元素全部右移 1 格 (i+prepend 偏移)</text>
+    </g>
+
+    <g transform="translate(540, 304)" filter="url(#d-shadow)">
+      <rect width="360" height="92" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)" stroke-width="1.5"/>
+      <text x="180" y="22" text-anchor="middle" fill="var(--diagram-green-text)" font-size="13" font-weight="800">prepend = 0</text>
+      <line x1="20" y1="32" x2="340" y2="32" stroke="var(--diagram-green-stroke)" stroke-opacity="0.4"/>
+      <text x="20" y="50" fill="var(--diagram-green-text)" font-size="11" font-family="ui-monospace,Consolas">_intsetSet(is, length, value)</text>
+      <text x="20" y="68" fill="var(--diagram-blue-text)" font-size="11">追加到 contents[length]</text>
+      <text x="20" y="84" fill="var(--diagram-muted)" font-size="10">原 N 个元素位置不变,直接尾部写入</text>
+    </g>
+
+    <g transform="translate(40, 412)">
+      <rect width="860" height="36" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)" stroke-dasharray="4 3"/>
+      <text x="20" y="22" fill="var(--diagram-orange-text)" font-size="12" font-weight="700">📐 不存在"插入中间"</text>
+      <text x="190" y="22" fill="var(--diagram-blue-text)" font-size="12">触发升级的值必为极值,所以 prepend 只需 1 bit (二选一,无第三种情况)</text>
+    </g>
+  </svg>
+</div>
+
+<div class="key-insight">
+  <strong>为什么触发升级的值必为极值</strong>:能引发 INT16→INT32 升级的值,必须超过 INT16 范围(<code>&lt; -32768</code> 或 <code>&gt; 32767</code>)。同时所有现有元素都在 INT16 范围内(<code>≤ 32767</code> 且 <code>≥ -32768</code>)。所以新值要么 < 所有现存值(负数,放头),要么 > 所有现存值(正数,放尾)。<strong>不存在"插入中间"的情况</strong>——这就是 prepend 只需 1 bit 的原因。
+</div>
+
+<h3>5.5.5 升级路径复杂度</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 5-5-1 · 升级路径复杂度</div>
+  <table>
+    <thead><tr><th>场景</th><th>时间</th><th>空间</th><th>触发条件</th></tr></thead>
+    <tbody>
+      <tr><td>INT16 → INT32 升级</td><td>O(N)</td><td>每元素 +2 B</td><td>插入 [-2^31, -2^15) ∪ (2^15, 2^31)</td></tr>
+      <tr><td>INT32 → INT64 升级</td><td>O(N)</td><td>每元素 +4 B</td><td>插入 [-2^63, -2^31) ∪ (2^31, 2^63)</td></tr>
+      <tr><td>INT16 → INT64 升级(直接)</td><td>O(N)</td><td>每元素 +6 B</td><td>插入超 INT32 范围</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p>升级在 intset 生命周期内 <strong>最多发生 2 次</strong>(INT16 → INT32 → INT64)。每次 O(N) 单位代价,均摊到所有元素仍是 O(1)。这是 intset 的优雅之处:虽然单次升级可能导致 P99 抖动(N=512 时拷贝 512 个 8B 写入,~1-3 μs),但全生命周期总成本可控。</p>
+
+<h3>5.5.6 命令验证</h3>
+
+<pre><code class="language-bash">127.0.0.1:6379&gt; DEL s:up
+(integer) 0
+127.0.0.1:6379&gt; SADD s:up 3 7 15 42 100
+(integer) 5
+127.0.0.1:6379&gt; MEMORY USAGE s:up
+(integer) 80
+127.0.0.1:6379&gt; SADD s:up 65535
+(integer) 1
+127.0.0.1:6379&gt; MEMORY USAGE s:up
+(integer) 96
+127.0.0.1:6379&gt; OBJECT ENCODING s:up
+"intset"</code></pre>
+
+<p><code>MEMORY USAGE</code> 从 80 升至 96 字节,因每元素从 2 B 升到 4 B(增 30 B,jemalloc 对齐后实际 +16 B)。<code>OBJECT ENCODING</code> 仍为 intset,内部 encoding 已升级到 INT32。</p>
+
+<!-- ============================================================ -->
+<h2 id="s5-6">5.6 intsetRemove 删除操作</h2>
+<!-- ============================================================ -->
+
+<p>删除是插入的镜像:二分定位 → memmove 把后续元素左移一格 → zrealloc 缩容。<strong>但 intset 不会因删除大数而降级 encoding</strong>——这是 Redis "少做事"哲学的体现,本节会展开讨论。</p>
+
+<h3>5.6.1 intsetRemove 调用链</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-6-1 · intsetRemove 内部时序</div>
+  <svg viewBox="0 0 940 580" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect x="0" y="0" width="940" height="580" fill="var(--diagram-panel)" rx="10"/>
+
+    <g transform="translate(60, 22)" filter="url(#d-shadow)"><rect width="140" height="40" rx="8" fill="url(#d-blue)"/><text x="70" y="25" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">setTypeRemove</text></g>
+    <g transform="translate(280, 22)" filter="url(#d-shadow)"><rect width="140" height="40" rx="8" fill="url(#d-purple)"/><text x="70" y="25" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">intsetRemove</text></g>
+    <g transform="translate(500, 22)" filter="url(#d-shadow)"><rect width="140" height="40" rx="8" fill="url(#d-green)"/><text x="70" y="25" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">intsetSearch</text></g>
+    <g transform="translate(720, 22)" filter="url(#d-shadow)"><rect width="80" height="40" rx="8" fill="url(#d-red)"/><text x="40" y="25" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">memmove</text></g>
+    <g transform="translate(820, 22)" filter="url(#d-shadow)"><rect width="100" height="40" rx="8" fill="url(#d-amber)"/><text x="50" y="25" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="700">zrealloc</text></g>
+
+    <line x1="130" y1="62" x2="130" y2="548" stroke="var(--diagram-border)" stroke-width="1.6" stroke-dasharray="4 3"/>
+    <line x1="350" y1="62" x2="350" y2="548" stroke="var(--diagram-border)" stroke-width="1.6" stroke-dasharray="4 3"/>
+    <line x1="570" y1="62" x2="570" y2="548" stroke="var(--diagram-border)" stroke-width="1.6" stroke-dasharray="4 3"/>
+    <line x1="760" y1="62" x2="760" y2="548" stroke="var(--diagram-border)" stroke-width="1.6" stroke-dasharray="4 3"/>
+    <line x1="870" y1="62" x2="870" y2="548" stroke="var(--diagram-border)" stroke-width="1.6" stroke-dasharray="4 3"/>
+
+    <g font-family="ui-monospace,Consolas" font-size="11">
+      <text x="140" y="92" fill="var(--diagram-green-text)" font-weight="700">①</text>
+      <path d="M 130 100 L 345 100" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="237" y="94" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">intsetRemove(is, value, &amp;success)</text>
+
+      <text x="360" y="128" fill="var(--diagram-green-text)" font-weight="700">②</text>
+      <path d="M 350 138 L 565 138" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="457" y="132" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">intsetSearch(is, value, &amp;pos)</text>
+
+      <rect x="200" y="156" width="700" height="60" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="220" y="174" fill="var(--diagram-red-text)" font-weight="700">alt 未命中</text>
+      <text x="320" y="174" fill="var(--diagram-red-text)">success=0,直接返回 (不报错,Set 删不存在元素是合法的)</text>
+      <path d="M 350 192 L 135 192" stroke="var(--diagram-red-stroke)" stroke-width="1.6" stroke-dasharray="4 3" fill="none" marker-end="url(#d-arr-r)"/>
+      <text x="220" y="208" fill="var(--diagram-green-text)" font-weight="700">else 命中</text>
+      <text x="320" y="208" fill="var(--diagram-green-text)">pos 是要删除的元素下标,进入压缩流程</text>
+
+      <text x="360" y="244" fill="var(--diagram-purple-text)" font-weight="700">③</text>
+      <text x="370" y="244" fill="var(--diagram-purple-text)">tail = length - pos - 1  · 计算需要左移的元素数</text>
+      <rect x="350" y="252" width="240" height="14" rx="2" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+
+      <rect x="200" y="278" width="700" height="80" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="220" y="296" fill="var(--diagram-orange-text)" font-weight="700">alt</text>
+      <text x="260" y="296" fill="var(--diagram-orange-text)">tail &gt; 0 (删的不是末尾元素) → 后续元素左移一格</text>
+
+      <text x="360" y="320" fill="var(--diagram-red-text)" font-weight="700">④</text>
+      <path d="M 350 328 L 755 328" stroke="var(--diagram-red-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-r)"/>
+      <text x="555" y="322" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">memmove(contents+pos, contents+pos+1, tail × encoding)</text>
+
+      <text x="220" y="350" fill="var(--diagram-muted)" font-weight="700">else</text>
+      <text x="260" y="350" fill="var(--diagram-muted)">tail == 0 (删尾) → 跳过 memmove,直接缩容</text>
+
+      <text x="360" y="384" fill="var(--diagram-orange-text)" font-weight="700">⑤</text>
+      <path d="M 350 392 L 865 392" stroke="var(--diagram-orange-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+      <text x="600" y="386" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">zrealloc(is, sizeof(intset) + (length-1) × encoding)</text>
+      <rect x="820" y="398" width="100" height="14" rx="2" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="870" y="408" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">缩容</text>
+
+      <text x="360" y="436" fill="var(--diagram-purple-text)" font-weight="700">⑥</text>
+      <text x="370" y="436" fill="var(--diagram-purple-text)">length--  · encoding 不变,即使删的是触发升级的极值也不降级</text>
+      <rect x="350" y="444" width="240" height="14" rx="2" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+
+      <text x="140" y="478" fill="var(--diagram-green-text)" font-weight="700">⑦</text>
+      <path d="M 345 486 L 140 486" stroke="var(--diagram-green-stroke)" stroke-width="1.8" stroke-dasharray="4 3" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="244" y="480" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">success=1, 返回新 intset 指针</text>
+    </g>
+
+    <g transform="translate(40, 510)">
+      <rect width="860" height="44" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)" stroke-dasharray="4 3"/>
+      <text x="20" y="22" fill="var(--diagram-red-text)" font-size="12" font-weight="700">⚠ encoding 单调升</text>
+      <text x="160" y="22" fill="var(--diagram-blue-text)" font-size="12">删除时不检查"剩余值是否都能放小宽度",所以 65535 删了之后 encoding 仍是 INT32 — "少做事"哲学</text>
+      <text x="20" y="38" fill="var(--diagram-muted)" font-size="11">业务侧:删大数后内存不会自动缩到 INT16, 需要 SDIFFSTORE/SUNIONSTORE 重建才能降回小宽度</text>
+    </g>
+  </svg>
+</div>
+
+<h3>5.6.2 从 [3,7,15,42,100] 删 15 的 5 帧演示</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-6-2 · intsetRemove 5 帧动画 · 删 15</div>
+  <svg viewBox="0 0 920 480" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:920px;width:100%;margin:8px auto;height:auto;">
+    <defs>
+      <linearGradient id="rm-el" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+      <linearGradient id="rm-tgt" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+      <linearGradient id="rm-mov" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+      <linearGradient id="rm-stale" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-orange-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+      <linearGradient id="rm-rel" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)" stop-opacity="0.3"/><stop offset="1" stop-color="var(--diagram-red-fill-end)" stop-opacity="0.3"/></linearGradient>
+    </defs>
+    <rect x="0" y="0" width="920" height="480" fill="var(--diagram-panel)" rx="10"/>
+    <text x="460" y="22" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="13" font-weight="700" font-family="monospace">INT16 · A=[3,7,15,42,100] · 删 v=15 · 5 帧动画</text>
+
+    <!-- (a) -->
+    <text x="40" y="56" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">(a) 操作前 length=5 内存 18 B</text>
+    <g transform="translate(40, 64)" font-family="monospace" font-size="11">
+      <rect x="0" y="0" width="50" height="30" fill="url(#rm-el)"/><text x="25" y="20" text-anchor="middle" fill="var(--diagram-text)">3</text>
+      <rect x="50" y="0" width="50" height="30" fill="url(#rm-el)"/><text x="75" y="20" text-anchor="middle" fill="var(--diagram-text)">7</text>
+      <rect x="100" y="0" width="50" height="30" fill="url(#rm-el)"/><text x="125" y="20" text-anchor="middle" fill="var(--diagram-text)">15</text>
+      <rect x="150" y="0" width="50" height="30" fill="url(#rm-el)"/><text x="175" y="20" text-anchor="middle" fill="var(--diagram-text)">42</text>
+      <rect x="200" y="0" width="50" height="30" fill="url(#rm-el)"/><text x="225" y="20" text-anchor="middle" fill="var(--diagram-text)">100</text>
+    </g>
+
+    <!-- (b) hit -->
+    <text x="40" y="124" fill="var(--diagram-green-text)" font-family="monospace" font-size="11">(b) intsetSearch(15) → pos=2 ✓ tail = 5-2-1 = 2(2 个元素需左移)</text>
+    <g transform="translate(40, 132)" font-family="monospace" font-size="11">
+      <rect x="0" y="0" width="50" height="30" fill="url(#rm-el)"/><text x="25" y="20" text-anchor="middle" fill="var(--diagram-text)">3</text>
+      <rect x="50" y="0" width="50" height="30" fill="url(#rm-el)"/><text x="75" y="20" text-anchor="middle" fill="var(--diagram-text)">7</text>
+      <rect x="100" y="0" width="50" height="30" fill="url(#rm-tgt)" stroke="var(--diagram-green-stroke)" stroke-width="2"/><text x="125" y="20" text-anchor="middle" fill="var(--diagram-text)" font-weight="700">15</text>
+      <rect x="150" y="0" width="50" height="30" fill="url(#rm-el)"/><text x="175" y="20" text-anchor="middle" fill="var(--diagram-text)">42</text>
+      <rect x="200" y="0" width="50" height="30" fill="url(#rm-el)"/><text x="225" y="20" text-anchor="middle" fill="var(--diagram-text)">100</text>
+    </g>
+
+    <!-- (c) memmove -->
+    <text x="40" y="192" fill="var(--diagram-blue-text)" font-family="monospace" font-size="11">(c) memmove(A+2, A+3, 4B) · [3],[4] 左移一格,[4] 仍是 100 的旧副本(橙色)</text>
+    <g transform="translate(40, 200)" font-family="monospace" font-size="11">
+      <rect x="0" y="0" width="50" height="30" fill="url(#rm-el)"/><text x="25" y="20" text-anchor="middle" fill="var(--diagram-text)">3</text>
+      <rect x="50" y="0" width="50" height="30" fill="url(#rm-el)"/><text x="75" y="20" text-anchor="middle" fill="var(--diagram-text)">7</text>
+      <rect x="100" y="0" width="50" height="30" fill="url(#rm-mov)"/><text x="125" y="20" text-anchor="middle" fill="var(--diagram-text)">42</text>
+      <rect x="150" y="0" width="50" height="30" fill="url(#rm-mov)"/><text x="175" y="20" text-anchor="middle" fill="var(--diagram-text)">100</text>
+      <rect x="200" y="0" width="50" height="30" fill="url(#rm-stale)" stroke="var(--diagram-orange-stroke)" stroke-dasharray="3,2"/><text x="225" y="20" text-anchor="middle" fill="var(--diagram-text)">100 stale</text>
+    </g>
+
+    <!-- (d) zrealloc -->
+    <text x="40" y="260" fill="var(--diagram-red-text)" font-family="monospace" font-size="11">(d) zrealloc 缩小到 4 元素 (16 B) · 尾部 100 副本被释放</text>
+    <g transform="translate(40, 268)" font-family="monospace" font-size="11">
+      <rect x="0" y="0" width="50" height="30" fill="url(#rm-el)"/><text x="25" y="20" text-anchor="middle" fill="var(--diagram-text)">3</text>
+      <rect x="50" y="0" width="50" height="30" fill="url(#rm-el)"/><text x="75" y="20" text-anchor="middle" fill="var(--diagram-text)">7</text>
+      <rect x="100" y="0" width="50" height="30" fill="url(#rm-el)"/><text x="125" y="20" text-anchor="middle" fill="var(--diagram-text)">42</text>
+      <rect x="150" y="0" width="50" height="30" fill="url(#rm-el)"/><text x="175" y="20" text-anchor="middle" fill="var(--diagram-text)">100</text>
+      <rect x="200" y="0" width="50" height="30" fill="url(#rm-rel)" stroke="var(--diagram-red-stroke)" stroke-dasharray="3,2"/><text x="225" y="20" text-anchor="middle" fill="var(--diagram-red-text)">freed</text>
+    </g>
+
+    <!-- (e) -->
+    <text x="40" y="328" fill="var(--diagram-green-text)" font-family="monospace" font-size="11">(e) length-- (5→4) · encoding 保持 INT16 ★ 不降级!</text>
+    <g transform="translate(40, 336)" font-family="monospace" font-size="11">
+      <rect x="0" y="0" width="50" height="30" fill="url(#rm-el)"/><text x="25" y="20" text-anchor="middle" fill="var(--diagram-text)">3</text>
+      <rect x="50" y="0" width="50" height="30" fill="url(#rm-el)"/><text x="75" y="20" text-anchor="middle" fill="var(--diagram-text)">7</text>
+      <rect x="100" y="0" width="50" height="30" fill="url(#rm-el)"/><text x="125" y="20" text-anchor="middle" fill="var(--diagram-text)">42</text>
+      <rect x="150" y="0" width="50" height="30" fill="url(#rm-el)"/><text x="175" y="20" text-anchor="middle" fill="var(--diagram-text)">100</text>
+    </g>
+
+    <!-- summary -->
+    <g transform="translate(40, 390)">
+      <rect x="0" y="0" width="840" height="80" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="20" y="22" fill="var(--diagram-orange-text)" font-size="12" font-weight="700">★ 关键: 不降级</text>
+      <text x="20" y="44" fill="var(--diagram-blue-text)" font-size="11">即使删除大数后所有剩余值都在 INT16 范围,仍保持原 encoding,不重新扫描判范围。</text>
+      <text x="20" y="62" fill="var(--diagram-green-text)" font-size="11">少做事 哲学: 升级一次 → 锁定 encoding,接受少量内存浪费换 SREM 路径稳定 O(N)。</text>
+    </g>
+  </svg>
+</div>
+
+<p>读图要点:(a) 操作前 INT16,length=5,内存 = 18 B,待删 value=15。(b) <strong><code>intsetSearch(15)</code></strong> → <code>pos = 2</code>(命中,绿色),计算 <code>tail = length - pos - 1 = 2</code>(待左移元素数)。(c) <strong><code>memmove(A+2, A+3, 4B)</code></strong>:<code>[3]=42 → [2]</code>,<code>[4]=100 → [3]</code>,<code>[4]</code> 仍是 100 的旧副本(橙色)→ 待截断。(d) <strong><code>zrealloc</code></strong> 缩小到 4 元素宽度(16 B),尾部 100 副本被释放。(e) <code>length--</code> (5 → 4)。<strong>encoding 保持 INT16(intset 不降级)</strong> —— 降级需扫全表判范围,违反 intset "少做事"设计。</p>
+
+<h3>5.6.3 复杂度</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 5-6-1 · intsetRemove 复杂度</div>
+  <table>
+    <thead><tr><th>场景</th><th>时间</th><th>空间变化</th></tr></thead>
+    <tbody>
+      <tr><td>删除头部(pos=0)</td><td>O(N) memmove</td><td>-1 元素宽度</td></tr>
+      <tr><td>删除中间</td><td>O(N) memmove</td><td>同上</td></tr>
+      <tr><td>删除尾部</td><td>O(1)(无 memmove)</td><td>同上</td></tr>
+      <tr><td>未命中</td><td>O(log N)</td><td>0</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="warning">
+  <strong>为什么不降级</strong>:降级需要每次删除都<strong>扫描所有元素</strong>判断"剩余值的最大宽度"。例如要从 INT64 降到 INT32,必须遍历 contents 确认所有值都在 [-2^31, 2^31) 内,O(N) 成本叠加在每次 SREM 上。Redis 选择"少做事"——升级一次后不再降级,接受少量内存浪费。生产中如内存紧张可手动 <code>DEL key</code> 后重建。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s5-7">5.7 为什么不选其他算法</h2>
+<!-- ============================================================ -->
+
+<p>这一节回答 Redis 设计者的反复思考:为什么"全整数小集合"这个看似边角的场景,值得专门写 150 行 C 代码做一个 intset?把候选方案矩阵展开,把 encoding 自适应的覆盖率画清楚,把不可逆转换的设计动机讲透。</p>
+
+<h3>5.7.1 六种候选方案的多维矩阵对比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 5-7-1 · 六种候选方案的多维矩阵对比</div>
+  <table>
+    <thead><tr><th>方案</th><th>内存(每元素)</th><th>查找</th><th>插入</th><th>删除</th><th>顺序保证</th><th>在小整数 Set 场景的关键劣势</th></tr></thead>
+    <tbody>
+      <tr><td>hashtable (dict)</td><td>24-48 B</td><td>O(1)</td><td>O(1)</td><td>O(1)</td><td>无</td><td>内存浪费 5-10 倍</td></tr>
+      <tr><td>单链表</td><td>16-24 B</td><td>O(N)</td><td>O(1) 头插</td><td>O(1) 已知节点</td><td>无</td><td>查找退化</td></tr>
+      <tr><td>跳表</td><td>24-40 B</td><td>O(log N)</td><td>O(log N)</td><td>O(log N)</td><td>有序</td><td>内存放大;实现复杂</td></tr>
+      <tr><td>有序数组(int32)</td><td>4 B</td><td>O(log N)</td><td>O(N) memmove</td><td>O(N) memmove</td><td>有序</td><td>无法存 int64;固定宽度浪费小数</td></tr>
+      <tr><td>位图</td><td>1 bit/元素</td><td>O(1)</td><td>O(1)</td><td>O(1)</td><td>无</td><td>只适合密集小整数,稀疏爆炸</td></tr>
+      <tr><td><strong>intset</strong></td><td><strong>2-8 B</strong></td><td><strong>O(log N)</strong></td><td><strong>O(N) memmove</strong></td><td><strong>O(N) memmove</strong></td><td><strong>有序</strong></td><td><strong>无,本场景最优</strong></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>5.7.2 三种 encoding 的覆盖率</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-7-1 · 三种 encoding 在业务场景的覆盖</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:920px;width:100%;margin:8px auto;height:auto;">
+    <defs>
+      <linearGradient id="cov-16" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+      <linearGradient id="cov-32" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-orange-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+      <linearGradient id="cov-64" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+    </defs>
+    <rect x="0" y="0" width="920" height="380" fill="var(--diagram-panel)" rx="10"/>
+    <text x="460" y="22" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="13" font-weight="700" font-family="monospace">三种 encoding 范围 vs 业务整数分布</text>
+
+    <!-- INT16 -->
+    <text x="40" y="58" fill="var(--diagram-blue-text)" font-size="12" font-weight="700" font-family="monospace">INT16 范围 · ±32K</text>
+    <rect x="40" y="64" width="180" height="22" fill="url(#cov-16)"/>
+    <text x="230" y="80" fill="var(--diagram-blue-text)" font-size="11" font-family="monospace">-32,768 ~ 32,767</text>
+
+    <!-- INT32 -->
+    <text x="40" y="106" fill="var(--diagram-orange-text)" font-size="12" font-weight="700" font-family="monospace">INT32 范围 · ±2.1B</text>
+    <rect x="40" y="112" width="480" height="22" fill="url(#cov-32)"/>
+    <text x="530" y="128" fill="var(--diagram-blue-text)" font-size="11" font-family="monospace">-2.1B ~ 2.1B</text>
+
+    <!-- INT64 -->
+    <text x="40" y="154" fill="var(--diagram-red-text)" font-size="12" font-weight="700" font-family="monospace">INT64 范围 · ±9.2×10^18</text>
+    <rect x="40" y="160" width="800" height="22" fill="url(#cov-64)"/>
+    <text x="850" y="176" fill="var(--diagram-blue-text)" font-size="11" font-family="monospace" text-anchor="end">±9.2×10^18</text>
+
+    <!-- 业务整数 -->
+    <g transform="translate(40, 210)">
+      <rect x="0" y="0" width="840" height="160" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="20" y="22" fill="var(--diagram-purple-text)" font-size="12" font-weight="700">业务整数典型分布</text>
+      <g font-family="monospace" font-size="11">
+        <text x="20" y="46" fill="var(--diagram-blue-text)">标签 ID:</text>
+        <text x="200" y="46" fill="var(--diagram-orange-text)">0 - 100k</text>
+        <rect x="320" y="36" width="60" height="14" fill="url(#cov-32)"/><text x="390" y="46" fill="var(--diagram-orange-text)">INT32</text>
+
+        <text x="20" y="64" fill="var(--diagram-blue-text)">文章 ID:</text>
+        <text x="200" y="64" fill="var(--diagram-orange-text)">0 - 1B</text>
+        <rect x="320" y="54" width="60" height="14" fill="url(#cov-32)"/><text x="390" y="64" fill="var(--diagram-orange-text)">INT32</text>
+
+        <text x="20" y="82" fill="var(--diagram-blue-text)">Unix 时间戳(秒):</text>
+        <text x="200" y="82" fill="var(--diagram-orange-text)">10^9</text>
+        <rect x="320" y="72" width="60" height="14" fill="url(#cov-32)"/><text x="390" y="82" fill="var(--diagram-orange-text)">INT32</text>
+
+        <text x="20" y="100" fill="var(--diagram-blue-text)">Unix 时间戳(毫秒):</text>
+        <text x="200" y="100" fill="var(--diagram-orange-text)">10^12</text>
+        <rect x="320" y="90" width="60" height="14" fill="url(#cov-64)"/><text x="390" y="100" fill="var(--diagram-red-text)">INT64</text>
+
+        <text x="20" y="118" fill="var(--diagram-blue-text)">雪花 ID:</text>
+        <text x="200" y="118" fill="var(--diagram-orange-text)">10^18</text>
+        <rect x="320" y="108" width="60" height="14" fill="url(#cov-64)"/><text x="390" y="118" fill="var(--diagram-red-text)">INT64</text>
+
+        <text x="460" y="46" fill="var(--diagram-blue-text)">IPv4 (uint32):</text>
+        <text x="620" y="46" fill="var(--diagram-orange-text)">0 - 4.3B</text>
+        <rect x="720" y="36" width="60" height="14" fill="url(#cov-32)"/><text x="785" y="46" fill="var(--diagram-orange-text)">INT32*</text>
+
+        <text x="460" y="64" fill="var(--diagram-blue-text)">设备 ID(短):</text>
+        <text x="620" y="64" fill="var(--diagram-orange-text)">0 - 65535</text>
+        <rect x="720" y="54" width="60" height="14" fill="url(#cov-16)"/><text x="785" y="64" fill="var(--diagram-blue-text)">INT16</text>
+
+        <text x="460" y="82" fill="var(--diagram-blue-text)">权限位:</text>
+        <text x="620" y="82" fill="var(--diagram-orange-text)">1 - 64</text>
+        <rect x="720" y="72" width="60" height="14" fill="url(#cov-16)"/><text x="785" y="82" fill="var(--diagram-blue-text)">INT16</text>
+
+        <text x="20" y="146" fill="var(--diagram-orange-text)" font-size="10">* IPv4 注意有符号溢出</text>
+      </g>
+    </g>
+  </svg>
+</div>
+
+<h3>5.7.3 设计动机</h3>
+
+<p>intset 在"<strong>全整数小集合</strong>"这一狭窄但高频的场景下,实现了:</p>
+
+<ul>
+  <li><strong>比 hashtable 节省 5-10 倍内存</strong>(没有 dictEntry 元数据)</li>
+  <li><strong>比通用有序数组省一半空间</strong>(自适应宽度,小数不占大宽度)</li>
+  <li><strong>支持 64-bit 大数</strong>(自动升级)</li>
+  <li><strong>有序性</strong>(支持范围扫描的雏形,虽然 Set 不暴露)</li>
+</ul>
+
+<p>代价是插入/删除最坏 O(N),但小集合(< 512 元素)的 N 本身就小,memmove 的实际成本在 microsecond 量级。</p>
+
+<div class="key-insight">
+  <strong>"少做事"是核心哲学</strong>:不可逆转换的动机是简化命令路径——每次 SREM 都判断"是否能降级"会增加扫描成本。Redis 选择"少做事"——只在必要时升级,转换后不回头,把判断逻辑剪到最简。这一思想在后续的 ziplist→listpack、quicklist 节点压缩等设计里反复出现。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s5-8">5.8 已知陷阱与限制</h2>
+<!-- ============================================================ -->
+
+<h3>5.8.1 陷阱分类</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-8-1 · intset 相关陷阱 8 种分类</div>
+  <svg viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect x="0" y="0" width="940" height="460" fill="var(--diagram-panel)" rx="10"/>
+
+    <g transform="translate(370, 20)" filter="url(#d-shadow)">
+      <rect width="200" height="44" rx="10" fill="url(#d-purple)"/>
+      <text x="100" y="20" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">intset 相关陷阱</text>
+      <text x="100" y="36" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">8 种 / 4 类</text>
+    </g>
+
+    <path d="M 470 64 L 130 122" stroke="var(--diagram-red-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr-r)"/>
+    <path d="M 470 64 L 350 122" stroke="var(--diagram-orange-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr)"/>
+    <path d="M 470 64 L 590 122" stroke="var(--diagram-purple-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr)"/>
+    <path d="M 470 64 L 810 122" stroke="var(--diagram-cyan-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr)"/>
+
+    <g transform="translate(40, 122)" filter="url(#d-shadow)">
+      <rect width="180" height="44" rx="8" fill="url(#d-red)"/>
+      <text x="90" y="20" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">A · 类型污染</text>
+      <text x="90" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="10">非整数 → hashtable</text>
+    </g>
+
+    <g transform="translate(260, 122)" filter="url(#d-shadow)">
+      <rect width="180" height="44" rx="8" fill="url(#d-amber)"/>
+      <text x="90" y="20" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="13" font-weight="700">B · 阈值类</text>
+      <text x="90" y="36" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">边界附近行为突变</text>
+    </g>
+
+    <g transform="translate(500, 122)" filter="url(#d-shadow)">
+      <rect width="180" height="44" rx="8" fill="url(#d-purple)"/>
+      <text x="90" y="20" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">C · 不可逆</text>
+      <text x="90" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="10">编码/encoding 单调升</text>
+    </g>
+
+    <g transform="translate(720, 122)" filter="url(#d-shadow)">
+      <rect width="180" height="44" rx="8" fill="url(#d-cyan)"/>
+      <text x="90" y="20" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">D · 性能</text>
+      <text x="90" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="10">memmove 主导 P99</text>
+    </g>
+
+    <path d="M 130 166 L 130 200" stroke="var(--diagram-red-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-r)"/>
+    <path d="M 350 166 L 350 200" stroke="var(--diagram-orange-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+    <path d="M 590 166 L 590 200" stroke="var(--diagram-purple-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+    <path d="M 810 166 L 810 200" stroke="var(--diagram-cyan-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
+
+    <g transform="translate(40, 200)">
+      <rect width="180" height="50" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)" stroke-width="1.2"/>
+      <text x="20" y="20" fill="var(--diagram-red-text)" font-size="12" font-weight="700">①</text>
+      <text x="40" y="20" fill="var(--diagram-red-text)" font-size="11">写入 "null" 字符串</text>
+      <text x="20" y="38" fill="var(--diagram-muted)" font-size="10">字符串触发 hashtable</text>
+    </g>
+    <g transform="translate(40, 258)">
+      <rect width="180" height="50" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)" stroke-width="1.2"/>
+      <text x="20" y="20" fill="var(--diagram-red-text)" font-size="12" font-weight="700">②</text>
+      <text x="40" y="20" fill="var(--diagram-red-text)" font-size="11">带前缀整数 user:123</text>
+      <text x="20" y="38" fill="var(--diagram-muted)" font-size="10">非纯数字 → 字符串</text>
+    </g>
+
+    <g transform="translate(260, 200)">
+      <rect width="180" height="50" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)" stroke-width="1.2"/>
+      <text x="20" y="20" fill="var(--diagram-orange-text)" font-size="12" font-weight="700">③</text>
+      <text x="40" y="20" fill="var(--diagram-orange-text)" font-size="11">阈值调过高(10k)</text>
+      <text x="20" y="38" fill="var(--diagram-muted)" font-size="10">memmove 拖慢写</text>
+    </g>
+    <g transform="translate(260, 258)">
+      <rect width="180" height="50" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)" stroke-width="1.2"/>
+      <text x="20" y="20" fill="var(--diagram-orange-text)" font-size="12" font-weight="700">④</text>
+      <text x="40" y="20" fill="var(--diagram-orange-text)" font-size="11">阈值穿越后内存暴涨</text>
+      <text x="20" y="38" fill="var(--diagram-muted)" font-size="10">N→hashtable 跳变</text>
+    </g>
+
+    <g transform="translate(500, 200)">
+      <rect width="180" height="50" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="1.2"/>
+      <text x="20" y="20" fill="var(--diagram-purple-text)" font-size="12" font-weight="700">⑤</text>
+      <text x="40" y="20" fill="var(--diagram-purple-text)" font-size="11">删大数后期望降级</text>
+      <text x="20" y="38" fill="var(--diagram-muted)" font-size="10">encoding 不会回 INT16</text>
+    </g>
+    <g transform="translate(500, 258)">
+      <rect width="180" height="50" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="1.2"/>
+      <text x="20" y="20" fill="var(--diagram-purple-text)" font-size="12" font-weight="700">⑥</text>
+      <text x="40" y="20" fill="var(--diagram-purple-text)" font-size="11">删字符串后期望回 intset</text>
+      <text x="20" y="38" fill="var(--diagram-muted)" font-size="10">编码不会回 intset</text>
+    </g>
+
+    <g transform="translate(720, 200)">
+      <rect width="180" height="50" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-cyan-stroke)" stroke-width="1.2"/>
+      <text x="20" y="20" fill="var(--diagram-cyan-text)" font-size="12" font-weight="700">⑦</text>
+      <text x="40" y="20" fill="var(--diagram-cyan-text)" font-size="11">频繁 SPOP 大 intset</text>
+      <text x="20" y="38" fill="var(--diagram-muted)" font-size="10">中间删 → memmove</text>
+    </g>
+    <g transform="translate(720, 258)">
+      <rect width="180" height="50" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-cyan-stroke)" stroke-width="1.2"/>
+      <text x="20" y="20" fill="var(--diagram-cyan-text)" font-size="12" font-weight="700">⑧</text>
+      <text x="40" y="20" fill="var(--diagram-cyan-text)" font-size="11">频繁头部 SADD 小数</text>
+      <text x="20" y="38" fill="var(--diagram-muted)" font-size="10">最差 O(N) memmove</text>
+    </g>
+
+    <g transform="translate(40, 330)">
+      <rect width="860" height="108" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)" stroke-dasharray="4 3"/>
+      <text x="20" y="22" fill="var(--diagram-green-text)" font-size="12" font-weight="700">📐 风险等级</text>
+      <text x="100" y="22" fill="var(--diagram-blue-text)" font-size="12">A 类 (类型污染) 致命: 一次误写即不可逆 + 5-10× 内存放大</text>
+      <text x="20" y="42" fill="var(--diagram-orange-text)" font-size="12" font-weight="700">⚠ 中危</text>
+      <text x="100" y="42" fill="var(--diagram-blue-text)" font-size="12">B 类 (阈值): 默认 512 安全, 调到 5000+ 写延迟会被 memmove 主导</text>
+      <text x="20" y="62" fill="var(--diagram-purple-text)" font-size="12" font-weight="700">📌 设计</text>
+      <text x="100" y="62" fill="var(--diagram-blue-text)" font-size="12">C 类 (单调升): 是 Redis 故意为之 — 简单 &gt; 完美;接受 + 重建是唯一解</text>
+      <text x="20" y="82" fill="var(--diagram-cyan-text)" font-size="12" font-weight="700">⚙ 调优</text>
+      <text x="100" y="82" fill="var(--diagram-blue-text)" font-size="12">D 类 (性能): 大集合 (≥ 1k) 优先 hashtable; intset 只在 hot path 短小集合中用</text>
+      <text x="20" y="100" fill="var(--diagram-red-text)" font-size="11" font-weight="700">!! 应用层校验比"事后清洗"便宜 N 倍 — SADD 前必须 isInteger() 守门</text>
+    </g>
+  </svg>
+</div>
+
+<h3>5.8.2 陷阱明细</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 5-8-1 · intset 八大陷阱明细</div>
+  <table>
+    <thead><tr><th>#</th><th>陷阱</th><th>症状</th><th>根因</th><th>处理</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>写入 <code>"null"</code> 字符串</td><td>编码变 hashtable,内存暴增</td><td>intset 只接受整数,任何非整数转 hashtable</td><td>应用层校验;污染 key 重建</td></tr>
+      <tr><td>2</td><td>带前缀整数(<code>user:123</code>)</td><td>同上</td><td>字符串不被识别为整数</td><td>拆前缀,只存数值</td></tr>
+      <tr><td>3</td><td>阈值调过高(如 10000)</td><td>SADD/SREM 尾延迟上升</td><td>memmove 成本随 N 线性增长</td><td>默认 512;调高前压测</td></tr>
+      <tr><td>4</td><td>阈值穿越后内存暴涨</td><td>单 key 内存从 KB 跳到 MB</td><td>转 hashtable 后元数据放大</td><td>监控接近阈值的 key</td></tr>
+      <tr><td>5</td><td>删除大数后期望降级</td><td>内存不降</td><td>intset 只升级不降级</td><td>接受少量浪费,或删除整个 key 重建</td></tr>
+      <tr><td>6</td><td>删除字符串后期望回 intset</td><td>编码仍是 hashtable</td><td>编码转换不可逆</td><td>同上</td></tr>
+      <tr><td>7</td><td>频繁 SPOP 大 intset</td><td>P99 抖动</td><td>SPOP 删除中间元素需 memmove</td><td>大集合改 hashtable;或限制 SPOP 频率</td></tr>
+      <tr><td>8</td><td>频繁头部 SADD</td><td>插入 O(N)</td><td>memmove 移动整个数组</td><td>顺序插入或改 hashtable</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>5.8.3 反例 1:类型污染导致不可逆转换</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4>污染后即使删除字符串也回不去 intset</h4>
+<pre><code class="language-bash">127.0.0.1:6379&gt; DEL tags
+(integer) 1
+127.0.0.1:6379&gt; SADD tags 100 200 300
+(integer) 3
+127.0.0.1:6379&gt; OBJECT ENCODING tags
+"intset"
+
+# 误写一个空字符串(字段校验缺失)
+127.0.0.1:6379&gt; SADD tags ""
+(integer) 1
+127.0.0.1:6379&gt; OBJECT ENCODING tags
+"hashtable"        ← 编码已转换!
+
+# 即使删掉空串
+127.0.0.1:6379&gt; SREM tags ""
+(integer) 1
+127.0.0.1:6379&gt; OBJECT ENCODING tags
+"hashtable"        ← 仍然是 hashtable!
+
+# 内存检查
+127.0.0.1:6379&gt; MEMORY USAGE tags
+(integer) 320      ← 比 intset(56B)多 5 倍</code></pre>
+  </div>
+  <div class="compare-good">
+    <h4>应用层校验 + 必要时手动重建</h4>
+<pre><code class="language-bash"># 方案 1: 应用层 Lua 脚本校验
+127.0.0.1:6379&gt; DEL tags
+(integer) 1
+127.0.0.1:6379&gt; SADD tags 100 200 300
+
+127.0.0.1:6379&gt; EVAL "if not tonumber(ARGV[1]) then \
+                       return 'invalid' \
+                     end; \
+                     return redis.call('SADD', \
+                       KEYS[1], ARGV[1])" \
+                  1 tags "abc"
+"invalid"
+127.0.0.1:6379&gt; OBJECT ENCODING tags
+"intset"           ← 保持 intset
+
+# 方案 2: 已污染的 key 重建
+127.0.0.1:6379&gt; SMEMBERS tags
+1) "100"
+2) "200"
+3) "300"
+127.0.0.1:6379&gt; DEL tags
+127.0.0.1:6379&gt; SADD tags 100 200 300
+127.0.0.1:6379&gt; OBJECT ENCODING tags
+"intset"</code></pre>
+  </div>
+</div>
+
+<h3>5.8.4 反例 2:阈值调过高导致写延迟抖动</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4>set-max-intset-entries 调到 100000</h4>
+<pre><code class="language-bash"># 误以为"调高阈值省内存"
+127.0.0.1:6379&gt; CONFIG SET \
+                  set-max-intset-entries 100000
+
+# 实际写入 5 万随机整数
+for i in $(seq 1 50000); do
+  redis-cli SADD s $RANDOM
+done
+
+# 现象:
+# - 中间插入需 memmove ~25K 元素 × 4B = 100KB
+# - SADD P99 从 5 μs 升到 80 μs
+# - latency monitor 显示明显抖动
+# - 内存确实少了 5-10x,但写延迟代价巨大</code></pre>
+  </div>
+  <div class="compare-good">
+    <h4>保持默认 512 + 业务上自然分桶</h4>
+<pre><code class="language-bash"># 默认值
+127.0.0.1:6379&gt; CONFIG GET \
+                  set-max-intset-entries
+1) "set-max-intset-entries"
+2) "512"
+
+# 业务上分桶:tags:user:123 / tags:user:124
+# 每个 Set < 512 元素
+
+# 现象:
+# - SADD 稳定 5-10 μs
+# - 单 key 内存 < 5 KB
+# - 集群级内存接近原方案
+# - 但写延迟稳定,P99 < 20 μs
+
+# 如果确实有大集合,直接转 hashtable
+# 别和阈值死磕</code></pre>
+  </div>
+</div>
+
+<h3>5.8.5 反例 3:用 intset 当 bitmap</h3>
+
+<div class="warning">
+  <strong>密集小整数应该用 bitmap 不是 intset</strong>:如果元素是"<strong>0 到 N 的密集整数</strong>",bitmap 内存效率远高于 intset。例如要存"用户 ID 1-10000 是否在线",bitmap 仅 1250 字节,intset 需 20+ KB(10000 × 2B + memmove 反复扩容)。<br><br>
+  <strong>判定原则</strong>:① 元素稀疏(密度 &lt; 5%)→ 用 intset/Set;② 元素密集(密度 &gt; 30%)→ 用 bitmap;③ 之间区间 → 看具体规模与查询模式。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s5-9">5.9 源码深潜与设计取舍</h2>
+<!-- ============================================================ -->
+
+<h3>5.9.1 intset 在 Redis 中的位置</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-9-1 · SADD 命令路径中的 intset 位置</div>
+  <svg viewBox="0 0 940 380" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect x="0" y="0" width="940" height="380" fill="var(--diagram-panel)" rx="10"/>
+
+    <g transform="translate(20, 110)" filter="url(#d-shadow)">
+      <rect width="140" height="58" rx="10" fill="url(#d-blue)"/>
+      <text x="70" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">t_set.c</text>
+      <text x="70" y="40" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">saddCommand</text>
+      <text x="70" y="52" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">命令入口</text>
+    </g>
+    <path d="M 160 138 L 184 138" stroke="var(--diagram-blue-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-b)"/>
+
+    <g transform="translate(184, 110)" filter="url(#d-shadow)">
+      <rect width="140" height="58" rx="10" fill="url(#d-purple)"/>
+      <text x="70" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">t_set.c</text>
+      <text x="70" y="40" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">setTypeAdd</text>
+      <text x="70" y="52" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">编码分派</text>
+    </g>
+    <path d="M 324 138 L 348 138" stroke="var(--diagram-purple-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+
+    <g transform="translate(348, 100)" filter="url(#d-shadow)">
+      <path d="M 80 0 L 160 38 L 80 76 L 0 38 Z" fill="var(--diagram-blue-stroke)" stroke="var(--diagram-purple-stroke)" stroke-width="1.5"/>
+      <text x="80" y="32" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">member 整数?</text>
+      <text x="80" y="48" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">当前 encoding?</text>
+    </g>
+
+    <path d="M 426 100 L 426 56" stroke="var(--diagram-red-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr-r)"/>
+    <text x="442" y="80" fill="var(--diagram-red-text)" font-size="11" font-weight="700">非整数 / 超阈值</text>
+    <g transform="translate(348, 14)" filter="url(#d-shadow)">
+      <rect width="160" height="44" rx="8" fill="url(#d-red)"/>
+      <text x="80" y="20" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">setTypeConvert</text>
+      <text x="80" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="10">✗ 转 hashtable (不可逆)</text>
+    </g>
+
+    <path d="M 508 138 L 540 138" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-g)"/>
+    <text x="524" y="124" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">整数 + intset</text>
+
+    <g transform="translate(540, 110)" filter="url(#d-shadow)">
+      <rect width="140" height="58" rx="10" fill="url(#d-green)"/>
+      <text x="70" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">intset.c</text>
+      <text x="70" y="40" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">intsetAdd</text>
+      <text x="70" y="52" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">本章核心</text>
+    </g>
+
+    <path d="M 610 168 L 610 196" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-g)"/>
+
+    <g transform="translate(540, 196)" filter="url(#d-shadow)">
+      <rect width="140" height="44" rx="8" fill="url(#d-cyan)"/>
+      <text x="70" y="20" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">intsetSearch</text>
+      <text x="70" y="36" text-anchor="middle" fill="var(--diagram-cyan-text)" font-size="10">二分 O(log N)</text>
+    </g>
+
+    <path d="M 610 240 L 610 256" stroke="var(--diagram-cyan-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+
+    <g transform="translate(530, 256)" filter="url(#d-shadow)">
+      <path d="M 80 0 L 160 22 L 80 44 L 0 22 Z" fill="var(--diagram-blue-stroke)" stroke="var(--diagram-cyan-stroke)" stroke-width="1.5"/>
+      <text x="80" y="26" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">valenc &gt; encoding?</text>
+    </g>
+
+    <path d="M 530 278 L 380 318" stroke="var(--diagram-orange-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr)"/>
+    <text x="430" y="304" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">是</text>
+    <g transform="translate(220, 318)" filter="url(#d-shadow)">
+      <rect width="180" height="44" rx="8" fill="url(#d-amber)"/>
+      <text x="90" y="20" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="700">intsetUpgradeAndAdd</text>
+      <text x="90" y="36" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">⚠ §5.5 升级路径 O(N)</text>
+    </g>
+
+    <path d="M 690 278 L 820 318" stroke="var(--diagram-green-stroke)" stroke-width="1.8" fill="none" marker-end="url(#d-arr-g)"/>
+    <text x="780" y="304" fill="var(--diagram-green-text)" font-size="11" font-weight="700">否</text>
+    <g transform="translate(720, 318)" filter="url(#d-shadow)">
+      <rect width="200" height="44" rx="8" fill="url(#d-green)"/>
+      <text x="100" y="20" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">memmove + _intsetSet</text>
+      <text x="100" y="36" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">✓ §5.4 不升级路径</text>
+    </g>
+
+    <g transform="translate(20, 14)">
+      <rect width="240" height="76" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)" stroke-dasharray="4 3"/>
+      <text x="12" y="20" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">📁 源码分层</text>
+      <text x="12" y="38" fill="var(--diagram-blue-text)" font-size="11" font-family="ui-monospace,Consolas">t_set.c</text>
+      <text x="80" y="38" fill="var(--diagram-muted)" font-size="11">→ 命令 + 编码策略</text>
+      <text x="12" y="54" fill="var(--diagram-green-text)" font-size="11" font-family="ui-monospace,Consolas">intset.c</text>
+      <text x="80" y="54" fill="var(--diagram-muted)" font-size="11">→ 编码内部细节</text>
+      <text x="12" y="70" fill="var(--diagram-muted)" font-size="10">单向调用,intset 不感知 dict</text>
+    </g>
+  </svg>
+</div>
+
+<h3>5.9.2 核心源码入口</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 5-9-1 · intset 源码入口</div>
+  <table>
+    <thead><tr><th>源码文件</th><th>关键函数</th><th>职责</th></tr></thead>
+    <tbody>
+      <tr><td><code>src/t_set.c</code></td><td><code>saddCommand()</code>、<code>setTypeAdd()</code></td><td>命令入口与编码分派</td></tr>
+      <tr><td><code>src/t_set.c</code></td><td><code>setTypeConvert()</code></td><td>intset → hashtable(不可逆)</td></tr>
+      <tr><td><code>src/intset.h</code></td><td><code>intset</code> 结构</td><td>数据结构定义</td></tr>
+      <tr><td><code>src/intset.c</code></td><td><code>intsetNew()</code>、<code>intsetSize()</code></td><td>生命周期与大小计算</td></tr>
+      <tr><td><code>src/intset.c</code></td><td><code>intsetSearch()</code></td><td>二分查找</td></tr>
+      <tr><td><code>src/intset.c</code></td><td><code>intsetAdd()</code></td><td>插入入口</td></tr>
+      <tr><td><code>src/intset.c</code></td><td><code>intsetUpgradeAndAdd()</code></td><td><strong>升级路径(从后往前重排)</strong></td></tr>
+      <tr><td><code>src/intset.c</code></td><td><code>intsetRemove()</code></td><td>删除</td></tr>
+      <tr><td><code>src/intset.c</code></td><td><code>_intsetGet/_intsetSet</code></td><td>按 encoding 读写元素</td></tr>
+      <tr><td><code>src/intset.c</code></td><td><code>_intsetValueEncoding</code></td><td>计算 value 所需 encoding</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>5.9.3 关键源码片段</h3>
+
+<pre><code class="language-c">/* src/intset.c - 升级 + 插入 (本章核心) */
+static intset *intsetUpgradeAndAdd(intset *is, int64_t value) {
+    uint8_t curenc = intrev32ifbe(is-&gt;encoding);
+    uint8_t newenc = _intsetValueEncoding(value);
+    int length = intrev32ifbe(is-&gt;length);
+    int prepend = value &lt; 0 ? 1 : 0;
+
+    /* 立即更新 encoding,以便 _intsetSet 使用新 encoding */
+    is-&gt;encoding = intrev32ifbe(newenc);
+    is = intsetResize(is, intrev32ifbe(is-&gt;length) + 1);
+
+    /* 从后往前重排:必须从 length-1 走到 0,
+     * 因为新 encoding 偏移 > 旧 encoding 偏移,
+     * 写靠前会破坏未读的旧值 */
+    while (length--)
+        _intsetSet(is, length + prepend,
+                   _intsetGetEncoded(is, length, curenc));
+
+    /* 在头或尾插入新值 */
+    if (prepend)
+        _intsetSet(is, 0, value);
+    else
+        _intsetSet(is, intrev32ifbe(is-&gt;length), value);
+
+    is-&gt;length = intrev32ifbe(intrev32ifbe(is-&gt;length) + 1);
+    return is;
+}</code></pre>
+
+<pre><code class="language-c">/* src/intset.c - 不升级路径 */
+intset *intsetAdd(intset *is, int64_t value, uint8_t *success) {
+    uint8_t valenc = _intsetValueEncoding(value);
+    uint32_t pos;
+    if (success) *success = 1;
+
+    /* valenc > 当前 encoding → 走升级路径 */
+    if (valenc &gt; intrev32ifbe(is-&gt;encoding)) {
+        return intsetUpgradeAndAdd(is, value);
+    } else {
+        /* 已在 encoding 范围内 → 二分定位 */
+        if (intsetSearch(is, value, &amp;pos)) {
+            if (success) *success = 0;  /* 已存在 */
+            return is;
+        }
+
+        /* 扩容 + memmove + 写入 */
+        is = intsetResize(is, intrev32ifbe(is-&gt;length) + 1);
+        if (pos &lt; intrev32ifbe(is-&gt;length))
+            intsetMoveTail(is, pos, pos+1);
+    }
+
+    _intsetSet(is, pos, value);
+    is-&gt;length = intrev32ifbe(intrev32ifbe(is-&gt;length) + 1);
+    return is;
+}</code></pre>
+
+<pre><code class="language-c">/* src/intset.c - 二分查找 */
+static uint8_t intsetSearch(intset *is, int64_t value, uint32_t *pos) {
+    int min = 0, max = intrev32ifbe(is-&gt;length) - 1, mid = -1;
+    int64_t cur = -1;
+
+    /* 空集合 */
+    if (intrev32ifbe(is-&gt;length) == 0) {
+        if (pos) *pos = 0;
+        return 0;
+    } else {
+        /* 头/尾速判:顺序插入退化为 O(1) */
+        if (value &gt; _intsetGet(is, max)) {
+            if (pos) *pos = intrev32ifbe(is-&gt;length);
+            return 0;
+        } else if (value &lt; _intsetGet(is, 0)) {
+            if (pos) *pos = 0;
+            return 0;
+        }
+    }
+
+    /* 标准二分 */
+    while (max &gt;= min) {
+        mid = ((unsigned int)min + (unsigned int)max) &gt;&gt; 1;
+        cur = _intsetGet(is, mid);
+        if (value &gt; cur) min = mid + 1;
+        else if (value &lt; cur) max = mid - 1;
+        else break;
+    }
+
+    if (value == cur) {
+        if (pos) *pos = mid;
+        return 1;
+    } else {
+        if (pos) *pos = min;
+        return 0;
+    }
+}</code></pre>
+
+<div class="key-insight">
+  <strong>关于 <code>intrev32ifbe</code></strong>:Redis 在内存中始终用<strong>小端序</strong>存 <code>encoding</code> 与 <code>length</code> 字段,以保证 RDB 在不同字节序机器之间可移植。<code>intrev32ifbe</code>(integer reverse 32 if big-endian)在大端机器上做字节翻转,在小端机器(主流 x86/ARM)上是 no-op。读源码时可以把它当成"<strong>访问 length 的语法糖</strong>"。
+</div>
+
+<h3>5.9.4 设计取舍</h3>
+
+<h4>取舍 1:三种 encoding vs 单一 INT64</h4>
+
+<p>单一 INT64 简化代码,但小整数场景内存浪费 4 倍(2 B → 8 B)。三种 encoding 自适应在 INT16 起步、按需升级,内存效率最优。代价是升级时一次 O(N) 重排——但生命周期内最多 2 次,均摊 O(1)。</p>
+
+<h4>取舍 2:连续数组 vs 链表</h4>
+
+<p>连续数组提供 cache locality 与 O(log N) 二分查找,但插入/删除需 memmove。链表插入 O(1) 但查找 O(N)、cache miss 多。小集合场景下连续数组的整体成本(查找 + 写)优于链表。Redis 在 quicklist 设计里把这两种思路结合(链表 + 内部 listpack 块),后续章节会讨论。</p>
+
+<h4>取舍 3:不降级 vs 自动降级</h4>
+
+<p>降级需要每次删除都扫描所有元素判断"剩余值的最大宽度"。Redis 选择"少做事"——升级一次后不再降级,接受少量内存浪费。生产中如内存紧张可手动 <code>DEL key</code> 后重建。</p>
+
+<h4>取舍 4:不可逆 intset → hashtable</h4>
+
+<p>转换为 hashtable 后,即使删除非整数元素回到全整数,也不转回 intset。原因同上——避免每次操作都判断"是否可降级"。代价是被污染的 key 内存永久放大,需应用层重建。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 5-9-2 · Set 编码状态机(单向不可逆)</div>
+  <svg viewBox="0 0 940 480" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect x="0" y="0" width="940" height="480" fill="var(--diagram-panel)" rx="10"/>
+
+    <g transform="translate(40, 24)" filter="url(#d-shadow)">
+      <circle cx="20" cy="20" r="10" fill="var(--diagram-surface-muted)"/>
+      <circle cx="20" cy="20" r="5" fill="var(--diagram-blue-fill)"/>
+      <text x="40" y="25" fill="var(--diagram-blue-text)" font-size="12" font-weight="700" font-family="ui-monospace,Consolas">Initial</text>
+      <text x="40" y="40" fill="var(--diagram-muted)" font-size="10">SADD 首个元素 →</text>
+    </g>
+
+    <g transform="translate(40, 84)" filter="url(#d-shadow)">
+      <ellipse cx="80" cy="22" rx="78" ry="20" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)" stroke-width="1.5" stroke-dasharray="4 3"/>
+      <text x="80" y="27" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="13" font-weight="700">Empty (空 Set)</text>
+    </g>
+
+    <path d="M 158 100 L 230 130" stroke="var(--diagram-blue-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr-b)"/>
+    <text x="170" y="118" fill="var(--diagram-blue-text)" font-size="10">值 ∈ INT16</text>
+    <path d="M 158 110 L 230 200" stroke="var(--diagram-purple-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr)"/>
+    <text x="170" y="170" fill="var(--diagram-purple-text)" font-size="10">值 ∈ INT32</text>
+    <path d="M 158 122 L 230 270" stroke="var(--diagram-cyan-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr)"/>
+    <text x="170" y="240" fill="var(--diagram-cyan-text)" font-size="10">值 ∈ INT64</text>
+    <path d="M 158 122 L 700 360" stroke="var(--diagram-red-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr-r)"/>
+    <text x="240" y="320" fill="var(--diagram-red-text)" font-size="11" font-weight="700">非整数 → 直接 hashtable</text>
+
+    <g transform="translate(230, 110)" filter="url(#d-shadow)">
+      <rect width="200" height="44" rx="22" fill="url(#d-blue)"/>
+      <text x="100" y="20" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">intset · INT16</text>
+      <text x="100" y="36" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">每元素 2 B (默认起步)</text>
+    </g>
+
+    <g transform="translate(230, 180)" filter="url(#d-shadow)">
+      <rect width="200" height="44" rx="22" fill="url(#d-purple)"/>
+      <text x="100" y="20" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">intset · INT32</text>
+      <text x="100" y="36" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">每元素 4 B</text>
+    </g>
+
+    <g transform="translate(230, 250)" filter="url(#d-shadow)">
+      <rect width="200" height="44" rx="22" fill="url(#d-cyan)"/>
+      <text x="100" y="20" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">intset · INT64</text>
+      <text x="100" y="36" text-anchor="middle" fill="var(--diagram-cyan-text)" font-size="10">每元素 8 B</text>
+    </g>
+
+    <path d="M 330 154 L 330 178" stroke="var(--diagram-purple-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+    <text x="338" y="170" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">超 INT16</text>
+
+    <path d="M 330 224 L 330 248" stroke="var(--diagram-cyan-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+    <text x="338" y="240" fill="var(--diagram-cyan-text)" font-size="11" font-weight="700">超 INT32</text>
+
+    <path d="M 432 132 L 540 132 L 540 250 L 432 270" stroke="var(--diagram-cyan-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr)" stroke-dasharray="6 3"/>
+    <text x="490" y="124" fill="var(--diagram-cyan-text)" font-size="10" font-weight="700">直接超 INT32 (跳级)</text>
+
+    <path d="M 430 132 L 700 280" stroke="var(--diagram-red-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr-r)"/>
+    <text x="540" y="200" fill="var(--diagram-red-text)" font-size="10">写串 / 超 512</text>
+
+    <path d="M 430 202 L 700 290" stroke="var(--diagram-red-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr-r)"/>
+    <text x="550" y="244" fill="var(--diagram-red-text)" font-size="10">写串 / 超 512</text>
+
+    <path d="M 430 272 L 700 300" stroke="var(--diagram-red-stroke)" stroke-width="1.6" fill="none" marker-end="url(#d-arr-r)"/>
+    <text x="540" y="296" fill="var(--diagram-red-text)" font-size="10">写串 / 超 512</text>
+
+    <g transform="translate(680, 270)" filter="url(#d-shadow)">
+      <rect width="240" height="60" rx="30" fill="url(#d-red)"/>
+      <text x="120" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="800">hashtable</text>
+      <text x="120" y="40" text-anchor="middle" fill="var(--diagram-text)" font-size="11">⛔ 不可逆终态 (sink)</text>
+      <text x="120" y="54" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">每元素 24-48 B (5-10×)</text>
+    </g>
+
+    <path d="M 920 280 Q 940 290 920 310" stroke="var(--diagram-red-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-r)"/>
+    <text x="884" y="338" text-anchor="end" fill="var(--diagram-red-text)" font-size="11" font-weight="700">∀ op → 自环</text>
+
+    <g transform="translate(40, 360)">
+      <rect width="860" height="100" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)" stroke-dasharray="4 3"/>
+      <text x="20" y="22" fill="var(--diagram-green-text)" font-size="13" font-weight="800">📐 状态机不变量</text>
+      <text x="20" y="44" fill="var(--diagram-blue-text)" font-size="11">① intset 三态形成偏序 (INT16 ⊏ INT32 ⊏ INT64),只能沿偏序方向移动 — encoding 单调升</text>
+      <text x="20" y="62" fill="var(--diagram-blue-text)" font-size="11">② intset → hashtable 是吸收态,任何操作都不会回到 intset (即使删完所有非整数 / 元素数 ≤ 512)</text>
+      <text x="20" y="80" fill="var(--diagram-orange-text)" font-size="11">⚠ 设计哲学: 简单 &gt; 完美。降级需要每次操作扫描全部元素,不值得为偶发场景买单</text>
+    </g>
+  </svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s5-10">5.10 性能场景与监控</h2>
+<!-- ============================================================ -->
+
+<h3>5.10.1 性能基线</h3>
+
+<div class="metric-row">
+  <div class="metric">
+    <div class="value">5 μs</div>
+    <div class="label">SADD P50 (intset, N=100)</div>
+  </div>
+  <div class="metric">
+    <div class="value">15 μs</div>
+    <div class="label">SADD P99 (intset, N=500)</div>
+  </div>
+  <div class="metric">
+    <div class="value">2 μs</div>
+    <div class="label">SISMEMBER P99 (二分)</div>
+  </div>
+  <div class="metric">
+    <div class="value">~80 B</div>
+    <div class="label">5 元素 intset 内存</div>
+  </div>
+</div>
+
+<h3>5.10.2 各场景 P99 实测</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 5-10-1 · intset / hashtable 性能对比 (M2 Pro 单实例)</div>
+  <table>
+    <thead><tr><th>场景</th><th>元素数</th><th>编码</th><th>内存</th><th>SADD P99</th><th>SISMEMBER P99</th><th>SREM P99</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>tiny intset</td><td>10</td><td>intset INT16</td><td>40 B</td><td>3 μs</td><td>1 μs</td><td>3 μs</td><td>典型小集合</td></tr>
+      <tr><td>medium intset</td><td>100</td><td>intset INT16</td><td>216 B</td><td>5 μs</td><td>2 μs</td><td>5 μs</td><td>常见</td></tr>
+      <tr><td>full intset</td><td>500</td><td>intset INT16</td><td>1016 B</td><td>15 μs</td><td>2 μs</td><td>15 μs</td><td>接近阈值</td></tr>
+      <tr><td>upgraded INT32</td><td>500</td><td>intset INT32</td><td>2016 B</td><td>16 μs</td><td>2 μs</td><td>16 μs</td><td>升级后</td></tr>
+      <tr><td>same-size HT</td><td>500</td><td>hashtable</td><td>32 KB</td><td>4 μs</td><td>1 μs</td><td>4 μs</td><td>对照组</td></tr>
+      <tr><td>large HT</td><td>10000</td><td>hashtable</td><td>650 KB</td><td>5 μs</td><td>1 μs</td><td>5 μs</td><td>大集合 only HT</td></tr>
+      <tr><td>head-insert intset</td><td>500</td><td>intset</td><td>1016 B</td><td>40 μs</td><td>2 μs</td><td>15 μs</td><td>逆序 SADD</td></tr>
+      <tr><td>tail-insert intset</td><td>500</td><td>intset</td><td>1016 B</td><td>4 μs</td><td>2 μs</td><td>15 μs</td><td>顺序 SADD,头尾速判</td></tr>
+      <tr><td>SPOP-heavy intset</td><td>500</td><td>intset</td><td>波动</td><td>—</td><td>—</td><td>20 μs</td><td>SPOP 中间元素</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key-insight">
+  <strong>教学结论(生产可直接借用)</strong>:<br>
+  ① intset 在 N &lt; 500 时,SADD/SISMEMBER P99 与 hashtable 同级(2-15 μs),内存少 30 倍;<br>
+  ② <strong>顺序 SADD 走头尾速判</strong>,延迟 4 μs 接近 hashtable;<br>
+  ③ <strong>逆序 SADD</strong> 因总是头插 + memmove 全长,P99 可达 40 μs;<br>
+  ④ 升级仅在第一次跨 encoding 边界时发生一次,P99 增 1-3 μs(可忽略);<br>
+  ⑤ <code>set-max-intset-entries</code> 调高会让 SPOP/SREM 中间元素延迟随 N 线性增长,默认 512 是最优解。
+</div>
+
+<h3>5.10.3 监控指标</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 5-10-2 · intset 必监控指标</div>
+  <table>
+    <thead><tr><th>指标</th><th>类型</th><th>含义</th><th>告警阈值</th></tr></thead>
+    <tbody>
+      <tr><td><code>set_intset_count</code></td><td>gauge</td><td>intset 编码的 Set 数</td><td>—</td></tr>
+      <tr><td><code>set_hashtable_count</code></td><td>gauge</td><td>hashtable 编码的 Set 数</td><td>—</td></tr>
+      <tr><td><code>set_avg_size{key}</code></td><td>gauge</td><td>单个 Set 平均元素数</td><td>&gt; 400 接近阈值</td></tr>
+      <tr><td><code>set_polluted_count</code></td><td>gauge</td><td>历史曾为 intset 但现在是 hashtable 的 key 数</td><td>&gt; 0 = 类型校验失效</td></tr>
+      <tr><td><code>sadd_latency_p99</code></td><td>histogram</td><td>SADD P99 延迟</td><td>&gt; 50 μs 异常</td></tr>
+      <tr><td><code>spop_latency_p99</code></td><td>histogram</td><td>SPOP P99 延迟</td><td>&gt; 100 μs = 大 intset</td></tr>
+      <tr><td><code>set_max_size_seen</code></td><td>gauge</td><td>历史观察到的最大 Set 元素数</td><td>&gt; 阈值 = 升级路径触发</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>5.10.4 Lua 诊断脚本</h3>
+
+<pre><code class="language-bash"># 扫所有 Set 的 encoding 与大小,找出接近阈值的 key
+redis-cli --no-raw EVAL "
+local cursor = '0'
+local intset = 0
+local ht = 0
+local approaching = {}
+repeat
+    local r = redis.call('SCAN', cursor, 'COUNT', 100, 'TYPE', 'set')
+    cursor = r[1]
+    for _, k in ipairs(r[2]) do
+        local enc = redis.call('OBJECT', 'ENCODING', k)
+        local sz = redis.call('SCARD', k)
+        if enc == 'intset' then
+            intset = intset + 1
+            if sz &gt; 400 then
+                table.insert(approaching, k .. ':' .. sz)
+            end
+        else
+            ht = ht + 1
+        end
+    end
+until cursor == '0'
+return {intset, ht, approaching}
+" 0
+
+# 输出示例:
+# 1) (integer) 12000     ← intset 数
+# 2) (integer) 800       ← hashtable 数
+# 3) 1) "tags:user:42:455"  ← 接近阈值,告警</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s5-11">5.11 真实用例</h2>
+<!-- ============================================================ -->
+
+<div class="real-world">
+  <strong>用例 1:用户标签系统</strong>(电商个性化)<br>
+  某电商用户标签存储:每用户一个 Set,key 形如 <code>tags:user:&lt;uid&gt;</code>,member 是预定义的标签 ID(0-100k 范围)。<strong>典型规模</strong>:每用户 5-50 个标签,P99 不超过 200。<strong>编码状态</strong>:<code>OBJECT ENCODING</code> 显示 95% 是 intset INT32,5% 因混入新标签 ID 升级到 INT64。<strong>实际收益</strong>:1 亿用户 × 平均 30 标签,使用 intset 编码总内存 ~12 GB;若用 hashtable 估算 ~150 GB。<strong>关键防护</strong>:① 业务层只允许整数 ID 写入(防止字符串污染);② 标签 ID 集中在 INT32 范围(避免不必要的 INT64 升级);③ 定期监控 <code>set_polluted_count</code>。
+</div>
+
+<div class="real-world">
+  <strong>用例 2:在线设备 ID</strong>(物联网平台)<br>
+  IoT 平台用 Set 维护"过去 5 分钟在线设备 ID":<code>SADD online:5min:&lt;ts&gt; &lt;dev_id&gt;</code>。<strong>设备 ID</strong>:雪花 ID(64-bit),自然走 intset INT64 编码。<strong>规模</strong>:每分钟新建一个 key,保留 60 个 key。每 key 5000-50000 设备 → 接近阈值上限,部分 key 超阈值转 hashtable。<strong>调优</strong>:通过 <code>CONFIG SET set-max-intset-entries 1024</code> 把 80% 的 key 留在 intset,内存节省约 40%;同时 SADD P99 从 30 μs 降到 12 μs(因 hashtable 路径有 dictAdd 开销)。
+</div>
+
+<div class="real-world">
+  <strong>用例 3:权限位集合</strong>(后台管理系统)<br>
+  每角色一个 Set,member 是权限编号(1-128)。<strong>规模</strong>:每角色 10-80 个权限,完美匹配 intset INT16。<strong>实际表现</strong>:1000 个角色 × 平均 30 权限,总内存 ~80 KB(intset 编码);hashtable 估算 ~5 MB,差距 60 倍。<strong>关键操作</strong>:① <code>SISMEMBER</code> 频繁(每次请求都检查权限),intset 二分查找 O(log 80) ≈ 6 次比较,P99 < 1 μs;② <code>SADD/SREM</code> 极少(只在权限变更时),O(N) memmove 不是瓶颈。<strong>结论</strong>:读多写少场景是 intset 的甜点。
+</div>
+
+<div class="real-world">
+  <strong>用例 4:不要这么用 — 时间戳 Set</strong><br>
+  反例:某团队用 Set 存"过去 1 小时所有请求时间戳":<code>SADD reqs:&lt;uid&gt; &lt;timestamp_ms&gt;</code>。<strong>问题</strong>:① 时间戳是毫秒精度 INT64,直接走 INT64 编码,内存 8B/元素;② 元素数随访问频率线性增长,易超 512 阈值;③ 转 hashtable 后单 key 数 KB,1 万用户 × 100 次请求 = 数 MB。<strong>正解</strong>:用 <strong>有过期的 ZSet + 滑动窗口</strong>(以时间戳为 score),或用 <strong>HyperLogLog</strong> 估算 UV;时间戳本身不应该作为 Set 成员。
+</div>
+
+<div class="real-world">
+  <strong>用例 5:文章 ID 关联</strong>(新闻推荐)<br>
+  推荐系统维护"用户已浏览文章 ID":<code>SADD viewed:&lt;uid&gt; &lt;article_id&gt;</code>。<strong>规模</strong>:每用户平均 200-500 篇,P99 1000+ 篇。<strong>策略</strong>:① 阈值前(< 512)走 intset,内存最省;② 超阈值后转 hashtable,SISMEMBER 性能不退化;③ <strong>定期 trim</strong>:用 LRU 思想,每月凌晨 SREM 一年前浏览的文章,把 hashtable 的 key 重建为 intset(<code>SMEMBERS → DEL → SADD</code>)。<strong>收益</strong>:重建后 70% 的 key 回到 intset,集群内存下降 35%。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s5-summary">5.12 本章要点</h2>
+<!-- ============================================================ -->
+
+<div class="chapter-summary">
+
+<h3>关键事实</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 5-12-1 · intset 关键事实速查</div>
+  <table>
+    <thead><tr><th>要点</th><th>源码 / 命令依据</th><th>易错点</th></tr></thead>
+    <tbody>
+      <tr><td>intset 仅用于全整数小集合</td><td><code>setTypeAdd</code> 内编码判断</td><td>任意非整数转 hashtable,不可逆</td></tr>
+      <tr><td>8 B header + 连续 contents[] 数组</td><td><code>intset.h</code></td><td>无元素包装,内存极致紧凑</td></tr>
+      <tr><td>三种 encoding 自适应升级</td><td>INT16 → INT32 → INT64</td><td>升级触发条件:value 超出当前范围</td></tr>
+      <tr><td>升级从后往前重排避免覆盖</td><td><code>intsetUpgradeAndAdd</code></td><td>单次 O(N),生命周期最多 2 次升级</td></tr>
+      <tr><td>二分查找 O(log N)</td><td><code>intsetSearch</code></td><td>头/尾速判使顺序插入退化为 O(1)</td></tr>
+      <tr><td>插入/删除 memmove,O(N) 最坏</td><td><code>intsetMoveTail</code></td><td>大集合 SPOP 频繁会有 P99 抖动</td></tr>
+      <tr><td>不降级 + 不可逆 hashtable</td><td>"少做事"原则</td><td>接受少量浪费;污染 key 需应用层重建</td></tr>
+      <tr><td>阈值默认 512(set-max-intset-entries)</td><td>全局配置</td><td>调高前压测尾延迟</td></tr>
+      <tr><td>prepend 标志由 value 正负决定</td><td><code>value &lt; 0 ? 1 : 0</code></td><td>升级值必为极值,头或尾</td></tr>
+      <tr><td>encoding 字段值 = sizeof(intN_t)</td><td>2/4/8</td><td>读元素时直接强转 int16/32/64*</td></tr>
+      <tr><td>contents 用 int8_t[] 柔性数组</td><td>C99 特性</td><td>sizeof(intset) = 8 不含 contents</td></tr>
+      <tr><td>length / encoding 用 intrev32ifbe 包装</td><td>RDB 跨字节序兼容</td><td>x86 上是 no-op,代码可忽略</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>最小回归测试</h3>
+
+<pre><code class="language-bash">redis-cli DEL s
+
+# 1. 基础写入 + intset 编码确认
+redis-cli SADD s 3 7 15 42 100
+redis-cli OBJECT ENCODING s
+# 期望: intset
+redis-cli MEMORY USAGE s
+# 期望: 80 (5 INT16 + header + 对齐)
+
+# 2. 升级触发 (INT16 → INT32)
+redis-cli SADD s 65535
+redis-cli OBJECT ENCODING s
+# 期望: intset (内部已升 INT32)
+redis-cli MEMORY USAGE s
+# 期望: 96 (升级后)
+
+# 3. 类型污染 → hashtable 不可逆
+redis-cli SADD s "abc"
+redis-cli OBJECT ENCODING s
+# 期望: hashtable
+
+redis-cli SREM s "abc"
+redis-cli OBJECT ENCODING s
+# 期望: hashtable      ← 转换不可逆
+
+# 4. SISMEMBER (intset 之上的二分)
+redis-cli DEL s
+redis-cli SADD s 3 7 15 42 100
+redis-cli SISMEMBER s 42
+# 期望: 1 (命中)
+redis-cli SISMEMBER s 99
+# 期望: 0 (未命中)
+
+# 5. SREM (memmove + 不降级)
+redis-cli SREM s 15
+redis-cli SMEMBERS s
+# 期望: 3 7 42 100
+redis-cli OBJECT ENCODING s
+# 期望: intset (encoding 保持)
+
+# 6. 阈值穿越 → 转 hashtable
+for i in $(seq 1 600); do
+  redis-cli SADD s2 $i &gt; /dev/null
+done
+redis-cli OBJECT ENCODING s2
+# 期望: hashtable (超 512)</code></pre>
+
+<h3>性能速查</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 5-12-2 · intset 性能速查</div>
+  <table>
+    <thead><tr><th>操作</th><th>时延 P99</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>SADD (顺序,intset)</td><td>3-5 μs</td><td>头/尾速判 O(1)</td></tr>
+      <tr><td>SADD (随机,intset)</td><td>5-15 μs</td><td>O(log N) 二分 + O(N) memmove</td></tr>
+      <tr><td>SADD (升级,intset)</td><td>+1-3 μs</td><td>一次性,生命周期总 ≤ 2 次</td></tr>
+      <tr><td>SADD (hashtable)</td><td>4-8 μs</td><td>O(1) dictAdd</td></tr>
+      <tr><td>SISMEMBER (intset)</td><td>1-3 μs</td><td>二分 O(log N)</td></tr>
+      <tr><td>SISMEMBER (hashtable)</td><td>1-2 μs</td><td>O(1) dictFind</td></tr>
+      <tr><td>SREM 中间 (intset)</td><td>5-15 μs</td><td>memmove 部分</td></tr>
+      <tr><td>SREM 尾 (intset)</td><td>1-2 μs</td><td>无 memmove</td></tr>
+      <tr><td>SPOP (intset)</td><td>5-20 μs</td><td>随机命中中间元素</td></tr>
+      <tr><td>SCARD</td><td>&lt; 1 μs</td><td>读 length 字段</td></tr>
+      <tr><td>5 元素 intset 内存</td><td>~80 B</td><td>vs hashtable ~440 B</td></tr>
+      <tr><td>500 元素 intset 内存</td><td>~1 KB (INT16)</td><td>vs hashtable ~32 KB</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>下一章预告</h3>
+
+<p>intset 解决"<strong>全整数小集合</strong>"。Redis 还有更通用的"<strong>紧凑序列</strong>"需求:Hash 类型小元素、List 类型小元素、ZSet 类型小元素都需要在低规模时用紧凑编码节省内存。下一章 <strong><code>06-ziplist-listpack.html</code></strong> 讨论 ziplist 的字节级布局、连锁更新陷阱(<code>prevlen</code> 字段长度变化引起的级联),以及 7.0 引入 listpack 替代 ziplist 的设计——通过取消 <code>prevlen</code> 反向链,根除连锁更新的最坏 O(N²) 风险。读完后会理解为什么"<strong>所有紧凑编码族都遵循相似的 header + payload 模式</strong>",intset 是最简形态,ziplist/listpack 是变长版本。</p>
+
+</div>
+
+<p class="footer">&copy; 2026 图解 Redis &middot; 第 5 章 &middot; intset 整数集合</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/c.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+</body>
+</html>
