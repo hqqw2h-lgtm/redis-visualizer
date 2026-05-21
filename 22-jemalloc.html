@@ -1,0 +1,1953 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.22 jemalloc 内存分配器 — 图解 Redis</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="d-purple" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-purple-fill-start)"/><stop offset="100%" stop-color="var(--diagram-purple-fill-end)"/></linearGradient>
+    <linearGradient id="d-green" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-green-fill-start)"/><stop offset="100%" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <linearGradient id="d-blue" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-blue-fill-start)"/><stop offset="100%" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <linearGradient id="d-orange" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-orange-fill-start)"/><stop offset="100%" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+    <linearGradient id="d-red" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-red-fill-start)"/><stop offset="100%" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+    <filter id="d-shadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="var(--diagram-text)" flood-opacity="0.4"/></filter>
+    <marker id="d-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-muted)"/></marker>
+    <marker id="d-arr-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-green-stroke)"/></marker>
+    <marker id="d-arr-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-red-stroke)"/></marker>
+    <marker id="d-arr-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-blue-stroke)"/></marker>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Redis</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="21-resp.html">上一章</a>
+  <a href="23-eviction.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s22-1">22.1 为什么选 jemalloc</a>
+  <a href="#s22-2">22.2 arena / bin / slab</a>
+  <a href="#s22-3">22.3 tcache 线程缓存</a>
+  <a href="#s22-4">22.4 size class 三层</a>
+  <a href="#s22-5">22.5 mem_fragmentation_ratio</a>
+  <a href="#s22-6">22.6 allocator_frag_ratio</a>
+  <a href="#s22-7">22.7 allocator_rss_ratio</a>
+  <a href="#s22-8">22.8 Active Defrag</a>
+  <a href="#s22-9">22.9 MEMORY PURGE</a>
+  <a href="#s22-10">22.10 THP 与 fork CoW</a>
+  <a href="#s22-11">22.11 MALLOC_CONF 调优</a>
+  <a href="#s22-12">22.12 陷阱速查</a>
+  <a href="#s22-13">22.13 源码深潜</a>
+  <a href="#s22-summary">22.14 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 22 章 · jemalloc 内存分配器</h1>
+<p class="subtitle">jemalloc 5.x · arena / bin / slab · tcache 线程缓存 · size class 量化 · 三层碎片指标 · Active Defrag · MEMORY PURGE · THP 与 BGSAVE CoW</p>
+
+<div class="chapter-intro">
+  <p class="lead">Redis 在 Linux 上默认链接 <strong>jemalloc 5.x</strong> 而非 glibc malloc 或 tcmalloc。该选择影响 String <strong>embstr 的 44 字节阈值</strong>、内存碎片表现、<code>MEMORY USAGE</code> 与 <code>INFO memory</code> 的输出语义、Active Defrag 的可行性,以及 fork BGSAVE 时的 <strong>Copy-on-Write</strong> 行为。</p>
+  <p>本章描述 jemalloc 的核心架构(<strong>size class、arena、bin、slab、tcache</strong>),给出 Redis 关心的内存指标计算公式,并讨论 <strong>Active Defrag</strong>、<code>MEMORY PURGE</code>、<strong>Transparent Huge Pages</strong> 对生产 Redis 的具体影响。读完本章,你应当能够看着 <code>INFO memory</code> 的 12 个字段说出每一项的含义、为什么 RSS 不会立刻随 DEL 下降、以及哪些参数在哪些场景下应该调。</p>
+  <ul class="will-learn">
+    <li>jemalloc 与 glibc / tcmalloc 三种分配器在 Redis 长跑场景下的实测对比</li>
+    <li>arena / bin / slab 三层结构与 small / large / huge 三类 size class 的边界</li>
+    <li>tcache 线程缓存怎样把锁竞争从"每分配一次"降到"每 ~50 次一次"</li>
+    <li>embstr 阈值 44 是怎么从 jemalloc 的 64 字节 size class 推导出来的</li>
+    <li><code>used_memory</code> / <code>allocator_allocated</code> / <code>active</code> / <code>resident</code> / <code>RSS</code> 的层次关系</li>
+    <li>三种碎片(内部 / 外部 / 元数据)的来源、检测指标与处理手段</li>
+    <li>Active Defrag 的 <code>je_get_defrag_hint</code> 钩子与 cycle CPU 占用控制</li>
+    <li><code>MEMORY PURGE</code> 与 <code>dirty_decay_ms</code> 在归还 RSS 上的分工</li>
+    <li>THP 把 fork CoW 粒度从 4 KiB 升到 2 MiB 后 BGSAVE 内存放大 50-200% 的根源</li>
+    <li>常用 <code>MALLOC_CONF</code> 参数与 <code>MEMORY MALLOC-STATS</code> 的解读</li>
+  </ul>
+  <p class="prereq">前置知识:第 1 章 SDS(理解 embstr / raw 阈值与 redisObject 内存布局);第 17-18 章 RDB / AOF(理解 fork BGSAVE 与 CoW 触发点);Linux 虚拟内存基础(RSS、页表、mmap、madvise、Transparent Huge Pages)。读者最好亲手跑过 <code>redis-cli INFO memory</code> 并对其中字段有过疑问。</p>
+</div>
+
+<h3>本章全景图</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-0 · 本章导览 — 4 大模块 14 节</div>
+  <svg viewBox="0 0 940 480" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="480" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="370" y="14" width="200" height="44" rx="10" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="470" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">jemalloc 内存分配</text>
+      <text x="470" y="52" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">14 节模块 · 4 大主题</text>
+
+      <line x1="470" y1="58" x2="120" y2="100" stroke="var(--diagram-border)"/>
+      <line x1="470" y1="58" x2="360" y2="100" stroke="var(--diagram-border)"/>
+      <line x1="470" y1="58" x2="580" y2="100" stroke="var(--diagram-border)"/>
+      <line x1="470" y1="58" x2="820" y2="100" stroke="var(--diagram-border)"/>
+
+      <rect x="20"  y="100" width="200" height="44" rx="6" fill="url(#d-blue)"/>
+      <text x="120" y="120" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">§22.1-22.3 架构</text>
+      <text x="120" y="134" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">arena · bin · slab · tcache</text>
+
+      <rect x="260" y="100" width="200" height="44" rx="6" fill="url(#d-green)"/>
+      <text x="360" y="120" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">§22.4 size class</text>
+      <text x="360" y="134" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">small / large / huge 三层</text>
+
+      <rect x="480" y="100" width="200" height="44" rx="6" fill="url(#d-orange)"/>
+      <text x="580" y="120" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">§22.5-22.7 碎片诊断</text>
+      <text x="580" y="134" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">三比率定位真碎片</text>
+
+      <rect x="720" y="100" width="200" height="44" rx="6" fill="url(#d-red)"/>
+      <text x="820" y="120" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">§22.8-22.14 调优源码</text>
+      <text x="820" y="134" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">defrag · purge · CoW</text>
+
+      <g font-size="10" fill="var(--diagram-blue-text)">
+        <rect x="20"  y="160" width="200" height="120" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+        <text x="120" y="178" text-anchor="middle" fill="var(--diagram-blue-text)" font-weight="700">架构三层</text>
+        <text x="120" y="196" text-anchor="middle">§22.1 为什么选 jemalloc</text>
+        <text x="120" y="214" text-anchor="middle">§22.2 arena / bin / slab</text>
+        <text x="120" y="232" text-anchor="middle">§22.3 tcache 线程缓存</text>
+        <text x="120" y="258" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">关键 API:je_malloc</text>
+        <text x="120" y="272" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">je_get_defrag_hint</text>
+
+        <rect x="260" y="160" width="200" height="120" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="360" y="178" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="700">size class 量化</text>
+        <text x="360" y="196" text-anchor="middle">small ≤ 14 KB</text>
+        <text x="360" y="214" text-anchor="middle">large ≤ 16 MB</text>
+        <text x="360" y="232" text-anchor="middle">huge &gt; 16 MB</text>
+        <text x="360" y="258" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">232 个标准 size</text>
+        <text x="360" y="272" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">向上对齐填规则槽</text>
+
+        <rect x="480" y="160" width="200" height="120" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+        <text x="580" y="178" text-anchor="middle" fill="var(--diagram-orange-text)" font-weight="700">三比率读法</text>
+        <text x="580" y="196" text-anchor="middle">§22.5 mem_fragmentation_ratio</text>
+        <text x="580" y="214" text-anchor="middle">§22.6 allocator_frag_ratio</text>
+        <text x="580" y="232" text-anchor="middle">§22.7 allocator_rss_ratio</text>
+        <text x="580" y="258" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">分清"假碎片"</text>
+        <text x="580" y="272" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">vs"真碎片"</text>
+
+        <rect x="720" y="160" width="200" height="120" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+        <text x="820" y="178" text-anchor="middle" fill="var(--diagram-red-text)" font-weight="700">调优工具箱</text>
+        <text x="820" y="196" text-anchor="middle">§22.8 Active Defrag</text>
+        <text x="820" y="214" text-anchor="middle">§22.9 MEMORY PURGE</text>
+        <text x="820" y="232" text-anchor="middle">§22.10 THP · fork CoW</text>
+        <text x="820" y="258" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">§22.11 MALLOC_CONF</text>
+        <text x="820" y="272" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">§22.12-14 陷阱+源码</text>
+      </g>
+
+      <rect x="120" y="310" width="700" height="60" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="470" y="332" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="700">本章主线:为什么 RSS 是 used_memory 的 1.5 倍?能不能在线收回来?</text>
+      <text x="470" y="352" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">size class 量化 → 物理碎片 → defrag_hint API → Active Defrag 在线整理</text>
+
+      <g font-size="10" fill="var(--diagram-muted)">
+        <text x="470" y="396" text-anchor="middle">读完本章你能:</text>
+        <text x="470" y="416" text-anchor="middle" fill="var(--diagram-blue-text)">读懂 INFO MEMORY 三个比率 · 判断"真碎片"还是"未归还" · 决定是否开 Active Defrag</text>
+        <text x="470" y="436" text-anchor="middle" fill="var(--diagram-blue-text)">理解 fork CoW 与 THP 互踩 · 配 MALLOC_CONF 调阈值</text>
+        <text x="470" y="464" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">前置:Linux 虚拟内存基础 · 后续:Ch.23 内存淘汰(maxmemory 交互)</text>
+      </g>
+    </g>
+  </svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s22-1">22.1 为什么选 jemalloc</h2>
+<!-- ============================================================ -->
+
+<p>分配器选型是 Redis 工程上"看不见但影响巨大"的一环。glibc 默认的 ptmalloc2 在长期运行场景下碎片严重,RSS 可达到 <code>used_memory</code> 的 1.5-2 倍;tcmalloc 表现接近 jemalloc 但缺少 Active Defrag 钩子;jemalloc 兼具<strong>低碎片 + 主动整理 + 公开统计</strong>三件套,是 Redis 在 Linux/macOS 上的默认选择。</p>
+
+<h3>22.1.1 三种 malloc 实现对比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-1-1 · glibc / jemalloc / tcmalloc 三种分配器在 Redis 上的关键差异</div>
+  <svg viewBox="0 0 940 440" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="440" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="20"  y="14" width="290" height="280" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)" stroke-width="1.5"/>
+      <rect x="325" y="14" width="290" height="280" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
+      <rect x="630" y="14" width="290" height="280" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)" stroke-width="1.5"/>
+
+      <rect x="20"  y="14" width="290" height="40" rx="8" fill="url(#d-red)"/>
+      <text x="165" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">glibc ptmalloc2</text>
+      <text x="165" y="48" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">Redis 长跑场景不推荐</text>
+
+      <rect x="325" y="14" width="290" height="40" rx="8" fill="url(#d-green)"/>
+      <text x="470" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">jemalloc 5.x  ★</text>
+      <text x="470" y="48" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">Redis 默认(Linux/macOS)</text>
+
+      <rect x="630" y="14" width="290" height="40" rx="8" fill="url(#d-orange)"/>
+      <text x="775" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">tcmalloc</text>
+      <text x="775" y="48" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">编译期可选</text>
+
+      <g font-size="11" fill="var(--diagram-blue-text)">
+        <text x="40"  y="80" font-weight="700" fill="var(--diagram-red-text)">arena 模型</text>
+        <text x="40"  y="98">arena 数 = 8 × CPU 核</text>
+        <text x="40"  y="114">每 arena 全局锁</text>
+        <text x="40"  y="130">不可调 / 不可关</text>
+
+        <text x="40"  y="156" font-weight="700" fill="var(--diagram-red-text)">线程缓存</text>
+        <text x="40"  y="174">无,每次走 arena 锁</text>
+
+        <text x="40"  y="200" font-weight="700" fill="var(--diagram-red-text)">size class</text>
+        <text x="40"  y="218">少量 small bin</text>
+        <text x="40"  y="234">大 chunk 走 mmap</text>
+
+        <text x="40"  y="260" font-weight="700" fill="var(--diagram-red-text)">碎片回收</text>
+        <text x="40"  y="278">仅 free 触发,被动</text>
+      </g>
+
+      <g font-size="11" fill="var(--diagram-blue-text)">
+        <text x="345" y="80" font-weight="700" fill="var(--diagram-green-text)">arena 模型</text>
+        <text x="345" y="98">narenas 可调(默认 4×CPU)</text>
+        <text x="345" y="114">线程 hash → arena</text>
+        <text x="345" y="130">每 arena 自治</text>
+
+        <text x="345" y="156" font-weight="700" fill="var(--diagram-green-text)">线程缓存 tcache</text>
+        <text x="345" y="174">小对象先命中 tcache</text>
+        <text x="345" y="190">大多无锁分配</text>
+
+        <text x="345" y="216" font-weight="700" fill="var(--diagram-green-text)">size class</text>
+        <text x="345" y="234">232 个标准 size</text>
+        <text x="345" y="250">small / large / huge 三层</text>
+
+        <text x="345" y="276" font-weight="700" fill="var(--diagram-green-text)">主动整理 ★</text>
+        <text x="345" y="294" font-weight="700">je_get_defrag_hint API</text>
+      </g>
+
+      <g font-size="11" fill="var(--diagram-blue-text)">
+        <text x="650" y="80" font-weight="700" fill="var(--diagram-orange-text)">arena 模型</text>
+        <text x="650" y="98">CentralCache + PageHeap</text>
+        <text x="650" y="114">无显式 arena 概念</text>
+
+        <text x="650" y="140" font-weight="700" fill="var(--diagram-orange-text)">线程缓存</text>
+        <text x="650" y="158">thread-local 高效</text>
+        <text x="650" y="174">central free list 兜底</text>
+
+        <text x="650" y="200" font-weight="700" fill="var(--diagram-orange-text)">size class</text>
+        <text x="650" y="218">~85 类,精度略粗</text>
+
+        <text x="650" y="244" font-weight="700" fill="var(--diagram-orange-text)">主动整理</text>
+        <text x="650" y="262">无公开 hint API</text>
+        <text x="650" y="278">无在线 defrag 钩子</text>
+      </g>
+
+      <line x1="165" y1="294" x2="165" y2="320" stroke="var(--diagram-red-stroke)" stroke-width="1.5" marker-end="url(#d-arr-r)"/>
+      <line x1="470" y1="294" x2="470" y2="320" stroke="var(--diagram-green-stroke)" stroke-width="2"   marker-end="url(#d-arr-g)"/>
+      <line x1="775" y1="294" x2="775" y2="320" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <rect x="20"  y="320" width="290" height="56" rx="6" fill="url(#d-red)" filter="url(#d-shadow)"/>
+      <text x="165" y="342" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">不推荐</text>
+      <text x="165" y="362" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">RSS = used × 1.5-1.75 · 无 defrag</text>
+
+      <rect x="325" y="320" width="290" height="56" rx="6" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="470" y="342" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">★ Redis 默认</text>
+      <text x="470" y="362" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">RSS ≈ used × 1.15 · 唯一支持 Active Defrag</text>
+
+      <rect x="630" y="320" width="290" height="56" rx="6" fill="url(#d-orange)" filter="url(#d-shadow)"/>
+      <text x="775" y="342" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">可选</text>
+      <text x="775" y="362" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">./configure --with-tcmalloc</text>
+
+      <rect x="120" y="394" width="700" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="470" y="412" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">关键差异:只有 jemalloc 暴露 <tspan font-family="ui-monospace" fill="var(--diagram-purple-text)">je_get_defrag_hint</tspan>,Redis 才能在线整理碎片</text>
+    </g>
+  </svg>
+</div>
+
+<h3>22.1.2 长跑场景实测</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 22-1-1 · Redis 在不同分配器下的实测(7.2,30 天稳态)</div>
+  <table>
+    <thead><tr><th>分配器</th><th>used_memory</th><th>RSS</th><th>mem_fragmentation_ratio</th><th>备注</th></tr></thead>
+    <tbody>
+      <tr><td>glibc malloc</td><td>8 GB</td><td>14 GB</td><td>1.75</td><td>长期运行后碎片严重</td></tr>
+      <tr><td><strong>jemalloc 5.x</strong></td><td><strong>8 GB</strong></td><td><strong>9.2 GB</strong></td><td><strong>1.15</strong></td><td><strong>Redis 默认</strong></td></tr>
+      <tr><td>tcmalloc</td><td>8 GB</td><td>9.5 GB</td><td>1.19</td><td>接近 jemalloc</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p>测试条件:Redis 7.2、长期运行 30 天、Hash/String 混合写入 1 亿次后稳态。jemalloc 通过精细 size class 与主动碎片回收把 RSS 控制在 <code>used_memory × 1.15</code> 以内。glibc 在同样负载下能膨胀到 1.75 倍,这就是 "看似没泄漏但 OOM" 的最常见根因。</p>
+
+<h3>22.1.3 Redis 编译时怎么链接 jemalloc</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-1-2 · Redis 内置 jemalloc 的编译流程</div>
+<pre><code class="language-text">  Redis 源码 deps/jemalloc 内置 jemalloc 5.x
+
+  Makefile 顺序:
+    1. ./configure --prefix=$REDIS_BUILD/deps/jemalloc \
+                   --with-jemalloc-prefix=je_       /* 函数前缀 je_ */
+                   --enable-cc-silence
+    2. make CFLAGS=-DJEMALLOC_NO_DEMANGLE
+    3. 链接 -ljemalloc
+
+  Redis 通过 zmalloc / zfree 等 wrapper 调用 jemalloc:
+    void *zmalloc(size_t size) {
+        void *ptr = je_malloc(size + PREFIX_SIZE);
+        update_zmalloc_stat_alloc(je_malloc_size(ptr));
+        return ptr;
+    }
+
+  Linux/macOS 默认 jemalloc;
+  Windows 用 jemalloc 子集(完整 jemalloc 不支持 Windows fork);
+  容器化构建可手动切 tcmalloc(--with-tcmalloc)。</code></pre>
+</div>
+
+<div class="key-insight">
+  <strong>为什么 Redis 强绑定 jemalloc</strong>:不是因为 jemalloc 速度最快,而是因为只有 jemalloc 提供了 <code>je_get_defrag_hint</code> 这个公开 API — 它告诉 Redis "<strong>这个指针所在的 slab 几乎空了,值得迁移</strong>"。glibc 与 tcmalloc 都没有同等钩子,所以无法实现在线 Active Defrag。一旦 Active Defrag 被纳入功能矩阵,jemalloc 就是不可替换的。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s22-2">22.2 arena / bin / slab 架构</h2>
+<!-- ============================================================ -->
+
+<p>jemalloc 的核心结构是三层:<strong>arena</strong>(并发隔离单位,每线程 hash 到一个) → <strong>bin</strong>(同一 size class 的所有 slab) → <strong>slab</strong>(一段连续内存,切成若干 region)。这套结构同时解决了三个问题:并发(arena)、size class 量化(bin)、批量分配(slab)。</p>
+
+<h3>22.2.1 三层结构总览</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-2-1 · jemalloc 三层结构 — arena / bin / slab / region</div>
+  <svg viewBox="0 0 940 510" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="510" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="370" y="14" width="200" height="40" rx="8" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="470" y="32" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">jemalloc 全局</text>
+      <text x="470" y="46" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">narenas = 4 × CPU</text>
+
+      <line x1="470" y1="54" x2="120" y2="84" stroke="var(--diagram-border)"/>
+      <line x1="470" y1="54" x2="350" y2="84" stroke="var(--diagram-border)"/>
+      <line x1="470" y1="54" x2="600" y2="84" stroke="var(--diagram-border)"/>
+      <line x1="470" y1="54" x2="820" y2="84" stroke="var(--diagram-border)"/>
+
+      <rect x="40"  y="84" width="160" height="36" rx="6" fill="url(#d-blue)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/>
+      <text x="120" y="106" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">arena_0  ★</text>
+      <rect x="270" y="84" width="160" height="36" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="350" y="106" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">arena_1</text>
+      <rect x="520" y="84" width="160" height="36" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="600" y="106" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">...</text>
+      <rect x="740" y="84" width="160" height="36" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="820" y="106" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">arena_N</text>
+
+      <line x1="120" y1="120" x2="60"  y2="160" stroke="var(--diagram-green-stroke)" stroke-width="1"/>
+      <line x1="120" y1="120" x2="160" y2="160" stroke="var(--diagram-green-stroke)" stroke-width="1"/>
+      <line x1="120" y1="120" x2="280" y2="160" stroke="var(--diagram-green-stroke)" stroke-width="1"/>
+      <line x1="120" y1="120" x2="420" y2="160" stroke="var(--diagram-green-stroke)" stroke-width="1"/>
+      <line x1="120" y1="120" x2="600" y2="160" stroke="var(--diagram-orange-stroke)" stroke-width="1"/>
+      <line x1="120" y1="120" x2="800" y2="160" stroke="var(--diagram-red-stroke)" stroke-width="1"/>
+
+      <text x="200" y="148" fill="var(--diagram-green-text)" font-size="10" font-weight="700">small bins(232 size class)</text>
+
+      <g font-size="10">
+        <rect x="20"  y="160" width="100" height="36" rx="4" fill="url(#d-green)" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
+        <text x="70"  y="178" text-anchor="middle" fill="var(--diagram-text)" font-weight="700">bin_8B  ★</text>
+        <text x="70"  y="190" text-anchor="middle" fill="var(--diagram-green-text)">small</text>
+
+        <rect x="130" y="160" width="100" height="36" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="180" y="178" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="700">bin_16B</text>
+
+        <rect x="240" y="160" width="100" height="36" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="290" y="178" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="700">bin_32B</text>
+
+        <rect x="350" y="160" width="100" height="36" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="400" y="178" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="700">...</text>
+
+        <rect x="460" y="160" width="120" height="36" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="520" y="178" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="700">bin_14336B</text>
+
+        <rect x="600" y="160" width="120" height="36" rx="4" fill="url(#d-orange)"/>
+        <text x="660" y="178" text-anchor="middle" fill="var(--diagram-text)" font-weight="800">large extents</text>
+        <text x="660" y="190" text-anchor="middle" fill="var(--diagram-orange-text)">14K-4M</text>
+
+        <rect x="740" y="160" width="180" height="36" rx="4" fill="url(#d-red)"/>
+        <text x="830" y="178" text-anchor="middle" fill="var(--diagram-text)" font-weight="800">huge → mmap</text>
+        <text x="830" y="190" text-anchor="middle" fill="var(--diagram-red-text)">&gt; 4 MiB</text>
+      </g>
+
+      <line x1="70" y1="196" x2="40"  y2="240" stroke="var(--diagram-green-stroke)" stroke-width="1"/>
+      <line x1="70" y1="196" x2="120" y2="240" stroke="var(--diagram-green-stroke)" stroke-width="1.5"/>
+      <line x1="70" y1="196" x2="200" y2="240" stroke="var(--diagram-green-stroke)" stroke-width="1"/>
+
+      <text x="280" y="226" fill="var(--diagram-green-text)" font-size="10" font-weight="700">每 bin 维护多个 slab(连续内存页)</text>
+
+      <g font-size="10">
+        <rect x="10"  y="240" width="60"  height="34" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="40"  y="258" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="700">slab_0 ★</text>
+
+        <rect x="80"  y="240" width="80"  height="34" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="120" y="258" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="700">slab_1</text>
+
+        <rect x="170" y="240" width="80" height="34" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="210" y="258" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="700">slab_2 ...</text>
+      </g>
+
+      <line x1="40" y1="274" x2="40"  y2="310" stroke="var(--diagram-green-stroke)" stroke-width="1"/>
+
+      <rect x="20" y="310" width="900" height="100" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="40" y="332" fill="var(--diagram-green-text)" font-size="11" font-weight="700">slab_0 = 1 OS 页(4 KiB) = bitmap header + 多个 region(每 region = bin 大小 = 8 B)</text>
+
+      <g font-size="10" font-family="ui-monospace, monospace">
+        <rect x="40"  y="346" width="100" height="44" rx="4" fill="url(#d-blue)"/>
+        <text x="90"  y="364" text-anchor="middle" fill="var(--diagram-text)" font-weight="800">slab header</text>
+        <text x="90"  y="380" text-anchor="middle" fill="var(--diagram-blue-text)">bitmap+ref</text>
+
+        <rect x="148" y="346" width="80"  height="44" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="188" y="364" text-anchor="middle" fill="var(--diagram-green-text)">region_0</text>
+        <text x="188" y="380" text-anchor="middle" fill="var(--diagram-green-text)">8 B</text>
+
+        <rect x="232" y="346" width="80"  height="44" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="272" y="364" text-anchor="middle" fill="var(--diagram-green-text)">region_1</text>
+        <text x="272" y="380" text-anchor="middle" fill="var(--diagram-green-text)">8 B</text>
+
+        <rect x="316" y="346" width="80"  height="44" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="356" y="364" text-anchor="middle" fill="var(--diagram-green-text)">region_2</text>
+
+        <rect x="400" y="346" width="60"  height="44" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,2"/>
+        <text x="430" y="364" text-anchor="middle" fill="var(--diagram-muted)">...</text>
+
+        <rect x="464" y="346" width="100" height="44" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="514" y="364" text-anchor="middle" fill="var(--diagram-green-text)">region_510</text>
+        <text x="514" y="380" text-anchor="middle" fill="var(--diagram-green-text)">8 B</text>
+
+        <rect x="568" y="346" width="100" height="44" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="618" y="364" text-anchor="middle" fill="var(--diagram-green-text)">region_511</text>
+        <text x="618" y="380" text-anchor="middle" fill="var(--diagram-green-text)">8 B</text>
+
+        <rect x="690" y="346" width="220" height="44" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)" stroke-dasharray="3,2"/>
+        <text x="800" y="364" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">slab 满 → 进 full list</text>
+        <text x="800" y="380" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">slab 空 → 归还 OS 或保留</text>
+      </g>
+
+      <rect x="20" y="430" width="900" height="64" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="40" y="452" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">三层结构同时解决三件事</text>
+      <g font-size="10" fill="var(--diagram-blue-text)">
+        <text x="40"  y="472"><tspan fill="var(--diagram-blue-text)" font-weight="700">arena</tspan> 解并发(线程 hash → arena,锁竞争 ÷ N)</text>
+        <text x="370" y="472"><tspan fill="var(--diagram-green-text)" font-weight="700">bin</tspan> 解 size 量化(同一大小聚一起,bitmap 高效)</text>
+        <text x="40"  y="488"><tspan fill="var(--diagram-orange-text)" font-weight="700">slab</tspan> 解批量(一次 mmap 4K 切几百个 region,均摊系统调用)</text>
+        <text x="500" y="488"><tspan fill="var(--diagram-purple-text)" font-weight="700">radix tree</tspan> 解反查(给指针找 slab/bin)</text>
+      </g>
+    </g>
+  </svg>
+</div>
+
+<h3>22.2.2 单个 slab 的字节布局</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-2-2 · slab 内部布局(以 size class = 32 B 为例)</div>
+<pre><code class="language-text">  一个 slab = 1 个 4 KiB OS 页(典型情况):
+
+  ┌──────────────────────────────────────────────┐
+  │ slab metadata header (~ 32 B)                │  bitmap, ref count
+  ├────────────┬────────────┬────────────┬───────┤
+  │ region_0   │ region_1   │ region_2   │  ...  │  每 region = 32 B
+  │   32 B     │   32 B     │   32 B     │       │
+  ├────────────┼────────────┼────────────┼───────┤
+  │ region_127 │            │            │       │
+  └────────────┴────────────┴────────────┴───────┘
+   合计 4 KiB - 32 B header ≈ 4064 B / 32 B = 127 个 region
+
+  分配流程:
+    1. zmalloc(30 B) → jemalloc 上调到 32 B size class
+    2. 在 bin_32 找当前 partial slab
+    3. slab bitmap 找空闲 region
+    4. bitmap 设位、返回 region 地址
+    5. 若 slab 满 → 移到 full list,bin 选下一个 slab
+
+  free 流程:
+    1. zfree(ptr) 通过指针定位所属 slab(jemalloc 用 radix tree 维护)
+    2. bitmap 清位
+    3. 若 slab 完全空 → 归还 OS 或保留备用</code></pre>
+</div>
+
+<h3>22.2.3 size class 序列</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-2-3 · jemalloc 5.x size class 序列(部分)</div>
+<pre><code class="language-text">  jemalloc 5.x size class 树(部分):
+
+  small classes(< 14 KiB):4 类增长方式
+    8, 16, 24, 32              (8B 间隔, 4 类)
+    48, 64, 80, 96, 112, 128   (16B 间隔, 6 类)
+    160, 192, 224, 256         (32B 间隔, 4 类)
+    320, 384, 448, 512          (64B 间隔, 4 类)
+    640, 768, 896, 1024         (128B 间隔)
+    1280, 1536, 1792, 2048      (256B 间隔)
+    2560, 3072, 3584, 4096      (512B 间隔)
+    5120, 6144, 7168, 8192      (1024B 间隔)
+    10240, 12288, 14336         (2048B 间隔)
+
+  large classes(14 KiB ~ 4 MiB):2 倍增长
+    16384, 20480, 24576, 28672, 32768
+    40960, 49152, 57344, 65536
+    ...
+
+  huge classes(> 4 MiB):
+    超大块直接 mmap
+
+  jemalloc 用 SC_LG_QUANTUM = 4 (16 B 量化)
+  与 SC_LG_NGROUP = 2 (每组 4 类) 控制密度。</code></pre>
+</div>
+
+<h3>22.2.4 arena 与线程绑定</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 22-2-1 · arena 数对线程行为的影响</div>
+  <table>
+    <thead><tr><th>arena 数</th><th>每线程行为</th><th>适用 CPU 数</th></tr></thead>
+    <tbody>
+      <tr><td>narenas = 1</td><td>全线程共享单 arena</td><td>单核 CPU</td></tr>
+      <tr><td>narenas = N</td><td>线程 hash 到 N 个 arena</td><td>N 核 CPU</td></tr>
+      <tr><td><strong>narenas = 4 × CPU</strong></td><td><strong>jemalloc 默认</strong></td><td><strong>推荐</strong></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p>Redis 主线程模型下默认 arena 即可;7.x 引入多线程 IO,jemalloc 默认 4×CPU 已足够避免 arena 锁竞争。手动调高 <code>narenas</code> 通常没有收益,反而增加每 arena 的元数据开销。</p>
+
+<!-- ============================================================ -->
+<h2 id="s22-3">22.3 tcache 线程缓存</h2>
+<!-- ============================================================ -->
+
+<p>arena 已经把锁竞争降到了"每 N 线程一把锁",但每次 malloc 仍要拿 arena 锁。jemalloc 在此之上加了 <strong>tcache</strong>:每线程一个本地缓存,缓存少量 free region;malloc 时优先从 tcache pop,完全无锁。tcache 空了才向 arena 批量补 ~50 个,把锁次数压到 1/50。这是 Redis 单线程模型下 jemalloc 锁开销"几乎不可见"的根本原因。</p>
+
+<h3>22.3.1 tcache 在分配路径中的位置</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-3-1 · malloc 调用链 — tcache 命中 vs 未命中</div>
+  <svg viewBox="0 0 940 510" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="510" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <g font-size="11" font-weight="800" fill="var(--diagram-text)">
+        <rect x="20"  y="14" width="150" height="32" rx="6" fill="url(#d-purple)"/>
+        <text x="95"  y="34" text-anchor="middle">malloc(28 B)</text>
+        <rect x="200" y="14" width="160" height="32" rx="6" fill="url(#d-green)"/>
+        <text x="280" y="34" text-anchor="middle">tcache(本线程)</text>
+        <rect x="390" y="14" width="160" height="32" rx="6" fill="url(#d-blue)"/>
+        <text x="470" y="34" text-anchor="middle">arena bin_32</text>
+        <rect x="580" y="14" width="160" height="32" rx="6" fill="url(#d-orange)"/>
+        <text x="660" y="34" text-anchor="middle">slab</text>
+        <rect x="770" y="14" width="150" height="32" rx="6" fill="url(#d-red)"/>
+        <text x="845" y="34" text-anchor="middle">mmap (OS)</text>
+      </g>
+
+      <line x1="95"  y1="46" x2="95"  y2="494" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="280" y1="46" x2="280" y2="494" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="470" y1="46" x2="470" y2="494" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="660" y1="46" x2="660" y2="494" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="845" y1="46" x2="845" y2="494" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+
+      <line x1="95" y1="78" x2="280" y2="78" stroke="var(--diagram-purple-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+      <text x="105" y="72" fill="var(--diagram-blue-text)" font-size="10">① 上调到 size class = 32 · 查 tcache 桶</text>
+
+      <rect x="180" y="98" width="320" height="80" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3"/>
+      <text x="190" y="116" fill="var(--diagram-green-text)" font-size="10" font-weight="700">alt · tcache 命中(99% 路径)</text>
+
+      <line x1="280" y1="148" x2="95"  y2="148" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+      <text x="100" y="142" fill="var(--diagram-green-text)" font-size="10" font-weight="700">② pop 一个 region · 完全无锁</text>
+      <text x="100" y="170" fill="var(--diagram-green-text)" font-size="9">→ 多数分配在此结束</text>
+
+      <rect x="180" y="190" width="740" height="290" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)" stroke-dasharray="3,3"/>
+      <text x="190" y="208" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">else · tcache 空(每 ~50 次 1 次)</text>
+
+      <g font-size="10" fill="var(--diagram-blue-text)">
+        <line x1="280" y1="234" x2="470" y2="234" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#d-arr-b)"/>
+        <text x="290" y="228" fill="var(--diagram-blue-text)">③ 取 arena 锁 · bin_32 批量取 ~50 个</text>
+
+        <line x1="470" y1="264" x2="660" y2="264" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#d-arr-b)"/>
+        <text x="480" y="258" fill="var(--diagram-blue-text)">④ 当前 partial slab 找空闲 region</text>
+
+        <rect x="500" y="280" width="380" height="100" rx="4" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)" stroke-dasharray="2,2"/>
+        <text x="510" y="296" fill="var(--diagram-orange-text)" font-size="9" font-weight="700">slab 内部分支</text>
+
+        <line x1="660" y1="320" x2="475" y2="320" stroke="var(--diagram-green-stroke)" stroke-width="1.5" marker-end="url(#d-arr-g)"/>
+        <text x="510" y="314" fill="var(--diagram-green-text)">⑤a 有空 region → bitmap 设位 → 返回</text>
+
+        <line x1="660" y1="350" x2="845" y2="350" stroke="var(--diagram-red-stroke)" stroke-width="1.5" marker-end="url(#d-arr-r)"/>
+        <text x="670" y="344" fill="var(--diagram-red-text)">⑤b slab 满 → mmap 新 4 KiB 页</text>
+
+        <line x1="845" y1="372" x2="660" y2="372" stroke="var(--diagram-red-stroke)" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#d-arr-r)"/>
+        <text x="670" y="366" fill="var(--diagram-red-text)">⑥ 新 slab 加入 bin · 切 region</text>
+
+        <line x1="470" y1="412" x2="280" y2="412" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#d-arr-b)"/>
+        <text x="290" y="406" fill="var(--diagram-blue-text)">⑦ bin 释放 arena 锁 · 50 个 region 交付 tcache</text>
+
+        <line x1="280" y1="442" x2="95" y2="442" stroke="var(--diagram-purple-stroke)" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#d-arr)"/>
+        <text x="100" y="436" fill="var(--diagram-purple-text)">⑧ tcache 留 49 · 返回 1 个给 App</text>
+
+        <text x="190" y="466" fill="var(--diagram-muted)" font-size="9">锁开销摊薄 1/50 · Redis 单线程主进程下 jemalloc 的"锁不可见"根因</text>
+      </g>
+    </g>
+  </svg>
+</div>
+
+<h3>22.3.2 tcache 减少锁竞争原理</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-3-2 · 有/无 tcache 的锁竞争对比</div>
+<pre><code class="language-text">  无 tcache 场景(每分配走 arena bin):
+
+   线程 A:malloc → 获 arena_0 锁 → bin → ... → 释放锁
+   线程 B:malloc → 等 arena_0 锁 → ...
+   线程 C:malloc → 等 arena_0 锁 → ...
+
+  有 tcache 场景:
+
+   线程 A 自己的 tcache:[free₁, free₂, ..., free_n]
+     malloc → 直接 pop 一个,无锁
+   线程 B / C 同理,各自 tcache 独立
+
+  锁竞争只在 tcache 空时(每 ~50 次分配 1 次):
+    线程 A 取 arena_0 拿 50 个补充
+    锁持有时间 << 单次 malloc
+
+  Redis 主线程几乎全部分配走 tcache,
+  jemalloc 锁开销基本不可见。</code></pre>
+</div>
+
+<h3>22.3.3 tcache 默认配置</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 22-3-1 · tcache 关键 MALLOC_CONF 项</div>
+  <table>
+    <thead><tr><th>配置</th><th>含义</th><th>默认</th></tr></thead>
+    <tbody>
+      <tr><td><code>opt.tcache</code></td><td>是否启用 tcache</td><td>true</td></tr>
+      <tr><td><code>opt.lg_tcache_max</code></td><td>tcache 最大 size class log₂</td><td>15(即 32 KB 以下都缓存)</td></tr>
+      <tr><td><code>opt.tcache_gc_incr_bytes</code></td><td>tcache GC 触发字节数</td><td>14 MB</td></tr>
+      <tr><td><code>opt.tcache_lazy_flush_threshold</code></td><td>多 tcache 启用懒刷新</td><td>100</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p><code>MALLOC_CONF="opt.tcache:false"</code> 可禁用 tcache,但通常仅在内存极度受限的环境使用。每线程 tcache 占约 1 MB 元数据,在 Redis 单线程主进程下是合算的成本。</p>
+
+<!-- ============================================================ -->
+<h2 id="s22-4">22.4 size class 三层</h2>
+<!-- ============================================================ -->
+
+<p>jemalloc 把所有分配请求按大小分到三层 — small(走 slab)、large(走 arena 大块 extent)、huge(直接 mmap)。三层的内存路径、元数据开销、归还策略都不同。理解这三层是看懂 <code>INFO memory</code> 输出的前提。</p>
+
+<h3>22.4.1 三层决策树</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-4-1 · small / large / huge 决策</div>
+  <svg viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="460" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="380" y="14" width="180" height="40" rx="6" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="470" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">malloc(size)</text>
+      <text x="470" y="48" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">size 决定路径</text>
+
+      <line x1="470" y1="54" x2="470" y2="74" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <polygon points="380,80 560,80 590,108 560,136 380,136 350,108" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="1.5"/>
+      <text x="470" y="105" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="12" font-weight="800">size ≤ 14 KiB ?</text>
+      <text x="470" y="122" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">第一道门</text>
+
+      <path d="M380,108 L 180,160" stroke="var(--diagram-green-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="240" y="138" fill="var(--diagram-green-text)" font-size="11" font-weight="700">是</text>
+
+      <path d="M560,108 L 760,160" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr)"/>
+      <text x="700" y="138" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">否</text>
+
+      <rect x="40"  y="160" width="280" height="46" rx="8" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="180" y="180" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">small class</text>
+      <text x="180" y="196" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">8 B ≤ size ≤ 14 KiB · 232 类</text>
+
+      <line x1="180" y1="206" x2="180" y2="230" stroke="var(--diagram-green-stroke)" stroke-width="1.5" marker-end="url(#d-arr-g)"/>
+
+      <g font-size="10" fill="var(--diagram-blue-text)">
+        <rect x="40"  y="230" width="280" height="124" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="180" y="250" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="700">分配特征</text>
+        <text x="60"  y="272">路径:tcache → bin → slab</text>
+        <text x="60"  y="290">粒度:上调到下一个 size class</text>
+        <text x="60"  y="308">元数据:slab 摊销 &lt; 5%</text>
+        <text x="60"  y="326">速度:大多无锁(99% tcache 命中)</text>
+        <text x="60"  y="344" fill="var(--diagram-muted)" font-size="9">Redis 90%+ 分配落在此层</text>
+      </g>
+
+      <polygon points="620,160 800,160 830,188 800,216 620,216 590,188" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="1.5"/>
+      <text x="710" y="184" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="12" font-weight="800">size ≤ 4 MiB ?</text>
+      <text x="710" y="202" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">第二道门</text>
+
+      <path d="M620,210 L 480,250" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr)"/>
+      <text x="540" y="232" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">是</text>
+
+      <path d="M800,210 L 880,250" stroke="var(--diagram-red-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr-r)"/>
+      <text x="855" y="232" fill="var(--diagram-red-text)" font-size="11" font-weight="700">否</text>
+
+      <rect x="340" y="250" width="240" height="46" rx="8" fill="url(#d-orange)" filter="url(#d-shadow)"/>
+      <text x="460" y="270" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">large class</text>
+      <text x="460" y="286" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">14 KiB ~ 4 MiB · 页对齐</text>
+
+      <line x1="460" y1="296" x2="460" y2="316" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <g font-size="10" fill="var(--diagram-blue-text)">
+        <rect x="340" y="316" width="240" height="100" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+        <text x="460" y="334" text-anchor="middle" fill="var(--diagram-orange-text)" font-weight="700">分配特征</text>
+        <text x="356" y="354">路径:arena 大 extent</text>
+        <text x="356" y="372">粒度:4 KiB 整数倍</text>
+        <text x="356" y="390">元数据:每块 ~64 B</text>
+        <text x="356" y="408" fill="var(--diagram-muted)" font-size="9">大 hash · 大 list 节点常落此</text>
+      </g>
+
+      <rect x="700" y="250" width="220" height="46" rx="8" fill="url(#d-red)" filter="url(#d-shadow)"/>
+      <text x="810" y="270" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">huge class</text>
+      <text x="810" y="286" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">&gt; 4 MiB · 直 mmap</text>
+
+      <line x1="810" y1="296" x2="810" y2="316" stroke="var(--diagram-red-stroke)" stroke-width="1.5" marker-end="url(#d-arr-r)"/>
+
+      <g font-size="10" fill="var(--diagram-blue-text)">
+        <rect x="700" y="316" width="220" height="100" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+        <text x="810" y="334" text-anchor="middle" fill="var(--diagram-red-text)" font-weight="700">分配特征</text>
+        <text x="716" y="354">路径:直接 mmap</text>
+        <text x="716" y="372">粒度:OS 页(独占)</text>
+        <text x="716" y="390">元数据:页对齐损失</text>
+        <text x="716" y="408" fill="var(--diagram-muted)" font-size="9">freeze 大 RDB 临时缓冲</text>
+      </g>
+
+      <rect x="40" y="430" width="880" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="480" y="446" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">三层走的元数据/碎片/归还策略都不同 · 看 INFO memory 必须知道是哪一层在膨胀</text>
+    </g>
+  </svg>
+</div>
+
+<h3>22.4.2 size class 量化对内存的影响</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-4-2 · 不同请求大小在 jemalloc 与 glibc 下的实际分配</div>
+<pre><code class="language-text">  请求 30 字节:
+    glibc malloc:可能返回 32 字节(下一个 16B 对齐)
+    jemalloc:返回 32 字节(下一个 size class)
+
+  请求 33 字节:
+    glibc:48 字节(16B 对齐)
+    jemalloc:48 字节(下一个 size class)
+
+  请求 100 字节:
+    glibc:112 字节(16B 对齐)
+    jemalloc:112 字节(size class)
+
+  量化粒度对比:
+    在 < 1 KB 范围,jemalloc 与 glibc 接近
+    在 1 KB ~ 14 KB,jemalloc 更紧密(16/32/64 等步长)
+    > 14 KB 走 large class,差异显著:
+      请求 16 KB → jemalloc 返回 16 KB(刚好 size class)
+      请求 17 KB → jemalloc 返回 20 KB(下一个 size class)
+                   glibc 可能返回 17 KB + chunk 头</code></pre>
+</div>
+
+<h3>22.4.3 embstr 阈值 44 的推导</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-4-3 · embstr 阈值 44 是怎么从 jemalloc 64 字节 size class 算出来的</div>
+<pre><code class="language-text">  String embstr:redisObject(16B) + sdshdr8(3B) + buf + \0(1B)
+                = 20 + len 字节
+
+  Redis 设计目标:embstr 整体落入单个 size class,
+                   保证一次 malloc 命中 cache line
+
+  关键 size class:
+    32, 48, 64, 80, 96, 128 (small classes)
+
+  如果选 size class = 64 B(jemalloc bin_64):
+    embstr 上限 = 64 - 20 = 44 字节
+    → 字符串内容长度 ≤ 44 时用 embstr
+    → 长度 > 44 升级 raw
+
+  embstr 阈值 44 由 jemalloc bin_64 决定;
+  若 jemalloc 改了 size class 序列(如下一个 bin 是 128),
+  embstr 阈值也需改 108(详见第 1 章 SDS)。
+
+  Redis 在 src/object.c:
+    #define OBJ_ENCODING_EMBSTR_SIZE_LIMIT 44
+
+  跨平台 jemalloc size class 一致,故 44 在所有平台通用。</code></pre>
+</div>
+
+<div class="key-insight">
+  <strong>为什么要"恰好填满 size class"</strong>:embstr 把 redisObject + SDS 头 + 字符串内容 + 末尾 <code>\0</code> 拼成一段连续内存,调用 <strong>一次</strong> <code>je_malloc</code> 即可分配。如果落入 64 字节 size class 后还剩字节,那是浪费;如果超出 64 字节落到 128,直接浪费一倍。Antirez 选 44 正是因为 <code>20 + 44 = 64</code> 刚好不浪费。
+</div>
+
+<h3>22.4.4 Redis 关键对象的 size 落点</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 22-4-1 · Redis 常见对象在 jemalloc 下的实际分配与浪费率</div>
+  <table>
+    <thead><tr><th>Redis 对象</th><th>实际字节数</th><th>jemalloc 实际分配</th><th>浪费率</th></tr></thead>
+    <tbody>
+      <tr><td>redisObject</td><td>16</td><td>16</td><td>0%</td></tr>
+      <tr><td>dictEntry</td><td>32</td><td>32</td><td>0%</td></tr>
+      <tr><td>sdshdr8 + 短串</td><td>19~24</td><td>32</td><td>38~52%</td></tr>
+      <tr><td><strong>embstr 整对象</strong></td><td><strong>64</strong></td><td><strong>64</strong></td><td><strong>0%</strong></td></tr>
+      <tr><td>listpack 头</td><td>11</td><td>16</td><td>31%</td></tr>
+      <tr><td>1 KB 字符串</td><td>1029</td><td>1280</td><td>25%</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p>embstr 选 64 字节 size class 是无浪费的最佳选择;1 KB 字符串落入 1280 size class 浪费 25%,这是非整 size class 数据不可避免的内部碎片。</p>
+
+<!-- ============================================================ -->
+<h2 id="s22-5">22.5 mem_fragmentation_ratio 指标</h2>
+<!-- ============================================================ -->
+
+<p>"内存碎片"是个被误用的词。Redis 的 <code>INFO memory</code> 给出了三个层次的碎片指标,每一层对应不同的碎片来源。读懂三个指标的层次关系,才能正确诊断"为什么 RSS 比 used_memory 高"。</p>
+
+<h3>22.5.1 三层指标的层次</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-5-1 · 从 OS RSS 到 used_memory 的四层视角</div>
+<pre><code class="language-text">  Redis 内存指标的三层视角:
+
+  +─────────────────────────────────────+
+  │ OS RSS                              │  ← top / ps 看到的物理内存
+  +─────────────────────────────────────+
+                ▼ 减去 OS 页对齐损失等
+  +─────────────────────────────────────+
+  │ allocator_resident                  │  ← jemalloc 报告的物理驻留
+  +─────────────────────────────────────+
+                ▼ 减去 jemalloc 内部碎片
+  +─────────────────────────────────────+
+  │ allocator_active                    │  ← jemalloc 已分配但未释放
+  +─────────────────────────────────────+
+                ▼ 减去 jemalloc 元数据
+  +─────────────────────────────────────+
+  │ allocator_allocated = used_memory   │  ← Redis 实际用
+  +─────────────────────────────────────+
+
+  比率含义:
+    mem_fragmentation_ratio = RSS / used_memory
+    allocator_frag_ratio    = allocator_active / used_memory
+    allocator_rss_ratio     = allocator_resident / allocator_active
+    allocator_frag_smallbins_ratio = small bins 内部 / 已分配</code></pre>
+</div>
+
+<h3>22.5.2 mem_fragmentation_ratio 直观读图</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-5-2 · mem_fragmentation_ratio 各取值范围的诊断结论</div>
+  <svg viewBox="0 0 940 380" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="380" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="350" y="14" width="240" height="40" rx="6" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="470" y="32" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">mem_fragmentation_ratio</text>
+      <text x="470" y="48" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">= used_memory_rss / used_memory</text>
+
+      <line x1="470" y1="54" x2="470" y2="78" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <rect x="40"  y="80" width="860" height="36" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="50" y="103" fill="var(--diagram-muted)" font-size="10">取值轴 →</text>
+      <line x1="100" y1="98" x2="900" y2="98" stroke="var(--diagram-border)"/>
+      <g font-size="10" font-weight="700" fill="var(--diagram-blue-text)">
+        <text x="160" y="103" text-anchor="middle">&lt; 1.0</text>
+        <text x="320" y="103" text-anchor="middle">1.0 ~ 1.1</text>
+        <text x="480" y="103" text-anchor="middle">1.1 ~ 1.5</text>
+        <text x="640" y="103" text-anchor="middle">1.5 ~ 2.0</text>
+        <text x="820" y="103" text-anchor="middle">&gt; 2.0</text>
+      </g>
+
+      <g font-size="10">
+        <rect x="40"  y="140" width="172" height="170" rx="8" fill="url(#d-red)" filter="url(#d-shadow)"/>
+        <text x="126" y="166" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="800">&lt; 1.0</text>
+        <text x="126" y="186" text-anchor="middle" fill="var(--diagram-red-text)" font-weight="700">★ 立刻处理</text>
+        <text x="126" y="208" text-anchor="middle" fill="var(--diagram-text)">RSS &lt; used_memory</text>
+        <text x="126" y="226" text-anchor="middle" fill="var(--diagram-text)">已 swap 出去</text>
+        <text x="126" y="248" text-anchor="middle" fill="var(--diagram-red-text)">检查:</text>
+        <text x="126" y="264" text-anchor="middle" fill="var(--diagram-red-text)">vm.swappiness</text>
+        <text x="126" y="278" text-anchor="middle" fill="var(--diagram-red-text)">cgroup memory limit</text>
+        <text x="126" y="294" text-anchor="middle" fill="var(--diagram-red-text)">同机其他进程占用</text>
+
+        <rect x="222" y="140" width="172" height="170" rx="8" fill="url(#d-green)" filter="url(#d-shadow)"/>
+        <text x="308" y="166" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="800">1.0 ~ 1.1</text>
+        <text x="308" y="186" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="700">健康</text>
+        <text x="308" y="208" text-anchor="middle" fill="var(--diagram-text)">RSS ≈ used</text>
+        <text x="308" y="226" text-anchor="middle" fill="var(--diagram-text)">几乎无碎片</text>
+        <text x="308" y="252" text-anchor="middle" fill="var(--diagram-green-text)">jemalloc 元数据</text>
+        <text x="308" y="266" text-anchor="middle" fill="var(--diagram-green-text)">+ 轻微 size 量化</text>
+        <text x="308" y="290" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">无需任何动作</text>
+
+        <rect x="404" y="140" width="172" height="170" rx="8" fill="url(#d-green)" filter="url(#d-shadow)" opacity="0.85"/>
+        <text x="490" y="166" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="800">1.1 ~ 1.5</text>
+        <text x="490" y="186" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="700">轻微碎片</text>
+        <text x="490" y="208" text-anchor="middle" fill="var(--diagram-text)">长跑后正常</text>
+        <text x="490" y="226" text-anchor="middle" fill="var(--diagram-text)">不影响业务</text>
+        <text x="490" y="252" text-anchor="middle" fill="var(--diagram-green-text)">可忽略</text>
+        <text x="490" y="270" text-anchor="middle" fill="var(--diagram-green-text)">或定期 PURGE</text>
+        <text x="490" y="290" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">绝大多数生产场景</text>
+
+        <rect x="586" y="140" width="172" height="170" rx="8" fill="url(#d-orange)" filter="url(#d-shadow)"/>
+        <text x="672" y="166" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="800">1.5 ~ 2.0</text>
+        <text x="672" y="186" text-anchor="middle" fill="var(--diagram-orange-text)" font-weight="700">明显碎片</text>
+        <text x="672" y="208" text-anchor="middle" fill="var(--diagram-text)">RSS 50%-100% 浪费</text>
+        <text x="672" y="226" text-anchor="middle" fill="var(--diagram-text)">可整理</text>
+        <text x="672" y="252" text-anchor="middle" fill="var(--diagram-orange-text)">动作:</text>
+        <text x="672" y="266" text-anchor="middle" fill="var(--diagram-orange-text)">activedefrag yes</text>
+        <text x="672" y="280" text-anchor="middle" fill="var(--diagram-orange-text)">MEMORY PURGE</text>
+        <text x="672" y="294" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">观察 frag/rss_ratio</text>
+
+        <rect x="768" y="140" width="132" height="170" rx="8" fill="url(#d-red)" filter="url(#d-shadow)"/>
+        <text x="834" y="166" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="800">&gt; 2.0</text>
+        <text x="834" y="186" text-anchor="middle" fill="var(--diagram-red-text)" font-weight="700">严重碎片</text>
+        <text x="834" y="208" text-anchor="middle" fill="var(--diagram-text)">RSS 翻倍</text>
+        <text x="834" y="226" text-anchor="middle" fill="var(--diagram-text)">多半已迁移失败</text>
+        <text x="834" y="252" text-anchor="middle" fill="var(--diagram-red-text)">动作:</text>
+        <text x="834" y="266" text-anchor="middle" fill="var(--diagram-red-text)">滚动重启</text>
+        <text x="834" y="280" text-anchor="middle" fill="var(--diagram-red-text)">主从切换迁移</text>
+      </g>
+
+      <rect x="40" y="328" width="860" height="38" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="470" y="346" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="700">⚠ &lt; 1.0 不是"好"</text>
+      <text x="470" y="362" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">表示 OS 已把 Redis 内存 swap 到磁盘 · 任何命令都可能触发 page fault · 性能灾难</text>
+    </g>
+  </svg>
+</div>
+
+<div class="warning">
+  <strong>&lt; 1.0 不是"好"</strong>:它意味着 OS 已经把部分内存换出到 swap,Redis 的实际"驻留"小于"已分配",这是<strong>性能灾难</strong>。看到 <code>mem_fragmentation_ratio &lt; 1</code> 应当立即检查 <code>vm.swappiness</code>、cgroup 限制、是否有其他进程抢内存。
+</div>
+
+<h3>22.5.3 INFO memory 字段速查</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 22-5-1 · INFO memory 关键字段</div>
+  <table>
+    <thead><tr><th>字段</th><th>含义</th><th>单位</th></tr></thead>
+    <tbody>
+      <tr><td><code>used_memory</code></td><td>Redis zmalloc 累计</td><td>字节</td></tr>
+      <tr><td><code>used_memory_rss</code></td><td>OS 报告的 RSS</td><td>字节</td></tr>
+      <tr><td><code>used_memory_peak</code></td><td>历史最大 used_memory</td><td>字节</td></tr>
+      <tr><td><code>total_system_memory</code></td><td>主机总内存</td><td>字节</td></tr>
+      <tr><td><code>mem_fragmentation_ratio</code></td><td>rss / used_memory</td><td>浮点数</td></tr>
+      <tr><td><code>mem_fragmentation_bytes</code></td><td>rss - used_memory</td><td>字节</td></tr>
+      <tr><td><code>allocator_allocated</code></td><td>jemalloc 已分配</td><td>字节</td></tr>
+      <tr><td><code>allocator_active</code></td><td>jemalloc 活跃 page</td><td>字节</td></tr>
+      <tr><td><code>allocator_resident</code></td><td>jemalloc 实际驻留</td><td>字节</td></tr>
+      <tr><td><code>allocator_frag_ratio</code></td><td>active / allocated</td><td>浮点数</td></tr>
+      <tr><td><code>allocator_rss_ratio</code></td><td>resident / active</td><td>浮点数</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<pre><code class="language-bash">127.0.0.1:6379&gt; INFO memory
+# Memory
+used_memory:1234567890
+used_memory_human:1.15G
+used_memory_rss:1380478976
+used_memory_rss_human:1.29G
+used_memory_peak:1234567890
+maxmemory:2147483648
+mem_fragmentation_ratio:1.12
+mem_fragmentation_bytes:145911086
+allocator_allocated:1238425600
+allocator_active:1268776960
+allocator_resident:1351778304
+allocator_frag_ratio:1.02
+allocator_rss_ratio:1.07</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s22-6">22.6 allocator_frag_ratio:内部碎片</h2>
+<!-- ============================================================ -->
+
+<h3>22.6.1 内部 vs 外部碎片</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-6-1 · 内部碎片(size class 量化) vs 外部碎片(slab 局部空闲)</div>
+<pre><code class="language-text">  内部碎片(allocator_frag):
+    分配 30 B → jemalloc 给 32 B size class
+    多出来的 2 B 永远浪费
+
+    场景:
+    - 写入大量 28~32 B 字符串(都被舍入到 32)
+    - 写入大量 1.2 KB 数据(都被舍入到 1280)
+
+    指标:allocator_frag_ratio
+      = active / allocated
+      理想 = 1.0,实际 1.05~1.10 是正常上界
+
+  外部碎片(allocator_rss):
+    slab 中删除 70% region 后剩 30% region
+    slab 整体不能归还 OS,即使 70% 闲置
+
+    场景:
+    - 大量短生命周期 key 频繁创建/删除
+    - 同 size class 的对象生命周期不一
+
+    指标:allocator_rss_ratio
+      = resident / active
+      理想 = 1.0,实际 1.10~1.30 在长期运行后正常</code></pre>
+</div>
+
+<h3>22.6.2 slab 局部空闲示意</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-6-2 · 同一 bin 下 4 个 slab 的占用率分布</div>
+<pre><code class="language-text">  bin_32 对应的 slab 序列(每 slab 127 个 32B region):
+
+  slab_0:  [█████████████████████████████]   全满
+  slab_1:  [█████████░░░░░░░░░░░░░░░░░░░░]   30% 用 70% 空
+  slab_2:  [██░░░░░░░░░░░░░░░░░░░░░░░░░░░]   10% 用 90% 空
+  slab_3:  [░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]   全空 → 可归还 OS
+
+  slab_1, slab_2 因为有部分 region 还在用,
+  整 slab 不能归还 OS。
+
+  解决方法:
+    1. Active Defrag:在线迁移 region 到其他 slab,
+       让 slab_1/slab_2 完全空,再归还 OS
+    2. MEMORY PURGE:让 jemalloc 立即检查并归还空 slab
+    3. 重启:全量内存归还(运维成本最高)</code></pre>
+</div>
+
+<h3>22.6.3 三种碎片的来源与处理</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 22-6-1 · 三种碎片的来源、检测指标与对应手段</div>
+  <table>
+    <thead><tr><th>碎片类型</th><th>来源</th><th>检测</th><th>处理</th></tr></thead>
+    <tbody>
+      <tr><td>内部(size class 量化)</td><td>请求大小不匹配 size class</td><td><code>allocator_frag_ratio</code></td><td>不可消除,接受</td></tr>
+      <tr><td>外部(slab 局部空闲)</td><td>短期对象删除</td><td><code>allocator_rss_ratio</code></td><td>Active Defrag</td></tr>
+      <tr><td>元数据(slab header 等)</td><td>jemalloc 必需</td><td><code>resident - active</code></td><td>不可消除,接受</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s22-7">22.7 allocator_rss_ratio:外部碎片与归还</h2>
+<!-- ============================================================ -->
+
+<h3>22.7.1 RSS 不归还 OS 的原因</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-7-1 · DEL 后 jemalloc 决定是否归还 OS 的决策树</div>
+  <svg viewBox="0 0 940 510" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="510" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="380" y="14" width="180" height="40" rx="6" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="470" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">DEL 大量 key</text>
+      <text x="470" y="48" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">应用层视角:已释放</text>
+
+      <line x1="470" y1="54" x2="470" y2="76" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <rect x="380" y="76" width="180" height="36" rx="6" fill="url(#d-blue)"/>
+      <text x="470" y="98" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">zfree(value)</text>
+
+      <line x1="470" y1="112" x2="470" y2="132" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <rect x="380" y="132" width="180" height="36" rx="6" fill="url(#d-blue)"/>
+      <text x="470" y="154" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">jemalloc: region free</text>
+
+      <line x1="470" y1="168" x2="470" y2="186" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <polygon points="380,190 560,190 590,218 560,246 380,246 350,218" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="1.5"/>
+      <text x="470" y="216" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="12" font-weight="800">slab 完全空?</text>
+      <text x="470" y="232" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">所有 region 都释放?</text>
+
+      <path d="M380,222 L 180,290" stroke="var(--diagram-red-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr-r)"/>
+      <text x="240" y="260" fill="var(--diagram-red-text)" font-size="11" font-weight="700">否</text>
+
+      <path d="M560,222 L 760,290" stroke="var(--diagram-green-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="700" y="260" fill="var(--diagram-green-text)" font-size="11" font-weight="700">是</text>
+
+      <rect x="40"  y="290" width="280" height="80" rx="8" fill="url(#d-red)" filter="url(#d-shadow)"/>
+      <text x="180" y="312" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">slab 保留(常见)</text>
+      <text x="180" y="332" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">下次同 size class 直接复用</text>
+      <text x="180" y="350" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">RSS 不下降</text>
+      <text x="180" y="364" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">"DEL 完 RSS 没动"= 这里</text>
+
+      <polygon points="650,290 870,290 900,318 870,346 650,346 620,318" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="1.5"/>
+      <text x="760" y="316" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="800">slab 在 dirty list ?</text>
+      <text x="760" y="332" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">decay 时间未到?</text>
+
+      <path d="M650,322 L 470,400" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr)"/>
+      <text x="540" y="370" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">是</text>
+
+      <path d="M870,322 L 870,400" stroke="var(--diagram-green-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="880" y="370" fill="var(--diagram-green-text)" font-size="11" font-weight="700">否</text>
+
+      <rect x="350" y="400" width="240" height="80" rx="8" fill="url(#d-orange)" filter="url(#d-shadow)"/>
+      <text x="470" y="420" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">延迟归还(默认 10s)</text>
+      <text x="470" y="438" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">opt.dirty_decay_ms = 10000</text>
+      <text x="470" y="454" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">background_thread 后台 purge</text>
+      <text x="470" y="468" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">MEMORY PURGE 命令可立即触发</text>
+
+      <rect x="710" y="400" width="200" height="80" rx="8" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="810" y="420" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">立即 munmap</text>
+      <text x="810" y="438" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">decay 时间已到</text>
+      <text x="810" y="454" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">RSS 立即下降</text>
+      <text x="810" y="468" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">归还 OS</text>
+
+      <rect x="20" y="490" width="900" height="0" rx="0" fill="none"/>
+    </g>
+  </svg>
+</div>
+
+<p>jemalloc 默认延迟归还以避免频繁 mmap/munmap 系统调用。代价是短期内 RSS 不下降 — 这是 "DEL 完了 RSS 没动" 的常见原因,不是 bug。</p>
+
+<h3>22.7.2 dirty page decay 机制</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-7-2 · jemalloc 5.x dirty page 衰减时间线</div>
+<pre><code class="language-text">  jemalloc 5.x 引入 dirty page decay 机制:
+
+  时间线:
+    t=0    DEL 大批 key,大量 region 释放
+    t=10s  jemalloc 标记若干 page 为 dirty(可归还)
+    t=10m  decay 时间到,后台线程处理 dirty
+    t=11m  munmap 归还 dirty page
+
+  decay 时间由 opt.dirty_decay_ms 控制:
+    默认 10000 ms(10 秒)
+    可调到 0 表示立即归还(代价是高频 syscall)
+
+  Redis 编译时设置:
+    deps/jemalloc/Makefile 中:
+      JE_DECAY=10000
+      ./configure --with-malloc-conf=dirty_decay_ms:10000</code></pre>
+</div>
+
+<h3>22.7.3 RSS 归还策略对比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 22-7-1 · 4 种归还策略的速度 / 开销 / 适用</div>
+  <table>
+    <thead><tr><th>策略</th><th><code>dirty_decay_ms</code></th><th>RSS 下降速度</th><th>syscall 开销</th><th>适用</th></tr></thead>
+    <tbody>
+      <tr><td>立即归还</td><td>0</td><td>即时</td><td>高</td><td>内存极度紧张</td></tr>
+      <tr><td><strong>默认</strong></td><td><strong>10000</strong></td><td><strong>10 秒延迟</strong></td><td><strong>低</strong></td><td><strong>通用</strong></td></tr>
+      <tr><td>长延迟</td><td>60000</td><td>60 秒延迟</td><td>极低</td><td>高频分配场景</td></tr>
+      <tr><td><code>MEMORY PURGE</code></td><td>(配置无关)</td><td>命令触发</td><td>中(单次)</td><td>主动运维</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s22-8">22.8 Active Defrag</h2>
+<!-- ============================================================ -->
+
+<p>Active Defrag 是 Redis 4.0 引入的"在线碎片整理"功能。它利用 jemalloc 的 <code>je_get_defrag_hint</code> API 找出"几乎空"的 slab 中的对象,搬到更紧凑的位置,让原 slab 完全空出来还给 OS。这是 Redis 唯一能"在不重启的前提下"降低 RSS 的手段。</p>
+
+<h3>22.8.1 Active Defrag 工作流</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-8-1 · serverCron 中 Active Defrag 一轮的决策与执行</div>
+  <svg viewBox="0 0 940 540" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="540" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="380" y="14" width="180" height="40" rx="6" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="470" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">serverCron 1Hz</text>
+      <text x="470" y="48" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">主线程定时回调</text>
+
+      <line x1="470" y1="54" x2="470" y2="74" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <polygon points="380,80 560,80 590,108 560,136 380,136 350,108" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="1.5"/>
+      <text x="470" y="106" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="800">activedefrag yes ?</text>
+      <text x="470" y="122" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">总开关 / 碎片率超阈值?</text>
+
+      <path d="M350,108 L 100,108" stroke="var(--diagram-border)" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#d-arr)"/>
+      <rect x="20"  y="92" width="80" height="36" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="60" y="114" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">否 → 跳过</text>
+
+      <line x1="470" y1="136" x2="470" y2="156" stroke="var(--diagram-green-stroke)" stroke-width="1.5" marker-end="url(#d-arr-g)"/>
+
+      <rect x="350" y="156" width="240" height="46" rx="6" fill="url(#d-blue)"/>
+      <text x="470" y="176" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">计算 CPU 时间预算</text>
+      <text x="470" y="192" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">cycle-min(1%) ~ cycle-max(25%)</text>
+
+      <line x1="470" y1="202" x2="470" y2="222" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <rect x="350" y="222" width="240" height="46" rx="6" fill="url(#d-blue)"/>
+      <text x="470" y="242" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">遍历 keyspace dict</text>
+      <text x="470" y="258" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">大 hash/zset 用 scan-fields 限速</text>
+
+      <line x1="470" y1="268" x2="470" y2="288" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <rect x="320" y="288" width="300" height="46" rx="6" fill="url(#d-purple)"/>
+      <text x="470" y="308" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">je_get_defrag_hint(robj 指针)</text>
+      <text x="470" y="324" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">jemalloc 公开 API · 0 / 1</text>
+
+      <line x1="470" y1="334" x2="470" y2="354" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <polygon points="380,358 560,358 590,386 560,414 380,414 350,386" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="1.5"/>
+      <text x="470" y="384" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="800">hint == 1?</text>
+      <text x="470" y="400" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">slab 较空,迁移有收益?</text>
+
+      <path d="M350,386 L 200,386" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#d-arr)"/>
+      <rect x="60"  y="368" width="140" height="36" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="130" y="390" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">否 → 跳过本对象</text>
+
+      <line x1="590" y1="386" x2="640" y2="386" stroke="var(--diagram-green-stroke)" stroke-width="1.5" marker-end="url(#d-arr-g)"/>
+
+      <g font-size="10">
+        <rect x="640" y="358" width="280" height="58" rx="6" fill="url(#d-green)"/>
+        <text x="780" y="378" text-anchor="middle" fill="var(--diagram-text)" font-weight="800">迁移 3 步</text>
+        <text x="780" y="394" text-anchor="middle" fill="var(--diagram-green-text)">① zmalloc 新内存 + memcpy</text>
+        <text x="780" y="408" text-anchor="middle" fill="var(--diagram-green-text)">② 更新所有指针引用 ③ zfree 旧</text>
+      </g>
+
+      <path d="M780,416 C 780,440 470,440 470,460" stroke="var(--diagram-purple-stroke)" stroke-width="1.5" fill="none" marker-end="url(#d-arr)"/>
+      <path d="M130,404 C 130,440 470,440 470,460" stroke="var(--diagram-border)" stroke-width="1.5" stroke-dasharray="4,3" fill="none" marker-end="url(#d-arr)"/>
+
+      <polygon points="380,460 560,460 590,486 560,514 380,514 350,486" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="1.5"/>
+      <text x="470" y="486" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="800">cycle 时间用完?</text>
+      <text x="470" y="502" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">达到 cycle-max %?</text>
+
+      <path d="M350,486 C 280,486 280,250 350,245" stroke="var(--diagram-border)" stroke-width="1.5" stroke-dasharray="4,3" fill="none" marker-end="url(#d-arr)"/>
+      <text x="245" y="370" fill="var(--diagram-muted)" font-size="9" transform="rotate(-90 245 370)">否 · 继续遍历</text>
+
+      <path d="M590,486 L 730,486" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+      <rect x="730" y="468" width="180" height="36" rx="6" fill="url(#d-orange)"/>
+      <text x="820" y="490" text-anchor="middle" fill="var(--diagram-text)" font-size="10" font-weight="800">是 · 返回主循环,下轮再来</text>
+    </g>
+  </svg>
+</div>
+
+<h3>22.8.2 Redis 怎么用 jemalloc 的 hint</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-8-2 · je_get_defrag_hint API 与 Redis 迁移逻辑</div>
+<pre><code class="language-text">  jemalloc 暴露 je_get_defrag_hint API:
+    int je_get_defrag_hint(void *ptr);
+    返回值:
+      0 = 该 ptr 所在 slab 几乎满,迁移收益低
+      1 = 该 ptr 所在 slab 较空,迁移可让 slab 释放
+
+  Redis 利用此 hint:
+    遍历 keyspace dict 找 hint = 1 的对象
+    重新 zmalloc 分配 + memcpy 数据
+    更新 dict / list / set / zset / hash 中的所有指针引用
+
+  代价:
+    - 每对象迁移有锁/拷贝开销
+    - 指针更新需要遍历所有引用方
+    - active-defrag-cycle-min ~ max 控制 CPU 占用比
+
+  收益:
+    在线整理碎片,RSS 显著下降
+    无需重启</code></pre>
+</div>
+
+<h3>22.8.3 Active Defrag 配置</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 22-8-1 · activedefrag 相关 7 个参数</div>
+  <table>
+    <thead><tr><th>参数</th><th>默认</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td><code>activedefrag</code></td><td>no</td><td>总开关</td></tr>
+      <tr><td><code>active-defrag-ignore-bytes</code></td><td>100mb</td><td>碎片字节小于此值不启动</td></tr>
+      <tr><td><code>active-defrag-threshold-lower</code></td><td>10</td><td>碎片率超过此百分比才启动</td></tr>
+      <tr><td><code>active-defrag-threshold-upper</code></td><td>100</td><td>碎片率达到此值时 max CPU 使用</td></tr>
+      <tr><td><code>active-defrag-cycle-min</code></td><td>1</td><td>最小 CPU 时间百分比</td></tr>
+      <tr><td><code>active-defrag-cycle-max</code></td><td>25</td><td>最大 CPU 时间百分比</td></tr>
+      <tr><td><code>active-defrag-max-scan-fields</code></td><td>1000</td><td>大 hash/zset 单次 scan 字段上限</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<pre><code class="language-bash">127.0.0.1:6379&gt; CONFIG SET activedefrag yes
+OK
+127.0.0.1:6379&gt; CONFIG SET active-defrag-threshold-lower 20
+OK
+127.0.0.1:6379&gt; CONFIG SET active-defrag-cycle-max 40
+OK
+127.0.0.1:6379&gt; INFO memory | grep -i defrag
+mem_defragmenter:enabled
+active_defrag_running:1
+active_defrag_hits:42345
+active_defrag_misses:1234
+active_defrag_key_hits:3456
+active_defrag_key_misses:78</code></pre>
+
+<p><code>active_defrag_running</code> 为 1 表示当前正在整理;<code>hits/misses</code> 反映迁移成功率。生产建议保持 <code>cycle-max</code> 为 25 — 调过大(如 75)会让主流程被 defrag 吃掉一半 CPU,延迟显著恶化。</p>
+
+<!-- ============================================================ -->
+<h2 id="s22-9">22.9 MEMORY PURGE 命令</h2>
+<!-- ============================================================ -->
+
+<h3>22.9.1 MEMORY PURGE 触发逻辑</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-9-1 · MEMORY PURGE 命令的内部时序</div>
+  <svg viewBox="0 0 940 410" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="410" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <g font-size="11" font-weight="800" fill="var(--diagram-text)">
+        <rect x="40"  y="14" width="180" height="32" rx="6" fill="url(#d-blue)"/>
+        <text x="130" y="34" text-anchor="middle">客户端</text>
+        <rect x="380" y="14" width="200" height="32" rx="6" fill="url(#d-purple)"/>
+        <text x="480" y="34" text-anchor="middle">MEMORY PURGE</text>
+        <rect x="720" y="14" width="180" height="32" rx="6" fill="url(#d-orange)"/>
+        <text x="810" y="34" text-anchor="middle">jemalloc</text>
+      </g>
+
+      <line x1="130" y1="46" x2="130" y2="394" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="480" y1="46" x2="480" y2="394" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="810" y1="46" x2="810" y2="394" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+
+      <line x1="130" y1="80" x2="480" y2="80" stroke="var(--diagram-purple-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+      <text x="140" y="74" fill="var(--diagram-blue-text)" font-size="10">① MEMORY PURGE</text>
+
+      <line x1="480" y1="116" x2="810" y2="116" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#d-arr-b)"/>
+      <text x="490" y="110" fill="var(--diagram-blue-text)" font-size="10">② je_mallctl("arena.N.purge")</text>
+
+      <rect x="600" y="140" width="320" height="160" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)" stroke-dasharray="3,3"/>
+      <text x="610" y="158" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">loop · 遍历每个 arena (narenas = 4×CPU)</text>
+
+      <g font-size="10" fill="var(--diagram-blue-text)">
+        <line x1="810" y1="180" x2="810" y2="200" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+        <text x="700" y="178" fill="var(--diagram-orange-text)">③ 找出 dirty extents</text>
+
+        <rect x="700" y="206" width="220" height="30" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+        <text x="810" y="225" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">扫描 dirty page bitmap</text>
+
+        <line x1="810" y1="244" x2="810" y2="264" stroke="var(--diagram-red-stroke)" stroke-width="1.5" marker-end="url(#d-arr-r)"/>
+        <text x="650" y="262" fill="var(--diagram-red-text)">④ madvise(MADV_DONTNEED)</text>
+
+        <rect x="700" y="270" width="220" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+        <text x="810" y="285" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10" font-weight="700">或 munmap 立即归还 OS</text>
+      </g>
+
+      <line x1="810" y1="320" x2="480" y2="320" stroke="var(--diagram-green-stroke)" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#d-arr-g)"/>
+      <text x="490" y="314" fill="var(--diagram-green-text)" font-size="10">⑤ 完成</text>
+
+      <line x1="480" y1="350" x2="130" y2="350" stroke="var(--diagram-green-stroke)" stroke-width="1.5" stroke-dasharray="3,2" marker-end="url(#d-arr-g)"/>
+      <text x="140" y="344" fill="var(--diagram-green-text)" font-size="10">⑥ +OK\r\n</text>
+
+      <rect x="40" y="370" width="880" height="28" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="480" y="388" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10" font-weight="700">⚠ 阻塞主线程 · 大内存(几十 GB)实例可能阻塞 10-100 ms · 高峰期慎用</text>
+    </g>
+  </svg>
+</div>
+
+<h3>22.9.2 工程含义与限制</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-9-2 · 何时该用 MEMORY PURGE,以及它做不到什么</div>
+<pre><code class="language-text">  使用场景:
+    1. 长期运行后 RSS 高于预期,但 used_memory 正常
+    2. 大批量 DEL 操作后立即查看效果
+    3. 容器化场景需要释放 RSS 给其他进程
+
+  限制:
+    1. 阻塞主线程(O(arena 数 × dirty page 数))
+    2. 不能整理 size class 量化的内部碎片
+    3. 不能整理 slab 局部空闲(需 Active Defrag)
+
+  等价命令(jemalloc 5.x):
+    redis-cli MEMORY PURGE
+      内部调用 je_mallctl 或等价 epoch-bumped purge
+
+  对比:
+    activedefrag yes:在线整理外部碎片,长期生效
+    MEMORY PURGE:立即归还 dirty page,一次性
+
+  生产建议:
+    定期 cron 调用 MEMORY PURGE(每周一次)
+    高碎片实例启用 activedefrag</code></pre>
+</div>
+
+<h3>22.9.3 MEMORY 命令族</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 22-9-1 · MEMORY 命令族五件套</div>
+  <table>
+    <thead><tr><th>命令</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td><code>MEMORY USAGE key</code></td><td>单 key 占用字节</td></tr>
+      <tr><td><code>MEMORY STATS</code></td><td>详细内存统计</td></tr>
+      <tr><td><code>MEMORY DOCTOR</code></td><td>内存健康检查 + 修复建议</td></tr>
+      <tr><td><code>MEMORY PURGE</code></td><td>强制 jemalloc 归还 dirty page</td></tr>
+      <tr><td><code>MEMORY MALLOC-STATS</code></td><td>输出 jemalloc 内部统计</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s22-10">22.10 THP 与 fork CoW</h2>
+<!-- ============================================================ -->
+
+<p>Transparent Huge Pages(THP)是 Linux 内核自动把连续 4 KiB 页合并为 2 MiB 页的特性,目标是减少 TLB miss。但 Redis 在 BGSAVE 时走 fork(2) + Copy-on-Write,THP 把 CoW 粒度从 4 KiB 升到 2 MiB,直接导致 BGSAVE 期间 RSS 放大 50-200%。这是 Redis 文档反复强调"<strong>关闭 THP</strong>"的根本原因。</p>
+
+<h3>22.10.1 THP 怎么影响 fork CoW</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-10-1 · THP 启用前后 fork CoW 的内存放大对比</div>
+<pre><code class="language-text">  Linux Transparent Huge Pages (THP):
+    标准页大小 4 KiB
+    THP 页大小 2 MiB(标准 huge page)
+
+  THP 启用时,内核自动把连续 4 KiB 页合并为 2 MiB 页:
+    优势:TLB miss 减少,大块内存访问性能高
+    劣势:Copy-on-Write 粒度从 4 KiB 升到 2 MiB
+
+  fork BGSAVE 场景:
+    主进程 fork 出子进程
+    Linux 用 CoW:fork 后内存共享,任一方写时复制对应页
+
+  无 THP:
+    主进程修改 1 字节 → 复制 4 KiB 页
+    1 GB 内存修改 1% → 复制 ~10 MB
+
+  有 THP:
+    主进程修改 1 字节 → 复制 2 MiB 页
+    1 GB 内存修改 1% → 复制 ~512 MB(50 倍放大)
+
+  Redis 强烈建议关闭 THP:
+    echo never > /sys/kernel/mm/transparent_hugepage/enabled</code></pre>
+</div>
+
+<h3>22.10.2 BGSAVE 内存放大对比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-10-2 · 8 GB 实例 BGSAVE 期间无 THP / 有 THP 的 RSS 增长</div>
+  <svg viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="460" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="380" y="14" width="180" height="40" rx="6" fill="url(#d-blue)" filter="url(#d-shadow)"/>
+      <text x="470" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">主进程 8 GB</text>
+      <text x="470" y="48" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">used_memory = 8 GB</text>
+
+      <line x1="470" y1="54" x2="470" y2="74" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <rect x="380" y="74" width="180" height="36" rx="6" fill="url(#d-purple)"/>
+      <text x="470" y="96" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">fork() · BGSAVE</text>
+
+      <line x1="470" y1="110" x2="470" y2="130" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+      <rect x="350" y="130" width="240" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="470" y="150" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">子进程持续 BGSAVE</text>
+      <text x="470" y="166" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">主进程持续 SET/HSET 写入</text>
+
+      <line x1="350" y1="170" x2="220" y2="200" stroke="var(--diagram-green-stroke)" stroke-width="1.5" marker-end="url(#d-arr-g)"/>
+      <line x1="590" y1="170" x2="720" y2="200" stroke="var(--diagram-red-stroke)" stroke-width="1.5" marker-end="url(#d-arr-r)"/>
+
+      <rect x="40"  y="200" width="360" height="220" rx="10" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="220" y="226" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="800">无 THP(推荐)</text>
+      <text x="220" y="244" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">echo never &gt; .../enabled</text>
+
+      <g font-size="11" fill="var(--diagram-text)">
+        <rect x="60"  y="260" width="320" height="32" rx="4" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="220" y="280" text-anchor="middle">CoW 粒度 = 4 KiB</text>
+
+        <rect x="60"  y="300" width="320" height="32" rx="4" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="220" y="320" text-anchor="middle">写 1 字节 → 复制 4 KiB</text>
+
+        <rect x="60"  y="340" width="320" height="32" rx="4" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="220" y="360" text-anchor="middle">改 1% 数据 → +80 MB(8GB×0.01)</text>
+
+        <rect x="60"  y="380" width="320" height="32" rx="4" fill="url(#d-green)" stroke="var(--diagram-green-stroke)"/>
+        <text x="220" y="400" text-anchor="middle" font-weight="800">BGSAVE 期间 RSS +5%~20%</text>
+      </g>
+
+      <rect x="540" y="200" width="360" height="220" rx="10" fill="url(#d-red)" filter="url(#d-shadow)"/>
+      <text x="720" y="226" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="800">有 THP(默认 madvise / always)</text>
+      <text x="720" y="244" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">2 MiB huge page 自动合并</text>
+
+      <g font-size="11" fill="var(--diagram-text)">
+        <rect x="560" y="260" width="320" height="32" rx="4" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+        <text x="720" y="280" text-anchor="middle">CoW 粒度 = 2 MiB(放大 512×)</text>
+
+        <rect x="560" y="300" width="320" height="32" rx="4" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+        <text x="720" y="320" text-anchor="middle">写 1 字节 → 复制 2 MiB</text>
+
+        <rect x="560" y="340" width="320" height="32" rx="4" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+        <text x="720" y="360" text-anchor="middle">改 1% 数据 → +4 GB(50× 放大)</text>
+
+        <rect x="560" y="380" width="320" height="32" rx="4" fill="url(#d-red)" stroke="var(--diagram-red-stroke)"/>
+        <text x="720" y="400" text-anchor="middle" font-weight="800">BGSAVE 期间 RSS +50%~200%</text>
+      </g>
+
+      <rect x="40" y="430" width="860" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="470" y="446" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">CoW 粒度差 512 倍 · 1 GB 实例同样负载差 50× → 必关 THP</text>
+    </g>
+  </svg>
+
+<h3>22.10.3 Redis 启动检测 THP</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-10-3 · Redis 启动时对 THP 状态的检测与告警</div>
+<pre><code class="language-text">  Redis 启动时检查 THP 状态(src/server.c):
+
+    if (linuxMadvFreeForkBugCheck()) ...
+    检测 /sys/kernel/mm/transparent_hugepage/enabled
+
+  若发现 THP enabled,启动日志告警:
+    "WARNING you have Transparent Huge Pages (THP) support
+     enabled in your kernel. This will create latency and
+     memory usage issues with Redis. To fix this issue run:
+       echo madvise > /sys/kernel/mm/transparent_hugepage/enabled
+     as root, and add it to your /etc/rc.local in order to
+     retain the setting after a reboot."
+
+  推荐设置:
+    永久关闭(/etc/rc.local 或 systemd unit):
+    echo never > /sys/kernel/mm/transparent_hugepage/enabled</code></pre>
+</div>
+
+<h3>22.10.4 THP 三种模式的对比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 22-10-1 · THP 模式 always / madvise / never 的影响</div>
+  <table>
+    <thead><tr><th>THP 模式</th><th>enabled 文件值</th><th>BGSAVE CoW 放大</th><th>推荐</th></tr></thead>
+    <tbody>
+      <tr><td>always</td><td>always</td><td>50-200%</td><td>不推荐</td></tr>
+      <tr><td>madvise</td><td>madvise</td><td>0%(jemalloc 不主动用)</td><td>可接受</td></tr>
+      <tr><td><strong>never(推荐)</strong></td><td><strong>never</strong></td><td><strong>0%</strong></td><td><strong>强推</strong></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s22-11">22.11 MALLOC_CONF 调优</h2>
+<!-- ============================================================ -->
+
+<h3>22.11.1 启动时 MALLOC_CONF</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-11-1 · 常用 MALLOC_CONF 参数与启动方式</div>
+<pre><code class="language-bash"># 减少 dirty page 保留时间(快速归还 OS)
+MALLOC_CONF="dirty_decay_ms:1000" redis-server
+
+# 关闭 tcache(极小内存场景,减少 metadata 开销)
+MALLOC_CONF="tcache:false" redis-server
+
+# 调高 arena 数量(高并发多线程 IO)
+MALLOC_CONF="narenas:8" redis-server
+
+# 启用统计与 dump(性能调优)
+MALLOC_CONF="stats_print:true,prof:true,prof_active:true" redis-server
+
+# 综合配置
+MALLOC_CONF="dirty_decay_ms:5000,tcache:true,narenas:4" redis-server</code></pre>
+</div>
+
+<h3>22.11.2 常用参数速查</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 22-11-1 · MALLOC_CONF 8 个常用参数</div>
+  <table>
+    <thead><tr><th>参数</th><th>默认</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td><code>dirty_decay_ms</code></td><td>10000</td><td>dirty page 衰减时间</td></tr>
+      <tr><td><code>muzzy_decay_ms</code></td><td>0(立即)</td><td>muzzy page 衰减(MADV_DONTNEED)</td></tr>
+      <tr><td><code>narenas</code></td><td>4 × CPU</td><td>arena 数</td></tr>
+      <tr><td><code>tcache</code></td><td>true</td><td>是否启用 tcache</td></tr>
+      <tr><td><code>lg_tcache_max</code></td><td>15</td><td>tcache 最大 size class log₂</td></tr>
+      <tr><td><code>stats_print</code></td><td>false</td><td>启动时打印统计</td></tr>
+      <tr><td><code>background_thread</code></td><td>false</td><td>是否启用后台 purge 线程</td></tr>
+      <tr><td><code>metadata_thp</code></td><td>disabled</td><td>jemalloc 元数据是否用 THP</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>22.11.3 观察 jemalloc 内部状态</h3>
+
+<pre><code class="language-bash">127.0.0.1:6379&gt; MEMORY MALLOC-STATS
+___ Begin jemalloc statistics ___
+Version: "5.3.0-0-g54eaed1d8b56b1aa528be3bdd1877e59c56fa90c"
+Build-time option settings
+  config.cache_oblivious: true
+  config.debug: false
+  config.fill: true
+  config.lazy_lock: false
+  config.malloc_conf: ""
+  config.opt_safety_checks: false
+  config.prof: false
+  ...
+Arenas: 4
+Quantum size: 16
+Page size: 4096
+Min active:dirty page ratio per arena: 1:8
+Maximum thread-cached size class: 32768
+
+allocated:    1238425600
+active:       1268776960
+metadata:     12345678 (n_thp 0)
+resident:     1351778304
+mapped:       1426063360
+retained:     74284032
+
+___ End jemalloc statistics ___</code></pre>
+
+<p><code>active</code>、<code>resident</code>、<code>metadata</code>、<code>mapped</code>、<code>retained</code> 五项分别对应:正在使用、物理驻留、jemalloc 自用、虚拟映射、已 munmap 但保留地址空间。这五项关系决定了 RSS 与 <code>used_memory</code> 的全部差异。</p>
+
+<!-- ============================================================ -->
+<h2 id="s22-12">22.12 陷阱速查</h2>
+<!-- ============================================================ -->
+
+<h3>22.12.1 陷阱分类</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-12-1 · jemalloc 在 Redis 上的 9 类常见陷阱</div>
+  <svg viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="460" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="380" y="14" width="180" height="40" rx="6" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="470" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">jemalloc 陷阱</text>
+      <text x="470" y="48" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">9 类 · 4 大主题</text>
+
+      <line x1="470" y1="54" x2="120" y2="100" stroke="var(--diagram-border)"/>
+      <line x1="470" y1="54" x2="370" y2="100" stroke="var(--diagram-border)"/>
+      <line x1="470" y1="54" x2="610" y2="100" stroke="var(--diagram-border)"/>
+      <line x1="470" y1="54" x2="820" y2="100" stroke="var(--diagram-border)"/>
+
+      <rect x="20"  y="100" width="200" height="40" rx="6" fill="url(#d-blue)"/>
+      <text x="120" y="120" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">认知误区</text>
+      <text x="120" y="134" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">3 类 · 看错指标</text>
+
+      <rect x="270" y="100" width="200" height="40" rx="6" fill="url(#d-orange)"/>
+      <text x="370" y="120" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">参数误调</text>
+      <text x="370" y="134" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">2 类 · 调过头</text>
+
+      <rect x="510" y="100" width="200" height="40" rx="6" fill="url(#d-red)"/>
+      <text x="610" y="120" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">运维操作</text>
+      <text x="610" y="134" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">2 类 · 系统层副作用</text>
+
+      <rect x="720" y="100" width="200" height="40" rx="6" fill="url(#d-green)"/>
+      <text x="820" y="120" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">平台差异</text>
+      <text x="820" y="134" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">2 类 · 非 Linux</text>
+
+      <g font-size="10" fill="var(--diagram-blue-text)">
+        <rect x="20"  y="160" width="200" height="200" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+        <text x="35"  y="180" fill="var(--diagram-blue-text)" font-weight="700">① 仅看 used_memory 估容量</text>
+        <text x="35"  y="196" fill="var(--diagram-muted)" font-size="9">→ 忽略 frag_ratio,容量算少</text>
+
+        <text x="35"  y="222" fill="var(--diagram-blue-text)" font-weight="700">② RSS 高即认为内存泄漏</text>
+        <text x="35"  y="238" fill="var(--diagram-muted)" font-size="9">→ 实际是 jemalloc 碎片</text>
+
+        <text x="35"  y="264" fill="var(--diagram-blue-text)" font-weight="700">③ 期望 DEL 后 RSS 立刻降</text>
+        <text x="35"  y="280" fill="var(--diagram-muted)" font-size="9">→ dirty_decay_ms 默认 10s</text>
+
+        <text x="35"  y="320" fill="var(--diagram-green-text)" font-size="9" font-weight="700">修复:看 INFO MEMORY 三比率</text>
+        <text x="35"  y="336" fill="var(--diagram-green-text)" font-size="9">用 used × 1.3 估容量底线</text>
+        <text x="35"  y="352" fill="var(--diagram-green-text)" font-size="9">必要时 MEMORY PURGE</text>
+
+        <rect x="270" y="160" width="200" height="200" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+        <text x="285" y="180" fill="var(--diagram-orange-text)" font-weight="700">④ dirty_decay_ms = 0</text>
+        <text x="285" y="196" fill="var(--diagram-muted)" font-size="9">→ 高频 syscall · P99 尖刺</text>
+
+        <text x="285" y="222" fill="var(--diagram-orange-text)" font-weight="700">⑤ activedefrag cycle-max 调高</text>
+        <text x="285" y="238" fill="var(--diagram-muted)" font-size="9">→ 主流程被 defrag 抢 CPU</text>
+
+        <text x="285" y="276" fill="var(--diagram-green-text)" font-size="9" font-weight="700">修复</text>
+        <text x="285" y="292" fill="var(--diagram-green-text)" font-size="9">decay 保持 10000(默认)</text>
+        <text x="285" y="308" fill="var(--diagram-green-text)" font-size="9">cycle-max ≤ 25(默认)</text>
+        <text x="285" y="324" fill="var(--diagram-green-text)" font-size="9">先看 frag 是否真高再开</text>
+        <text x="285" y="340" fill="var(--diagram-green-text)" font-size="9">调参后观察 latency-monitor</text>
+
+        <rect x="510" y="160" width="200" height="200" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+        <text x="525" y="180" fill="var(--diagram-red-text)" font-weight="700">⑥ THP 启用 → BGSAVE 放大</text>
+        <text x="525" y="196" fill="var(--diagram-muted)" font-size="9">→ 2MiB CoW 粒度,RSS+200%</text>
+
+        <text x="525" y="222" fill="var(--diagram-red-text)" font-weight="700">⑦ 高峰频繁 MEMORY PURGE</text>
+        <text x="525" y="238" fill="var(--diagram-muted)" font-size="9">→ 阻塞主线程 10-100ms</text>
+
+        <text x="525" y="276" fill="var(--diagram-green-text)" font-size="9" font-weight="700">修复</text>
+        <text x="525" y="292" fill="var(--diagram-green-text)" font-size="9">echo never &gt; .../enabled</text>
+        <text x="525" y="308" fill="var(--diagram-green-text)" font-size="9">/etc/rc.local 持久化</text>
+        <text x="525" y="324" fill="var(--diagram-green-text)" font-size="9">PURGE 放低峰 cron</text>
+
+        <rect x="720" y="160" width="200" height="200" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="735" y="180" fill="var(--diagram-green-text)" font-weight="700">⑧ macOS 表现不同</text>
+        <text x="735" y="196" fill="var(--diagram-muted)" font-size="9">→ jemalloc 版本/内核差异</text>
+
+        <text x="735" y="222" fill="var(--diagram-green-text)" font-weight="700">⑨ Windows 无 fork(2)</text>
+        <text x="735" y="238" fill="var(--diagram-muted)" font-size="9">→ jemalloc 仅子集</text>
+
+        <text x="735" y="276" fill="var(--diagram-green-text)" font-size="9" font-weight="700">修复</text>
+        <text x="735" y="292" fill="var(--diagram-green-text)" font-size="9">基准/容量评估在 Linux 做</text>
+        <text x="735" y="308" fill="var(--diagram-green-text)" font-size="9">macOS 仅开发用</text>
+        <text x="735" y="324" fill="var(--diagram-green-text)" font-size="9">Windows 容器化为佳</text>
+      </g>
+
+      <rect x="40" y="380" width="860" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="470" y="400" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">容量规划口径:maxmemory ≥ used_memory × 1.3 (开 Active Defrag) 或 × 1.5 (未开)</text>
+
+      <text x="470" y="438" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">前 3 类是对 jemalloc 行为的误解,后 6 类是配置/平台引发的真问题</text>
+    </g>
+  </svg>
+</div>
+
+<h3>22.12.2 陷阱明细</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 22-12-1 · 9 大陷阱明细</div>
+  <table>
+    <thead><tr><th>#</th><th>陷阱</th><th>症状</th><th>根因</th><th>修复</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>仅看 used_memory 估容量</td><td>OOM 才发现 RSS 已超 maxmemory</td><td>没考虑 frag_ratio</td><td>用 <code>used_memory × 1.2~1.3</code> 估算</td></tr>
+      <tr><td>2</td><td>RSS 高即认为泄漏</td><td>DEBUG 找不到泄漏</td><td>实际是碎片</td><td>看 <code>mem_fragmentation_ratio</code></td></tr>
+      <tr><td>3</td><td>期望 DEL 后立即归还</td><td>DEL 后 RSS 不变</td><td>dirty_decay_ms 默认 10s</td><td>等待或 <code>MEMORY PURGE</code></td></tr>
+      <tr><td>4</td><td><code>dirty_decay_ms = 0</code></td><td>频繁 mmap/munmap,延迟尖刺</td><td>立即归还引发 syscall</td><td>默认 10000 ms</td></tr>
+      <tr><td>5</td><td>activedefrag 失控</td><td>CPU 100%,主流程卡顿</td><td>cycle-max 调过大</td><td>调回 25(默认)</td></tr>
+      <tr><td>6</td><td>THP 启用 BGSAVE 放大</td><td>BGSAVE 期间 OOM</td><td>2 MiB CoW 粒度过大</td><td><code>echo never &gt; .../enabled</code></td></tr>
+      <tr><td>7</td><td>频繁 <code>MEMORY PURGE</code></td><td>命令延迟周期性尖刺</td><td>PURGE 阻塞主线程</td><td>调度低峰期 cron 执行</td></tr>
+      <tr><td>8</td><td>macOS 表现不同</td><td>RSS 不下降</td><td>不同 jemalloc 版本与 OS 内核</td><td>不要在 macOS 做内存基准</td></tr>
+      <tr><td>9</td><td>Windows fork 缺失</td><td>BGSAVE 走 disk-based fork</td><td>Windows 无 fork(2)</td><td>用 Linux 容器</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="warning">
+  <strong>容量规划口径</strong>:Redis 容量评估必须用 <code>maxmemory ≥ used_memory × 1.3</code> 作底线,留 30% 给 jemalloc 碎片 + fork CoW + 内核 page cache。在没启 Active Defrag 的实例上,这个倍数应进一步拉到 1.5。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s22-13">22.13 源码深潜</h2>
+<!-- ============================================================ -->
+
+<h3>22.13.1 Redis zmalloc → jemalloc 调用链</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 22-13-1 · zmalloc / zfree / INFO memory 三条核心调用链</div>
+  <svg viewBox="0 0 940 410" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="410" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <text x="470" y="22" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">三条核心调用链 · src/zmalloc.c 是 Redis 与 jemalloc 的唯一桥</text>
+
+      <text x="160" y="48" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">① 分配路径 · zmalloc</text>
+
+      <g font-size="10">
+        <rect x="40"  y="58" width="240" height="46" rx="6" fill="url(#d-blue)"/>
+        <text x="160" y="78" text-anchor="middle" fill="var(--diagram-text)" font-weight="800">zmalloc(size)</text>
+        <text x="160" y="94" text-anchor="middle" fill="var(--diagram-blue-text)" font-family="ui-monospace">src/zmalloc.c</text>
+
+        <line x1="160" y1="104" x2="160" y2="124" stroke="var(--diagram-green-stroke)" stroke-width="1.5" marker-end="url(#d-arr-g)"/>
+
+        <rect x="40"  y="124" width="240" height="40" rx="6" fill="url(#d-orange)"/>
+        <text x="160" y="148" text-anchor="middle" fill="var(--diagram-text)" font-weight="800" font-family="ui-monospace">je_malloc(size + PREFIX)</text>
+
+        <line x1="160" y1="164" x2="160" y2="184" stroke="var(--diagram-green-stroke)" stroke-width="1.5" marker-end="url(#d-arr-g)"/>
+
+        <rect x="40"  y="184" width="240" height="46" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="160" y="204" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="700">update_zmalloc_stat_alloc</text>
+        <text x="160" y="220" text-anchor="middle" fill="var(--diagram-green-text)" font-family="ui-monospace">used_memory += sz</text>
+
+        <line x1="160" y1="230" x2="160" y2="250" stroke="var(--diagram-green-stroke)" stroke-width="1.5" marker-end="url(#d-arr-g)"/>
+
+        <rect x="40"  y="250" width="240" height="36" rx="6" fill="url(#d-green)"/>
+        <text x="160" y="272" text-anchor="middle" fill="var(--diagram-text)" font-weight="800">return ptr</text>
+      </g>
+
+      <text x="470" y="48" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="700">② 释放路径 · zfree</text>
+
+      <g font-size="10">
+        <rect x="350" y="58" width="240" height="46" rx="6" fill="url(#d-blue)"/>
+        <text x="470" y="78" text-anchor="middle" fill="var(--diagram-text)" font-weight="800">zfree(ptr)</text>
+        <text x="470" y="94" text-anchor="middle" fill="var(--diagram-blue-text)" font-family="ui-monospace">src/zmalloc.c</text>
+
+        <line x1="470" y1="104" x2="470" y2="124" stroke="var(--diagram-red-stroke)" stroke-width="1.5" marker-end="url(#d-arr-r)"/>
+
+        <rect x="350" y="124" width="240" height="40" rx="6" fill="url(#d-orange)"/>
+        <text x="470" y="148" text-anchor="middle" fill="var(--diagram-text)" font-weight="800" font-family="ui-monospace">je_malloc_size(ptr)</text>
+
+        <line x1="470" y1="164" x2="470" y2="184" stroke="var(--diagram-red-stroke)" stroke-width="1.5" marker-end="url(#d-arr-r)"/>
+
+        <rect x="350" y="184" width="240" height="46" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+        <text x="470" y="204" text-anchor="middle" fill="var(--diagram-red-text)" font-weight="700">update_zmalloc_stat_free</text>
+        <text x="470" y="220" text-anchor="middle" fill="var(--diagram-red-text)" font-family="ui-monospace">used_memory -= sz</text>
+
+        <line x1="470" y1="230" x2="470" y2="250" stroke="var(--diagram-red-stroke)" stroke-width="1.5" marker-end="url(#d-arr-r)"/>
+
+        <rect x="350" y="250" width="240" height="36" rx="6" fill="url(#d-red)"/>
+        <text x="470" y="272" text-anchor="middle" fill="var(--diagram-text)" font-weight="800" font-family="ui-monospace">je_free(ptr)</text>
+      </g>
+
+      <text x="780" y="48" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">③ 统计路径 · INFO memory</text>
+
+      <g font-size="10">
+        <rect x="660" y="58" width="240" height="46" rx="6" fill="url(#d-purple)"/>
+        <text x="780" y="78" text-anchor="middle" fill="var(--diagram-text)" font-weight="800">INFO memory</text>
+        <text x="780" y="94" text-anchor="middle" fill="var(--diagram-purple-text)" font-family="ui-monospace">命令入口</text>
+
+        <line x1="780" y1="104" x2="780" y2="124" stroke="var(--diagram-purple-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+        <rect x="660" y="124" width="240" height="40" rx="6" fill="url(#d-blue)"/>
+        <text x="780" y="148" text-anchor="middle" fill="var(--diagram-text)" font-weight="800" font-family="ui-monospace">generateMemoryStats</text>
+
+        <line x1="780" y1="164" x2="780" y2="184" stroke="var(--diagram-purple-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+        <rect x="660" y="184" width="240" height="46" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+        <text x="780" y="202" text-anchor="middle" fill="var(--diagram-purple-text)" font-weight="700" font-family="ui-monospace">je_mallctl(epoch++)</text>
+        <text x="780" y="218" text-anchor="middle" fill="var(--diagram-purple-text)">读 allocated/active/resident</text>
+
+        <line x1="780" y1="230" x2="780" y2="250" stroke="var(--diagram-purple-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+
+        <rect x="660" y="250" width="240" height="36" rx="6" fill="url(#d-purple)"/>
+        <text x="780" y="272" text-anchor="middle" fill="var(--diagram-text)" font-weight="800">拼装 INFO 输出</text>
+      </g>
+
+      <rect x="40" y="310" width="860" height="84" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="60" y="330" fill="var(--diagram-green-text)" font-size="11" font-weight="700">关键不变量</text>
+      <g font-size="10" fill="var(--diagram-blue-text)">
+        <text x="60" y="350">PREFIX_SIZE 在 ptr 前 8 字节存"用户请求大小",zmalloc_size 才能算 size class 量化损失</text>
+        <text x="60" y="368">je_malloc_size(ptr) 返回 jemalloc <tspan fill="var(--diagram-purple-text)" font-weight="700">实际</tspan>分配字节(含量化)→ used_memory 反映"含量化的真实占用"</text>
+        <text x="60" y="386">je_mallctl(epoch++) 每次必先递增 epoch,否则读到的 active/resident 是上一次缓存值</text>
+      </g>
+    </g>
+  </svg>
+</div>
+
+<h3>22.13.2 zmalloc 关键代码</h3>
+
+<pre><code class="language-c">/* src/zmalloc.c — 简化 */
+static __thread size_t used_memory_thread = 0;
+
+void *zmalloc(size_t size) {
+    void *ptr = je_malloc(size + PREFIX_SIZE);
+    if (!ptr) zmalloc_oom_handler(size);
+
+    /* 记录实际分配大小 */
+    *((size_t*)ptr) = size;
+    update_zmalloc_stat_alloc(zmalloc_size(ptr));
+    return (char*)ptr + PREFIX_SIZE;
+}
+
+size_t zmalloc_size(void *ptr) {
+    void *real = (char*)ptr - PREFIX_SIZE;
+    return je_malloc_size(real);
+    /* je_malloc_size 返回 jemalloc 实际分配大小
+       (含 size class 量化的字节) */
+}
+
+void zfree(void *ptr) {
+    if (ptr == NULL) return;
+    void *real = (char*)ptr - PREFIX_SIZE;
+    update_zmalloc_stat_free(je_malloc_size(real));
+    je_free(real);
+}</code></pre>
+
+<h3>22.13.3 核心源码入口</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 22-13-1 · jemalloc / Active Defrag / THP 检测的源码地图</div>
+  <table>
+    <thead><tr><th>源码文件</th><th>关键函数/字段</th><th>职责</th></tr></thead>
+    <tbody>
+      <tr><td><code>src/zmalloc.c</code></td><td><code>zmalloc</code>、<code>zfree</code>、<code>zmalloc_size</code></td><td>jemalloc wrapper</td></tr>
+      <tr><td><code>src/object.c</code></td><td><code>generateMemoryStats</code></td><td>INFO memory 输出</td></tr>
+      <tr><td><code>src/object.c</code></td><td><code>getMemoryUsageBytes</code></td><td>MEMORY USAGE 实现</td></tr>
+      <tr><td><code>src/defrag.c</code></td><td><code>activeDefragCycle</code></td><td>Active Defrag 主循环</td></tr>
+      <tr><td><code>src/defrag.c</code></td><td><code>defragRobjMaybeRealloc</code></td><td>单对象迁移</td></tr>
+      <tr><td><code>deps/jemalloc/</code></td><td>jemalloc 5.x 源码</td><td>分配器实现</td></tr>
+      <tr><td><code>src/server.c</code></td><td><code>linuxMadvFreeForkBugCheck</code></td><td>THP 启动告警</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>22.13.4 设计取舍</h3>
+
+<h4>取舍 1:jemalloc 而非 tcmalloc / glibc</h4>
+
+<p>jemalloc 提供 <code>je_get_defrag_hint</code> API,这是 Active Defrag 的基础。glibc 与 tcmalloc 缺乏类似 hook,无法实现在线碎片整理。Redis 强绑定 jemalloc 的根本原因是 Active Defrag。</p>
+
+<h4>取舍 2:tcache 默认启用</h4>
+
+<p>线程缓存以约 1 MB / 线程的内存换取无锁分配。Redis 主线程模型下 tcache 内存浪费仅 ~1 MB,远小于性能收益。</p>
+
+<h4>取舍 3:dirty_decay_ms 默认 10 秒</h4>
+
+<p>立即归还会引发频繁 syscall;永久保留浪费内存。10 秒在两者间平衡:短期波动不归还(避免抖动),长期过剩归还。</p>
+
+<h4>取舍 4:Active Defrag 默认关闭</h4>
+
+<p>整理消耗 CPU,大多数业务无明显碎片问题。仅在 <code>mem_fragmentation_ratio</code> 持续 &gt; 1.5 时启用,且通过 <code>active-defrag-cycle-max</code> 控制 CPU 占用上限。</p>
+
+<!-- ============================================================ -->
+<h2 id="s22-summary">22.14 本章要点</h2>
+<!-- ============================================================ -->
+
+<div class="chapter-summary">
+
+<h3>关键事实</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 22-14-1 · jemalloc 关键事实速查</div>
+  <table>
+    <thead><tr><th>要点</th><th>源码/命令依据</th><th>易错点</th></tr></thead>
+    <tbody>
+      <tr><td>jemalloc 三层:arena / bin / slab</td><td><code>je_malloc → bin → slab</code></td><td>全局 narenas 默认 4×CPU</td></tr>
+      <tr><td>size class 量化产生内部碎片</td><td>jemalloc 5.x 序列</td><td>embstr 阈值 44 由 64 size class 决定</td></tr>
+      <tr><td>tcache 线程缓存避免锁竞争</td><td><code>je_tcache_create</code></td><td>Redis 主线程模型下天然适合</td></tr>
+      <tr><td>三个碎片指标层次</td><td><code>INFO memory</code></td><td>rss / active / allocated</td></tr>
+      <tr><td><code>dirty_decay_ms</code> 控制归还时机</td><td>jemalloc 5.x 默认 10s</td><td>DEL 后 RSS 不立即降是正常</td></tr>
+      <tr><td>Active Defrag 在线整理</td><td><code>activedefrag yes</code></td><td>cycle-max 控制 CPU 上限</td></tr>
+      <tr><td><code>MEMORY PURGE</code> 立即归还</td><td><code>je_mallctl arena.0.purge</code></td><td>阻塞主线程,低峰期执行</td></tr>
+      <tr><td>THP 启用导致 BGSAVE 内存放大</td><td><code>echo never &gt; .../enabled</code></td><td>强烈建议关闭</td></tr>
+      <tr><td>Windows 无 fork 走 disk-based BGSAVE</td><td>jemalloc Windows 子集</td><td>生产用 Linux</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>最小回归测试</h3>
+
+<pre><code class="language-bash">redis-cli SET test:1 "hello"
+redis-cli STRLEN test:1
+redis-cli MEMORY USAGE test:1
+redis-cli INFO memory | grep -E "used_memory|fragmentation|allocator"
+redis-cli MEMORY STATS | head -20
+redis-cli CONFIG GET activedefrag
+redis-cli MEMORY DOCTOR
+redis-cli MEMORY PURGE</code></pre>
+
+<pre><code class="language-text">OK
+5
+56
+used_memory:1234567
+used_memory_human:1.18M
+mem_fragmentation_ratio:1.10
+mem_fragmentation_bytes:118784
+allocator_allocated:1234567
+allocator_active:1268776
+allocator_resident:1351778
+allocator_frag_ratio:1.02
+allocator_rss_ratio:1.07
+... (MEMORY STATS 详细输出) ...
+1) "activedefrag"
+2) "no"
+Sam, I detected a few issues in this Redis instance memory implants:
+ * High allocator fragmentation: ...
+ * To fix the issues you can ...
+OK</code></pre>
+
+<p><code>MEMORY USAGE test:1</code> 返回 56 字节包括:robj 16 + sdshdr8 3 + buf 5 + <code>\0</code> 1 = 25,经 size class 量化为 32,加上 dictEntry 32 - 共享 = 56。</p>
+
+<h3>章末总结</h3>
+
+<p>第 22 章是"编码 / 算法 / 压缩 / 分配器"四章组的收尾。回顾本组八章的脉络:</p>
+
+<ul>
+  <li><strong>第 10 章</strong>(对象编码与切换)描述了 Redis 五种 type 的多编码体系与单向升级语义;</li>
+  <li><strong>第 11 章</strong>(HyperLogLog)用零-run + 调和平均给出 0.81% 误差的基数估算;</li>
+  <li><strong>第 12 章</strong>(Geohash)通过位交错把二维坐标映射到 ZSet 的一维 score;</li>
+  <li><strong>第 13 章</strong>(LRU / LFU)用采样近似与 Morris 对数计数实现 24 bit 内的淘汰决策;</li>
+  <li><strong>第 14 章</strong>(SipHash)用 keyed hash 抵御 HashDoS,与 CRC16 在 Cluster 路由分工;</li>
+  <li><strong>第 15 章</strong>(CRC + LZF)用 8 位表驱动 CRC 校验 RDB 完整性,LZF 压缩 quicklist 中间节点;</li>
+  <li><strong>第 16 章</strong>(Bloom / CMS / TopK)在 RedisBloom 模块层提供概率结构;</li>
+  <li><strong>第 22 章</strong>(jemalloc)落地到底层分配器,影响所有上述结构的实际内存表现。</li>
+</ul>
+
+<h3>下一章预告</h3>
+
+<p>下一组(第 17-21 章)进入<strong>集群与持久化</strong>主题:RDB/AOF 双持久化、复制协议、Sentinel 故障转移、Cluster slot 迁移与 gossip 协议。这些主题在工程上更接近运维与部署,但仍以"图解 + 源码 + 配置"的方式呈现。理解 jemalloc 之后,第 17-18 章的 fork CoW、第 19 章的复制全量同步内存峰值、第 20 章 Sentinel 的内存预算估算都会有<strong>共同的语言</strong>。</p>
+
+</div>
+
+<p class="footer">&copy; 2026 图解 Redis &middot; 第 22 章 &middot; jemalloc 内存分配器</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/c.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){setTimeout(function(){document.querySelectorAll('.diagram svg').forEach(function(svg){var h=parseInt(svg.getAttribute('height')||svg.getBoundingClientRect().height);if(h>500){svg.style.maxHeight='500px';svg.style.width='auto';var p=svg.closest('.diagram');if(p)p.style.overflowX='auto';}});},1500);});</script>
+</body>
+</html>

@@ -1,0 +1,1837 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.18 AOF 持久化 — 图解 Redis</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="d-purple" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="var(--diagram-purple-fill-start)"/><stop offset="100%" stop-color="var(--diagram-purple-fill-end)"/>
+    </linearGradient>
+    <linearGradient id="d-green" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="var(--diagram-green-fill-start)"/><stop offset="100%" stop-color="var(--diagram-green-fill-end)"/>
+    </linearGradient>
+    <linearGradient id="d-blue" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="var(--diagram-blue-fill-start)"/><stop offset="100%" stop-color="var(--diagram-blue-fill-end)"/>
+    </linearGradient>
+    <linearGradient id="d-orange" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="var(--diagram-orange-fill-start)"/><stop offset="100%" stop-color="var(--diagram-orange-fill-end)"/>
+    </linearGradient>
+    <linearGradient id="d-red" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="var(--diagram-red-fill-start)"/><stop offset="100%" stop-color="var(--diagram-red-fill-end)"/>
+    </linearGradient>
+    <filter id="d-shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="var(--diagram-text)" flood-opacity="0.4"/>
+    </filter>
+    <marker id="d-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-muted)"/>
+    </marker>
+    <marker id="d-arr-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-green-stroke)"/>
+    </marker>
+    <marker id="d-arr-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-red-stroke)"/>
+    </marker>
+    <marker id="d-arr-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-blue-stroke)"/>
+    </marker>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Redis</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="17-rdb.html">上一章</a>
+  <a href="19-ae-eventloop.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s18-0">18.0 章首速览</a>
+  <a href="#s18-1">18.1 AOF 与 RDB 的语义边界</a>
+  <a href="#s18-2">18.2 AOF 写入三阶段管道</a>
+  <a href="#s18-3">18.3 三种 fsync 策略</a>
+  <a href="#s18-4">18.4 BGREWRITEAOF 重写机制</a>
+  <a href="#s18-5">18.5 Multi-Part AOF 文件结构</a>
+  <a href="#s18-6">18.6 混合持久化</a>
+  <a href="#s18-7">18.7 多部署模式</a>
+  <a href="#s18-8">18.8 性能与观测</a>
+  <a href="#s18-9">18.9 陷阱与限制</a>
+  <a href="#s18-10">18.10 源码深潜</a>
+  <a href="#s18-summary">18.11 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 18 章 · AOF 持久化</h1>
+<p class="subtitle">命令日志 · 三阶段管道 · always/everysec/no fsync · BGREWRITEAOF · Multi-Part AOF (BASE + INCR + manifest) · 混合持久化 · CoW 内存放大</p>
+
+<div class="chapter-intro">
+  <p class="lead">RDB 通过周期性快照获取 keyspace 一致副本,但<strong>两次快照之间的写入仅存在于内存</strong>。AOF (Append Only File) 采用补偿性方案:<strong>每条成功执行的写命令以 RESP 协议格式追加到日志文件</strong>,重启时通过回放日志重建 keyspace。</p>
+  <p>AOF 的关键约束有三:其一,<strong>主线程命令执行路径上的额外开销必须小于 5%</strong>;其二,<strong>fsync 策略必须可配置</strong>,以适配不同业务的丢失容忍度;其三,<strong>日志体积必须可控</strong>,避免无限膨胀消耗磁盘。Redis 通过分层管道(执行 → aof_buf → write → fsync)、三种 fsync 策略(<code>always / everysec / no</code>)、子进程重写(BGREWRITEAOF)三项机制同时满足三类约束。</p>
+  <p>Redis 7.0 进一步将单文件 AOF 拆为 <strong>BASE + INCR + MANIFEST</strong> 的多部分结构 (Multi-Part AOF),原子切换从单文件 rename 改为清单更新,简化重写期间的状态管理。</p>
+  <ul class="will-learn">
+    <li>RDB 与 AOF 在丢失窗口、恢复速度、文件体积三个维度的取舍</li>
+    <li>"后写日志"语义为何与传统 WAL 方向相反,以及 <code>aof_last_write_status</code> 的错误保护机制</li>
+    <li>三阶段管道(<code>feedAppendOnlyFile → flushAppendOnlyFile → fsync</code>)各自的物理含义与延迟量级</li>
+    <li>RESP 协议的 AOF 编码格式与典型 2-3 倍体积膨胀比</li>
+    <li><code>appendfsync always / everysec / no</code> 三种策略的吞吐量基线(8k vs 100k vs 120k ops/s)</li>
+    <li><code>aof_delayed_fsync</code> 指标作为 <code>everysec</code> 退化为主线程阻塞的早期信号</li>
+    <li>BGREWRITEAOF 子进程遍历 keyspace 生成最小等价命令的工作原理</li>
+    <li>Redis 7 Multi-Part AOF 通过 manifest 原子切换的实现机制</li>
+    <li>混合持久化(<code>aof-use-rdb-preamble yes</code>)将 10M keys 恢复时间从 25 秒降至 5 秒</li>
+    <li>Master 关闭 AOF 必须配合 Sentinel/Cluster 自动 failover 的原因</li>
+    <li>重写期间 CoW 复制 + aof_rewrite_buf 内存峰值的估算公式</li>
+    <li>七类典型陷阱及其根因、症状、修复路径与监控指标</li>
+  </ul>
+  <p class="prereq">前置知识:第 17 章 RDB 持久化(理解 fork + CoW 机制与 BGSAVE 调度);第 19 章 ae 事件循环预读(理解 <code>beforeSleep</code> 钩子);第 21 章 RESP 协议(理解 AOF 文本编码的 <code>*N\r\n$N\r\n...</code> 格式);Linux 内核知识(page cache、<code>fsync()</code>、<code>dirty_expire_centisecs</code>、<code>rename()</code> 原子性)。读者最好亲手跑过 <code>cat appendonly.aof</code> 查看过文件内容。</p>
+</div>
+
+<h3>本章全景图</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-0 · 本章导览 — 6 大模块 12 节</div>
+  <svg viewBox="0 0 940 480" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect x="0" y="0" width="940" height="480" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="370" y="20" width="200" height="50" rx="10" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="470" y="42" text-anchor="middle" fill="var(--diagram-text)" font-weight="800" font-size="14">AOF 持久化</text>
+      <text x="470" y="60" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">命令追加日志</text>
+
+      <line x1="470" y1="70" x2="100" y2="105" stroke="var(--diagram-border)" stroke-width="1.5"/>
+      <line x1="470" y1="70" x2="250" y2="105" stroke="var(--diagram-border)" stroke-width="1.5"/>
+      <line x1="470" y1="70" x2="400" y2="105" stroke="var(--diagram-border)" stroke-width="1.5"/>
+      <line x1="470" y1="70" x2="540" y2="105" stroke="var(--diagram-border)" stroke-width="1.5"/>
+      <line x1="470" y1="70" x2="690" y2="105" stroke="var(--diagram-border)" stroke-width="1.5"/>
+      <line x1="470" y1="70" x2="840" y2="105" stroke="var(--diagram-border)" stroke-width="1.5"/>
+
+      <rect x="10"  y="105" width="180" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="100" y="124" text-anchor="middle" fill="var(--diagram-blue-text)" font-weight="700" font-size="11">§18.1 与 RDB 边界</text>
+      <text x="100" y="140" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">AOF 命令日志 vs RDB 快照</text>
+
+      <rect x="160" y="105" width="180" height="44" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="250" y="124" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="700" font-size="11">§18.2-18.3 写入与 fsync</text>
+      <text x="250" y="140" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">aof_buf → write → fsync</text>
+
+      <rect x="310" y="105" width="180" height="44" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="400" y="124" text-anchor="middle" fill="var(--diagram-orange-text)" font-weight="700" font-size="11">§18.4-18.5 重写</text>
+      <text x="400" y="140" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">BGREWRITEAOF + Multi-Part</text>
+
+      <rect x="450" y="105" width="180" height="44" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="540" y="124" text-anchor="middle" fill="var(--diagram-purple-text)" font-weight="700" font-size="11">§18.6 混合持久化</text>
+      <text x="540" y="140" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">RDB preamble + AOF tail</text>
+
+      <rect x="600" y="105" width="180" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="690" y="124" text-anchor="middle" fill="var(--diagram-blue-text)" font-weight="700" font-size="11">§18.7 多部署模式</text>
+      <text x="690" y="140" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">主从 / Sentinel / Cluster</text>
+
+      <rect x="750" y="105" width="180" height="44" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="840" y="124" text-anchor="middle" fill="var(--diagram-red-text)" font-weight="700" font-size="11">§18.8-18.11 陷阱+源码</text>
+      <text x="840" y="140" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">delayed_fsync / 容量 / CoW</text>
+
+      <g font-size="9">
+        <line x1="100" y1="149" x2="100" y2="172" stroke="var(--diagram-blue-stroke)" stroke-width="1"/>
+        <rect x="10" y="172" width="180" height="78" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+        <text x="100" y="190" text-anchor="middle" fill="var(--diagram-blue-text)" font-weight="700">RDB 快照"盲区"</text>
+        <text x="100" y="206" text-anchor="middle" fill="var(--diagram-muted)">两次 BGSAVE 间命令丢</text>
+        <text x="100" y="222" text-anchor="middle" fill="var(--diagram-muted)">AOF 1 秒内丢失窗口</text>
+        <text x="100" y="240" text-anchor="middle" fill="var(--diagram-muted)">命令文本日志</text>
+
+        <line x1="250" y1="149" x2="250" y2="172" stroke="var(--diagram-green-stroke)" stroke-width="1"/>
+        <rect x="160" y="172" width="180" height="78" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+        <text x="250" y="190" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="700">aof_buf RESP 文本</text>
+        <text x="250" y="206" text-anchor="middle" fill="var(--diagram-muted)">write 到 page cache</text>
+        <text x="250" y="222" text-anchor="middle" fill="var(--diagram-muted)">fsync 落到磁盘</text>
+        <text x="250" y="240" text-anchor="middle" fill="var(--diagram-muted)">always/everysec/no</text>
+
+        <line x1="400" y1="149" x2="400" y2="172" stroke="var(--diagram-orange-stroke)" stroke-width="1"/>
+        <rect x="310" y="172" width="180" height="78" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+        <text x="400" y="190" text-anchor="middle" fill="var(--diagram-orange-text)" font-weight="700">fork + CoW</text>
+        <text x="400" y="206" text-anchor="middle" fill="var(--diagram-muted)">子进程遍历内存</text>
+        <text x="400" y="222" text-anchor="middle" fill="var(--diagram-muted)">BASE + INCR + manifest</text>
+        <text x="400" y="240" text-anchor="middle" fill="var(--diagram-muted)">原子 rename 切换</text>
+
+        <line x1="540" y1="149" x2="540" y2="172" stroke="var(--diagram-purple-stroke)" stroke-width="1"/>
+        <rect x="450" y="172" width="180" height="78" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+        <text x="540" y="190" text-anchor="middle" fill="var(--diagram-purple-text)" font-weight="700">混合 = RDB + AOF</text>
+        <text x="540" y="206" text-anchor="middle" fill="var(--diagram-muted)">头部 RDB 紧凑</text>
+        <text x="540" y="222" text-anchor="middle" fill="var(--diagram-muted)">尾部 AOF 增量</text>
+        <text x="540" y="240" text-anchor="middle" fill="var(--diagram-muted)">aof-use-rdb-preamble</text>
+
+        <line x1="690" y1="149" x2="690" y2="172" stroke="var(--diagram-blue-stroke)" stroke-width="1"/>
+        <rect x="600" y="172" width="180" height="78" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+        <text x="690" y="190" text-anchor="middle" fill="var(--diagram-blue-text)" font-weight="700">单节点 / 主从</text>
+        <text x="690" y="206" text-anchor="middle" fill="var(--diagram-muted)">Sentinel 故障转移</text>
+        <text x="690" y="222" text-anchor="middle" fill="var(--diagram-muted)">Cluster 16384 槽</text>
+        <text x="690" y="240" text-anchor="middle" fill="var(--diagram-muted)">每节点独立 AOF</text>
+
+        <line x1="840" y1="149" x2="840" y2="172" stroke="var(--diagram-red-stroke)" stroke-width="1"/>
+        <rect x="750" y="172" width="180" height="78" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+        <text x="840" y="190" text-anchor="middle" fill="var(--diagram-red-text)" font-weight="700">aof_delayed_fsync</text>
+        <text x="840" y="206" text-anchor="middle" fill="var(--diagram-muted)">磁盘容量耗尽</text>
+        <text x="840" y="222" text-anchor="middle" fill="var(--diagram-muted)">CoW + rewrite_buf</text>
+        <text x="840" y="240" text-anchor="middle" fill="var(--diagram-muted)">aof.c 源码导览</text>
+      </g>
+
+      <rect x="170" y="280" width="600" height="80" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="470" y="305" text-anchor="middle" fill="var(--diagram-purple-text)" font-weight="800" font-size="13">学习路径</text>
+      <text x="470" y="328" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">边界(§18.1) → 写入管道(§18.2-18.3) → 重写(§18.4-18.5) → 混合(§18.6) → 多部署(§18.7) → 陷阱+源码(§18.8-18.11)</text>
+      <text x="470" y="348" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">前 5 节理解机制,§18.8 之后掌握生产实战</text>
+
+      <rect x="170" y="380" width="600" height="80" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="470" y="402" text-anchor="middle" fill="var(--diagram-blue-text)" font-weight="800" font-size="12">核心定位</text>
+      <text x="470" y="422" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">AOF 是 RDB 的<tspan font-weight="800">补偿机制</tspan>,不是替代</text>
+      <text x="470" y="438" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">RDB 解决"快速恢复 + 紧凑存储",AOF 解决"细粒度数据安全 + 1 秒丢失窗口"</text>
+      <text x="470" y="454" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">混合持久化 = 双方优点的工程合一</text>
+    </g>
+  </svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s18-0">18.0 章首速览</h2>
+<!-- ============================================================ -->
+
+<p>本章按"<strong>持久化语义边界 → 写入管道 → 重写机制 → 文件结构 → 部署适配 → 观测与陷阱</strong>"六层组织。前两节定义 AOF 的命令日志语义与刷盘策略,中间两节解析重写如何控制日志体积,后两节聚焦生产观测信号与边界条件。</p>
+
+<div class="key-insight">
+  <strong>核心定位:</strong> AOF 是 RDB 的<strong>补偿机制</strong>,不是替代。RDB 解决"快速恢复 + 紧凑存储",AOF 解决"细粒度数据安全 + 1 秒以内的丢失窗口"。Redis 5.0+ 默认开启的<strong>混合持久化</strong>正是把两者捏在一起:BASE 用 RDB 格式,INCR 用 AOF 格式,一份文件兼顾两边的优点。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s18-1">18.1 AOF 与 RDB 的语义边界</h2>
+<!-- ============================================================ -->
+
+<h3>18.1.1 RDB 与 AOF 的丢失窗口</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-1-1 · 崩溃恢复时间线 — RDB 与 AOF 的丢失窗口对比</div>
+  <svg viewBox="0 0 940 380" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect x="0" y="0" width="940" height="380" fill="var(--diagram-panel)" rx="10"/>
+
+    <g font-family="ui-monospace,Consolas">
+      <line x1="40" y1="80" x2="900" y2="80" stroke="var(--diagram-border)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <text x="900" y="70" text-anchor="end" fill="var(--diagram-muted)" font-size="11">时间轴</text>
+
+      <circle cx="80"  cy="80" r="8" fill="var(--diagram-purple-fill)"/>
+      <text x="80"  y="58" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="800">t=0</text>
+      <text x="80"  y="105" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">RDB 上次快照</text>
+      <text x="80"  y="120" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">save 3600 1</text>
+
+      <circle cx="240" cy="80" r="8" fill="var(--diagram-green-fill)"/>
+      <text x="240" y="58" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="800">t=1</text>
+      <text x="240" y="105" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">SET k1 v1</text>
+      <text x="240" y="120" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">→ aof_buf</text>
+
+      <circle cx="400" cy="80" r="8" fill="var(--diagram-green-fill)"/>
+      <text x="400" y="58" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="800">t=2</text>
+      <text x="400" y="105" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">SET k2 v2</text>
+      <text x="400" y="120" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">→ aof_buf</text>
+
+      <circle cx="560" cy="80" r="8" fill="var(--diagram-green-fill)"/>
+      <text x="560" y="58" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="800">t=3</text>
+      <text x="560" y="105" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">SET k3 v3</text>
+      <text x="560" y="120" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">→ aof_buf</text>
+
+      <circle cx="700" cy="80" r="10" fill="var(--diagram-red-fill)"/>
+      <text x="700" y="58" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="800">t=3.5</text>
+      <text x="700" y="105" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10" font-weight="700">⚡ 进程崩溃</text>
+      <text x="700" y="120" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">RAM 全清空</text>
+
+      <circle cx="840" cy="80" r="8" fill="var(--diagram-blue-fill)"/>
+      <text x="840" y="58" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="800">t=4</text>
+      <text x="840" y="105" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">重启 redis-server</text>
+
+      <line x1="80"  y1="170" x2="700" y2="170" stroke="var(--diagram-orange-stroke)" stroke-width="3" stroke-dasharray="6 4"/>
+      <line x1="80"  y1="166" x2="80"  y2="174" stroke="var(--diagram-orange-stroke)" stroke-width="3"/>
+      <line x1="700" y1="166" x2="700" y2="174" stroke="var(--diagram-orange-stroke)" stroke-width="3"/>
+      <text x="390" y="160" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="800">RDB 丢失窗口 ≈ 5-15 分钟</text>
+      <text x="390" y="187" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">两次 BGSAVE 之间所有命令丢失</text>
+
+      <line x1="240" y1="220" x2="700" y2="220" stroke="var(--diagram-green-stroke)" stroke-width="3" stroke-dasharray="2 4"/>
+      <line x1="240" y1="216" x2="240" y2="224" stroke="var(--diagram-green-stroke)" stroke-width="3"/>
+      <line x1="700" y1="216" x2="700" y2="224" stroke="var(--diagram-green-stroke)" stroke-width="3"/>
+      <text x="470" y="210" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="800">AOF 丢失窗口 ≤ 1 秒(everysec)</text>
+      <text x="470" y="237" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">aof_buf 未 fsync 部分丢失</text>
+
+      <rect x="80" y="270" width="380" height="90" rx="8" fill="url(#d-orange)" filter="url(#d-shadow)"/>
+      <text x="270" y="293" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">RDB 恢复</text>
+      <text x="270" y="312" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">仅恢复到 t=0 状态</text>
+      <text x="270" y="329" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">k1 / k2 / k3 全部丢失</text>
+      <text x="270" y="348" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">缓存场景可接受,核心数据不行</text>
+
+      <rect x="500" y="270" width="380" height="90" rx="8" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="690" y="293" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">AOF 恢复</text>
+      <text x="690" y="312" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">回放 t=1, t=2, t=3 所有命令</text>
+      <text x="690" y="329" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">最坏丢失 t=3 的 ~1 秒数据</text>
+      <text x="690" y="348" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">计数 / 库存 / 会话场景必备</text>
+    </g>
+  </svg>
+</div>
+
+<p>RDB 的盲区是"两次快照之间的写入"。在默认 <code>save 3600 1 / save 300 100 / save 60 10000</code> 配置下,业务低峰期触发频率约 5-15 分钟一次,即崩溃可能<strong>丢失 5-15 分钟数据</strong>。该窗口对缓存场景可接受,对计数、库存、会话等场景不可接受。</p>
+
+<p>AOF 通过"每条成功执行的写命令立即追加到日志"消除该盲区。最坏丢失窗口由 <code>appendfsync</code> 策略决定:<code>always</code> 时为单条命令未落盘,<code>everysec</code> 时为约 1 秒,<code>no</code> 时由内核脏页回写策略决定 (Linux 默认 <code>dirty_expire_centisecs=3000</code>,即 30 秒)。</p>
+
+<h3>18.1.2 AOF 的"后写日志"语义</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-1-2 · 命令执行与 AOF 追加的时序</div>
+  <svg viewBox="0 0 940 360" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect x="0" y="0" width="940" height="360" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-monospace,Consolas">
+      <rect x="40"  y="20" width="160" height="34" rx="6" fill="url(#d-blue)" filter="url(#d-shadow)"/>
+      <text x="120" y="42" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Client</text>
+      <line x1="120" y1="54" x2="120" y2="350" stroke="var(--diagram-blue-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="280" y="20" width="160" height="34" rx="6" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="360" y="42" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Main thread</text>
+      <line x1="360" y1="54" x2="360" y2="350" stroke="var(--diagram-purple-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="520" y="20" width="160" height="34" rx="6" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="600" y="42" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Keyspace</text>
+      <line x1="600" y1="54" x2="600" y2="350" stroke="var(--diagram-green-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="760" y="20" width="160" height="34" rx="6" fill="url(#d-orange)" filter="url(#d-shadow)"/>
+      <text x="840" y="42" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">aof_buf</text>
+      <line x1="840" y1="54" x2="840" y2="350" stroke="var(--diagram-orange-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <path d="M125,90 L355,90" stroke="var(--diagram-blue-stroke)" stroke-width="2" marker-end="url(#d-arr-b)"/>
+      <text x="240" y="82" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10" font-weight="700">SET name redis</text>
+
+      <path d="M355,118 C 320,118 320,138 355,138" stroke="var(--diagram-purple-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+      <text x="240" y="130" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">类型 / 参数校验</text>
+
+      <rect x="100" y="158" width="780" height="60" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)" stroke-dasharray="4 3"/>
+      <text x="490" y="178" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="800">分支 1: 校验失败</text>
+
+      <path d="M355,200 L125,200" stroke="var(--diagram-red-stroke)" stroke-width="2" marker-end="url(#d-arr-r)"/>
+      <text x="240" y="195" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">- ERR wrong type</text>
+      <text x="500" y="208" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">不写 aof_buf(后写日志的关键)</text>
+
+      <rect x="100" y="232" width="780" height="100" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)" stroke-dasharray="4 3"/>
+      <text x="490" y="252" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="800">分支 2: 校验通过</text>
+
+      <path d="M365,275 L595,275" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+      <text x="480" y="270" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">修改 keyspace</text>
+
+      <path d="M365,300 L835,300" stroke="var(--diagram-orange-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <text x="600" y="294" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">feedAppendOnlyFile → 追加 RESP 文本</text>
+
+      <path d="M355,322 L125,322" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+      <text x="240" y="318" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10" font-weight="700">+OK</text>
+    </g>
+  </svg>
+</div>
+
+<p>Redis AOF 是<strong>后写日志</strong>(先 apply 后 log),与传统数据库的 WAL (Write-Ahead Log,先 log 后 apply) 方向相反。后写日志的工程价值在于:<strong>仅记录已成功执行的命令</strong>,避免将语法错误、类型错误、参数越界等失败命令写入恢复流。</p>
+
+<div class="warning">
+  <strong>错误状态保护:</strong> 代价是 apply 与 log 之间存在窗口——命令已修改内存但 aof_buf 写入失败时,需通过错误状态保护机制阻止后续写入,以避免内存与日志的不一致扩散。该机制由 <code>aof_last_write_status</code> 字段记录,<code>write</code> 失败后 Redis 拒绝所有写命令直至 AOF 恢复正常。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s18-2">18.2 AOF 写入三阶段管道</h2>
+<!-- ============================================================ -->
+
+<h3>18.2.1 命令到磁盘的三阶段路径</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-2-1 · 三阶段管道 — 命令到磁盘的完整路径</div>
+  <svg viewBox="0 0 940 380" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="380" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-monospace,Consolas">
+      <rect x="370" y="14" width="200" height="36" rx="8" fill="url(#d-purple)"/>
+      <text x="470" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">命令执行成功 call()</text>
+      <path d="M470,50 L470,72" stroke="var(--diagram-border)" stroke-width="2" marker-end="url(#d-arr)"/>
+
+      <rect x="280" y="74" width="380" height="56" rx="8" fill="url(#d-green)"/>
+      <text x="470" y="94" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">阶段 1 · feedAppendOnlyFile</text>
+      <text x="470" y="110" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">命令编码为 RESP → 追加到 aof_buf(用户态内存)</text>
+      <text x="470" y="124" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">纳秒级 · 纯内存拷贝</text>
+      <path d="M470,130 L470,150" stroke="var(--diagram-border)" stroke-width="2" marker-end="url(#d-arr)"/>
+
+      <rect x="280" y="150" width="380" height="56" rx="8" fill="url(#d-blue)"/>
+      <text x="470" y="170" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">阶段 2 · flushAppendOnlyFile</text>
+      <text x="470" y="186" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">aof_buf → write() → OS page cache</text>
+      <text x="470" y="200" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">微秒级 · 用户态 → 内核态</text>
+      <path d="M470,206 L470,228" stroke="var(--diagram-border)" stroke-width="2" marker-end="url(#d-arr)"/>
+
+      <path d="M340,254 L470,228 L600,254 L470,280 Z" fill="var(--diagram-orange-stroke)" stroke="var(--diagram-orange-stroke)" stroke-width="2"/>
+      <text x="470" y="252" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="800">阶段 3 · 何时 fsync?</text>
+      <text x="470" y="268" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">appendfsync 配置</text>
+
+      <path d="M340,254 L160,310" stroke="var(--diagram-red-stroke)" stroke-width="2" marker-end="url(#d-arr-r)"/>
+      <text x="220" y="288" fill="var(--diagram-red-text)" font-size="10" font-weight="700">always</text>
+      <rect x="40" y="310" width="240" height="60" rx="6" fill="url(#d-red)"/>
+      <text x="160" y="330" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">主线程 fsync</text>
+      <text x="160" y="346" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">每次 flush 都同步落盘</text>
+      <text x="160" y="360" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">~10 ms · 数据最安全</text>
+
+      <path d="M470,280 L470,310" stroke="var(--diagram-purple-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <text x="500" y="298" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">everysec</text>
+      <rect x="350" y="310" width="240" height="60" rx="6" fill="url(#d-purple)"/>
+      <text x="470" y="330" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">bio_aof_fsync 后台线程</text>
+      <text x="470" y="346" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">每秒一次 fsync</text>
+      <text x="470" y="360" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">默认值 · 1 秒丢失窗口</text>
+
+      <path d="M600,254 L780,310" stroke="var(--diagram-orange-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <text x="720" y="288" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">no</text>
+      <rect x="660" y="310" width="240" height="60" rx="6" fill="url(#d-orange)"/>
+      <text x="780" y="330" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">不主动 fsync</text>
+      <text x="780" y="346" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">交内核脏页回写</text>
+      <text x="780" y="360" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">~30 秒 · 性能最好</text>
+    </g>
+  </svg>
+</div>
+
+<p>三阶段的物理含义不同:</p>
+<ul>
+  <li><strong>阶段 1</strong> 是用户态内存追加,纯内存拷贝,<strong>纳秒级</strong>;</li>
+  <li><strong>阶段 2</strong> 是用户态到内核态的数据传递(<code>write()</code> 系统调用),数据进入内核 page cache,<strong>微秒级</strong>;</li>
+  <li><strong>阶段 3</strong> 是内核到磁盘控制器的同步刷盘(<code>fsync()</code>),<strong>毫秒级</strong>。</li>
+</ul>
+
+<p><code>aof_buf</code> 是 SDS 类型的内存缓冲区,容量由 <code>server.aof_buf</code> 字段管理。每次事件循环的 <code>beforeSleep()</code> 阶段会调用 <code>flushAppendOnlyFile()</code>,将 aof_buf 内容通过 <code>write()</code> 写入 page cache 后清空。fsync 时机由策略决定。</p>
+
+<h3>18.2.2 aof_buf 与命令的关系</h3>
+
+<svg class="svg-diagram" viewBox="0 0 920 480" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="af-buf" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="var(--diagram-green-fill-start)"/><stop offset="100%" stop-color="var(--diagram-green-fill-end)"/>
+    </linearGradient>
+    <linearGradient id="af-pc" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="var(--diagram-blue-fill-start)"/><stop offset="100%" stop-color="var(--diagram-blue-fill-end)"/>
+    </linearGradient>
+    <linearGradient id="af-disk" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="var(--diagram-orange-fill-start)"/><stop offset="100%" stop-color="var(--diagram-orange-fill-end)"/>
+    </linearGradient>
+    <marker id="af-arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-purple-stroke)"/>
+    </marker>
+  </defs>
+
+  <!-- aof_buf (用户态) -->
+  <rect x="60" y="20" width="800" height="120" rx="10" fill="url(#af-buf)" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
+  <text x="460" y="46" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="bold">aof_buf (用户态 SDS 缓冲)</text>
+  <g font-family="ui-monospace, monospace" font-size="11" fill="var(--diagram-text)">
+    <rect x="80" y="60" width="760" height="22" rx="3" fill="var(--diagram-surface)"/>
+    <text x="92" y="76">*3\r\n$3\r\nSET\r\n$4\r\nname\r\n$5\r\nredis\r\n           ← 一条 SET</text>
+
+    <rect x="80" y="86" width="760" height="22" rx="3" fill="var(--diagram-surface)"/>
+    <text x="92" y="102">*2\r\n$4\r\nINCR\r\n$7\r\ncounter\r\n                    ← 一条 INCR</text>
+
+    <rect x="80" y="112" width="760" height="22" rx="3" fill="var(--diagram-surface)"/>
+    <text x="92" y="128" fill="var(--diagram-blue-text)">...</text>
+  </g>
+
+  <!-- 箭头 1 -->
+  <path d="M460 145 L460 175" stroke="var(--diagram-purple-stroke)" stroke-width="2.5" marker-end="url(#af-arr)"/>
+  <rect x="510" y="148" width="280" height="26" rx="4" fill="var(--diagram-purple-fill)" stroke="var(--diagram-purple-stroke)"/>
+  <text x="650" y="166" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-family="ui-monospace, monospace">flushAppendOnlyFile() → write()</text>
+
+  <!-- page cache (内核态) -->
+  <rect x="60" y="185" width="800" height="90" rx="10" fill="url(#af-pc)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/>
+  <text x="460" y="211" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="bold">OS page cache (内核缓冲)</text>
+  <g font-family="ui-monospace, monospace" font-size="11" fill="var(--diagram-text)">
+    <rect x="80" y="225" width="760" height="22" rx="3" fill="var(--diagram-surface)"/>
+    <text x="460" y="241" text-anchor="middle">同样的 RESP 字节流, 等待 fsync</text>
+    <text x="460" y="265" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">数据已脱离应用进程, 但仍在内存</text>
+  </g>
+
+  <!-- 箭头 2 -->
+  <path d="M460 280 L460 310" stroke="var(--diagram-purple-stroke)" stroke-width="2.5" marker-end="url(#af-arr)"/>
+  <rect x="510" y="283" width="280" height="26" rx="4" fill="var(--diagram-purple-fill)" stroke="var(--diagram-purple-stroke)"/>
+  <text x="650" y="301" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-family="ui-monospace, monospace">fsync() 按 appendfsync 策略</text>
+
+  <!-- 磁盘 -->
+  <rect x="60" y="320" width="800" height="90" rx="10" fill="url(#af-disk)" stroke="var(--diagram-orange-stroke)" stroke-width="2"/>
+  <text x="460" y="346" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="bold">磁盘持久化文件 (appendonlydir/)</text>
+  <g font-family="ui-monospace, monospace" font-size="11" fill="var(--diagram-text)">
+    <rect x="80" y="360" width="760" height="22" rx="3" fill="var(--diagram-surface)"/>
+    <text x="460" y="376" text-anchor="middle">appendonly.aof.N.incr.aof</text>
+    <text x="460" y="400" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">真正落盘, 断电安全</text>
+  </g>
+
+  <!-- 三层延迟标注 -->
+  <rect x="20" y="430" width="280" height="40" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+  <text x="160" y="450" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">① 内存追加: 纳秒级</text>
+  <text x="160" y="465" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">memcpy + sdscatprintf</text>
+
+  <rect x="320" y="430" width="280" height="40" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="460" y="450" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="bold">② write(): 微秒级</text>
+  <text x="460" y="465" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">用户态 → 内核 page cache</text>
+
+  <rect x="620" y="430" width="280" height="40" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="760" y="450" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="bold">③ fsync(): 毫秒级</text>
+  <text x="760" y="465" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">内核 → 磁盘控制器</text>
+</svg>
+
+<p>RESP 是文本协议,大多数命令可直接通过 <code>cat</code> 查看(value 含二进制字节时不可读)。该选择带来三项优势:体积虽大于二进制快照但<strong>可读</strong>、加载逻辑与命令处理路径同构、<strong>不受内部数据结构演进影响</strong>。</p>
+
+<h3>18.2.3 RESP 命令编码示例</h3>
+
+<p style="color:var(--text-muted); font-size:12px; margin:8px 0;">SET name redis 的 RESP 编码字节流:</p>
+<table class="data-table">
+  <thead><tr><th>字段</th><th>十六进制字节</th><th>含义</th><th>长度</th></tr></thead>
+  <tbody>
+    <tr><td><code>*3\r\n</code></td><td><code>0x2A 0x33 0x0D 0x0A</code></td><td>Array, len=3</td><td>4 B</td></tr>
+    <tr><td><code>$3\r\n</code></td><td><code>0x24 0x33 0x0D 0x0A</code></td><td>Bulk string, len=3</td><td>4 B</td></tr>
+    <tr><td><code>SET\r\n</code></td><td><code>0x53 0x45 0x54 0x0D 0x0A</code></td><td>命令名</td><td>5 B</td></tr>
+    <tr><td><code>$4\r\n</code></td><td><code>0x24 0x34 0x0D 0x0A</code></td><td>Bulk string, len=4</td><td>4 B</td></tr>
+    <tr><td><code>name\r\n</code></td><td><code>0x6E 0x61 0x6D 0x65 0x0D 0x0A</code></td><td>参数 1</td><td>6 B</td></tr>
+    <tr><td><code>$5\r\n</code></td><td><code>0x24 0x35 0x0D 0x0A</code></td><td>Bulk string, len=5</td><td>4 B</td></tr>
+    <tr><td><code>redis\r\n</code></td><td><code>0x72 0x65 0x64 0x69 0x73 0x0D 0x0A</code></td><td>参数 2</td><td>7 B</td></tr>
+  </tbody>
+  <tfoot><tr><td colspan="3"><strong>合计</strong></td><td><strong>34 B</strong></td></tr></tfoot>
+</table>
+<div class="key-insight">
+  <strong>体积膨胀比 ≈ 2-3 倍:</strong> 原始命令 <code>SET name redis</code> 仅 13 字节, RESP 编码 34 字节。这是文本协议为"可读 + 与命令处理路径同构"付出的代价。膨胀通过周期性 BGREWRITEAOF 控制 (§18.4)。
+</div>
+
+<p>RESP 编码的体积膨胀比典型为 <strong>2-3 倍</strong>。该膨胀通过周期性 BGREWRITEAOF 控制(见 §18.4)。</p>
+
+<!-- ============================================================ -->
+<h2 id="s18-3">18.3 三种 fsync 策略</h2>
+<!-- ============================================================ -->
+
+<h3>18.3.1 appendfsync 策略对比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 18-3-1 · 三种 fsync 策略全维度对比</div>
+  <table class="data-table">
+    <thead>
+      <tr><th>策略</th><th>fsync 频率</th><th>执行者</th><th>最大丢失</th><th>主线程影响</th><th>吞吐上限 (NVMe SSD)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>always</code></td><td>每次 flush</td><td>主线程</td><td>已 fsync 的命令通常不丢</td><td>阻塞 ~0.1-1 ms</td><td>~10,000 ops/s</td></tr>
+      <tr><td><code>everysec</code></td><td>每秒一次</td><td>bio_aof_fsync 线程</td><td>约 1 秒,极端 2 秒</td><td>几乎为零</td><td>~100,000 ops/s</td></tr>
+      <tr><td><code>no</code></td><td>不主动</td><td>内核回写</td><td>30 秒(<code>dirty_expire_centisecs</code>)</td><td>零</td><td>~120,000 ops/s</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p>三种策略代表三种不同的<strong>安全-性能平衡点</strong>。<code>always</code> 在主线程上同步等待磁盘确认,吞吐受 fsync 延迟主导;<code>everysec</code> 将 fsync 卸载到后台线程,主线程仅做内存拷贝;<code>no</code> 完全交给操作系统,丢失窗口最大但开销最低。</p>
+
+<h3>18.3.2 always 策略的事件循环时序</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-3-2 · always 同步 fsync — 事件循环内的完整时序</div>
+  <svg viewBox="0 0 940 380" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="380" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-monospace,Consolas">
+      <rect x="40"  y="14" width="160" height="34" rx="6" fill="url(#d-blue)"/>
+      <text x="120" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Client</text>
+      <line x1="120" y1="48" x2="120" y2="370" stroke="var(--diagram-blue-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="280" y="14" width="160" height="34" rx="6" fill="url(#d-purple)"/>
+      <text x="360" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Main thread</text>
+      <line x1="360" y1="48" x2="360" y2="370" stroke="var(--diagram-purple-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="520" y="14" width="160" height="34" rx="6" fill="url(#d-orange)"/>
+      <text x="600" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Page cache</text>
+      <line x1="600" y1="48" x2="600" y2="370" stroke="var(--diagram-orange-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="760" y="14" width="160" height="34" rx="6" fill="url(#d-red)"/>
+      <text x="840" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Disk(物理磁盘)</text>
+      <line x1="840" y1="48" x2="840" y2="370" stroke="var(--diagram-red-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <path d="M125,80 L355,80" stroke="var(--diagram-blue-stroke)" stroke-width="2" marker-end="url(#d-arr-b)"/>
+      <text x="240" y="74" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">SET k v</text>
+
+      <path d="M355,108 C 320,108 320,128 355,128" stroke="var(--diagram-purple-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+      <text x="240" y="120" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">修改 keyspace</text>
+
+      <path d="M355,148 C 320,148 320,168 355,168" stroke="var(--diagram-purple-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+      <text x="240" y="160" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">aof_buf 追加 RESP</text>
+
+      <path d="M355,190 L125,190" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+      <text x="240" y="184" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10" font-weight="700">+OK(此时 aof 还在 RAM)</text>
+
+      <rect x="280" y="208" width="380" height="22" rx="4" fill="var(--diagram-red-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="470" y="223" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">事件循环 beforeSleep 钩子</text>
+
+      <path d="M365,246 L595,246" stroke="var(--diagram-orange-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <text x="480" y="240" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">write(aof_buf) → page cache</text>
+
+      <path d="M365,278 L835,278" stroke="var(--diagram-red-stroke)" stroke-width="2" marker-end="url(#d-arr-r)"/>
+      <text x="600" y="272" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10" font-weight="700">fsync() — 阻塞主线程</text>
+
+      <rect x="540" y="288" width="320" height="40" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)" stroke-dasharray="3 3"/>
+      <text x="700" y="305" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10" font-weight="700">SSD: 0.1-1 ms · HDD: 1-10 ms</text>
+      <text x="700" y="320" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">这段时间主线程完全停摆</text>
+
+      <path d="M835,348 L365,348" stroke="var(--diagram-red-stroke)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#d-arr-r)"/>
+      <text x="600" y="343" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">fsync 返回 → 主线程恢复</text>
+    </g>
+  </svg>
+</div>
+
+<p><code>always</code> 模式下,每次事件循环的 flush 都触发同步 fsync。一个事件循环内的多条写命令可合并为一次 fsync (<strong>group commit</strong>),实际吞吐高于"单条命令一次 fsync"的简化估算,但吞吐仍受 fsync 延迟和磁盘 IOPS 主导。</p>
+
+<h3>18.3.3 everysec 策略的双线程协作</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-3-3 · everysec 后台 fsync 与 2 秒退化保护</div>
+  <svg viewBox="0 0 940 520" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="520" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-monospace,Consolas">
+      <rect x="20"  y="14" width="140" height="32" rx="6" fill="url(#d-purple)"/>
+      <text x="90"  y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">Main thread</text>
+      <line x1="90" y1="46" x2="90" y2="510" stroke="var(--diagram-purple-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="200" y="14" width="140" height="32" rx="6" fill="url(#d-blue)"/>
+      <text x="270" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">aof_buf</text>
+      <line x1="270" y1="46" x2="270" y2="510" stroke="var(--diagram-blue-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="380" y="14" width="140" height="32" rx="6" fill="url(#d-orange)"/>
+      <text x="450" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">Page cache</text>
+      <line x1="450" y1="46" x2="450" y2="510" stroke="var(--diagram-orange-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="560" y="14" width="160" height="32" rx="6" fill="url(#d-green)"/>
+      <text x="640" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">bio_aof_fsync</text>
+      <line x1="640" y1="46" x2="640" y2="510" stroke="var(--diagram-green-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="760" y="14" width="160" height="32" rx="6" fill="url(#d-red)"/>
+      <text x="840" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">Disk</text>
+      <line x1="840" y1="46" x2="840" y2="510" stroke="var(--diagram-red-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="40" y="62" width="500" height="120" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)" stroke-dasharray="4 3"/>
+      <text x="290" y="80" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10" font-weight="800">loop · 每个事件循环 · 仅写不 fsync(微秒级)</text>
+
+      <path d="M95,108 L265,108" stroke="var(--diagram-purple-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <text x="180" y="102" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">追加 RESP 到 aof_buf</text>
+
+      <path d="M95,140 L445,140" stroke="var(--diagram-orange-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <text x="270" y="134" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">write(aof_buf) → page cache</text>
+
+      <text x="290" y="166" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">主线程不调用 fsync,数据仍在内核 RAM</text>
+
+      <rect x="40" y="200" width="850" height="22" rx="4" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="465" y="216" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">触发条件: now - last_fsync ≥ 1000ms</text>
+
+      <path d="M95,246 L635,246" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+      <text x="365" y="240" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">提交 fsync 任务到 bio 队列(异步)</text>
+
+      <path d="M645,272 L835,272" stroke="var(--diagram-red-stroke)" stroke-width="2" marker-end="url(#d-arr-r)"/>
+      <text x="740" y="266" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">fsync() — bio 线程阻塞,不影响主线程</text>
+
+      <path d="M835,300 L645,300" stroke="var(--diagram-red-stroke)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#d-arr-r)"/>
+      <text x="740" y="294" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">返回</text>
+
+      <path d="M635,326 L95,326" stroke="var(--diagram-green-stroke)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#d-arr-g)"/>
+      <text x="365" y="320" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">更新 last_fsync_time</text>
+
+      <rect x="40" y="350" width="850" height="150" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)" stroke-dasharray="4 3"/>
+      <text x="465" y="370" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="800">退化保护 · 当上次 fsync 延迟 &gt; 2 秒</text>
+      <text x="465" y="386" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">磁盘 I/O 饱和 / 内核 page cache 大量脏页 / 同盘 fsync 排队</text>
+
+      <path d="M95,418 C 60,418 60,438 95,438" stroke="var(--diagram-red-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-r)"/>
+      <text x="280" y="430" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10" font-weight="700">主线程在下次 flushAppendOnlyFile 前阻塞等待</text>
+
+      <text x="465" y="464" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">目的: 防止 aof_buf 无限增长 → 内存爆掉</text>
+      <text x="465" y="482" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">观测: aof_delayed_fsync 计数(INFO persistence)</text>
+    </g>
+  </svg>
+</div>
+
+<p><code>everysec</code> 是<strong>默认推荐策略</strong>。主线程仅承担 <code>write()</code> 开销(微秒级),fsync 由后台 bio 线程异步执行。当后台 fsync 因磁盘 I/O 饱和延迟超过 <strong>2 秒</strong>时,主线程下一次 <code>flushAppendOnlyFile()</code> 会阻塞等待,以防止 aof_buf 无限增长。</p>
+
+<h3>18.3.4 fsync 退化为阻塞的边界条件</h3>
+
+<div class="compare-grid">
+  <div class="compare-item good">
+    <div class="compare-title">✅ 正常 everysec 时序</div>
+    <table class="data-table">
+      <thead><tr><th>时刻 (ms)</th><th>事件</th></tr></thead>
+      <tbody>
+        <tr><td>t=0</td><td><code>write(aof_buf, 128B)</code></td></tr>
+        <tr><td>t=0.001</td><td>submit BIO_AOF_FSYNC</td></tr>
+        <tr><td>t=0.500</td><td><span style="color:var(--green)">bio fsync 完成 (磁盘正常)</span></td></tr>
+        <tr><td>t=1.000</td><td><code>write(aof_buf, 256B)</code></td></tr>
+        <tr><td>t=1.001</td><td>submit BIO_AOF_FSYNC</td></tr>
+      </tbody>
+    </table>
+    <div style="margin-top:8px; color:var(--green); font-size:12px;">→ 主线程不阻塞, 后台 fsync 1s 内完成</div>
+  </div>
+  <div class="compare-item bad">
+    <div class="compare-title">❌ 慢盘退化时序</div>
+    <table class="data-table">
+      <thead><tr><th>时刻 (ms)</th><th>事件</th></tr></thead>
+      <tbody>
+        <tr><td>t=0</td><td><code>write(aof_buf, 128B)</code></td></tr>
+        <tr><td>t=0.001</td><td>submit BIO_AOF_FSYNC</td></tr>
+        <tr><td>t=2.500</td><td><span style="color:var(--red)">bio fsync 仍执行 (磁盘饱和)</span></td></tr>
+        <tr><td>t=2.501</td><td><strong style="color:var(--red)">主线程检查 → 上次延迟 &gt;2000ms → 阻塞等待</strong></td></tr>
+        <tr><td>t=4.000</td><td>bio fsync 完成</td></tr>
+        <tr><td>t=4.001</td><td>主线程恢复</td></tr>
+      </tbody>
+    </table>
+    <div style="margin-top:8px; color:var(--red); font-size:12px;">→ <code>aof_delayed_fsync</code>+1, 客户端 P99 飙升</div>
+  </div>
+</div>
+
+<div class="warning">
+  <strong>诊断指标:</strong> <code>aof_delayed_fsync</code> 累计计数 · <strong>告警阈值:</strong> 单位时间增量持续 &gt; 0 (绝对值在长跑实例上会很大, 看不出近期退化)
+</div>
+
+<div class="key-insight">
+  <strong>核心观测信号:</strong> <code>aof_delayed_fsync</code> 是该退化的核心观测信号。该指标增长意味着主线程在 <code>write()</code> 路径上发生了阻塞等待,延迟会反馈到客户端 P99。<strong>监控应配置该指标的单位时间增量,而非绝对值</strong>(绝对值在长跑 Redis 上会累积到很大,看不出近期是否在退化)。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s18-4">18.4 BGREWRITEAOF 重写机制</h2>
+<!-- ============================================================ -->
+
+<h3>18.4.1 重写的目标与价值</h3>
+
+<div class="compare-grid">
+  <div class="compare-item bad">
+    <div class="compare-title">❌ 重写前 (冗余 101 条命令)</div>
+<pre><code class="language-bash">SET counter 1
+INCR counter            → counter = 2
+INCR counter            → counter = 3
+... (重复 97 次)
+INCR counter            → counter = 100
+SET name "old"
+SET name "new"          ← 覆盖前一行</code></pre>
+    <div style="margin-top:8px; padding:6px 10px; background:rgba(248,81,73,0.1); border-left:3px solid var(--red); border-radius:3px;">
+      <strong style="color:var(--red);">101 条命令</strong>, 大量冗余
+    </div>
+  </div>
+  <div class="compare-item good">
+    <div class="compare-title">✅ 重写后 (等价精简 2 条)</div>
+<pre><code class="language-bash">SET counter 100
+SET name "new"</code></pre>
+    <div style="margin-top:8px; padding:6px 10px; background:rgba(63,185,80,0.1); border-left:3px solid var(--green); border-radius:3px;">
+      <strong style="color:var(--green);">2 条命令</strong>, 与重写前完全等价
+    </div>
+  </div>
+</div>
+
+<p>重写的核心思想是"<strong>用当前内存状态生成最小等价命令集</strong>"。对单 key 的多次 <code>INCR</code> / <code>APPEND</code> / <code>LPUSH</code> / <code>SADD</code> 等增量操作,重写后等价为单条 <code>SET</code> / 完整列表/集合的赋值。该过程<strong>不读旧 AOF 文件</strong>,而是直接遍历内存数据结构。</p>
+
+<h3>18.4.2 重写的整体流程 (Redis 7 Multi-Part)</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-4-2 · BGREWRITEAOF 流程(Redis 7 Multi-Part AOF)</div>
+  <svg viewBox="0 0 940 480" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="480" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-monospace,Consolas">
+      <rect x="350" y="14" width="240" height="38" rx="8" fill="url(#d-blue)"/>
+      <text x="470" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">触发 BGREWRITEAOF</text>
+      <text x="470" y="48" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">手动命令 / auto-aof-rewrite 自动</text>
+
+      <path d="M470,52 L470,72" stroke="var(--diagram-border)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <rect x="350" y="72" width="240" height="34" rx="8" fill="url(#d-purple)"/>
+      <text x="470" y="94" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">fork() 创建子进程</text>
+
+      <path d="M470,106 L180,140" stroke="var(--diagram-purple-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <path d="M470,106 L760,140" stroke="var(--diagram-purple-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
+
+      <rect x="40" y="140" width="280" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="180" y="160" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="800">父进程: 继续处理写命令</text>
+      <text x="180" y="176" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">不被 rewrite 阻塞</text>
+
+      <path d="M180,184 L180,210" stroke="var(--diagram-blue-stroke)" stroke-width="2" marker-end="url(#d-arr-b)"/>
+      <rect x="40" y="210" width="280" height="60" rx="6" fill="url(#d-blue)"/>
+      <text x="180" y="232" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">新写命令 → 新 INCR AOF</text>
+      <text x="180" y="250" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">appendonly.aof.2.incr.aof</text>
+      <text x="180" y="262" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">不双写到旧文件</text>
+
+      <rect x="620" y="140" width="280" height="44" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="760" y="160" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="800">子进程: 遍历 keyspace</text>
+      <text x="760" y="176" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">不读旧 AOF, 直接读内存</text>
+
+      <path d="M760,184 L760,210" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+      <rect x="620" y="210" width="280" height="60" rx="6" fill="url(#d-green)"/>
+      <text x="760" y="230" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">key → 最小等价命令</text>
+      <text x="760" y="246" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">大集合分批 ≤ 64 元素</text>
+      <text x="760" y="260" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">N×INCR → 1×SET</text>
+
+      <path d="M760,270 L760,295" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+      <rect x="620" y="295" width="280" height="40" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="760" y="313" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">写 .base.rdb 或 .base.aof</text>
+      <text x="760" y="328" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">aof-use-rdb-preamble 决定格式</text>
+
+      <path d="M760,335 L470,360" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+      <text x="640" y="350" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">SIGCHLD 通知</text>
+
+      <rect x="320" y="360" width="300" height="40" rx="6" fill="url(#d-orange)"/>
+      <text x="470" y="380" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">父进程更新 manifest 文件</text>
+      <text x="470" y="394" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">manifest 是真正的"原子切换点"</text>
+
+      <path d="M380,400 L150,430" stroke="var(--diagram-orange-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <path d="M470,400 L470,430" stroke="var(--diagram-orange-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <path d="M560,400 L790,430" stroke="var(--diagram-orange-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
+
+      <rect x="20" y="430" width="260" height="38" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="150" y="448" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">新 BASE + INCR 标记 active</text>
+      <text x="150" y="462" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">manifest 记录 type=b/i</text>
+
+      <rect x="340" y="430" width="260" height="38" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="470" y="448" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">旧 BASE + INCR 标为 history</text>
+      <text x="470" y="462" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">不再被加载</text>
+
+      <rect x="660" y="430" width="260" height="38" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="790" y="448" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">异步 unlink 旧文件</text>
+      <text x="790" y="462" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">bio_lazy_free 后台</text>
+    </g>
+  </svg>
+</div>
+
+<p>Redis 7 Multi-Part AOF 的重写通过 manifest 文件原子切换,避免了 Redis 6 时代单文件原地 rename 的边界问题。<strong>子进程仅负责生成新 BASE,新写命令始终写入独立的 INCR 文件</strong>,不需要重写期间双写到旧文件。</p>
+
+<h3>18.4.3 Redis 6 与 Redis 7 重写的差异</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 18-4-3 · 单文件 vs Multi-Part</div>
+  <table class="data-table">
+    <thead>
+      <tr><th>维度</th><th>Redis 6.x 单文件 AOF</th><th>Redis 7.x Multi-Part AOF</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>重写期间新命令</td><td>双写到旧 AOF + aof_rewrite_buf</td><td>仅写新 INCR AOF</td></tr>
+      <tr><td>切换机制</td><td>子进程将 aof_rewrite_buf 写入新文件后 rename</td><td>父进程更新 manifest</td></tr>
+      <tr><td>切换原子性</td><td>依赖 rename 系统调用</td><td>依赖 manifest 写入</td></tr>
+      <tr><td>主线程阻塞</td><td>rename 完成的瞬间短暂阻塞</td><td>manifest 写入,更短</td></tr>
+      <tr><td>备份单位</td><td>单个 .aof 文件</td><td>整个 appendonlydir 目录</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>18.4.4 子进程遍历内存的命令生成</h3>
+
+<div class="compare-grid">
+  <div class="compare-item">
+    <div class="compare-title">内存中的 hash key user:42</div>
+<pre><code class="language-bash">user:42 = {
+    name: "Alice",
+    age:  30,
+    role: "admin"
+}</code></pre>
+  </div>
+  <div class="compare-item good">
+    <div class="compare-title">→ 子进程生成的等价 RESP 命令</div>
+<pre><code class="language-bash">*5\r\n
+$4\r\nHSET\r\n
+$7\r\nuser:42\r\n
+$4\r\nname\r\n
+$5\r\nAlice\r\n
+
+*5\r\n
+$4\r\nHSET\r\n
+$7\r\nuser:42\r\n
+$3\r\nage\r\n
+$2\r\n30\r\n
+...</code></pre>
+  </div>
+</div>
+
+<div class="key-insight">
+  <strong>大集合分批策略 (<code>aof-rewrite-incremental-fsync</code>):</strong>
+  <ul style="margin: 8px 0;">
+    <li>list / set / hash / zset <strong>每批最多 64 元素</strong></li>
+    <li>超过则分多条 <code>LPUSH</code> / <code>SADD</code> / <code>HSET</code> / <code>ZADD</code></li>
+    <li>避免单条命令的 RESP buffer 过大, 让 fsync 节奏更平滑</li>
+  </ul>
+</div>
+
+<p>分批生成的目的有二:其一,RESP 协议的单个命令理论无大小限制,但子进程内存与磁盘 I/O 受限,过大的命令会导致重写延迟增加;其二,加载时单条命令的解析开销与体积线性相关,分批后加载更平滑。</p>
+
+<h3>18.4.5 自动重写触发条件</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-4-5 · 自动重写决策树</div>
+  <svg viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="460" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-monospace,Consolas">
+      <rect x="350" y="14" width="240" height="38" rx="8" fill="url(#d-purple)"/>
+      <text x="470" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">serverCron 周期检查</text>
+      <text x="470" y="48" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">每 100 ms</text>
+
+      <path d="M470,52 L470,74" stroke="var(--diagram-border)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <path d="M340,98 L470,74 L600,98 L470,122 Z" fill="var(--diagram-orange-stroke)" stroke="var(--diagram-orange-stroke)" stroke-width="2"/>
+      <text x="470" y="100" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="800">① AOF 已开启?</text>
+      <text x="470" y="116" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">appendonly = yes</text>
+
+      <path d="M340,110 L160,160" stroke="var(--diagram-border)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <text x="240" y="138" fill="var(--diagram-muted)" font-size="9">否</text>
+
+      <path d="M470,122 L470,148" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+      <text x="500" y="142" fill="var(--diagram-green-text)" font-size="9">是</text>
+
+      <path d="M340,170 L470,148 L600,170 L470,192 Z" fill="var(--diagram-orange-stroke)" stroke="var(--diagram-orange-stroke)" stroke-width="2"/>
+      <text x="470" y="170" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="800">② 当前已有重写?</text>
+      <text x="470" y="186" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">aof_rewrite_in_progress</text>
+
+      <path d="M600,180 L760,210" stroke="var(--diagram-border)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <text x="680" y="190" fill="var(--diagram-muted)" font-size="9">是 → 跳过</text>
+
+      <path d="M470,192 L470,218" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+      <text x="500" y="212" fill="var(--diagram-green-text)" font-size="9">否</text>
+
+      <path d="M310,250 L470,218 L630,250 L470,282 Z" fill="var(--diagram-orange-stroke)" stroke="var(--diagram-orange-stroke)" stroke-width="2"/>
+      <text x="470" y="248" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="800">③ 文件够大?</text>
+      <text x="470" y="264" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">aof_current_size ≥</text>
+      <text x="470" y="278" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">auto-aof-rewrite-min-size(64MB)</text>
+
+      <path d="M310,260 L160,260" stroke="var(--diagram-border)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <text x="235" y="254" fill="var(--diagram-muted)" font-size="9">否 → 跳过</text>
+
+      <path d="M470,282 L470,310" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+      <text x="500" y="304" fill="var(--diagram-green-text)" font-size="9">是</text>
+
+      <path d="M280,346 L470,310 L660,346 L470,382 Z" fill="var(--diagram-orange-stroke)" stroke="var(--diagram-orange-stroke)" stroke-width="2"/>
+      <text x="470" y="340" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="800">④ 增长率超阈值?</text>
+      <text x="470" y="356" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">(current_size - base_size) / base_size</text>
+      <text x="470" y="370" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">≥ percentage(默认 100% = 翻倍)</text>
+
+      <path d="M280,360 L160,360" stroke="var(--diagram-border)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <text x="225" y="354" fill="var(--diagram-muted)" font-size="9">否 → 跳过</text>
+
+      <rect x="60" y="138" width="180" height="50" rx="6" fill="var(--diagram-canvas)" stroke="var(--diagram-border)"/>
+      <text x="150" y="158" text-anchor="middle" fill="var(--diagram-muted)" font-size="11" font-weight="700">跳过本轮</text>
+      <text x="150" y="174" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">下次 serverCron 再检查</text>
+
+      <rect x="60" y="240" width="180" height="40" rx="6" fill="var(--diagram-canvas)" stroke="var(--diagram-border)"/>
+      <text x="150" y="265" text-anchor="middle" fill="var(--diagram-muted)" font-size="11" font-weight="700">跳过本轮</text>
+
+      <rect x="60" y="340" width="180" height="40" rx="6" fill="var(--diagram-canvas)" stroke="var(--diagram-border)"/>
+      <text x="150" y="365" text-anchor="middle" fill="var(--diagram-muted)" font-size="11" font-weight="700">跳过本轮</text>
+
+      <rect x="700" y="190" width="180" height="40" rx="6" fill="var(--diagram-canvas)" stroke="var(--diagram-border)"/>
+      <text x="790" y="215" text-anchor="middle" fill="var(--diagram-muted)" font-size="11" font-weight="700">跳过本轮</text>
+
+      <path d="M470,382 L470,406" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+      <text x="500" y="400" fill="var(--diagram-green-text)" font-size="9">是</text>
+
+      <rect x="290" y="406" width="360" height="42" rx="8" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="470" y="426" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">rewriteAppendOnlyFileBackground</text>
+      <text x="470" y="442" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">fork 子进程 + 生成新 BASE</text>
+    </g>
+  </svg>
+</div>
+
+<p>默认配置 <code>auto-aof-rewrite-percentage 100 / auto-aof-rewrite-min-size 64mb</code> 的语义是:<strong>文件至少 64 MiB 且相比上次重写后翻倍</strong>。该规则避免小文件频繁重写,同时控制大文件无限膨胀。</p>
+
+<!-- ============================================================ -->
+<h2 id="s18-5">18.5 Multi-Part AOF 文件结构</h2>
+<!-- ============================================================ -->
+
+<h3>18.5.1 appendonlydir 目录结构</h3>
+
+<svg class="svg-diagram" viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="ad-dir" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="var(--diagram-blue-fill-start)"/><stop offset="100%" stop-color="var(--diagram-blue-fill-end)"/>
+    </linearGradient>
+    <linearGradient id="ad-base" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="var(--diagram-purple-fill-start)"/><stop offset="100%" stop-color="var(--diagram-purple-fill-end)"/>
+    </linearGradient>
+    <linearGradient id="ad-incr" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="var(--diagram-green-fill-start)"/><stop offset="100%" stop-color="var(--diagram-green-fill-end)"/>
+    </linearGradient>
+    <linearGradient id="ad-hist" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="var(--diagram-surface-muted)"/><stop offset="100%" stop-color="var(--diagram-surface)"/>
+    </linearGradient>
+    <linearGradient id="ad-mani" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="var(--diagram-orange-fill-start)"/><stop offset="100%" stop-color="var(--diagram-orange-fill-end)"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 目录头 -->
+  <rect x="20" y="20" width="200" height="40" rx="6" fill="url(#ad-dir)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="120" y="45" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="bold" font-family="ui-monospace, monospace">appendonlydir/</text>
+
+  <!-- 旧 BASE/INCR (history) -->
+  <text x="55" y="85" fill="var(--diagram-muted)" font-size="11" font-family="ui-monospace, monospace">├──</text>
+  <rect x="90" y="73" width="340" height="30" rx="4" fill="url(#ad-hist)" stroke="var(--diagram-border)" stroke-dasharray="3 3"/>
+  <text x="100" y="92" fill="var(--diagram-text)" font-size="11" font-family="ui-monospace, monospace">appendonly.aof.1.base.rdb</text>
+  <text x="450" y="92" fill="var(--diagram-muted)" font-size="11">type h · 旧 BASE (HISTORY, 等待异步删除)</text>
+
+  <text x="55" y="115" fill="var(--diagram-muted)" font-size="11" font-family="ui-monospace, monospace">├──</text>
+  <rect x="90" y="103" width="340" height="30" rx="4" fill="url(#ad-hist)" stroke="var(--diagram-border)" stroke-dasharray="3 3"/>
+  <text x="100" y="122" fill="var(--diagram-text)" font-size="11" font-family="ui-monospace, monospace">appendonly.aof.1.incr.aof</text>
+  <text x="450" y="122" fill="var(--diagram-muted)" font-size="11">type h · 旧 INCR (HISTORY)</text>
+
+  <!-- 新 BASE/INCR (active) -->
+  <text x="55" y="145" fill="var(--diagram-muted)" font-size="11" font-family="ui-monospace, monospace">├──</text>
+  <rect x="90" y="133" width="340" height="30" rx="4" fill="url(#ad-base)" stroke="var(--diagram-purple-stroke)" stroke-width="2"/>
+  <text x="100" y="152" fill="var(--diagram-text)" font-size="11" font-family="ui-monospace, monospace">appendonly.aof.2.base.rdb</text>
+  <text x="450" y="152" fill="var(--diagram-purple-text)" font-size="11" font-weight="bold">type b · 新 BASE (RDB 格式, 基础状态) ★</text>
+
+  <text x="55" y="175" fill="var(--diagram-muted)" font-size="11" font-family="ui-monospace, monospace">├──</text>
+  <rect x="90" y="163" width="340" height="30" rx="4" fill="url(#ad-incr)" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
+  <text x="100" y="182" fill="var(--diagram-text)" font-size="11" font-family="ui-monospace, monospace">appendonly.aof.2.incr.aof</text>
+  <text x="450" y="182" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">type i · 新 INCR (RESP 命令, BASE 之后增量) ★</text>
+
+  <!-- manifest -->
+  <text x="55" y="205" fill="var(--diagram-muted)" font-size="11" font-family="ui-monospace, monospace">└──</text>
+  <rect x="90" y="193" width="340" height="30" rx="4" fill="url(#ad-mani)" stroke="var(--diagram-orange-stroke)" stroke-width="2"/>
+  <text x="100" y="212" fill="var(--diagram-text)" font-size="11" font-family="ui-monospace, monospace">appendonly.aof.manifest</text>
+  <text x="450" y="212" fill="var(--diagram-orange-text)" font-size="11" font-weight="bold">清单 · 恢复入口 · 原子切换关键</text>
+
+  <!-- manifest 内容 -->
+  <rect x="20" y="245" width="880" height="100" rx="8" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="35" y="268" fill="var(--diagram-orange-text)" font-size="13" font-weight="bold">manifest 文件内容</text>
+  <g font-size="11" font-family="ui-monospace, monospace">
+    <text x="35" y="290" fill="var(--diagram-blue-text)">file appendonly.aof.2.base.rdb seq 2 type b</text>
+    <text x="35" y="308" fill="var(--diagram-blue-text)">file appendonly.aof.2.incr.aof seq 2 type i</text>
+  </g>
+  <text x="35" y="335" fill="var(--diagram-muted)" font-size="11">类型: <tspan fill="var(--diagram-purple-text)">type b</tspan> BASE · <tspan fill="var(--diagram-green-text)">type i</tspan> INCR · <tspan fill="var(--diagram-muted)">type h</tspan> HISTORY (等异步删除) · 父进程更新 manifest 即完成切换</text>
+</svg>
+
+<p>manifest 是<strong>恢复入口的唯一来源</strong>。重启时 Redis 读取 manifest,按 seq 顺序加载 BASE 与 INCR 文件,先恢复基础状态再回放增量。该机制将"切换有效文件"从原地 rename 简化为<strong>追加 manifest 行 + fsync</strong>。</p>
+
+<h3>18.5.2 manifest 切换的原子性保障</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-5-2 · rename POSIX 原子切换</div>
+  <svg viewBox="0 0 940 420" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="420" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-monospace,Consolas">
+      <rect x="40"  y="14" width="220" height="44" rx="6" fill="url(#d-orange)"/>
+      <text x="150" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">旧 manifest</text>
+      <text x="150" y="50" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">active: 1.base + 1.incr</text>
+      <line x1="150" y1="58" x2="150" y2="410" stroke="var(--diagram-orange-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="380" y="14" width="180" height="44" rx="6" fill="url(#d-green)"/>
+      <text x="470" y="40" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">子进程</text>
+      <line x1="470" y1="58" x2="470" y2="410" stroke="var(--diagram-green-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="680" y="14" width="220" height="44" rx="6" fill="url(#d-purple)"/>
+      <text x="790" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">新 manifest</text>
+      <text x="790" y="50" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">active: 2.base + 2.incr</text>
+      <line x1="790" y1="58" x2="790" y2="410" stroke="var(--diagram-purple-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <path d="M460,90 C 430,90 430,108 460,108" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="350" y="100" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">① 写入 2.base.rdb 完成</text>
+
+      <path d="M475,134 L155,134" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+      <text x="305" y="128" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">② signal 父进程</text>
+
+      <rect x="40" y="158" width="860" height="22" rx="4" fill="var(--diagram-red-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="470" y="173" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">父进程构造新 manifest 内容(2.base + 2.incr 标 active, 1.base + 1.incr 标 history)</text>
+
+      <path d="M785,200 C 760,200 760,220 785,220" stroke="var(--diagram-purple-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+      <text x="640" y="212" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">③ 写临时 manifest.tmp</text>
+
+      <path d="M785,244 C 760,244 760,262 785,262" stroke="var(--diagram-purple-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+      <text x="640" y="254" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">④ fsync(manifest.tmp) 落盘</text>
+
+      <path d="M785,290 L155,290" stroke="var(--diagram-red-stroke)" stroke-width="3" marker-end="url(#d-arr-r)"/>
+      <text x="470" y="282" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="800">⑤ rename(manifest.tmp, manifest)</text>
+
+      <rect x="160" y="305" width="620" height="36" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="470" y="322" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10" font-weight="800">★ rename 是 POSIX 原子操作 — 崩溃时新旧 manifest 二选一,绝不会读到中间状态</text>
+      <text x="470" y="335" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">同一文件系统内由内核 vfs_rename 保证</text>
+
+      <path d="M165,360 L460,360" stroke="var(--diagram-orange-stroke)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#d-arr)"/>
+      <text x="310" y="354" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">⑥ 标记旧 1.base / 1.incr 为 history</text>
+
+      <path d="M460,390 C 430,390 430,402 460,402" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="320" y="398" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">⑦ 异步 bio_lazy_free unlink 旧文件</text>
+    </g>
+  </svg>
+</div>
+
+<p><code>rename()</code> 在<strong>同一文件系统内</strong>是 POSIX 原子操作,manifest 切换保证崩溃时要么读到旧 manifest(继续使用旧 BASE+INCR),要么读到新 manifest(使用新 BASE+INCR),<strong>不会读到中间状态</strong>。</p>
+
+<h3>18.5.3 加载流程</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-5-3 · 重启时的 AOF 加载</div>
+  <svg viewBox="0 0 940 420" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="420" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-monospace,Consolas">
+      <rect x="370" y="14" width="200" height="38" rx="8" fill="url(#d-purple)"/>
+      <text x="470" y="38" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Redis 启动</text>
+
+      <path d="M470,52 L470,72" stroke="var(--diagram-border)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <path d="M340,98 L470,72 L600,98 L470,124 Z" fill="var(--diagram-orange-stroke)" stroke="var(--diagram-orange-stroke)" stroke-width="2"/>
+      <text x="470" y="100" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="800">manifest 存在?</text>
+      <text x="470" y="116" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">Multi-Part 标志</text>
+
+      <path d="M340,110 L120,150" stroke="var(--diagram-border)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <text x="220" y="140" fill="var(--diagram-muted)" font-size="9">否(Redis 6)</text>
+
+      <rect x="20" y="150" width="200" height="50" rx="6" fill="var(--diagram-canvas)" stroke="var(--diagram-border)"/>
+      <text x="120" y="170" text-anchor="middle" fill="var(--diagram-muted)" font-size="10" font-weight="700">按旧版加载</text>
+      <text x="120" y="186" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">appendonly.aof</text>
+
+      <path d="M470,124 L470,148" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+      <text x="500" y="142" fill="var(--diagram-green-text)" font-size="9">是</text>
+
+      <rect x="350" y="148" width="240" height="34" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="470" y="170" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">读取 manifest + 按 seq 排序</text>
+
+      <path d="M470,182 L470,200" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+      <rect x="350" y="200" width="240" height="34" rx="6" fill="url(#d-blue)"/>
+      <text x="470" y="222" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="700">加载 BASE 文件(type=b)</text>
+
+      <path d="M470,234 L470,252" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+      <rect x="350" y="252" width="240" height="34" rx="6" fill="url(#d-blue)"/>
+      <text x="470" y="274" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="700">逐个加载 INCR(type=i)</text>
+
+      <path d="M470,286 L470,300" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+      <path d="M340,326 L470,300 L600,326 L470,352 Z" fill="var(--diagram-orange-stroke)" stroke="var(--diagram-orange-stroke)" stroke-width="2"/>
+      <text x="470" y="328" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="800">末尾完整?</text>
+      <text x="470" y="344" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">CRC + 命令边界检查</text>
+
+      <path d="M600,330 L780,330" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+      <text x="690" y="324" fill="var(--diagram-green-text)" font-size="9">是</text>
+      <rect x="780" y="316" width="140" height="34" rx="6" fill="url(#d-green)"/>
+      <text x="850" y="338" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">进入服务态</text>
+
+      <path d="M340,330 L260,330" stroke="var(--diagram-red-stroke)" stroke-width="2" marker-end="url(#d-arr-r)"/>
+      <text x="295" y="324" fill="var(--diagram-red-text)" font-size="9">否</text>
+
+      <path d="M180,348 L260,330 L180,312 Z" fill="var(--diagram-red-stroke)" stroke="var(--diagram-red-stroke)"/>
+      <text x="220" y="334" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9" font-weight="700">aof-load</text>
+      <text x="220" y="345" text-anchor="middle" fill="var(--diagram-red-text)" font-size="8">truncated?</text>
+
+      <rect x="20" y="370" width="200" height="40" rx="6" fill="url(#d-orange)"/>
+      <text x="120" y="388" text-anchor="middle" fill="var(--diagram-text)" font-size="10" font-weight="700">yes: 截断到最后完整</text>
+      <text x="120" y="402" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">打印警告 + 进入服务</text>
+
+      <rect x="240" y="370" width="200" height="40" rx="6" fill="url(#d-red)"/>
+      <text x="340" y="388" text-anchor="middle" fill="var(--diagram-text)" font-size="10" font-weight="700">no: 启动失败</text>
+      <text x="340" y="402" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">进程退出</text>
+
+      <path d="M150,360 L120,370" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+      <path d="M250,360 L320,370" stroke="var(--diagram-red-stroke)" stroke-width="1.5" marker-end="url(#d-arr-r)"/>
+    </g>
+  </svg>
+</div>
+
+<p><code>aof-load-truncated yes</code>(默认开启)在断电导致末尾命令半写入时<strong>自动截断到最后完整命令并启动</strong>。该选项以"丢失最后几条未完成命令"为代价换取启动可用性。</p>
+
+<!-- ============================================================ -->
+<h2 id="s18-6">18.6 混合持久化</h2>
+<!-- ============================================================ -->
+
+<h3>18.6.1 混合持久化的文件结构</h3>
+
+<div class="compare-grid">
+  <div class="compare-item bad">
+    <div class="compare-title">❌ 传统纯 AOF (aof-use-rdb-preamble no)</div>
+    <svg viewBox="0 0 360 200" xmlns="http://www.w3.org/2000/svg" style="width:100%;">
+      <rect x="20" y="20" width="320" height="160" rx="8" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="180" y="44" text-anchor="middle" fill="var(--diagram-red-text)" font-size="13" font-weight="bold">RESP 命令文本 (全量)</text>
+      <text x="40" y="75" fill="var(--diagram-blue-text)" font-size="11" font-family="ui-monospace, monospace">SET key1 value1</text>
+      <text x="40" y="95" fill="var(--diagram-blue-text)" font-size="11" font-family="ui-monospace, monospace">HSET hash1 field1 value1</text>
+      <text x="40" y="115" fill="var(--diagram-blue-text)" font-size="11" font-family="ui-monospace, monospace">LPUSH list1 a b c</text>
+      <text x="40" y="135" fill="var(--diagram-muted)" font-size="11" font-family="ui-monospace, monospace">...</text>
+      <line x1="20" y1="155" x2="340" y2="155" stroke="var(--diagram-red-stroke)" stroke-dasharray="3 3"/>
+      <text x="180" y="172" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="bold">恢复: 逐条解析 + 执行, O(N) 命令</text>
+    </svg>
+    <div style="margin-top:6px; color:var(--red); font-size:12px;">→ 10M keys 加载 ~25 秒</div>
+  </div>
+
+  <div class="compare-item good">
+    <div class="compare-title">✅ 混合持久化 (aof-use-rdb-preamble yes)</div>
+    <svg viewBox="0 0 360 200" xmlns="http://www.w3.org/2000/svg" style="width:100%;">
+      <rect x="20" y="15" width="320" height="80" rx="8" fill="var(--diagram-purple-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="180" y="35" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="12" font-weight="bold">BASE: RDB 二进制 preamble</text>
+      <text x="40" y="58" fill="var(--diagram-blue-text)" font-size="10" font-family="ui-monospace, monospace">REDIS0011 ... (序列化 keyspace)</text>
+      <text x="40" y="75" fill="var(--diagram-blue-text)" font-size="10" font-family="ui-monospace, monospace">... CRC64 ...</text>
+      <text x="180" y="92" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">.base.rdb</text>
+
+      <rect x="20" y="105" width="320" height="65" rx="8" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="180" y="125" text-anchor="middle" fill="var(--diagram-green-text)" font-size="12" font-weight="bold">INCR: RESP 命令 (重写期间增量)</text>
+      <text x="40" y="145" fill="var(--diagram-blue-text)" font-size="10" font-family="ui-monospace, monospace">SET keyN valueN</text>
+      <text x="180" y="163" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">.incr.aof</text>
+
+      <text x="180" y="190" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">恢复: 二进制反序列化 + 少量命令回放</text>
+    </svg>
+    <div style="margin-top:6px; color:var(--green); font-size:12px;">→ 10M keys 加载 ~5 秒, <strong>5× 加速</strong></div>
+  </div>
+</div>
+
+<p>混合持久化由 <code>aof-use-rdb-preamble yes</code> 启用(Redis 5.0+ 默认开启)。重写时子进程生成 RDB 格式的 BASE 文件而非 RESP,加载速度从"逐条解析回放"降为"二进制反序列化",<strong>10M keys 规模下恢复时间从约 25 秒降至约 5 秒</strong>。</p>
+
+<h3>18.6.2 三种持久化形式的对比矩阵</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 18-6-2 · 持久化形式全维度对比</div>
+  <table class="data-table">
+    <thead>
+      <tr><th>维度</th><th>纯 RDB</th><th>纯 AOF</th><th>混合持久化</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>数据安全</td><td>丢失 5-15 分钟</td><td>最多 1 秒</td><td>最多 1 秒</td></tr>
+      <tr><td>恢复速度 (10M keys)</td><td>~3 秒</td><td>~25 秒</td><td>~5 秒</td></tr>
+      <tr><td>文件体积 (10M keys)</td><td>~550 MB</td><td>~1.2 GB</td><td>~600 MB</td></tr>
+      <tr><td>主线程开销</td><td>仅 fork 时</td><td>每命令追加 + fsync</td><td>同纯 AOF</td></tr>
+      <tr><td>可读性</td><td>二进制</td><td>文本</td><td>部分文本(尾部)</td></tr>
+      <tr><td>Redis 7 默认</td><td>save 配置存在时启用</td><td>appendonly yes 启用</td><td>appendonly + preamble 双开</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key-insight">
+  <strong>生产推荐:</strong> 混合持久化结合 RDB 的恢复速度与 AOF 的丢失窗口控制,是<strong>生产环境推荐配置</strong>。仅当业务需要完全可读的命令日志(如审计、迁移工具直接消费 AOF)时才关闭 preamble。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s18-7">18.7 多部署模式下的 AOF</h2>
+<!-- ============================================================ -->
+
+<h3>18.7.1 不同部署模式的 AOF 角色</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 18-7-1 · 四种部署模式 AOF 对照</div>
+  <table class="data-table">
+    <thead>
+      <tr><th>部署模式</th><th>Master AOF</th><th>Replica AOF</th><th>关键约束</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>单节点</td><td>必须开启</td><td>N/A</td><td>BGREWRITEAOF 期间 CoW + rewrite_buf 内存压力</td></tr>
+      <tr><td>主从复制</td><td>可关闭</td><td>建议开启</td><td>Master 关闭 AOF 时必须配合 Sentinel/Cluster,避免空 Master 重启污染 Replica</td></tr>
+      <tr><td>Sentinel</td><td>全部开启</td><td>全部开启</td><td>failover 后新 Master 继续使用本地 AOF</td></tr>
+      <tr><td>Cluster</td><td>每节点独立</td><td>每节点独立</td><td>节点间不传播 AOF,Slot 迁移命令记录到本地 AOF</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>18.7.2 Master 关闭 AOF 的风险</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-7-2 · 空 Master 重启污染 Replica — 生产事故场景</div>
+  <svg viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="460" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-monospace,Consolas">
+      <rect x="40"  y="14" width="200" height="34" rx="6" fill="url(#d-red)"/>
+      <text x="140" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">Master(无持久化)</text>
+      <line x1="140" y1="48" x2="140" y2="450" stroke="var(--diagram-red-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="370" y="14" width="200" height="34" rx="6" fill="url(#d-green)"/>
+      <text x="470" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">Replica(有 AOF)</text>
+      <line x1="470" y1="48" x2="470" y2="450" stroke="var(--diagram-green-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="700" y="14" width="200" height="34" rx="6" fill="url(#d-blue)"/>
+      <text x="800" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">Client</text>
+      <line x1="800" y1="48" x2="800" y2="450" stroke="var(--diagram-blue-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <path d="M795,76 L145,76" stroke="var(--diagram-blue-stroke)" stroke-width="2" marker-end="url(#d-arr-b)"/>
+      <text x="470" y="70" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">① SET k v</text>
+
+      <path d="M145,104 C 110,104 110,124 145,124" stroke="var(--diagram-purple-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+      <text x="80" y="118" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">② 写入内存</text>
+
+      <path d="M145,150 L465,150" stroke="var(--diagram-purple-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <text x="305" y="144" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">③ 复制流传播</text>
+
+      <path d="M465,178 C 430,178 430,196 465,196" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="395" y="190" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">④ 写入内存 + AOF</text>
+
+      <path d="M145,222 L795,222" stroke="var(--diagram-green-stroke)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#d-arr-g)"/>
+      <text x="470" y="216" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10" font-weight="700">⑤ +OK(client 以为安全了)</text>
+
+      <rect x="20" y="240" width="240" height="44" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)" stroke-dasharray="3 3"/>
+      <text x="140" y="259" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="800">⚡ 进程崩溃</text>
+      <text x="140" y="276" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">无 RDB / 无 AOF / 无 Sentinel</text>
+
+      <rect x="20" y="294" width="240" height="44" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)" stroke-dasharray="3 3"/>
+      <text x="140" y="313" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="800">重启 — 内存为空</text>
+      <text x="140" y="330" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">runid 改变!</text>
+
+      <path d="M155,360 L455,360" stroke="var(--diagram-red-stroke)" stroke-width="2" marker-end="url(#d-arr-r)"/>
+      <text x="305" y="354" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10" font-weight="700">⑥ PSYNC ?(新 runid → 强制全量同步)</text>
+
+      <path d="M455,388 L155,388" stroke="var(--diagram-green-stroke)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#d-arr-g)"/>
+      <text x="305" y="382" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">⑦ Replica 给 Master 自己的 RDB(全量同步反向)</text>
+
+      <rect x="280" y="406" width="380" height="44" rx="6" fill="url(#d-red)" filter="url(#d-shadow)"/>
+      <text x="470" y="426" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">⑧ Master 把"空 RDB"反推给 Replica</text>
+      <text x="470" y="442" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">★ Replica 本地 AOF 被空数据覆盖 — 数据全丢</text>
+    </g>
+  </svg>
+</div>
+
+<div class="warning">
+  <strong>严重事故场景:</strong> Master 关闭 AOF 且无 Sentinel 自动 failover 时,崩溃重启会以空 keyspace 启动,Replica 的全量同步会用空数据覆盖自身。生产环境 Master 关闭 AOF 必须满足两项前提:其一,<strong>Sentinel/Cluster 检测到 Master 失联立即提升 Replica</strong>;其二,<strong>旧 Master 重启后以 Replica 身份加入</strong>,从新 Master 同步数据。
+</div>
+
+<h3>18.7.3 Cluster 中 AOF 与 Slot 迁移</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-7-3 · Slot 迁移在两节点 AOF 的独立记录</div>
+  <svg viewBox="0 0 940 320" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="320" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-monospace,Consolas">
+      <rect x="350" y="14" width="240" height="44" rx="8" fill="url(#d-blue)"/>
+      <text x="470" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">MIGRATE k slot=100</text>
+      <text x="470" y="50" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">node A → node B</text>
+
+      <path d="M380,58 L160,110" stroke="var(--diagram-purple-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <path d="M560,58 L780,110" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+
+      <rect x="40" y="110" width="240" height="68" rx="8" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="160" y="132" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">node A 本地 AOF</text>
+      <text x="160" y="150" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">记录 DEL k</text>
+      <text x="160" y="166" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">迁出方视角:本地不再持有</text>
+
+      <rect x="660" y="110" width="240" height="68" rx="8" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="780" y="132" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">node B 本地 AOF</text>
+      <text x="780" y="150" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10" font-weight="700">记录 RESTORE k payload</text>
+      <text x="780" y="166" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">迁入方视角:新增 key</text>
+
+      <path d="M160,178 L160,200" stroke="var(--diagram-purple-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <path d="M780,178 L780,200" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+
+      <rect x="40" y="200" width="240" height="60" rx="8" fill="var(--diagram-red-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="160" y="220" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">A 重启回放</text>
+      <text x="160" y="238" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">回放到 DEL k 时</text>
+      <text x="160" y="252" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">k 不在内存(自然一致)</text>
+
+      <rect x="660" y="200" width="240" height="60" rx="8" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="780" y="220" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">B 重启回放</text>
+      <text x="780" y="238" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">回放到 RESTORE k payload</text>
+      <text x="780" y="252" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">k 完整恢复到内存</text>
+
+      <rect x="60" y="278" width="820" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="470" y="296" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10" font-weight="800">关键观察 — Cluster 节点 AOF 互不感知拓扑,各自独立; 集群一致性由 CLUSTER NODES 元数据保证</text>
+    </g>
+  </svg>
+</div>
+
+<p>Cluster 节点的 AOF 仅记录该节点的本地命令,不感知集群拓扑。Slot 迁移期间,源节点 AOF 记录 <code>DEL</code>,目标节点 AOF 记录 <code>RESTORE</code>,各自独立。重启时各节点按本地 AOF 恢复,<strong>集群拓扑由 cluster nodes 状态独立管理</strong>。</p>
+
+<!-- ============================================================ -->
+<h2 id="s18-8">18.8 性能与观测</h2>
+<!-- ============================================================ -->
+
+<h3>18.8.1 fsync 策略的吞吐量基线</h3>
+
+<svg class="svg-diagram" viewBox="0 0 920 300" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bar-none" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="var(--diagram-green-fill-start)"/><stop offset="100%" stop-color="var(--diagram-green-fill-end)"/>
+    </linearGradient>
+    <linearGradient id="bar-no" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="var(--diagram-blue-fill-start)"/><stop offset="100%" stop-color="var(--diagram-blue-fill-end)"/>
+    </linearGradient>
+    <linearGradient id="bar-ev" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="var(--diagram-orange-fill-start)"/><stop offset="100%" stop-color="var(--diagram-orange-fill-end)"/>
+    </linearGradient>
+    <linearGradient id="bar-al" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="var(--diagram-red-fill-start)"/><stop offset="100%" stop-color="var(--diagram-red-fill-end)"/>
+    </linearGradient>
+  </defs>
+
+  <text x="20" y="26" fill="var(--diagram-blue-text)" font-size="13" font-weight="bold">基线: 64 GB RAM · NVMe SSD (~10 µs fsync) · Redis 7.2 · SET 100B value, pipeline=1</text>
+
+  <!-- 坐标轴 -->
+  <line x1="180" y1="60" x2="180" y2="240" stroke="var(--diagram-border)"/>
+  <line x1="180" y1="240" x2="850" y2="240" stroke="var(--diagram-border)"/>
+
+  <!-- 刻度 -->
+  <g font-size="10" fill="var(--diagram-muted)" font-family="ui-monospace, monospace">
+    <text x="180" y="255" text-anchor="middle">0</text>
+    <text x="313" y="255" text-anchor="middle">25K</text>
+    <text x="447" y="255" text-anchor="middle">50K</text>
+    <text x="580" y="255" text-anchor="middle">75K</text>
+    <text x="713" y="255" text-anchor="middle">100K</text>
+    <text x="846" y="255" text-anchor="middle">125K ops/s</text>
+  </g>
+
+  <!-- 条形 -->
+  <!-- 无持久化: 125,000 → 670px -->
+  <text x="170" y="92" text-anchor="end" fill="var(--diagram-green-text)" font-size="12" font-weight="bold">无持久化</text>
+  <rect x="180" y="76" width="666" height="30" rx="3" fill="url(#bar-none)" stroke="var(--diagram-green-stroke)"/>
+  <text x="860" y="96" fill="var(--diagram-green-text)" font-size="12" font-weight="bold">125,000</text>
+
+  <!-- AOF no: 115,000 -->
+  <text x="170" y="132" text-anchor="end" fill="var(--diagram-blue-text)" font-size="12" font-weight="bold">AOF no</text>
+  <rect x="180" y="116" width="613" height="30" rx="3" fill="url(#bar-no)" stroke="var(--diagram-blue-stroke)"/>
+  <text x="807" y="136" fill="var(--diagram-blue-text)" font-size="12" font-weight="bold">115,000</text>
+
+  <!-- AOF everysec: 105,000 -->
+  <text x="170" y="172" text-anchor="end" fill="var(--diagram-orange-text)" font-size="12" font-weight="bold">AOF everysec ★</text>
+  <rect x="180" y="156" width="560" height="30" rx="3" fill="url(#bar-ev)" stroke="var(--diagram-orange-stroke)"/>
+  <text x="754" y="176" fill="var(--diagram-orange-text)" font-size="12" font-weight="bold">105,000</text>
+
+  <!-- AOF always: 8,000 -->
+  <text x="170" y="212" text-anchor="end" fill="var(--diagram-red-text)" font-size="12" font-weight="bold">AOF always</text>
+  <rect x="180" y="196" width="43" height="30" rx="3" fill="url(#bar-al)" stroke="var(--diagram-red-stroke)"/>
+  <text x="237" y="216" fill="var(--diagram-red-text)" font-size="12" font-weight="bold">8,000</text>
+
+  <!-- 比例标注 -->
+  <text x="20" y="285" fill="var(--diagram-muted)" font-size="11">吞吐比例: everysec / 无持久化 ≈ <tspan fill="var(--diagram-green-text)" font-weight="bold">0.84 (推荐)</tspan>  ·  always / 无持久化 ≈ <tspan fill="var(--diagram-red-text)" font-weight="bold">0.064 (生产慎用)</tspan></text>
+</svg>
+
+<p><code>always</code> 的吞吐瓶颈是<strong>单次 fsync 延迟 × 命令数</strong>。NVMe SSD 单次 fsync 约 0.1 ms,理论上限 10,000 ops/s;HDD 约 5 ms,上限约 200 ops/s。多条命令在同一事件循环可合并为一次 fsync (group commit),实测高于该理论上限。</p>
+
+<h3>18.8.2 重写期间的 CoW 内存放大</h3>
+
+<p style="color:var(--text-muted); font-size:12px; margin:8px 0;">情形: 60 GB keyspace · 写流量 10,000 ops/s · BGREWRITEAOF 持续 60 秒</p>
+<table class="data-table">
+  <thead><tr><th>时间轴 (s)</th><th>父进程驻留</th><th>CoW 复制</th><th>rewrite_buf</th><th>总内存</th></tr></thead>
+  <tbody>
+    <tr><td>0 (开始)</td><td>60 GB</td><td>0</td><td>0</td><td>60 GB</td></tr>
+    <tr><td>10</td><td>60 GB</td><td>3.6 GB</td><td>40 MB</td><td>~64 GB</td></tr>
+    <tr><td>30</td><td>60 GB</td><td>10.8 GB</td><td>120 MB</td><td>~71 GB</td></tr>
+    <tr><td>60 (峰值)</td><td>60 GB</td><td><strong style="color:var(--red)">21.6 GB</strong></td><td><strong style="color:var(--red)">240 MB</strong></td><td><strong style="color:var(--red)">~82 GB</strong></td></tr>
+    <tr><td>重写完成</td><td>60 GB</td><td>0</td><td>0</td><td>60 GB</td></tr>
+  </tbody>
+</table>
+<div class="key-insight">
+  <strong>CoW 复制公式:</strong> <code>CoW_size ≈ 写流量 × 重写时间 × 平均 page 复制比例</code><br>
+  典型比例 ≈ <strong>0.6</strong> (热点写集中在少量 page, 而非均匀分布全 keyspace)<br>
+  → 60 GB 实例 BGREWRITEAOF 期间内存峰值可达 <strong>1.4×</strong>, 必须留足余量
+</div>
+
+<div class="real-world">
+  <strong>真实事故:</strong> 某游戏公司大版本上线日 19:00,QPS 从 5k 飙到 30k,正巧触发 <code>auto-aof-rewrite-percentage 100</code> 阈值。重写过程持续 4 分钟,CoW 内存放大到 ~28 GB(原 60 GB 实例),系统总内存 95% 触发 OOM Killer 杀 Redis 进程。事后规则:其一,<code>auto-aof-rewrite-min-size</code> 从 64mb 调到 1gb 减少重写触发频率;其二,<code>BGREWRITEAOF</code> 改用 cron 在业务低峰 03:00 手动触发;其三,<code>maxmemory</code> 从 70% 降到 55% 留出 CoW 余量。
+</div>
+
+<h3>18.8.3 核心观测指标</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 18-8-3 · AOF 核心监控指标</div>
+  <table class="data-table">
+    <thead>
+      <tr><th>指标</th><th>来源</th><th>含义</th><th>异常阈值</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>aof_enabled</code></td><td>INFO persistence</td><td>AOF 是否开启</td><td>期望值 1</td></tr>
+      <tr><td><code>aof_last_write_status</code></td><td>INFO persistence</td><td>最近一次 write 状态</td><td>ok / err</td></tr>
+      <tr><td><code>aof_last_bgrewrite_status</code></td><td>INFO persistence</td><td>最近一次重写状态</td><td>ok / err</td></tr>
+      <tr><td><code>aof_delayed_fsync</code></td><td>INFO persistence</td><td>fsync 阻塞主线程的累计次数</td><td>单位时间增量 &gt; 0 即告警</td></tr>
+      <tr><td><code>aof_current_size</code></td><td>INFO persistence</td><td>当前 AOF 总字节</td><td>监控增长趋势</td></tr>
+      <tr><td><code>aof_base_size</code></td><td>INFO persistence</td><td>上次重写后大小</td><td>与 current 比例评估重写时机</td></tr>
+      <tr><td><code>aof_rewrite_in_progress</code></td><td>INFO persistence</td><td>重写是否进行中</td><td>0 / 1</td></tr>
+      <tr><td><code>latest_fork_usec</code></td><td>INFO stats</td><td>最近 fork 延迟 (微秒)</td><td>&gt; 50,000 调查 hugepage</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>18.8.4 PromQL 监控示例</h3>
+
+<pre><code class="language-yaml"># fsync 阻塞主线程增量
+- record: redis:aof_delayed_fsync_rate
+  expr: rate(redis_aof_delayed_fsync_total[5m])
+
+# AOF 体积增长率
+- record: redis:aof_size_growth
+  expr: rate(redis_aof_current_size_bytes[5m])
+
+# 告警: fsync 退化
+- alert: RedisAofFsyncDelayed
+  expr: rate(redis_aof_delayed_fsync_total[5m]) &gt; 0
+  for: 5m
+  annotations:
+    summary: "AOF fsync 退化为主线程阻塞 (instance={{ $labels.instance }})"
+
+# 告警: fork 慢
+- alert: RedisForkSlow
+  expr: redis_latest_fork_usec &gt; 50000
+  annotations:
+    summary: "fork 耗时 &gt; 50ms (instance={{ $labels.instance }}),检查 THP"</code></pre>
+
+<!-- ============================================================ -->
+<h2 id="s18-9">18.9 陷阱与限制</h2>
+<!-- ============================================================ -->
+
+<h3>18.9.1 陷阱分类</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-9-1 · 四类 AOF 陷阱</div>
+  <svg viewBox="0 0 940 380" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="380" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="370" y="14" width="200" height="44" rx="10" fill="url(#d-red)" filter="url(#d-shadow)"/>
+      <text x="470" y="38" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">AOF 陷阱</text>
+      <text x="470" y="52" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">9 项 / 4 类</text>
+
+      <line x1="470" y1="58" x2="160" y2="100" stroke="var(--diagram-border)" stroke-width="1.5"/>
+      <line x1="470" y1="58" x2="380" y2="100" stroke="var(--diagram-border)" stroke-width="1.5"/>
+      <line x1="470" y1="58" x2="600" y2="100" stroke="var(--diagram-border)" stroke-width="1.5"/>
+      <line x1="470" y1="58" x2="800" y2="100" stroke="var(--diagram-border)" stroke-width="1.5"/>
+
+      <rect x="40"  y="100" width="240" height="40" rx="8" fill="url(#d-orange)"/>
+      <text x="160" y="125" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">① 容量类(2)</text>
+
+      <rect x="280" y="100" width="200" height="40" rx="8" fill="url(#d-purple)"/>
+      <text x="380" y="125" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">② 性能类(3)</text>
+
+      <rect x="500" y="100" width="200" height="40" rx="8" fill="url(#d-blue)"/>
+      <text x="600" y="125" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">③ 一致性类(2)</text>
+
+      <rect x="720" y="100" width="200" height="40" rx="8" fill="url(#d-green)"/>
+      <text x="820" y="125" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">④ 运维类(2)</text>
+
+      <g font-size="10">
+        <rect x="40" y="148" width="240" height="40" rx="4" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+        <text x="50" y="166" fill="var(--diagram-orange-text)">A1. AOF 无限膨胀</text>
+        <text x="50" y="180" fill="var(--diagram-muted)" font-size="9">未调 auto-aof-rewrite-percentage</text>
+
+        <rect x="40" y="192" width="240" height="40" rx="4" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
+        <text x="50" y="210" fill="var(--diagram-orange-text)">A2. 重写期间磁盘占用翻倍</text>
+        <text x="50" y="224" fill="var(--diagram-muted)" font-size="9">旧 + 新 BASE 共存</text>
+
+        <rect x="280" y="148" width="200" height="40" rx="4" fill="var(--diagram-red-fill)" stroke="var(--diagram-purple-stroke)"/>
+        <text x="290" y="166" fill="var(--diagram-purple-text)">B1. always 吞吐崩塌</text>
+        <text x="290" y="180" fill="var(--diagram-muted)" font-size="9">100k → 8k ops/s</text>
+
+        <rect x="280" y="192" width="200" height="40" rx="4" fill="var(--diagram-red-fill)" stroke="var(--diagram-purple-stroke)"/>
+        <text x="290" y="210" fill="var(--diagram-purple-text)">B2. everysec 退化阻塞</text>
+        <text x="290" y="224" fill="var(--diagram-muted)" font-size="9">aof_delayed_fsync ↑</text>
+
+        <rect x="280" y="236" width="200" height="40" rx="4" fill="var(--diagram-red-fill)" stroke="var(--diagram-purple-stroke)"/>
+        <text x="290" y="254" fill="var(--diagram-purple-text)">B3. 重写 CoW 内存放大</text>
+        <text x="290" y="268" fill="var(--diagram-muted)" font-size="9">+ rewrite_buf 双倍</text>
+
+        <rect x="500" y="148" width="200" height="40" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+        <text x="510" y="166" fill="var(--diagram-blue-text)">C1. 空 Master 重启</text>
+        <text x="510" y="180" fill="var(--diagram-muted)" font-size="9">污染 Replica AOF</text>
+
+        <rect x="500" y="192" width="200" height="40" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+        <text x="510" y="210" fill="var(--diagram-blue-text)">C2. AOF 文件损坏</text>
+        <text x="510" y="224" fill="var(--diagram-muted)" font-size="9">启动失败 / 截断丢命令</text>
+
+        <rect x="720" y="148" width="200" height="40" rx="4" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="730" y="166" fill="var(--diagram-green-text)">D1. 仅备份 .aof</text>
+        <text x="730" y="180" fill="var(--diagram-muted)" font-size="9">遗漏 manifest 不可用</text>
+
+        <rect x="720" y="192" width="200" height="40" rx="4" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+        <text x="730" y="210" fill="var(--diagram-green-text)">D2. redis-check-aof 误用</text>
+        <text x="730" y="224" fill="var(--diagram-muted)" font-size="9">无备份直接 fix 截尾</text>
+      </g>
+
+      <rect x="40" y="296" width="880" height="34" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="480" y="314" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="800">关键防御</text>
+      <text x="480" y="328" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">auto-aof-rewrite-percentage 调优 + 监控 aof_delayed_fsync + Master 必开 AOF + manifest 一并备份 + check-aof 前先 cp</text>
+
+      <rect x="40" y="338" width="880" height="34" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="480" y="356" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="800">监控信号</text>
+      <text x="480" y="370" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">aof_current_size / aof_base_size / aof_delayed_fsync / aof_last_write_status / aof_last_bgrewrite_status</text>
+    </g>
+  </svg>
+</div>
+
+<h3>18.9.2 陷阱速查表</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 18-9-2 · 七类典型陷阱</div>
+  <table class="data-table">
+    <thead>
+      <tr><th>#</th><th>陷阱</th><th>症状</th><th>根因</th><th>修复</th><th>监控指标</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1</td><td>AOF 无限膨胀</td><td>磁盘写满,write ENOSPC</td><td><code>auto-aof-rewrite-percentage 0</code> 禁用自动重写</td><td>立即 BGREWRITEAOF,恢复 percentage 配置</td><td><code>aof_current_size</code> 增长趋势</td></tr>
+      <tr><td>2</td><td>always 吞吐崩塌</td><td>OPS 从 10 万降至 8 千</td><td>fsync 同步阻塞主线程</td><td>改为 everysec</td><td>OPS / fsync 延迟</td></tr>
+      <tr><td>3</td><td>everysec 阻塞</td><td>P99 偶发尖刺</td><td>bio fsync 延迟 &gt; 2 秒,主线程等待</td><td>AOF 独立磁盘,排查 I/O 竞争</td><td><code>aof_delayed_fsync</code> 增量</td></tr>
+      <tr><td>4</td><td>重写 CoW 放大</td><td>内存峰值翻倍,触发 OOM</td><td>写流量高 × 重写持续时间</td><td>业务低峰手动重写,上调 <code>auto-aof-rewrite-min-size</code></td><td><code>latest_fork_usec</code> / 内存峰值</td></tr>
+      <tr><td>5</td><td>Master 无持久化重启</td><td>重启后 keyspace 空,Replica 也清空</td><td>Master 全量同步空 RDB 给 Replica</td><td>Master 必须持久化或配 Sentinel 提升 Replica</td><td><code>aof_enabled</code> 配置审计</td></tr>
+      <tr><td>6</td><td>AOF 损坏</td><td>启动报"Bad file format"</td><td>断电导致末尾命令半写入</td><td>备份后 <code>redis-check-aof --fix manifest</code></td><td>启动日志监控</td></tr>
+      <tr><td>7</td><td>备份遗漏 manifest</td><td>恢复时无法识别 BASE/INCR</td><td>仅 cp 单个 .aof 文件</td><td>备份整个 appendonlydir</td><td>备份脚本审计</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>18.9.3 redis-check-aof 修复流程</h3>
+
+<pre><code class="language-bash"># 正确的损坏修复流程
+
+# 1. 先备份(必须,fix 是有损操作)
+cp -a appendonlydir appendonlydir.bak.$(date +%Y%m%d-%H%M%S)
+
+# 2. Redis 7 Multi-Part AOF
+redis-check-aof --fix appendonlydir/appendonly.aof.manifest
+
+# 3. Redis 6 单文件 AOF
+redis-check-aof --fix appendonly.aof
+
+# 4. 启动验证
+redis-server redis.conf
+
+# 5. 验证 keyspace 完整性 (业务侧)
+redis-cli DBSIZE
+redis-cli --scan --pattern '*' | wc -l</code></pre>
+
+<div class="warning">
+  <strong>不可逆操作:</strong> <code>redis-check-aof --fix</code> 的物理动作是<strong>截断到最后一条完整命令,丢弃半写入的尾部</strong>。该操作不可逆,<strong>无备份直接 fix 等同于丢失数据</strong>。
+</div>
+
+<h3>18.9.4 反模式与修复对比</h3>
+
+<div class="compare-grid">
+  <div class="compare-card bad">
+    <h4>❌ 反模式 · 备份单文件</h4>
+<pre><code class="language-bash"># 旧脚本沿用 Redis 6 思路
+cp /var/lib/redis/appendonly.aof  /backup/
+
+# Redis 7 实际位置:
+ls /var/lib/redis/appendonlydir/
+# appendonly.aof.1.base.rdb
+# appendonly.aof.1.incr.aof
+# appendonly.aof.manifest        ← 缺这个就无法识别!
+
+# 恢复时:
+cp /backup/appendonly.aof /var/lib/redis/
+redis-server redis.conf  # 启动失败:no manifest</code></pre>
+    <p>Redis 7 把 AOF 拆成多文件 + manifest,只备份单文件无法恢复。</p>
+  </div>
+  <div class="compare-card good">
+    <h4>✅ 正确做法 · 备份整个目录</h4>
+<pre><code class="language-bash">#!/bin/bash
+# /etc/cron.daily/redis-backup
+TS=$(date +%Y%m%d-%H%M%S)
+SRC=/var/lib/redis/appendonlydir
+DST=/backup/redis-$TS
+
+# 触发最新重写(可选,减小备份体积)
+redis-cli BGREWRITEAOF
+
+# 等重写完成
+while [ "$(redis-cli INFO persistence | grep aof_rewrite_in_progress)" = "aof_rewrite_in_progress:1" ]; do
+  sleep 2
+done
+
+# 备份整个目录(含 manifest)
+cp -a $SRC $DST
+
+# 校验
+ls $DST/*.manifest || { echo "ERROR: manifest missing"; exit 1; }</code></pre>
+    <p>Redis 7 备份必须以 <code>appendonlydir</code> 整目录为单位,保留 BASE+INCR+manifest 三部分。</p>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s18-10">18.10 源码深潜</h2>
+<!-- ============================================================ -->
+
+<h3>18.10.1 AOF 调用链</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 18-10-1 · AOF 写入完整源码调用链</div>
+  <svg viewBox="0 0 940 480" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="480" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-monospace,Consolas">
+      <rect x="20"  y="14" width="160" height="32" rx="6" fill="url(#d-blue)"/>
+      <text x="100" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">call()</text>
+      <line x1="100" y1="46" x2="100" y2="470" stroke="var(--diagram-blue-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="200" y="14" width="180" height="32" rx="6" fill="url(#d-purple)"/>
+      <text x="290" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">feedAppendOnlyFile</text>
+      <line x1="290" y1="46" x2="290" y2="470" stroke="var(--diagram-purple-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="400" y="14" width="140" height="32" rx="6" fill="url(#d-orange)"/>
+      <text x="470" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">aof_buf</text>
+      <line x1="470" y1="46" x2="470" y2="470" stroke="var(--diagram-orange-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="560" y="14" width="180" height="32" rx="6" fill="url(#d-green)"/>
+      <text x="650" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">flushAppendOnlyFile</text>
+      <line x1="650" y1="46" x2="650" y2="470" stroke="var(--diagram-green-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <rect x="760" y="14" width="160" height="32" rx="6" fill="url(#d-red)"/>
+      <text x="840" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">bio_aof_fsync</text>
+      <line x1="840" y1="46" x2="840" y2="470" stroke="var(--diagram-red-stroke)" stroke-width="1" stroke-dasharray="3 3"/>
+
+      <path d="M105,76 L285,76" stroke="var(--diagram-blue-stroke)" stroke-width="2" marker-end="url(#d-arr-b)"/>
+      <text x="190" y="70" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">① 命令成功执行后</text>
+
+      <path d="M285,104 C 250,104 250,124 285,124" stroke="var(--diagram-purple-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr)"/>
+      <text x="190" y="116" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">② catAppendOnlyGenericCommand</text>
+
+      <path d="M295,148 L465,148" stroke="var(--diagram-orange-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <text x="380" y="142" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">③ sdscat(RESP) → 追加到 aof_buf</text>
+
+      <rect x="20" y="170" width="900" height="20" rx="4" fill="var(--diagram-red-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="470" y="184" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">命令路径返回 +OK,数据仍仅在 aof_buf(RAM)</text>
+
+      <rect x="20" y="200" width="900" height="22" rx="4" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="470" y="216" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10" font-weight="700">事件循环 beforeSleep 钩子触发 — flushAppendOnlyFile 启动</text>
+
+      <path d="M465,244 L645,244" stroke="var(--diagram-orange-stroke)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#d-arr-g)"/>
+      <text x="555" y="238" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">④ 取出 aof_buf 内容</text>
+
+      <path d="M645,272 C 610,272 610,292 645,292" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="540" y="284" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">⑤ write(aof_fd, buf, len) → page cache</text>
+
+      <path d="M645,316 C 610,316 610,336 645,336" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#d-arr-g)"/>
+      <text x="540" y="328" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">⑥ sdsclear(aof_buf) 重置缓冲区</text>
+
+      <rect x="200" y="358" width="280" height="44" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="340" y="378" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="800">分支 A · always</text>
+      <text x="340" y="394" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">主线程直接 aof_fsync(同步阻塞)</text>
+
+      <path d="M480,378 L645,378" stroke="var(--diagram-red-stroke)" stroke-width="2" marker-end="url(#d-arr-r)"/>
+      <text x="570" y="372" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">主线程 fsync</text>
+
+      <rect x="500" y="412" width="380" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="690" y="432" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="800">分支 B · everysec</text>
+      <text x="690" y="448" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">bioCreateFsyncJob → bio 后台线程异步 aof_fsync</text>
+
+      <path d="M650,420 L835,420" stroke="var(--diagram-green-stroke)" stroke-width="2" stroke-dasharray="3 3" marker-end="url(#d-arr-g)"/>
+      <text x="745" y="414" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">提交任务</text>
+    </g>
+  </svg>
+</div>
+
+<h3>18.10.2 核心源码入口</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 18-10-2 · 关键函数与职责</div>
+  <table class="data-table">
+    <thead>
+      <tr><th>文件</th><th>函数/结构</th><th>运行时职责</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>src/aof.c</code></td><td><code>feedAppendOnlyFile()</code></td><td>命令成功后转 RESP 追加到 aof_buf</td></tr>
+      <tr><td><code>src/aof.c</code></td><td><code>flushAppendOnlyFile()</code></td><td>beforeSleep 触发的 write + 策略性 fsync</td></tr>
+      <tr><td><code>src/aof.c</code></td><td><code>aof_fsync()</code></td><td>always 主线程同步刷盘</td></tr>
+      <tr><td><code>src/aof.c</code></td><td><code>rewriteAppendOnlyFileBackground()</code></td><td>fork 子进程重写入口</td></tr>
+      <tr><td><code>src/aof.c</code></td><td><code>rewriteAppendOnlyFile()</code></td><td>子进程遍历 keyspace 生成新 BASE</td></tr>
+      <tr><td><code>src/aof.c</code></td><td><code>aofManifest</code> / <code>aofLoadManifestFromDisk()</code></td><td>Multi-Part AOF 清单管理</td></tr>
+      <tr><td><code>src/bio.c</code></td><td><code>bioProcessBackgroundJobs(BIO_AOF_FSYNC)</code></td><td>everysec 后台 fsync 循环</td></tr>
+      <tr><td><code>src/server.c</code></td><td><code>serverCron()</code></td><td>检查自动重写条件、回收子进程</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>18.10.3 feedAppendOnlyFile 后写日志核心</h3>
+
+<pre><code class="language-c">/* aof.c: feedAppendOnlyFile - 后写日志的核心
+ * 仅在命令成功执行后被调用 */
+void feedAppendOnlyFile(int dictid, robj **argv, int argc) {
+    sds buf = sdsempty();
+    if (dictid != server.aof_selected_db) {
+        /* DB 切换记录 */
+        char seldb[64];
+        snprintf(seldb, sizeof(seldb), "%d", dictid);
+        buf = sdscatprintf(buf, "*2\r\n$6\r\nSELECT\r\n$%lu\r\n%s\r\n",
+            (unsigned long)strlen(seldb), seldb);
+        server.aof_selected_db = dictid;
+    }
+    /* 命令编码为 RESP */
+    buf = catAppendOnlyGenericCommand(buf, argc, argv);
+    /* 追加到 aof_buf */
+    if (server.aof_state == AOF_ON ||
+        server.aof_state == AOF_WAIT_REWRITE)
+        server.aof_buf = sdscatlen(server.aof_buf, buf, sdslen(buf));
+    sdsfree(buf);
+}</code></pre>
+
+<h3>18.10.4 flushAppendOnlyFile 三策略统一入口</h3>
+
+<pre><code class="language-c">/* aof.c: flushAppendOnlyFile - 三策略统一入口
+ * beforeSleep 阶段调用 */
+void flushAppendOnlyFile(int force) {
+    ssize_t nwritten;
+    if (sdslen(server.aof_buf) == 0) return;
+
+    nwritten = aofWrite(server.aof_fd, server.aof_buf,
+                        sdslen(server.aof_buf));
+    if (nwritten != (ssize_t)sdslen(server.aof_buf)) {
+        /* write 失败处理: 标记 last_write_status,拒绝后续写 */
+        server.aof_last_write_status = C_ERR;
+        return;
+    }
+    server.aof_current_size += nwritten;
+    sdsclear(server.aof_buf);
+
+    if (server.aof_fsync == AOF_FSYNC_ALWAYS) {
+        redis_fsync(server.aof_fd);
+        server.aof_fsync_offset = server.aof_current_size;
+        server.aof_last_fsync = server.unixtime;
+    } else if ((server.aof_fsync == AOF_FSYNC_EVERYSEC &amp;&amp;
+                server.unixtime &gt; server.aof_last_fsync)) {
+        /* 提交后台 fsync */
+        if (!sync_in_progress) aof_background_fsync(server.aof_fd);
+    }
+}</code></pre>
+
+<h3>18.10.5 设计取舍</h3>
+
+<p>AOF 选择"<strong>后写日志</strong>"是为了保持命令日志的语义清洁:仅记录已生效的修改,避免恢复路径处理无效命令。代价是 apply-log 之间的窗口需要错误状态保护(<code>aof_last_write_status</code>),write 失败时 Redis 拒绝所有写命令直至 AOF 恢复。</p>
+
+<p><code>appendfsync everysec</code> 是默认策略的根本原因是<strong>吞吐与丢失窗口的非线性关系</strong>:从 always 到 everysec,丢失窗口从"已 fsync 命令通常不丢"放宽到"约 1 秒",但吞吐量从 8,000 ops/s 提升至 105,000 ops/s,提升约 13 倍。该非线性来源于 fsync 是每命令同步操作时的放大效应。</p>
+
+<p>Redis 7 Multi-Part AOF 的设计动机是<strong>简化重写期间的状态管理</strong>。Redis 6 单文件方案需要重写期间双写到旧 AOF 与 rewrite_buf,切换瞬间将 rewrite_buf 拼接进新文件并 rename;该流程在主线程引入了"拼接 + rename"的不可中断段,且 aof_rewrite_buf 在写流量大时可达数百 MB。Multi-Part 方案将 BASE 与 INCR 物理分离,父进程始终只写 INCR,子进程仅写 BASE,切换从 rename 简化为更新 manifest,主线程影响显著降低。</p>
+
+<!-- ============================================================ -->
+<h2 id="s18-summary">18.11 本章要点</h2>
+<!-- ============================================================ -->
+
+<div class="chapter-summary">
+  <table class="data-table">
+    <thead>
+      <tr><th>#</th><th>要点</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1</td><td>AOF 是<strong>后写日志</strong>:仅记录成功执行的命令,与传统 WAL(预写日志)方向相反</td></tr>
+      <tr><td>2</td><td>三阶段管道:命令执行 → <code>aof_buf</code> 追加 → <code>write</code> 至 page cache → <code>fsync</code> 落盘</td></tr>
+      <tr><td>3</td><td><code>appendfsync</code> 三策略:<code>always</code>(每命令 fsync,吞吐 ~8k)、<code>everysec</code>(后台每秒,~100k,<strong>默认推荐</strong>)、<code>no</code>(交内核,丢失 30 秒)</td></tr>
+      <tr><td>4</td><td><code>aof_delayed_fsync</code> 是 <code>everysec</code> 退化为主线程阻塞的<strong>早期信号</strong>,单位时间增量 &gt; 0 立即告警</td></tr>
+      <tr><td>5</td><td>BGREWRITEAOF 通过 <strong>fork + 子进程遍历 keyspace</strong> 生成最小等价命令,父进程继续接受新写并独立追加到 INCR</td></tr>
+      <tr><td>6</td><td>Redis 7 Multi-Part AOF 将单文件拆为 <strong>BASE + INCR + manifest</strong>,切换从 rename 简化为 manifest 更新</td></tr>
+      <tr><td>7</td><td>混合持久化(<code>aof-use-rdb-preamble yes</code>)通过 RDB 二进制 BASE 加 RESP 增量 INCR,恢复速度从 <strong>25 秒降至 5 秒</strong>(10M keys)</td></tr>
+      <tr><td>8</td><td>Master 关闭 AOF 必须配合 Sentinel/Cluster 自动 failover,否则空 Master 重启会通过全量同步污染 Replica</td></tr>
+      <tr><td>9</td><td>备份单位是<strong>整个 appendonlydir 目录</strong>,仅备份单个 .aof 文件会遗漏 manifest 导致无法恢复</td></tr>
+      <tr><td>10</td><td>重写期间 <strong>CoW 复制 + aof_rewrite_buf</strong> 可使内存峰值翻倍,生产环境建议业务低峰手动触发或上调 <code>auto-aof-rewrite-min-size</code></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>最小回归测试</h3>
+
+<pre><code class="language-bash"># 1. 启用 AOF + 混合持久化
+redis-cli CONFIG SET appendonly yes
+redis-cli CONFIG SET appendfsync everysec
+redis-cli CONFIG SET aof-use-rdb-preamble yes
+
+# 2. 写入测试数据
+for i in $(seq 1 10000); do redis-cli SET "k:$i" "v$i" &gt; /dev/null; done
+
+# 3. 触发重写
+redis-cli BGREWRITEAOF
+
+# 4. 检查文件结构
+ls -lh /var/lib/redis/appendonlydir/
+# 期望: appendonly.aof.N.base.rdb + appendonly.aof.N.incr.aof + appendonly.aof.manifest
+
+# 5. 检查指标
+redis-cli INFO persistence | grep -E "aof_enabled|aof_last_write_status|aof_delayed_fsync|aof_current_size|aof_base_size"
+
+# 6. 模拟重启(本地测试)
+redis-cli SHUTDOWN
+redis-server redis.conf
+redis-cli DBSIZE   # 期望: 10000</code></pre>
+
+<h3>章末总结</h3>
+
+<p>第 17 章 RDB + 第 18 章 AOF 共同构成 Redis 的持久化层:</p>
+<ul>
+  <li><strong>RDB</strong>:周期性二进制快照,恢复快、文件小,但丢失窗口大(5-15 分钟);</li>
+  <li><strong>AOF</strong>:命令日志,丢失窗口小(1 秒)、可读,但恢复慢、文件大;</li>
+  <li><strong>混合持久化</strong>:RDB 做 BASE + AOF 做 INCR,集两者优点。</li>
+</ul>
+
+<h3>下一章预告</h3>
+
+<p>第 19 章讨论 <strong>ae 事件循环</strong>的实现细节,这是主线程命令执行、后台 fsync 提交、客户端 I/O 调度三者协同的核心机制。本章里 <code>beforeSleep</code> 与 <code>bio_aof_fsync</code> 协作的时机,在第 19 章会展开到 <code>aeEventLoop</code> 结构与 epoll/kqueue 多路复用的具体调用栈。</p>
+
+</div>
+
+<p class="footer">&copy; 2026 图解 Redis &middot; 第 18 章 &middot; AOF 持久化</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/c.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){setTimeout(function(){document.querySelectorAll('.diagram svg').forEach(function(svg){var h=parseInt(svg.getAttribute('height')||svg.getBoundingClientRect().height);if(h>500){svg.style.maxHeight='500px';svg.style.width='auto';var p=svg.closest('.diagram');if(p)p.style.overflowX='auto';}});},1500);});</script>
+</body>
+</html>

@@ -1,0 +1,1377 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.30 Pub/Sub 与 Sharded Pub/Sub — 图解 Redis</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute;" aria-hidden="true">
+<defs>
+  <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-muted)"/>
+  </marker>
+  <marker id="arr-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-green-stroke)"/>
+  </marker>
+  <marker id="arr-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-red-stroke)"/>
+  </marker>
+  <linearGradient id="g-purple" x1="0%" y1="0%" x2="100%" y2="100%">
+    <stop offset="0%" stop-color="var(--diagram-purple-fill-start)"/><stop offset="100%" stop-color="var(--diagram-purple-fill-end)"/>
+  </linearGradient>
+  <linearGradient id="g-blue" x1="0%" y1="0%" x2="100%" y2="100%">
+    <stop offset="0%" stop-color="var(--diagram-blue-fill-start)"/><stop offset="100%" stop-color="var(--diagram-blue-fill-end)"/>
+  </linearGradient>
+  <linearGradient id="g-green" x1="0%" y1="0%" x2="100%" y2="100%">
+    <stop offset="0%" stop-color="var(--diagram-green-fill-start)"/><stop offset="100%" stop-color="var(--diagram-green-fill-end)"/>
+  </linearGradient>
+  <linearGradient id="g-amber" x1="0%" y1="0%" x2="100%" y2="100%">
+    <stop offset="0%" stop-color="var(--diagram-orange-fill-start)"/><stop offset="100%" stop-color="var(--diagram-orange-fill-end)"/>
+  </linearGradient>
+  <linearGradient id="g-red" x1="0%" y1="0%" x2="100%" y2="100%">
+    <stop offset="0%" stop-color="var(--diagram-red-fill-start)"/><stop offset="100%" stop-color="var(--diagram-red-fill-end)"/>
+  </linearGradient>
+  <linearGradient id="g-slate" x1="0%" y1="0%" x2="100%" y2="100%">
+    <stop offset="0%" stop-color="var(--diagram-surface)"/><stop offset="100%" stop-color="var(--diagram-blue-fill-end)"/>
+  </linearGradient>
+  <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
+    <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="var(--diagram-text)" flood-opacity="0.45"/>
+  </filter>
+</defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Redis</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="29-lua.html">上一章</a>
+  <a href="31-stream.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s30-0">30.0 章首速览</a>
+  <a href="#s30-1">30.1 解决的问题</a>
+  <a href="#s30-2">30.2 核心数据结构</a>
+  <a href="#s30-3">30.3 SUBSCRIBE/PUBLISH</a>
+  <a href="#s30-4">30.4 PSUBSCRIBE 与 glob</a>
+  <a href="#s30-5">30.5 fire-and-forget</a>
+  <a href="#s30-6">30.6 Cluster 网络放大</a>
+  <a href="#s30-7">30.7 Sharded Pub/Sub</a>
+  <a href="#s30-8">30.8 跨系统比较</a>
+  <a href="#s30-9">30.9 多部署模式</a>
+  <a href="#s30-10">30.10 性能与基线</a>
+  <a href="#s30-11">30.11 陷阱与最佳实践</a>
+  <a href="#s30-12">30.12 源码深潜</a>
+  <a href="#s30-summary">30.13 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 30 章 · Pub/Sub 与 Sharded Pub/Sub</h1>
+<p class="subtitle">双向索引 · glob 匹配 · fire-and-forget · Cluster Bus 网络放大 · Sharded 路由 · 慢消费者治理</p>
+
+<div class="chapter-intro">
+  <p class="lead">Redis 的发布订阅由 <strong>两个 dict 加一个 list</strong> 实现完整的 channel/pattern 订阅模型,语义是 <em>fire-and-forget</em>:消息不持久化、不堆积、无 ACK,投递语义是 <strong>at-most-once</strong>。这种设计在单节点上提供低于毫秒的投递延迟,代价是任何环节(订阅者离线、缓冲溢出、消费者 crash)都可能丢消息。</p>
+  <p>在 Cluster 模式下,普通 <code>PUBLISH</code> 通过 Cluster Bus 广播到所有节点,产生 <strong>O(N) 网络放大</strong>;Redis 7.0 引入 <strong>Sharded Pub/Sub</strong>(<code>SPUBLISH</code>/<code>SSUBSCRIBE</code>),把 channel 当成 key 计算 slot,消息仅在归属节点投递,网络放大降至 O(1)。Pub/Sub 与 Stream 共同覆盖 Redis 的消息光谱:Pub/Sub 选择极致延迟与简单性,Stream 提供 backlog/ACK/offset/consumer group,牺牲部分延迟换取可靠投递。</p>
+  <ul class="will-learn">
+    <li>服务端 <code>pubsub_channels</code> dict + <code>pubsub_patterns</code> list + 客户端镜像的双向索引设计,以及为何这样选</li>
+    <li><code>SUBSCRIBE</code>/<code>PUBLISH</code>/<code>PSUBSCRIBE</code> 的 C 源码核心路径与 O(1)/O(S+P×M) 复杂度推导</li>
+    <li>glob 通配符 <code>* ? [abc] [a-z]</code> 的递归回溯匹配,以及为何 pattern 不用 dict 索引</li>
+    <li>fire-and-forget 在 <strong>订阅者离线/缓冲溢出/消费者 crash</strong> 三个时点的消息丢失模型</li>
+    <li>Cluster 模式下 PUBLISH 的 O(N-1) Bus 放大公式,N=12 / N=100 的带宽估算</li>
+    <li>Sharded Pub/Sub 的 slot 路由、MOVED 重定向、slot 迁移期的订阅中断处理</li>
+    <li>Redis Pub/Sub vs MQTT / RabbitMQ / Kafka / PG NOTIFY / NATS Core 的六维对比矩阵</li>
+    <li>主从复制中 PUBLISH 不经复制流的设计原因,以及"客户端必须连主"的工程结论</li>
+    <li>慢消费者的 <code>client-output-buffer-limit pubsub 32mb 8mb 60</code> 治理 + <code>CLIENT LIST</code> 观测路径</li>
+    <li>大 fan-out 场景 P99 延迟从 0.5ms → 60ms 的退化曲线 + 分层架构(Redis → Kafka → 终端)的取舍</li>
+    <li>客户端自动重订阅模板:指数退避 + socket_keepalive + health_check 三件套</li>
+    <li>Sentinel 自身使用 <code>__sentinel__:hello</code> 做服务发现的设计动机</li>
+  </ul>
+  <p class="prereq">前置知识:第 4 章 dict 渐进 rehash(理解 dictAdd/dictFind 复杂度);第 27 章 Cluster(理解 Bus、slot、MOVED);第 31 章 Stream(对比 backlog/ACK);第 25 章 主从复制(理解 PSYNC 与复制流);TCP 输出缓冲与背压基础;客户端重连退避策略基础。</p>
+</div>
+
+<h3>本章全景图</h3>
+
+<p class="svg-title">图 30-0 · 本章导览 — 12 节地图</p>
+<svg class="svg-diagram" viewBox="0 0 920 370" xmlns="http://www.w3.org/2000/svg">
+  <g filter="url(#shadow)">
+    <rect x="350" y="14" width="220" height="48" rx="10" fill="url(#g-purple)" stroke="var(--diagram-purple-stroke)"/>
+    <text x="460" y="44" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="700">第 30 章 · Pub/Sub 全景</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="20"  y="100" width="170" height="46" rx="9" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="105" y="128" text-anchor="middle" fill="var(--diagram-text)" font-size="13">§30.1 解决的问题</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="210" y="100" width="170" height="46" rx="9" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="295" y="128" text-anchor="middle" fill="var(--diagram-text)" font-size="13">§30.2 双向索引</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="400" y="100" width="170" height="46" rx="9" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/>
+    <text x="485" y="128" text-anchor="middle" fill="var(--diagram-text)" font-size="13">§30.3 SUB/PUB 实现</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="590" y="100" width="170" height="46" rx="9" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/>
+    <text x="675" y="128" text-anchor="middle" fill="var(--diagram-text)" font-size="13">§30.4 PSUB 与 glob</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="780" y="100" width="130" height="46" rx="9" fill="url(#g-red)" stroke="var(--diagram-red-stroke)"/>
+    <text x="845" y="128" text-anchor="middle" fill="var(--diagram-text)" font-size="13">§30.5 丢消息</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="20"  y="180" width="170" height="46" rx="9" fill="url(#g-amber)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="105" y="208" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="600">§30.6 Cluster 放大</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="210" y="180" width="170" height="46" rx="9" fill="url(#g-amber)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="295" y="208" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="600">§30.7 Sharded Pub/Sub</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="400" y="180" width="170" height="46" rx="9" fill="url(#g-amber)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="485" y="208" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="600">§30.8 跨系统比较</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="590" y="180" width="170" height="46" rx="9" fill="url(#g-amber)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="675" y="208" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="600">§30.9 多部署模式</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="780" y="180" width="130" height="46" rx="9" fill="url(#g-amber)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="845" y="208" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="600">§30.10 基线</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="210" y="260" width="170" height="46" rx="9" fill="url(#g-red)" stroke="var(--diagram-red-stroke)"/>
+    <text x="295" y="288" text-anchor="middle" fill="var(--diagram-text)" font-size="13">§30.11 陷阱</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="400" y="260" width="170" height="46" rx="9" fill="url(#g-slate)" stroke="var(--diagram-border)"/>
+    <text x="485" y="288" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="13">§30.12 源码深潜</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="590" y="260" width="170" height="46" rx="9" fill="url(#g-slate)" stroke="var(--diagram-border)"/>
+    <text x="675" y="288" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="13">§30.13 本章要点</text>
+  </g>
+  <path d="M460,62 L460,80 L105,80 L105,100"  stroke="var(--diagram-border)" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  <path d="M460,62 L460,80 L295,80 L295,100"  stroke="var(--diagram-border)" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  <path d="M460,62 L460,80 L485,80 L485,100"  stroke="var(--diagram-border)" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  <path d="M460,62 L460,80 L675,80 L675,100"  stroke="var(--diagram-border)" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  <path d="M460,62 L460,80 L845,80 L845,100"  stroke="var(--diagram-border)" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  <path d="M105,146 L105,180" stroke="var(--diagram-border)" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  <path d="M295,146 L295,180" stroke="var(--diagram-border)" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  <path d="M485,146 L485,180" stroke="var(--diagram-border)" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  <path d="M675,146 L675,180" stroke="var(--diagram-border)" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  <path d="M845,146 L845,180" stroke="var(--diagram-border)" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  <path d="M105,226 L105,242 L295,242 L295,260" stroke="var(--diagram-border)" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  <path d="M675,226 L675,242 L485,242 L485,260" stroke="var(--diagram-border)" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+  <path d="M845,226 L845,242 L675,242 L675,260" stroke="var(--diagram-border)" stroke-width="1.2" fill="none" marker-end="url(#arr)"/>
+</svg>
+
+<h2 id="s30-0">30.0 章首速览</h2>
+
+<p>Pub/Sub 的全景可以用一张"发布路径分流图"概括:发布者只有一个动作 <code>PUBLISH</code> 或 <code>SPUBLISH</code>,但下方的分流路径和投递成本差别很大。</p>
+
+<p class="svg-title">图 30-0-1 · Pub/Sub 全景 — 发布路径分流</p>
+<svg class="svg-diagram" viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <g filter="url(#shadow)">
+    <rect x="380" y="10" width="160" height="44" rx="9" fill="url(#g-purple)" stroke="var(--diagram-purple-stroke)"/>
+    <text x="460" y="38" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="700">Publisher</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="370" y="80" width="180" height="44" rx="9" fill="url(#g-amber)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="460" y="108" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="600">发布方式分流</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="150" y="150" width="240" height="44" rx="9" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="270" y="178" text-anchor="middle" fill="var(--diagram-text)" font-size="13">PUBLISH channel msg — 全局广播</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="530" y="150" width="240" height="44" rx="9" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/>
+    <text x="650" y="178" text-anchor="middle" fill="var(--diagram-text)" font-size="13">SPUBLISH shard-channel — slot 路由</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="20"  y="230" width="170" height="64" rx="9" fill="url(#g-slate)" stroke="var(--diagram-border)"/>
+    <text x="105" y="256" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">本节点 pubsub_channels</text>
+    <text x="105" y="276" text-anchor="middle" fill="var(--diagram-muted)" font-size="11">dict: channel → list&lt;client&gt;</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="210" y="230" width="170" height="64" rx="9" fill="url(#g-slate)" stroke="var(--diagram-border)"/>
+    <text x="295" y="256" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">pubsub_patterns</text>
+    <text x="295" y="276" text-anchor="middle" fill="var(--diagram-muted)" font-size="11">list, glob 线性匹配</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="400" y="230" width="170" height="64" rx="9" fill="url(#g-red)" stroke="var(--diagram-red-stroke)"/>
+    <text x="485" y="256" text-anchor="middle" fill="var(--diagram-text)" font-size="12">Cluster Bus 广播</text>
+    <text x="485" y="276" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">O(N-1) 节点放大</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="590" y="230" width="170" height="64" rx="9" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/>
+    <text x="675" y="256" text-anchor="middle" fill="var(--diagram-text)" font-size="12">CRC16(channel) % 16384</text>
+    <text x="675" y="276" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">slot 路由,本地投递</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="780" y="230" width="130" height="64" rx="9" fill="url(#g-amber)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="845" y="256" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="600">slot owner?</text>
+    <text x="845" y="276" text-anchor="middle" fill="var(--diagram-muted)" font-size="11">否 → MOVED</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="200" y="340" width="200" height="44" rx="9" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="300" y="368" text-anchor="middle" fill="var(--diagram-text)" font-size="13">SUBSCRIBE / PSUBSCRIBE 客户端</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="540" y="340" width="200" height="44" rx="9" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/>
+    <text x="640" y="368" text-anchor="middle" fill="var(--diagram-text)" font-size="13">SSUBSCRIBE 客户端</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="290" y="410" width="340" height="38" rx="9" fill="url(#g-red)" stroke="var(--diagram-red-stroke)"/>
+    <text x="460" y="434" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="600">语义边界: at-most-once, 无持久化, 无 ACK</text>
+  </g>
+  <path d="M460,54 L460,80" stroke="var(--diagram-border)" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+  <path d="M420,124 L270,150" stroke="var(--diagram-blue-stroke)" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+  <path d="M500,124 L650,150" stroke="var(--diagram-green-stroke)" stroke-width="1.6" fill="none" marker-end="url(#arr-g)"/>
+  <path d="M220,194 L105,230" stroke="var(--diagram-border)" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M270,194 L295,230" stroke="var(--diagram-border)" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M340,194 L485,230" stroke="var(--diagram-red-stroke)" stroke-width="1.4" fill="none" marker-end="url(#arr-r)"/>
+  <path d="M650,194 L675,230" stroke="var(--diagram-green-stroke)" stroke-width="1.4" fill="none" marker-end="url(#arr-g)"/>
+  <path d="M700,194 L845,230" stroke="var(--diagram-orange-stroke)" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M105,294 L105,320 L300,320 L300,340" stroke="var(--diagram-border)" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M295,294 L300,340" stroke="var(--diagram-border)" stroke-width="1.4" fill="none" marker-end="url(#arr)"/>
+  <path d="M675,294 L640,340" stroke="var(--diagram-green-stroke)" stroke-width="1.4" fill="none" marker-end="url(#arr-g)"/>
+  <path d="M300,384 L420,410" stroke="var(--diagram-red-stroke)" stroke-width="1.4" fill="none" marker-end="url(#arr-r)"/>
+  <path d="M640,384 L500,410" stroke="var(--diagram-red-stroke)" stroke-width="1.4" fill="none" marker-end="url(#arr-r)"/>
+</svg>
+
+<div class="key-insight">
+  <p><strong>一句话总览。</strong>普通 <code>PUBLISH</code> 走"本地 dict + pattern list + Cluster Bus 广播"三条路径;<code>SPUBLISH</code> 把 channel 当 key 走 slot 路由,只在 owner 节点投递。所有路径共享同一条 fire-and-forget 语义底线。</p>
+</div>
+
+<h2 id="s30-1">30.1 Pub/Sub 解决的问题</h2>
+
+<p>Pub/Sub 之所以存在,是为了把"客户端反复拉" 改成"事件来了主动推"。一个具体场景能立刻说明差距。</p>
+
+<p class="svg-title">图 30-1-1 · 轮询 vs 推送 — 50 实例感知配置变更的成本对比</p>
+<svg class="svg-diagram" viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
+  <g filter="url(#shadow)">
+    <rect x="20" y="14" width="420" height="40" rx="9" fill="url(#g-red)" stroke="var(--diagram-red-stroke)"/>
+    <text x="230" y="40" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="700">方式 1 · 客户端轮询 (每 100ms GET)</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="480" y="14" width="420" height="40" rx="9" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/>
+    <text x="690" y="40" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="700">方式 2 · Pub/Sub 推送 (一次 SUBSCRIBE)</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="40" y="80" width="180" height="46" rx="9" fill="url(#g-slate)" stroke="var(--diagram-border)"/>
+    <text x="130" y="108" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="13">QPS = 50 × 10 = 500/s</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="240" y="80" width="180" height="46" rx="9" fill="url(#g-slate)" stroke="var(--diagram-border)"/>
+    <text x="330" y="108" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="13">99% 返回 "未变化"</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="40" y="142" width="180" height="46" rx="9" fill="url(#g-amber)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="130" y="170" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="600">延迟 = 50-100 ms</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="240" y="142" width="180" height="46" rx="9" fill="url(#g-red)" stroke="var(--diagram-red-stroke)"/>
+    <text x="330" y="170" text-anchor="middle" fill="var(--diagram-text)" font-size="13">Redis CPU 持续占用</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="40" y="220" width="380" height="120" rx="9" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+    <text x="55" y="246" fill="var(--diagram-blue-text)" font-size="13" font-weight="700">局限</text>
+    <text x="55" y="270" fill="var(--diagram-muted)" font-size="12">• 缩短间隔 → 成本上升</text>
+    <text x="55" y="290" fill="var(--diagram-muted)" font-size="12">• 延长间隔 → 通知延迟上升</text>
+    <text x="55" y="310" fill="var(--diagram-muted)" font-size="12">• 无法兼顾低延迟与低成本</text>
+    <text x="55" y="332" fill="var(--diagram-red-text)" font-size="12" font-weight="600">→ 本质是浪费 99% 资源换 100ms 延迟</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="500" y="80" width="180" height="46" rx="9" fill="url(#g-slate)" stroke="var(--diagram-border)"/>
+    <text x="590" y="108" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="13">50 长连接, 无活跃流量</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="700" y="80" width="180" height="46" rx="9" fill="url(#g-slate)" stroke="var(--diagram-border)"/>
+    <text x="790" y="108" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="13">PUBLISH 时一次扇出</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="500" y="142" width="180" height="46" rx="9" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/>
+    <text x="590" y="170" text-anchor="middle" fill="var(--diagram-text)" font-size="13">延迟 &lt; 1 ms (RTT)</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="700" y="142" width="180" height="46" rx="9" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/>
+    <text x="790" y="170" text-anchor="middle" fill="var(--diagram-text)" font-size="13">无空轮询</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="500" y="220" width="380" height="120" rx="9" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+    <text x="515" y="246" fill="var(--diagram-blue-text)" font-size="13" font-weight="700">优势</text>
+    <text x="515" y="270" fill="var(--diagram-muted)" font-size="12">• 变更时才有流量,无浪费</text>
+    <text x="515" y="290" fill="var(--diagram-muted)" font-size="12">• 延迟接近零</text>
+    <text x="515" y="310" fill="var(--diagram-muted)" font-size="12">• 主动推送,无需客户端配合</text>
+    <text x="515" y="332" fill="var(--diagram-green-text)" font-size="12" font-weight="600">→ 本质是 push vs poll 的资源效率差</text>
+  </g>
+</svg>
+
+<p>Pub/Sub 适合"通知是状态而非历史"的场景,不适合需要可靠投递、负载均衡、回放历史的场景。下表把"该用"与"别用"分开。</p>
+
+<div class="compare-grid">
+<div>
+<h4 style="color:var(--green)">✓ 适用</h4>
+<ul>
+<li>配置变更广播(业务可容忍偶尔丢)</li>
+<li>实时仪表盘推送</li>
+<li>多实例缓存失效通知(有补偿机制)</li>
+<li>Sentinel 心跳与服务发现</li>
+<li>Streaming API(客户端在线接收)</li>
+</ul>
+</div>
+<div>
+<h4 style="color:var(--red)">✗ 不适用</h4>
+<ul>
+<li>订单/支付/库存等需要可靠投递</li>
+<li>消费者重启后从断点恢复</li>
+<li>消费者组负载均衡</li>
+<li>大集群高频消息(Cluster Bus 放大)</li>
+<li>需要回放历史(无 backlog)</li>
+</ul>
+</div>
+</div>
+
+<div class="key-insight">
+  <p><strong>选型口令。</strong>需要可靠投递时改用 Stream(<code>XADD</code> / <code>XREADGROUP</code> / <code>XACK</code>)或外部 MQ(Kafka / RabbitMQ / RocketMQ);Pub/Sub 的最佳位置就是"丢一条不会有人来追责"的场景。</p>
+</div>
+
+<h2 id="s30-2">30.2 核心数据结构</h2>
+
+<p>Pub/Sub 的核心结构只有三处:服务端的 <code>pubsub_channels</code> dict、<code>pubsub_patterns</code> list、<code>pubsubshard_channels</code> dict;每个客户端再镜像一份"自己订阅了什么"。</p>
+
+<pre><code class="language-c">/* server.h - redisServer 结构体相关字段 */
+struct redisServer {
+    dict *pubsub_channels;        /* channel → list&lt;client*&gt; */
+    list *pubsub_patterns;        /* list&lt;pubsubPattern&gt; */
+    dict *pubsubshard_channels;   /* Redis 7.0+ shard channel → list&lt;client*&gt; */
+};
+
+typedef struct pubsubPattern {
+    client *client;        /* 订阅此 pattern 的客户端 */
+    robj   *pattern;       /* glob 模式字符串 */
+} pubsubPattern;
+
+struct client {
+    dict *pubsub_channels;        /* 此客户端订阅的 channel 集合 */
+    list *pubsub_patterns;        /* 此客户端订阅的 pattern 列表 */
+    dict *pubsubshard_channels;   /* Redis 7.0+ */
+};</code></pre>
+
+<p class="svg-title">图 30-2-1 · 双向索引 — 服务端与客户端互相持有</p>
+<svg class="svg-diagram" viewBox="0 0 920 420" xmlns="http://www.w3.org/2000/svg">
+  <g filter="url(#shadow)">
+    <rect x="40" y="14" width="380" height="40" rx="9" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="230" y="40" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="700">服务端 redisServer (单向索引视角)</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="500" y="14" width="380" height="40" rx="9" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/>
+    <text x="690" y="40" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="700">客户端 (镜像索引视角)</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="40" y="80" width="180" height="80" rx="9" fill="url(#g-slate)" stroke="var(--diagram-border)"/>
+    <text x="130" y="106" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="13" font-weight="700">pubsub_channels</text>
+    <text x="130" y="128" text-anchor="middle" fill="var(--diagram-muted)" font-size="11">dict</text>
+    <text x="130" y="148" text-anchor="middle" fill="var(--diagram-muted)" font-size="11">channel → list&lt;client&gt;</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="240" y="80" width="180" height="80" rx="9" fill="url(#g-slate)" stroke="var(--diagram-border)"/>
+    <text x="330" y="106" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="13" font-weight="700">pubsub_patterns</text>
+    <text x="330" y="128" text-anchor="middle" fill="var(--diagram-muted)" font-size="11">list</text>
+    <text x="330" y="148" text-anchor="middle" fill="var(--diagram-muted)" font-size="11">{client, pattern}</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="140" y="180" width="180" height="60" rx="9" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/>
+    <text x="230" y="206" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">pubsubshard_channels</text>
+    <text x="230" y="226" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">Redis 7.0+ dict</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="40" y="280" width="380" height="38" rx="9" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+    <text x="60" y="304" fill="var(--diagram-blue-text)" font-size="12">news → [clientA, clientB]</text>
+    <text x="280" y="304" fill="var(--diagram-muted)" font-size="12">orders → [clientD]</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="40" y="324" width="380" height="38" rx="9" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+    <text x="60" y="348" fill="var(--diagram-blue-text)" font-size="12">pattern={news.*, client=clientC}</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="500" y="80" width="180" height="56" rx="9" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="590" y="104" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">clientA</text>
+    <text x="590" y="124" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">.pubsub_channels: news</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="700" y="80" width="180" height="56" rx="9" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="790" y="104" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">clientB</text>
+    <text x="790" y="124" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">.pubsub_channels: news</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="500" y="148" width="180" height="56" rx="9" fill="url(#g-amber)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="590" y="172" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">clientC</text>
+    <text x="590" y="192" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">.pubsub_patterns: news.*</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="700" y="148" width="180" height="56" rx="9" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/>
+    <text x="790" y="172" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">clientD</text>
+    <text x="790" y="192" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">.pubsubshard_channels: orders</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="500" y="240" width="380" height="120" rx="9" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+    <text x="515" y="266" fill="var(--diagram-blue-text)" font-size="13" font-weight="700">为何双向?</text>
+    <text x="515" y="290" fill="var(--diagram-muted)" font-size="12">客户端断连时,若仅 server 端持有索引,</text>
+    <text x="515" y="310" fill="var(--diagram-muted)" font-size="12">清理需遍历所有 channel × 订阅者链表;</text>
+    <text x="515" y="330" fill="var(--diagram-muted)" font-size="12">镜像后只需 O(此客户端订阅数) 精确移除。</text>
+    <text x="515" y="350" fill="var(--diagram-green-text)" font-size="12" font-weight="600">→ 空间换时间,与二级索引同构</text>
+  </g>
+  <path d="M130,160 L590,80" stroke="var(--diagram-blue-stroke)" stroke-width="1.2" fill="none" opacity="0.6"/>
+  <path d="M130,160 L790,80" stroke="var(--diagram-blue-stroke)" stroke-width="1.2" fill="none" opacity="0.6"/>
+  <path d="M330,160 L590,148" stroke="var(--diagram-orange-stroke)" stroke-width="1.2" fill="none" opacity="0.6"/>
+  <path d="M230,240 L790,148" stroke="var(--diagram-green-stroke)" stroke-width="1.2" fill="none" opacity="0.6"/>
+</svg>
+
+<p>"双向索引"是空间换时间的经典权衡。下表把单向与双向在四类操作上的成本对齐:</p>
+
+<table>
+<thead><tr><th>操作</th><th>单向 (仅 server 持有)</th><th>双向 (client 也持有)</th></tr></thead>
+<tbody>
+<tr><td>SUBSCRIBE channel</td><td>O(1)</td><td>O(1)</td></tr>
+<tr><td>PUBLISH channel</td><td>O(订阅者数)</td><td>O(订阅者数)</td></tr>
+<tr><td>UNSUBSCRIBE channel</td><td>O(1)</td><td>O(1)</td></tr>
+<tr><td><strong>断连清理</strong></td><td><strong>O(全部 channel)</strong></td><td><strong>O(此客户端订阅数)</strong></td></tr>
+<tr><td>内存开销</td><td>低</td><td>略高(双倍指针)</td></tr>
+</tbody>
+</table>
+
+<div class="key-insight">
+  <p><strong>设计同构。</strong>双向索引 = 数据库的二级索引:用一定空间换查询时间。Redis 在所有"反向需精确定位"的地方都用了这个模式(Cluster slot ↔ key 的反查、过期 key 的反查、复制 ID 的反查)。</p>
+</div>
+
+<h2 id="s30-3">30.3 SUBSCRIBE 与 PUBLISH 实现</h2>
+
+<p>核心实现都在 <code>pubsub.c</code> 中,大约 200 行。先看 SUBSCRIBE 的 4 步走。</p>
+
+<pre><code class="language-c">/* pubsub.c - 简化版 */
+int pubsubSubscribeChannel(client *c, robj *channel) {
+    /* 1. 加入客户端的 pubsub_channels */
+    if (dictAdd(c->pubsub_channels, channel, NULL) != DICT_OK)
+        return 0;  /* 已订阅,跳过 */
+    incrRefCount(channel);
+
+    /* 2. 在服务端 dict 中查找/创建该 channel 的客户端链表 */
+    list *clients;
+    dictEntry *de = dictFind(server.pubsub_channels, channel);
+    if (de == NULL) {
+        clients = listCreate();
+        dictAdd(server.pubsub_channels, channel, clients);
+        incrRefCount(channel);
+    } else {
+        clients = dictGetVal(de);
+    }
+
+    /* 3. 客户端追加到链表尾部 */
+    listAddNodeTail(clients, c);
+
+    /* 4. 回复客户端当前订阅总数 */
+    addReplyPubsubSubscribed(c, channel);
+    return 1;
+}</code></pre>
+
+<p class="svg-title">图 30-3-1 · SUBSCRIBE 4 步走 — 全程 O(1) 摊销</p>
+<svg class="svg-diagram" viewBox="0 0 920 230" xmlns="http://www.w3.org/2000/svg">
+  <g filter="url(#shadow)">
+    <rect x="20"  y="60" width="190" height="80" rx="10" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="115" y="86" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">1. dictAdd 到客户端</text>
+    <text x="115" y="108" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">c-&gt;pubsub_channels</text>
+    <text x="115" y="128" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">O(1) 摊销</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="250" y="60" width="190" height="80" rx="10" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="345" y="86" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">2. dictFind / 新建链表</text>
+    <text x="345" y="108" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">server.pubsub_channels</text>
+    <text x="345" y="128" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">O(1) 摊销</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="480" y="60" width="190" height="80" rx="10" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/>
+    <text x="575" y="86" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">3. listAddNodeTail</text>
+    <text x="575" y="108" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">追加到 tail</text>
+    <text x="575" y="128" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">O(1)</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="710" y="60" width="190" height="80" rx="10" fill="url(#g-amber)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="805" y="86" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">4. addReply 订阅总数</text>
+    <text x="805" y="108" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">回客户端</text>
+    <text x="805" y="128" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">O(1)</text>
+  </g>
+  <path d="M210,100 L250,100" stroke="var(--diagram-blue-stroke)" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+  <path d="M440,100 L480,100" stroke="var(--diagram-green-stroke)" stroke-width="1.6" fill="none" marker-end="url(#arr-g)"/>
+  <path d="M670,100 L710,100" stroke="var(--diagram-orange-stroke)" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+  <g filter="url(#shadow)">
+    <rect x="280" y="170" width="360" height="40" rx="9" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+    <text x="460" y="194" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="13">总成本 = O(1) 摊销 (rehash 期偶发 O(n))</text>
+  </g>
+</svg>
+
+<p>PUBLISH 分两个阶段:dict 找直接订阅者一次性投递,然后线性遍历 pattern list 做 glob 匹配。</p>
+
+<pre><code class="language-c">/* pubsub.c - 简化版 */
+int pubsubPublishMessageInternal(robj *channel, robj *message) {
+    int receivers = 0;
+
+    /* 阶段 1: 直接订阅者投递 */
+    dictEntry *de = dictFind(server.pubsub_channels, channel);
+    if (de) {
+        list *clients = dictGetVal(de);
+        listIter li;  listNode *ln;
+        listRewind(clients, &amp;li);
+        while ((ln = listNext(&amp;li)) != NULL) {
+            client *c = listNodeValue(ln);
+            addReplyPubsubMessage(c, channel, message);
+            receivers++;
+        }
+    }
+
+    /* 阶段 2: pattern 订阅者投递 */
+    if (server.pubsub_patterns) {
+        listIter li;  listNode *ln;
+        listRewind(server.pubsub_patterns, &amp;li);
+        while ((ln = listNext(&amp;li)) != NULL) {
+            pubsubPattern *pat = listNodeValue(ln);
+            if (stringmatchlen(pat-&gt;pattern-&gt;ptr, sdslen(pat-&gt;pattern-&gt;ptr),
+                              channel-&gt;ptr, sdslen(channel-&gt;ptr), 0)) {
+                addReplyPubsubPatMessage(pat-&gt;client, pat-&gt;pattern,
+                                        channel, message);
+                receivers++;
+            }
+        }
+    }
+    return receivers;
+}</code></pre>
+
+<p class="svg-title">图 30-3-2 · PUBLISH 消息投递时序 — 两阶段</p>
+<svg class="svg-diagram" viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
+  <g filter="url(#shadow)">
+    <rect x="20" y="20" width="140" height="36" rx="8" fill="url(#g-purple)" stroke="var(--diagram-purple-stroke)"/>
+    <text x="90" y="44" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">Publisher</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="260" y="20" width="180" height="36" rx="8" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="350" y="44" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">Redis 单线程主循环</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="540" y="20" width="160" height="36" rx="8" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/>
+    <text x="620" y="44" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">SubA: SUB news</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="740" y="20" width="160" height="36" rx="8" fill="url(#g-amber)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="820" y="44" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">SubB: PSUB news.*</text>
+  </g>
+  <line x1="90" y1="56" x2="90" y2="360" stroke="var(--diagram-border)" stroke-width="1" stroke-dasharray="3,3"/>
+  <line x1="350" y1="56" x2="350" y2="360" stroke="var(--diagram-border)" stroke-width="1" stroke-dasharray="3,3"/>
+  <line x1="620" y1="56" x2="620" y2="360" stroke="var(--diagram-border)" stroke-width="1" stroke-dasharray="3,3"/>
+  <line x1="820" y1="56" x2="820" y2="360" stroke="var(--diagram-border)" stroke-width="1" stroke-dasharray="3,3"/>
+  <path d="M90,80 L350,80" stroke="var(--diagram-purple-stroke)" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="220" y="74" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="600">PUBLISH news redis-7.2-released</text>
+  <g><rect x="220" y="100" width="260" height="22" rx="4" fill="var(--diagram-blue-fill)" opacity="0.25"/>
+    <text x="350" y="116" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="600">阶段 1 · dict 查直接订阅者</text></g>
+  <path d="M350,140 L620,140" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#arr-g)"/>
+  <text x="485" y="134" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">["message", "news", "redis-7.2-released"]</text>
+  <g><rect x="220" y="170" width="260" height="22" rx="4" fill="var(--diagram-orange-fill)" opacity="0.25"/>
+    <text x="350" y="186" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="600">阶段 2 · 遍历 pattern list</text></g>
+  <g><rect x="220" y="200" width="260" height="22" rx="4" fill="var(--diagram-orange-fill)" opacity="0.15"/>
+    <text x="350" y="216" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">stringmatchlen(news.*, news) = match</text></g>
+  <path d="M350,240 L820,240" stroke="var(--diagram-orange-stroke)" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="585" y="234" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">["pmessage", "news.*", "news", "redis-7.2-released"]</text>
+  <path d="M350,280 L90,280" stroke="var(--diagram-border)" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="220" y="274" text-anchor="middle" fill="var(--diagram-muted)" font-size="11" font-weight="600">integer 2 (receivers)</text>
+  <g filter="url(#shadow)">
+    <rect x="220" y="310" width="540" height="40" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+    <text x="490" y="334" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">单线程: 在主循环内同步完成 dict 查 + N 次 addReply + P 次 stringmatch</text>
+  </g>
+</svg>
+
+<div class="warning">
+  <p><strong>PUBLISH 返回值的真实含义</strong>。返回的整数 = 本次<em>本节点</em>投递的客户端数,包括直接订阅 + pattern 匹配,<strong>不包括</strong>:Cluster 其他节点的订阅者、业务层是否真处理了、TCP 是否成功送达。<br>
+  <code>0</code> 不代表"无人收到"(本节点没订阅 + 其他节点有订阅 → 仍是 0);<code>N&gt;0</code> 也不代表"N 人已处理"(只代表"写入了 N 个客户端的输出缓冲区")。</p>
+</div>
+
+<h2 id="s30-4">30.4 PSUBSCRIBE 与 glob 匹配</h2>
+
+<p>PSUBSCRIBE 用 glob 通配符订阅一组 channel,代价是每次 PUBLISH 都要对全部 pattern 跑一遍 <code>stringmatchlen</code>。</p>
+
+<table>
+<thead><tr><th>通配符</th><th>含义</th><th>示例 pattern</th><th>匹配</th><th>不匹配</th></tr></thead>
+<tbody>
+<tr><td><code>*</code></td><td>0+ 任意字符</td><td><code>news.*</code></td><td><code>news.tech</code>, <code>news.tech.ai</code></td><td><code>newsfeed</code></td></tr>
+<tr><td><code>?</code></td><td>1 个任意字符</td><td><code>log.?</code></td><td><code>log.a</code>, <code>log.1</code></td><td><code>log.ab</code></td></tr>
+<tr><td><code>[abc]</code></td><td>字符类</td><td><code>ch.[ab]</code></td><td><code>ch.a</code>, <code>ch.b</code></td><td><code>ch.c</code></td></tr>
+<tr><td><code>[a-z]</code></td><td>字符范围</td><td><code>ch.[a-z]</code></td><td><code>ch.x</code></td><td><code>ch.5</code></td></tr>
+<tr><td><code>\*</code></td><td>字面量转义</td><td><code>ch\*</code></td><td><code>ch*</code></td><td><code>chx</code></td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-c">/* util.c - 简化核心 */
+int stringmatchlen(const char *pattern, int patternLen,
+                   const char *string, int stringLen, int nocase) {
+    while (patternLen &amp;&amp; stringLen) {
+        switch (pattern[0]) {
+        case '*':
+            while (patternLen &amp;&amp; pattern[0] == '*') {
+                pattern++; patternLen--;
+            }
+            if (patternLen == 0) return 1;  /* 尾部 * 匹配一切 */
+            /* 对 string 的每个后缀尝试匹配剩余 pattern */
+            while (stringLen) {
+                if (stringmatchlen(pattern, patternLen,
+                                  string, stringLen, nocase))
+                    return 1;
+                string++; stringLen--;
+            }
+            return 0;
+        case '?':
+            string++; stringLen--;
+            break;
+        case '[':
+            /* 字符类匹配,省略 */
+            break;
+        default:
+            if (pattern[0] != string[0]) return 0;
+            string++; stringLen--;
+        }
+        pattern++; patternLen--;
+    }
+    while (patternLen &amp;&amp; pattern[0] == '*') { pattern++; patternLen--; }
+    return (patternLen == 0 &amp;&amp; stringLen == 0);
+}</code></pre>
+
+<p class="svg-title">图 30-4-1 · PSUBSCRIBE 成本模型 — P × M 的线性扫描</p>
+<svg class="svg-diagram" viewBox="0 0 920 320" xmlns="http://www.w3.org/2000/svg">
+  <g filter="url(#shadow)">
+    <rect x="20" y="14" width="880" height="40" rx="9" fill="url(#g-amber)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="460" y="40" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="700">每次 PUBLISH 都要对全部 P 个 pattern 跑 stringmatchlen</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="40" y="80" width="280" height="50" rx="9" fill="url(#g-slate)" stroke="var(--diagram-border)"/>
+    <text x="180" y="100" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">T_publish = O(1) + O(S) + O(P × M)</text>
+    <text x="180" y="120" text-anchor="middle" fill="var(--diagram-muted)" font-size="11">dict find + S 个 addReply + 模式匹配</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="350" y="80" width="220" height="50" rx="9" fill="url(#g-slate)" stroke="var(--diagram-border)"/>
+    <text x="460" y="100" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">S = 直接订阅者数</text>
+    <text x="460" y="120" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">P = pattern 总数</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="600" y="80" width="280" height="50" rx="9" fill="url(#g-slate)" stroke="var(--diagram-border)"/>
+    <text x="740" y="100" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">M = 平均 pattern 长度</text>
+    <text x="740" y="120" text-anchor="middle" fill="var(--diagram-muted)" font-size="11">stringmatchlen 含 * 回溯最坏 O(M × L)</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="40" y="160" width="270" height="130" rx="9" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/>
+    <text x="175" y="186" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">P &lt; 100</text>
+    <text x="175" y="208" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">影响可忽略</text>
+    <text x="175" y="228" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">PUBLISH 延迟 &lt; 5 µs</text>
+    <text x="175" y="252" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">推荐生产配置</text>
+    <text x="175" y="272" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">不需要特别优化</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="325" y="160" width="270" height="130" rx="9" fill="url(#g-amber)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="460" y="186" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">P 100-1000</text>
+    <text x="460" y="208" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">显著开销</text>
+    <text x="460" y="228" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">PUBLISH 延迟 +10-100 µs</text>
+    <text x="460" y="252" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">需收敛 channel 命名</text>
+    <text x="460" y="272" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">监控 cmdstat_publish</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="610" y="160" width="270" height="130" rx="9" fill="url(#g-red)" stroke="var(--diagram-red-stroke)"/>
+    <text x="745" y="186" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">P &gt; 1000</text>
+    <text x="745" y="208" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">严重影响</text>
+    <text x="745" y="228" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">PUBLISH 退化到毫秒级</text>
+    <text x="745" y="252" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">应分流到 Stream</text>
+    <text x="745" y="272" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">或重构 channel 命名</text>
+  </g>
+</svg>
+
+<div class="key-insight">
+  <p><strong>为何 pattern 不用 dict 索引?</strong>dict 加速的前提是"有可哈希的 key 直接定位到 value",但 pattern 是<em>表达式</em>,channel 是<em>具体字符串</em>,两者不可逆——<code>news.*</code> 不能反向构造出 <code>news</code>。每次 PUBLISH 必须对每个 pattern 调用 stringmatchlen,无法跳过。trie/NFA 可优化前缀共享场景,但生产环境通常 &lt; 100 个 pattern,代码复杂度收益不显著,Redis 选择保留最简洁的 list。</p>
+</div>
+
+<h2 id="s30-5">30.5 fire-and-forget 设计抉择</h2>
+
+<p>Pub/Sub 的语义边界由"消息可能在三个时点丢失"清楚定义。</p>
+
+<p class="svg-title">图 30-5-1 · 消息丢失的三个时点 — at-most-once 的本质</p>
+<svg class="svg-diagram" viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <g filter="url(#shadow)">
+    <rect x="370" y="14" width="180" height="44" rx="10" fill="url(#g-purple)" stroke="var(--diagram-purple-stroke)"/>
+    <text x="460" y="42" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="700">PUBLISH price.changed</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="370" y="90" width="180" height="44" rx="10" fill="url(#g-amber)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="460" y="118" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="600">订阅者在线?</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="60" y="170" width="220" height="60" rx="10" fill="url(#g-red)" stroke="var(--diagram-red-stroke)"/>
+    <text x="170" y="194" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">丢失 ①</text>
+    <text x="170" y="214" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">订阅者离线 → 无 backlog 缓存</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="640" y="170" width="220" height="44" rx="10" fill="url(#g-amber)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="750" y="198" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="600">输出缓冲可写?</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="60" y="250" width="220" height="60" rx="10" fill="url(#g-red)" stroke="var(--diagram-red-stroke)"/>
+    <text x="170" y="274" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">丢失 ②</text>
+    <text x="170" y="294" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">缓冲溢出 → 断连 + 离线消息丢失</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="640" y="250" width="220" height="44" rx="10" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="750" y="278" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="600">写入 TCP socket</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="640" y="320" width="220" height="44" rx="10" fill="url(#g-amber)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="750" y="348" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="600">消费者处理完成?</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="60" y="390" width="220" height="60" rx="10" fill="url(#g-red)" stroke="var(--diagram-red-stroke)"/>
+    <text x="170" y="414" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">丢失 ③</text>
+    <text x="170" y="434" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">crash 在处理前 → 无 ACK 无重发</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="640" y="390" width="220" height="60" rx="10" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/>
+    <text x="750" y="414" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">业务消费成功</text>
+    <text x="750" y="434" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">at-most-once 的唯一成功路径</text>
+  </g>
+  <path d="M460,134 L460,150 L170,150 L170,170" stroke="var(--diagram-red-stroke)" stroke-width="1.6" fill="none" marker-end="url(#arr-r)"/>
+  <text x="280" y="156" fill="var(--diagram-red-text)" font-size="11" font-weight="600">否</text>
+  <path d="M460,134 L460,150 L750,150 L750,170" stroke="var(--diagram-border)" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+  <text x="640" y="156" fill="var(--diagram-green-text)" font-size="11" font-weight="600">是</text>
+  <path d="M750,214 L750,230 L170,230 L170,250" stroke="var(--diagram-red-stroke)" stroke-width="1.6" fill="none" marker-end="url(#arr-r)"/>
+  <text x="280" y="236" fill="var(--diagram-red-text)" font-size="11" font-weight="600">溢出 hard limit</text>
+  <path d="M750,214 L750,250" stroke="var(--diagram-border)" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+  <text x="770" y="232" fill="var(--diagram-green-text)" font-size="11" font-weight="600">可写</text>
+  <path d="M750,294 L750,320" stroke="var(--diagram-border)" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+  <path d="M750,364 L750,380 L170,380 L170,390" stroke="var(--diagram-red-stroke)" stroke-width="1.6" fill="none" marker-end="url(#arr-r)"/>
+  <text x="280" y="386" fill="var(--diagram-red-text)" font-size="11" font-weight="600">crash 在处理前</text>
+  <path d="M750,364 L750,390" stroke="var(--diagram-green-stroke)" stroke-width="1.6" fill="none" marker-end="url(#arr-g)"/>
+  <text x="770" y="382" fill="var(--diagram-green-text)" font-size="11" font-weight="600">完成</text>
+  <path d="M460,58 L460,90" stroke="var(--diagram-border)" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+</svg>
+
+<p>把 Pub/Sub 和 Stream 放一起看,可以明白 Redis 自己设计了"消息能力光谱"的两端:Pub/Sub 牺牲可靠性换延迟,Stream 牺牲延迟换可靠性。</p>
+
+<table>
+<thead><tr><th>特性</th><th>Redis Pub/Sub</th><th>Redis Stream</th></tr></thead>
+<tbody>
+<tr><td>消息持久化</td><td>否</td><td>是(RDB/AOF)</td></tr>
+<tr><td>消息堆积</td><td>否(无 backlog)</td><td>是(按 ID 保留)</td></tr>
+<tr><td>消费者确认</td><td>否</td><td><code>XACK</code> 逐条</td></tr>
+<tr><td>断线重连</td><td>丢失离线消息</td><td>从上次 ID 继续读</td></tr>
+<tr><td>消费者组</td><td>否</td><td><code>XREADGROUP</code></td></tr>
+<tr><td>历史回溯</td><td>否</td><td><code>XRANGE</code> 任意时段</td></tr>
+<tr><td>投递语义</td><td>at-most-once</td><td>at-least-once</td></tr>
+<tr><td>单条延迟</td><td>&lt; 1 ms</td><td>1-3 ms</td></tr>
+<tr><td>单节点吞吐</td><td>~50 万 msg/s</td><td>~20 万 msg/s</td></tr>
+<tr><td>内存开销</td><td>仅订阅元数据</td><td>消息体常驻直到 trim</td></tr>
+</tbody>
+</table>
+
+<h2 id="s30-6">30.6 Cluster 模式的网络放大</h2>
+
+<p>Cluster 中的 PUBLISH 有一个隐藏成本:每条消息都通过 Cluster Bus 转发到所有其他节点。</p>
+
+<pre><code class="language-c">/* cluster.c - 简化逻辑 */
+void clusterPropagatePublish(robj *channel, robj *message) {
+    dictIterator *di = dictGetIterator(server.cluster-&gt;nodes);
+    dictEntry *de;
+    while ((de = dictNext(di)) != NULL) {
+        clusterNode *node = dictGetVal(de);
+        if (node == myself) continue;
+        if (node-&gt;flags &amp; (CLUSTER_NODE_HANDSHAKE |
+                           CLUSTER_NODE_NOADDR)) continue;
+        clusterSendPublish(node-&gt;link, channel, message);  /* 单条放大 N-1 倍 */
+    }
+    dictReleaseIterator(di);
+}</code></pre>
+
+<p class="svg-title">图 30-6-1 · PUBLISH vs SPUBLISH — Cluster Bus 放大对比</p>
+<svg class="svg-diagram" viewBox="0 0 920 420" xmlns="http://www.w3.org/2000/svg">
+  <g filter="url(#shadow)">
+    <rect x="20" y="14" width="420" height="40" rx="9" fill="url(#g-red)" stroke="var(--diagram-red-stroke)"/>
+    <text x="230" y="40" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="700">传统 PUBLISH — O(N-1) 广播</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="480" y="14" width="420" height="40" rx="9" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/>
+    <text x="690" y="40" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="700">Sharded SPUBLISH — O(1) 本地</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="120" y="80" width="100" height="36" rx="8" fill="url(#g-purple)" stroke="var(--diagram-purple-stroke)"/>
+    <text x="170" y="104" text-anchor="middle" fill="var(--diagram-text)" font-size="13">Client</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="120" y="160" width="220" height="40" rx="8" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="230" y="184" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">Node 1 (本地处理)</text>
+  </g>
+  <g><rect x="20"  y="240" width="80" height="32" rx="6" fill="url(#g-slate)" stroke="var(--diagram-border)"/><text x="60"  y="260" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">Node 2</text></g>
+  <g><rect x="110" y="240" width="80" height="32" rx="6" fill="url(#g-slate)" stroke="var(--diagram-border)"/><text x="150" y="260" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">Node 3</text></g>
+  <g><rect x="200" y="240" width="80" height="32" rx="6" fill="url(#g-slate)" stroke="var(--diagram-border)"/><text x="240" y="260" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">Node 4</text></g>
+  <g><rect x="290" y="240" width="80" height="32" rx="6" fill="url(#g-slate)" stroke="var(--diagram-border)"/><text x="330" y="260" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">Node 5</text></g>
+  <g><rect x="380" y="240" width="60" height="32" rx="6" fill="url(#g-slate)" stroke="var(--diagram-border)"/><text x="410" y="260" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">…</text></g>
+  <path d="M170,116 L230,160" stroke="var(--diagram-purple-stroke)" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+  <path d="M230,200 L60,240"  stroke="var(--diagram-red-stroke)" stroke-width="1.4" fill="none" marker-end="url(#arr-r)"/>
+  <path d="M230,200 L150,240" stroke="var(--diagram-red-stroke)" stroke-width="1.4" fill="none" marker-end="url(#arr-r)"/>
+  <path d="M230,200 L240,240" stroke="var(--diagram-red-stroke)" stroke-width="1.4" fill="none" marker-end="url(#arr-r)"/>
+  <path d="M230,200 L330,240" stroke="var(--diagram-red-stroke)" stroke-width="1.4" fill="none" marker-end="url(#arr-r)"/>
+  <path d="M230,200 L410,240" stroke="var(--diagram-red-stroke)" stroke-width="1.4" fill="none" marker-end="url(#arr-r)"/>
+  <g filter="url(#shadow)">
+    <rect x="60" y="300" width="340" height="50" rx="9" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+    <text x="230" y="324" text-anchor="middle" fill="var(--diagram-red-text)" font-size="13" font-weight="700">Cluster Bus 上 N-1 条消息</text>
+    <text x="230" y="342" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">N=12: 22 MB/s · N=100: 198 MB/s @ 10k msg/s × 200B</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="580" y="80" width="100" height="36" rx="8" fill="url(#g-purple)" stroke="var(--diagram-purple-stroke)"/>
+    <text x="630" y="104" text-anchor="middle" fill="var(--diagram-text)" font-size="13">Client</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="520" y="160" width="340" height="40" rx="8" fill="url(#g-amber)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="690" y="184" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">CRC16(channel) % 16384 → slot N</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="580" y="240" width="220" height="40" rx="8" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/>
+    <text x="690" y="264" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">仅 slot owner 节点投递</text>
+  </g>
+  <path d="M630,116 L690,160" stroke="var(--diagram-purple-stroke)" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+  <path d="M690,200 L690,240" stroke="var(--diagram-green-stroke)" stroke-width="1.6" fill="none" marker-end="url(#arr-g)"/>
+  <g filter="url(#shadow)">
+    <rect x="520" y="300" width="340" height="50" rx="9" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+    <text x="690" y="324" text-anchor="middle" fill="var(--diagram-green-text)" font-size="13" font-weight="700">Cluster Bus 上 0 条消息</text>
+    <text x="690" y="342" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">N 越大,差距越显著 · 大集群必须用 SPUBLISH</text>
+  </g>
+</svg>
+
+<div class="real-world">
+  <p><strong>定理 30-6-1 · Cluster PUBLISH 的网络开销公式</strong>。设 Cluster 节点数 N,PUBLISH 吞吐 R msg/s,单条消息 B 字节:</p>
+  <ul>
+    <li>每条 PUBLISH 触发 Bus 消息数:<code>M = N - 1</code></li>
+    <li>总 Bus 消息流量:<code>R_bus = R × (N - 1) msg/s</code></li>
+    <li>Bus 带宽:<code>BW_bus = R × (N - 1) × B bytes/s</code></li>
+  </ul>
+  <p><strong>数值示例</strong>(B = 200 字节,R = 10,000 msg/s):</p>
+  <ul>
+    <li>小集群 N = 12: <code>R_bus = 110,000 msg/s</code>, <code>BW_bus ≈ 22 MB/s</code></li>
+    <li>大集群 N = 100: <code>R_bus = 990,000 msg/s</code>, <code>BW_bus ≈ 198 MB/s</code></li>
+  </ul>
+  <p>Bus 带宽是 Redis 集群协议的"血管",承担 gossip、PFAIL/FAIL、SLOTUPDATE、manual failover。PUBLISH 抢占 Bus → 心跳排队 → PFAIL 误判 → 误判 failover → 业务可用性下降。</p>
+</div>
+
+<h2 id="s30-7">30.7 Sharded Pub/Sub(Redis 7.0)</h2>
+
+<p>Sharded Pub/Sub 是对 Cluster PUBLISH 不可扩展性的根本回应:把 channel 当成 key,按 hash slot 路由,只在 owner 节点投递,网络放大降至 O(1)。</p>
+
+<p class="svg-title">图 30-7-1 · SSUBSCRIBE/SPUBLISH 命令模型 — slot 路由 + MOVED</p>
+<svg class="svg-diagram" viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
+  <g filter="url(#shadow)">
+    <rect x="20" y="20" width="140" height="36" rx="8" fill="url(#g-purple)" stroke="var(--diagram-purple-stroke)"/>
+    <text x="90" y="44" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">Client</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="380" y="20" width="180" height="36" rx="8" fill="url(#g-amber)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="470" y="44" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">Node 1 (non-owner)</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="720" y="20" width="180" height="36" rx="8" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/>
+    <text x="810" y="44" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">Node 2 (slot 9572 owner)</text>
+  </g>
+  <line x1="90"  y1="56" x2="90"  y2="440" stroke="var(--diagram-border)" stroke-width="1" stroke-dasharray="3,3"/>
+  <line x1="470" y1="56" x2="470" y2="440" stroke="var(--diagram-border)" stroke-width="1" stroke-dasharray="3,3"/>
+  <line x1="810" y1="56" x2="810" y2="440" stroke="var(--diagram-border)" stroke-width="1" stroke-dasharray="3,3"/>
+  <path d="M90,90 L470,90" stroke="var(--diagram-purple-stroke)" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="280" y="84" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="600">SSUBSCRIBE orders</text>
+  <g><rect x="350" y="110" width="240" height="22" rx="4" fill="var(--diagram-orange-fill)" opacity="0.25"/>
+    <text x="470" y="126" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="600">CRC16(orders) % 16384 = 9572</text></g>
+  <g><rect x="350" y="138" width="240" height="22" rx="4" fill="var(--diagram-orange-fill)" opacity="0.25"/>
+    <text x="470" y="154" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">检查 slot 9572 ownership</text></g>
+  <path d="M470,180 L90,180" stroke="var(--diagram-red-stroke)" stroke-width="2" fill="none" marker-end="url(#arr-r)"/>
+  <text x="280" y="174" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="700">MOVED 9572 N2_addr</text>
+  <path d="M90,210 L810,210" stroke="var(--diagram-purple-stroke)" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="450" y="204" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="600">SSUBSCRIBE orders (重连)</text>
+  <g><rect x="690" y="230" width="240" height="22" rx="4" fill="var(--diagram-green-fill)" opacity="0.25"/>
+    <text x="810" y="246" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="600">dictAdd(pubsubshard_channels)</text></g>
+  <path d="M810,278 L90,278" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#arr-g)"/>
+  <text x="450" y="272" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="600">ssubscribe orders 1</text>
+  <path d="M90,310 L810,310" stroke="var(--diagram-purple-stroke)" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="450" y="304" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="600">SPUBLISH orders {...}</text>
+  <g><rect x="690" y="330" width="240" height="22" rx="4" fill="var(--diagram-green-fill)" opacity="0.25"/>
+    <text x="810" y="346" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">dictFind + addReply 本地完成</text></g>
+  <path d="M810,378 L90,378" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#arr-g)"/>
+  <text x="450" y="372" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="600">integer 1 + smessage orders {...}</text>
+  <g filter="url(#shadow)">
+    <rect x="280" y="400" width="360" height="36" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+    <text x="460" y="424" text-anchor="middle" fill="var(--diagram-green-text)" font-size="12" font-weight="600">Cluster Bus 不参与传输</text>
+  </g>
+</svg>
+
+<pre><code class="language-c">/* pubsub.c - 简化 */
+int pubsubPublishMessageShard(robj *channel, robj *message) {
+    int receivers = 0;
+    dictEntry *de = dictFind(server.pubsubshard_channels, channel);
+    if (de) {
+        list *clients = dictGetVal(de);
+        listIter li;  listNode *ln;
+        listRewind(clients, &amp;li);
+        while ((ln = listNext(&amp;li)) != NULL) {
+            client *c = listNodeValue(ln);
+            addReplyPubsubMessage(c, channel, message);
+            receivers++;
+        }
+    }
+    /* 关键差异: 1) 无 clusterPropagatePublish 调用 2) 无 pubsub_patterns 遍历 */
+    return receivers;
+}
+
+void spublishCommand(client *c) {
+    int receivers = pubsubPublishMessageShard(c-&gt;argv[1], c-&gt;argv[2]);
+    if (server.cluster_enabled) {
+        /* 仅向该 slot 的 replica 传播 (走复制流, 不走 Bus 广播) */
+        clusterPropagatePublishShard(c-&gt;argv[1], c-&gt;argv[2]);
+    }
+    addReplyLongLong(c, receivers);
+}</code></pre>
+
+<div class="warning">
+  <p><strong>slot 迁移期的订阅中断</strong>。当 slot 9572 从 Node A 迁移到 Node B:</p>
+  <ul>
+    <li><strong>T0</strong>: Node A 接收 <code>CLUSTER SETSLOT 9572 MIGRATING B</code>,Node B 接收 <code>IMPORTING A</code></li>
+    <li><strong>T1</strong>: 已连 A 的客户端仍接收消息;新连 B 的 <code>SSUBSCRIBE</code> 被 <code>MOVED</code> 回 A</li>
+    <li><strong>T2</strong>: <code>CLUSTER SETSLOT 9572 NODE B</code> 广播,Node A 关闭相关订阅 → 客户端被踢</li>
+    <li><strong>T3</strong>: 客户端重连 B 后重新 <code>SSUBSCRIBE</code>,期间发布的消息已丢</li>
+  </ul>
+  <p><strong>工程要求</strong>:客户端必须实现"断线 → 重新订阅",期间消息按 fire-and-forget 接受丢失;关键消息应使用 Stream。</p>
+</div>
+
+<table>
+<thead><tr><th>维度</th><th>PUBLISH</th><th>SPUBLISH</th></tr></thead>
+<tbody>
+<tr><td>引入版本</td><td>Redis 2.0</td><td>Redis 7.0</td></tr>
+<tr><td>Cluster 行为</td><td>广播所有节点</td><td>仅 slot owner</td></tr>
+<tr><td>网络开销</td><td>O(N) Bus 消息</td><td>O(1) 本地 + replica 传播</td></tr>
+<tr><td>Pattern 支持</td><td>PSUBSCRIBE</td><td>不支持</td></tr>
+<tr><td>客户端要求</td><td>任意节点连接即可</td><td>cluster-aware(处理 MOVED)</td></tr>
+<tr><td>slot 迁移</td><td>无影响</td><td>订阅者需重连</td></tr>
+<tr><td>持久化</td><td>否</td><td>否</td></tr>
+<tr><td>投递语义</td><td>at-most-once</td><td>at-most-once</td></tr>
+<tr><td>适用规模</td><td>小集群 / 全局通知</td><td>大集群 / 高频本地消息</td></tr>
+</tbody>
+</table>
+
+<h2 id="s30-8">30.8 跨系统比较</h2>
+
+<p>Redis Pub/Sub 在消息系统光谱里属于"低延迟无可靠性"一端,最接近的同构是 NATS Core 和 PostgreSQL LISTEN/NOTIFY。</p>
+
+<p class="svg-title">图 30-8-1 · 消息系统选型三轴 — 延迟 / 路由 / 可靠</p>
+<svg class="svg-diagram" viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
+  <g filter="url(#shadow)">
+    <rect x="370" y="14" width="180" height="40" rx="9" fill="url(#g-purple)" stroke="var(--diagram-purple-stroke)"/>
+    <text x="460" y="40" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="700">选型三轴</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="40"  y="100" width="220" height="44" rx="9" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="150" y="128" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">低延迟 / 无可靠</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="350" y="100" width="220" height="44" rx="9" fill="url(#g-amber)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="460" y="128" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">路由优化</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="660" y="100" width="220" height="44" rx="9" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/>
+    <text x="770" y="128" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">可靠投递</text>
+  </g>
+  <g><rect x="40"  y="180" width="220" height="32" rx="6" fill="var(--diagram-blue-fill)" opacity="0.25"/><text x="150" y="200" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">Redis Pub/Sub</text></g>
+  <g><rect x="40"  y="220" width="220" height="32" rx="6" fill="var(--diagram-blue-fill)" opacity="0.25"/><text x="150" y="240" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">NATS Core</text></g>
+  <g><rect x="40"  y="260" width="220" height="32" rx="6" fill="var(--diagram-blue-fill)" opacity="0.25"/><text x="150" y="280" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">PostgreSQL LISTEN/NOTIFY</text></g>
+  <g><rect x="350" y="180" width="220" height="32" rx="6" fill="var(--diagram-orange-fill)" opacity="0.3"/><text x="460" y="200" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="12">Redis Sharded Pub/Sub</text></g>
+  <g><rect x="350" y="220" width="220" height="32" rx="6" fill="var(--diagram-orange-fill)" opacity="0.3"/><text x="460" y="240" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="12">NATS Subject 路由</text></g>
+  <g><rect x="350" y="260" width="220" height="32" rx="6" fill="var(--diagram-orange-fill)" opacity="0.3"/><text x="460" y="280" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="12">MQTT shared subscription</text></g>
+  <g><rect x="660" y="180" width="220" height="32" rx="6" fill="var(--diagram-green-fill)" opacity="0.3"/><text x="770" y="200" text-anchor="middle" fill="var(--diagram-green-text)" font-size="12">Redis Stream</text></g>
+  <g><rect x="660" y="220" width="220" height="32" rx="6" fill="var(--diagram-green-fill)" opacity="0.3"/><text x="770" y="240" text-anchor="middle" fill="var(--diagram-green-text)" font-size="12">Apache Kafka</text></g>
+  <g><rect x="660" y="260" width="220" height="32" rx="6" fill="var(--diagram-green-fill)" opacity="0.3"/><text x="770" y="280" text-anchor="middle" fill="var(--diagram-green-text)" font-size="12">RabbitMQ / NATS JetStream</text></g>
+  <path d="M460,54 L150,100" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  <path d="M460,54 L460,100" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  <path d="M460,54 L770,100" stroke="var(--diagram-green-stroke)" stroke-width="1.5" fill="none" marker-end="url(#arr-g)"/>
+  <g filter="url(#shadow)">
+    <rect x="200" y="320" width="520" height="40" rx="9" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+    <text x="460" y="344" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">同设计哲学: "通知是状态的提示,不是历史的记录"</text>
+  </g>
+</svg>
+
+<table>
+<thead><tr><th>维度</th><th>Redis Pub/Sub</th><th>MQTT</th><th>RabbitMQ</th><th>Kafka</th><th>PG NOTIFY</th><th>NATS Core</th></tr></thead>
+<tbody>
+<tr><td>持久化</td><td>否</td><td>QoS 1/2 有</td><td>持久队列可选</td><td>默认持久</td><td>否</td><td>否</td></tr>
+<tr><td>ACK</td><td>否</td><td>PUBACK</td><td>Basic.Ack</td><td>offset commit</td><td>否</td><td>否</td></tr>
+<tr><td>模式订阅</td><td>glob</td><td>topic filter <code>+/#</code></td><td>routing key</td><td>否</td><td>否</td><td>subject 通配</td></tr>
+<tr><td>消费者组</td><td>否</td><td>shared sub (5.0)</td><td>队列竞争</td><td>Consumer Group</td><td>否</td><td>Queue Group</td></tr>
+<tr><td>历史回溯</td><td>否</td><td>retained 仅最后</td><td>否</td><td>是(offset)</td><td>否</td><td>否</td></tr>
+<tr><td>单条延迟</td><td>&lt; 1 ms</td><td>1-10 ms</td><td>1-5 ms</td><td>2-10 ms</td><td>&lt; 1 ms(同 PG 进程)</td><td>&lt; 1 ms</td></tr>
+<tr><td>吞吐峰值</td><td>~50 万/s</td><td>~10 万/s</td><td>~5 万/s</td><td>~100 万/s</td><td>~1 万/s</td><td>~1000 万/s</td></tr>
+<tr><td>部署</td><td>Redis 进程内</td><td>独立 broker</td><td>独立 broker</td><td>独立集群</td><td>与 PG 同进程</td><td>独立集群</td></tr>
+</tbody>
+</table>
+
+<h2 id="s30-9">30.9 多部署模式</h2>
+
+<p>不同部署形态下,PUBLISH/SUBSCRIBE 的行为有明显差别,尤其是主从复制中的"PUBLISH 不经复制流"。</p>
+
+<table>
+<thead><tr><th>部署</th><th>PUBLISH/SUBSCRIBE</th><th>SPUBLISH/SSUBSCRIBE</th><th>关键约束</th></tr></thead>
+<tbody>
+<tr><td>单节点</td><td>标准本地投递</td><td>等同普通 Pub/Sub</td><td>单线程瓶颈</td></tr>
+<tr><td>主从</td><td>PUBLISH <strong>不经复制流</strong></td><td>同</td><td>主从订阅孤立</td></tr>
+<tr><td>Sentinel</td><td>failover 后需重订阅</td><td>同</td><td>自身用 <code>__sentinel__:hello</code></td></tr>
+<tr><td>Cluster</td><td>广播全节点 O(N)</td><td>仅 slot owner O(1)</td><td>大集群必须 Sharded</td></tr>
+</tbody>
+</table>
+
+<p class="svg-title">图 30-9-1 · 主从复制下 PUBLISH 的行为 — 主从订阅完全独立</p>
+<svg class="svg-diagram" viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg">
+  <g filter="url(#shadow)">
+    <rect x="20" y="20" width="380" height="320" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+    <text x="210" y="46" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="14" font-weight="700">客户端连 master</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="60" y="70" width="120" height="40" rx="8" fill="url(#g-purple)" stroke="var(--diagram-purple-stroke)"/>
+    <text x="120" y="94" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">Publisher</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="240" y="70" width="120" height="40" rx="8" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="300" y="94" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">Master</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="60" y="140" width="120" height="40" rx="8" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/>
+    <text x="120" y="164" text-anchor="middle" fill="var(--diagram-text)" font-size="12">SubA (连 master)</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="240" y="210" width="120" height="40" rx="8" fill="url(#g-slate)" stroke="var(--diagram-border)"/>
+    <text x="300" y="234" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12">Replica</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="60" y="280" width="120" height="40" rx="8" fill="url(#g-amber)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="120" y="304" text-anchor="middle" fill="var(--diagram-text)" font-size="12">SubB (连 replica)</text>
+  </g>
+  <path d="M180,90 L240,90" stroke="var(--diagram-purple-stroke)" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+  <text x="210" y="84" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">PUBLISH</text>
+  <path d="M240,110 L180,140" stroke="var(--diagram-green-stroke)" stroke-width="1.6" fill="none" marker-end="url(#arr-g)"/>
+  <text x="200" y="130" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">收到 ✓</text>
+  <path d="M300,110 L300,210" stroke="var(--diagram-red-stroke)" stroke-width="1.6" stroke-dasharray="5,5" fill="none"/>
+  <text x="320" y="160" fill="var(--diagram-red-text)" font-size="10">不经复制流</text>
+  <path d="M240,250 L180,280" stroke="var(--diagram-red-stroke)" stroke-width="1.6" stroke-dasharray="5,5" fill="none" marker-end="url(#arr-r)"/>
+  <text x="200" y="270" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">收不到 ✗</text>
+  <g filter="url(#shadow)">
+    <rect x="500" y="20" width="400" height="320" rx="10" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
+    <text x="700" y="48" text-anchor="middle" fill="var(--diagram-green-text)" font-size="14" font-weight="700">设计原因</text>
+    <text x="520" y="80" fill="var(--diagram-blue-text)" font-size="12" font-weight="700">PUBLISH 即时投递</text>
+    <text x="520" y="102" fill="var(--diagram-green-text)" font-size="11">复制流是异步的, replica 接收时间晚</text>
+    <text x="520" y="124" fill="var(--diagram-green-text)" font-size="11">于 master, 重放会重复投递</text>
+    <text x="520" y="158" fill="var(--diagram-blue-text)" font-size="12" font-weight="700">Redis 取舍</text>
+    <text x="520" y="180" fill="var(--diagram-green-text)" font-size="11">PUBLISH 只在执行节点处理</text>
+    <text x="520" y="202" fill="var(--diagram-green-text)" font-size="11">主/从 订阅者完全独立, 互不感知</text>
+    <text x="520" y="236" fill="var(--diagram-blue-text)" font-size="12" font-weight="700">实践结论</text>
+    <text x="520" y="258" fill="var(--diagram-green-text)" font-size="11">应用层规定客户端连 master</text>
+    <text x="520" y="280" fill="var(--diagram-green-text)" font-size="11">或使用 Cluster + Sharded Pub/Sub</text>
+    <text x="520" y="314" fill="var(--diagram-green-text)" font-size="12" font-weight="600">→ Cluster 中 Bus 广播保证全局可达</text>
+  </g>
+</svg>
+
+<div class="real-world">
+  <p><strong>Sentinel 自身使用 Pub/Sub 做服务发现</strong>。每个 Sentinel 实例在所有监控的 master/replica 上 <code>SUBSCRIBE __sentinel__:hello</code>,每 2 秒 <code>PUBLISH</code> 自身信息(<code>sentinel_ip:port@master_name/epoch</code>)。通过共同监控的 master,任意一对 Sentinel 都能互相发现,不需要手动配置完整列表。这是 Pub/Sub 的经典适用场景:fire-and-forget 与"最新存活状态"的语义天然契合。</p>
+</div>
+
+<h2 id="s30-10">30.10 性能与基线</h2>
+
+<p>单节点 fan-out 是 Pub/Sub 的核心成本曲线:订阅者越多,P99 延迟下降越快。</p>
+
+<p class="svg-title">图 30-10-1 · 单节点 fan-out 退化曲线 — 1 → 10,000 订阅者</p>
+<svg class="svg-diagram" viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
+  <g filter="url(#shadow)">
+    <rect x="20" y="14" width="880" height="36" rx="9" fill="url(#g-purple)" stroke="var(--diagram-purple-stroke)"/>
+    <text x="460" y="40" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">基准: Redis 7.2 单节点 · 128B 消息 · AMD EPYC 7763</text>
+  </g>
+  <line x1="80" y1="320" x2="880" y2="320" stroke="var(--diagram-border)" stroke-width="1.5"/>
+  <line x1="80" y1="80"  x2="80"  y2="320" stroke="var(--diagram-border)" stroke-width="1.5"/>
+  <text x="40"  y="86"  fill="var(--diagram-muted)" font-size="10">P99 (ms)</text>
+  <text x="40"  y="180" fill="var(--diagram-muted)" font-size="10">60</text>
+  <text x="40"  y="240" fill="var(--diagram-muted)" font-size="10">10</text>
+  <text x="40"  y="280" fill="var(--diagram-muted)" font-size="10">1</text>
+  <text x="40"  y="320" fill="var(--diagram-muted)" font-size="10">0</text>
+  <text x="155" y="340" fill="var(--diagram-muted)" font-size="10">1</text>
+  <text x="295" y="340" fill="var(--diagram-muted)" font-size="10">10</text>
+  <text x="435" y="340" fill="var(--diagram-muted)" font-size="10">100</text>
+  <text x="575" y="340" fill="var(--diagram-muted)" font-size="10">1k</text>
+  <text x="715" y="340" fill="var(--diagram-muted)" font-size="10">10k</text>
+  <text x="855" y="340" fill="var(--diagram-muted)" font-size="10">subs</text>
+  <path d="M155,310 L295,308 L435,290 L575,220 L715,150" stroke="var(--diagram-green-stroke)" stroke-width="2.4" fill="none"/>
+  <circle cx="155" cy="310" r="5" fill="var(--diagram-green-fill)"/>
+  <circle cx="295" cy="308" r="5" fill="var(--diagram-green-fill)"/>
+  <circle cx="435" cy="290" r="5" fill="var(--diagram-orange-fill)"/>
+  <circle cx="575" cy="220" r="5" fill="var(--diagram-orange-fill)"/>
+  <circle cx="715" cy="150" r="5" fill="var(--diagram-red-fill)"/>
+  <text x="155" y="298" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">&lt;0.5</text>
+  <text x="295" y="296" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">&lt;0.6</text>
+  <text x="435" y="278" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">~1.2</text>
+  <text x="575" y="208" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">~8</text>
+  <text x="715" y="138" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">~60</text>
+  <g filter="url(#shadow)">
+    <rect x="20" y="58" width="880" height="20" rx="4" fill="var(--diagram-blue-fill)"/>
+    <text x="100" y="74" fill="var(--diagram-green-text)" font-size="11">520k msg/s</text>
+    <text x="260" y="74" fill="var(--diagram-green-text)" font-size="11">480k msg/s</text>
+    <text x="420" y="74" fill="var(--diagram-orange-text)" font-size="11">320k msg/s</text>
+    <text x="560" y="74" fill="var(--diagram-orange-text)" font-size="11">85k msg/s</text>
+    <text x="700" y="74" fill="var(--diagram-red-text)" font-size="11">9.5k msg/s</text>
+  </g>
+</svg>
+
+<div class="key-insight">
+  <p><strong>fan-out 取舍</strong>:</p>
+  <ul>
+    <li><strong>小 fan-out</strong> (&lt; 100): Pub/Sub 几乎免费</li>
+    <li><strong>中 fan-out</strong> (100-1000): 注意 P99 延迟,准备分流</li>
+    <li><strong>大 fan-out</strong> (&gt; 1000): 必须分层架构 → Redis → Kafka → 终端</li>
+  </ul>
+  <p>PUBLISH 总成本 = 序列化 + S × 输出缓冲写入;S × T_buffer_write 在 S=10000 时占主导,主线程被复制操作打满,其他命令延迟也会上升。</p>
+</div>
+
+<table>
+<thead><tr><th>方式</th><th>吞吐 (msg/s)</th><th>Bus 消息/s</th><th>Bus 带宽</th></tr></thead>
+<tbody>
+<tr><td>PUBLISH(N=12)</td><td>~180,000</td><td>~1,980,000</td><td>~242 MB/s</td></tr>
+<tr><td>SPUBLISH(N=12)</td><td>~460,000</td><td>~0</td><td>~0</td></tr>
+</tbody>
+</table>
+
+<p>吞吐差异 2.6×,带宽节省 ~99%。节点越多差距越大:N=30 时 PUBLISH 接近不可用,N=100 时必然瘫痪。</p>
+
+<h3>30.10.x · 观测指标</h3>
+
+<table>
+<thead><tr><th>指标</th><th>来源</th><th>用途</th></tr></thead>
+<tbody>
+<tr><td><code>pubsub_channels</code></td><td><code>INFO stats</code></td><td>当前直接订阅 channel 数</td></tr>
+<tr><td><code>pubsub_patterns</code></td><td><code>INFO stats</code></td><td>当前 pattern 订阅数</td></tr>
+<tr><td><code>pubsub_shardchannels</code></td><td><code>INFO stats</code></td><td>当前 shard 订阅数</td></tr>
+<tr><td><code>cmdstat_publish</code></td><td><code>INFO commandstats</code></td><td>PUBLISH 调用频率与 usec_per_call</td></tr>
+<tr><td><code>CLIENT LIST TYPE pubsub</code></td><td>CLIENT 命令</td><td>订阅者输出缓冲状态(oll/omem)</td></tr>
+<tr><td><code>PUBSUB NUMSUB &lt;ch&gt;</code></td><td>PUBSUB 命令</td><td>指定 channel 的订阅者数</td></tr>
+<tr><td><code>PUBSUB NUMPAT</code></td><td>PUBSUB 命令</td><td>全局 pattern 数</td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-bash">$ redis-cli INFO stats | grep -E 'pubsub_channels|pubsub_patterns|pubsub_shard'
+pubsub_channels:23
+pubsub_patterns:5
+pubsub_shardchannels:147
+
+$ redis-cli INFO commandstats | grep publish
+cmdstat_publish:calls=12345678,usec=98765432,usec_per_call=8.0
+cmdstat_spublish:calls=98765432,usec=246912345,usec_per_call=2.5
+
+$ redis-cli CLIENT LIST TYPE pubsub
+id=42 ... oll=15234 omem=8412156 cmd=subscribe</code></pre>
+
+<h2 id="s30-11">30.11 陷阱与最佳实践</h2>
+
+<table>
+<thead><tr><th>#</th><th>陷阱</th><th>症状</th><th>根因</th><th>修复</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>慢消费者撑爆缓冲</td><td>omem 持续增长,被断连</td><td>消费者处理慢于发布</td><td>调 client-output-buffer-limit</td></tr>
+<tr><td>2</td><td>Cluster PUBLISH 风暴</td><td>Bus 带宽飙升,PFAIL 误判</td><td>O(N) 广播</td><td>改用 SPUBLISH</td></tr>
+<tr><td>3</td><td>过多 pattern</td><td>PUBLISH 延迟上升</td><td>每次 O(P × M)</td><td>收敛命名,减少 pattern</td></tr>
+<tr><td>4</td><td>断线后无重订阅</td><td>业务静默丢消息</td><td>TCP 断连清状态</td><td>客户端 reconnect + resubscribe</td></tr>
+<tr><td>5</td><td>主从订阅孤立</td><td>部分客户端收不到</td><td>PUBLISH 不复制</td><td>规范连 master</td></tr>
+<tr><td>6</td><td>Sharded slot 迁移</td><td>订阅突然中断</td><td>新 owner 拒绝旧连接</td><td>处理 MOVED 自动重连</td></tr>
+<tr><td>7</td><td>大消息 × 高 fan-out</td><td>输出缓冲快速膨胀</td><td>message × subscribers</td><td>payload &lt; 1KB,改 ID + 查询</td></tr>
+<tr><td>8</td><td>用 Pub/Sub 做可靠投递</td><td>业务重试逻辑复杂</td><td>模型选错</td><td>改 Stream</td></tr>
+<tr><td>9</td><td>RESP2 订阅连接误用</td><td>命令报错</td><td>订阅状态命令受限</td><td>订阅连接专用</td></tr>
+<tr><td>10</td><td>Sentinel failover 不重订阅</td><td>failover 后失联</td><td>切主无通知</td><td>实现自动重订阅</td></tr>
+</tbody>
+</table>
+
+<h3>30.11.x · 慢消费者输出缓冲控制</h3>
+
+<pre><code class="language-bash"># redis.conf
+client-output-buffer-limit pubsub &lt;hard&gt; &lt;soft&gt; &lt;seconds&gt;
+# 默认: 32mb 8mb 60
+
+# hard limit (32 MB): 单次写入即触发, 立即断开
+# soft limit (8 MB) + 60s: 持续超过 soft 达 60 秒才断开</code></pre>
+
+<p class="svg-title">图 30-11-1 · 客户端自动重订阅模板 — 指数退避 + keepalive + health_check</p>
+<svg class="svg-diagram" viewBox="0 0 920 340" xmlns="http://www.w3.org/2000/svg">
+  <g filter="url(#shadow)">
+    <rect x="370" y="14" width="180" height="40" rx="9" fill="url(#g-purple)" stroke="var(--diagram-purple-stroke)"/>
+    <text x="460" y="40" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">while True</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="280" y="80" width="360" height="44" rx="9" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/>
+    <text x="460" y="108" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">conn = Redis(keepalive, health_check_interval=30)</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="280" y="140" width="360" height="44" rx="9" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/>
+    <text x="460" y="168" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">pubsub.subscribe(*CHANNELS) → 重置退避计数</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="280" y="200" width="360" height="44" rx="9" fill="url(#g-amber)" stroke="var(--diagram-orange-stroke)"/>
+    <text x="460" y="228" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">for msg in pubsub.listen()</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="80"  y="260" width="240" height="60" rx="9" fill="url(#g-red)" stroke="var(--diagram-red-stroke)"/>
+    <text x="200" y="284" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">ConnectionError</text>
+    <text x="200" y="304" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">sleep(backoff[1,2,5,10,30]) → 重连</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="600" y="260" width="240" height="60" rx="9" fill="url(#g-slate)" stroke="var(--diagram-border)"/>
+    <text x="720" y="284" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="700">其他异常</text>
+    <text x="720" y="304" text-anchor="middle" fill="var(--diagram-muted)" font-size="11">log + raise(不静默吞)</text>
+  </g>
+  <path d="M460,54 L460,80" stroke="var(--diagram-border)" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+  <path d="M460,124 L460,140" stroke="var(--diagram-blue-stroke)" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+  <path d="M460,184 L460,200" stroke="var(--diagram-green-stroke)" stroke-width="1.6" fill="none" marker-end="url(#arr-g)"/>
+  <path d="M280,222 L200,260" stroke="var(--diagram-red-stroke)" stroke-width="1.6" fill="none" marker-end="url(#arr-r)"/>
+  <path d="M200,260 L460,90 L460,54" stroke="var(--diagram-red-stroke)" stroke-width="1.2" fill="none" stroke-dasharray="5,5"/>
+  <path d="M640,222 L720,260" stroke="var(--diagram-border)" stroke-width="1.6" fill="none" marker-end="url(#arr)"/>
+</svg>
+
+<pre><code class="language-python">import time, logging, redis
+from redis.exceptions import ConnectionError
+
+CHANNELS = ["config.changed", "feature.flag"]
+RETRY_BACKOFF = [1, 2, 5, 10, 30]
+
+def run_subscriber(host, port):
+    backoff_idx = 0
+    while True:
+        try:
+            conn = redis.Redis(host=host, port=port,
+                              health_check_interval=30,
+                              socket_keepalive=True)
+            pubsub = conn.pubsub()
+            pubsub.subscribe(*CHANNELS)
+            logging.info("subscribed channels=%s", CHANNELS)
+            backoff_idx = 0
+
+            for msg in pubsub.listen():
+                if msg["type"] == "message":
+                    handle_message(msg["channel"], msg["data"])
+
+        except ConnectionError as ex:
+            wait = RETRY_BACKOFF[min(backoff_idx, len(RETRY_BACKOFF)-1)]
+            backoff_idx += 1
+            logging.warning("pubsub disconnected err=%s wait=%ds", ex, wait)
+            time.sleep(wait)
+        except Exception as ex:
+            logging.error("pubsub fatal err=%s", ex)
+            raise</code></pre>
+
+<div class="warning">
+  <p><strong>关键要点</strong>:</p>
+  <ul>
+    <li>✓ 异常捕获后必须重新进入循环重订阅</li>
+    <li>✓ 指数退避避免瞬时雪崩</li>
+    <li>✓ socket_keepalive 检测 TCP 半开连接</li>
+    <li>✓ health_check_interval 主动探活</li>
+    <li>✗ 不要在 listen 内 catch 后 continue(订阅状态已丢)</li>
+    <li>✗ 不要不退避立即重连(可能撑爆服务器)</li>
+  </ul>
+</div>
+
+<h2 id="s30-12">30.12 源码深潜</h2>
+
+<table>
+<thead><tr><th>文件</th><th>函数/结构</th><th>职责</th></tr></thead>
+<tbody>
+<tr><td><code>src/pubsub.c</code></td><td><code>subscribeCommand()</code></td><td>SUBSCRIBE 入口</td></tr>
+<tr><td><code>src/pubsub.c</code></td><td><code>psubscribeCommand()</code></td><td>PSUBSCRIBE 入口</td></tr>
+<tr><td><code>src/pubsub.c</code></td><td><code>publishCommand()</code></td><td>PUBLISH 入口</td></tr>
+<tr><td><code>src/pubsub.c</code></td><td><code>ssubscribeCommand()</code></td><td>SSUBSCRIBE 入口</td></tr>
+<tr><td><code>src/pubsub.c</code></td><td><code>spublishCommand()</code></td><td>SPUBLISH 入口</td></tr>
+<tr><td><code>src/pubsub.c</code></td><td><code>pubsubSubscribeChannel()</code></td><td>订阅核心实现</td></tr>
+<tr><td><code>src/pubsub.c</code></td><td><code>pubsubPublishMessageInternal()</code></td><td>发布核心实现</td></tr>
+<tr><td><code>src/pubsub.c</code></td><td><code>pubsubPublishMessageShard()</code></td><td>Sharded 发布实现</td></tr>
+<tr><td><code>src/cluster.c</code></td><td><code>clusterPropagatePublish()</code></td><td>Cluster Bus 广播</td></tr>
+<tr><td><code>src/util.c</code></td><td><code>stringmatchlen()</code></td><td>glob 匹配</td></tr>
+</tbody>
+</table>
+
+<pre><code class="language-c">/* src/pubsub.c - SUBSCRIBE 命令入口 */
+void subscribeCommand(client *c) {
+    int j;
+    if ((c-&gt;flags &amp; CLIENT_PUBSUB) &amp;&amp; c-&gt;resp == 2) {
+        /* RESP2 下,订阅状态有命令限制 */
+        addReplyError(c, "...");
+        return;
+    }
+    for (j = 1; j &lt; c-&gt;argc; j++)
+        pubsubSubscribeChannel(c, c-&gt;argv[j]);
+    c-&gt;flags |= CLIENT_PUBSUB;
+}
+
+/* src/pubsub.c - PUBLISH 命令入口 */
+void publishCommand(client *c) {
+    int receivers = pubsubPublishMessage(c-&gt;argv[1], c-&gt;argv[2]);
+    if (server.cluster_enabled) {
+        clusterPropagatePublish(c-&gt;argv[1], c-&gt;argv[2]);
+    } else {
+        forceCommandPropagation(c, PROPAGATE_REPL);
+    }
+    addReplyLongLong(c, receivers);
+}
+
+/* src/cluster.c - Cluster 广播 */
+void clusterPropagatePublish(robj *channel, robj *message) {
+    dictIterator *di = dictGetIterator(server.cluster-&gt;nodes);
+    dictEntry *de;
+    while ((de = dictNext(di)) != NULL) {
+        clusterNode *node = dictGetVal(de);
+        if (node == myself) continue;
+        if (node-&gt;flags &amp; (CLUSTER_NODE_HANDSHAKE | CLUSTER_NODE_NOADDR))
+            continue;
+        clusterSendPublish(node-&gt;link, channel, message);
+    }
+    dictReleaseIterator(di);
+}</code></pre>
+
+<h3>设计取舍</h3>
+
+<p>Redis Pub/Sub 选择"双向索引"是空间换时间的经典权衡。若仅 server 端持有 channel → clients 映射,客户端断连时清理需遍历所有 channel,O(全 channel × 平均订阅者)。增加 client 端镜像后,断连清理为 O(此客户端的订阅数),代价是每个订阅消耗双倍指针。该模式与关系数据库的二级索引设计同构:用一定空间换查询时间。</p>
+
+<p><code>pubsub_patterns</code> 选择 list 而非 dict 的根本原因是 pattern 与 channel 的不可逆关系。dict 加速的前提是有可哈希的 key 直接定位到 value;但 pattern 是表达式,channel 是具体字符串,两者不能互相反推。每次 PUBLISH 必须对每个 pattern 调用 stringmatchlen 判定,无法跳过。trie 或 NFA 可优化前缀共享场景,但代码复杂度显著增加,对生产环境通常 &lt; 100 个 pattern 的规模收益不大,Redis 选择保留最简洁的 list 实现。</p>
+
+<p>PUBLISH 不经过主从复制流是 Pub/Sub 即时性的必然结果。复制流是异步的,从节点接收时间晚于主节点,若从节点重放 PUBLISH 会导致重复投递;若仅从节点重放,主节点订阅者无消息。Redis 选择"PUBLISH 仅在执行节点处理",主从订阅者独立,代价是从节点订阅者无法完整看到全局消息流,需应用层规定连接到主节点。</p>
+
+<p>Redis 7.0 引入 Sharded Pub/Sub 是对 Cluster 模式 PUBLISH 不可扩展性的根本回应。原生 PUBLISH 通过 Cluster Bus 广播保证全局可达,但 O(N) 网络放大在大集群下不可接受。Sharded Pub/Sub 将 channel 提升为 key,通过 hash slot 路由,牺牲全局可达性换取 O(1) 网络成本。该设计与 Redis Cluster 的核心 key 分片模式一致,使消息系统与数据系统共用同一拓扑模型。代价是 pattern 订阅在 Sharded 模式下不存在(<code>SPSUBSCRIBE</code> 不实现),因为 pattern 的全局语义与 slot 隔离原则冲突。</p>
+
+<h2 id="s30-summary">30.13 本章要点</h2>
+
+<div class="chapter-summary">
+<ol>
+<li>Pub/Sub 由 dict(channels)+ list(patterns)实现,服务端与客户端<strong>双向索引</strong>以支持 O(1) 断连清理</li>
+<li>PUBLISH 投递分两阶段:dict 查找直接订阅者,list 遍历对每个 pattern 调用 <code>stringmatchlen</code></li>
+<li>PUBLISH 返回值是<strong>本节点</strong>投递客户端数,不包括 Cluster 其他节点;不代表业务层处理完成</li>
+<li>Pub/Sub 投递语义为 <strong>at-most-once</strong>:无 backlog、无 ACK,断连/慢消费者/crash 均会丢消息</li>
+<li>Cluster 普通 PUBLISH 通过 Cluster Bus 广播到所有节点,产生 <strong>O(N) 网络放大</strong></li>
+<li>Redis 7.0 <strong>Sharded Pub/Sub</strong>(<code>SPUBLISH</code>/<code>SSUBSCRIBE</code>)将 channel 视作 key,按 slot 路由消除 Bus 放大</li>
+<li>Sharded Pub/Sub <strong>不支持 pattern</strong>,客户端需处理 MOVED 重定向,slot 迁移触发订阅中断</li>
+<li>PUBLISH 不经主从复制流传播,主从订阅者状态独立;实践中应规定客户端连主节点</li>
+<li>慢消费者通过 <code>client-output-buffer-limit pubsub 32mb 8mb 60</code> 控制</li>
+<li>需要可靠投递时应使用 Stream;Sentinel 自身用 <code>__sentinel__:hello</code> 通过 Pub/Sub 做服务发现</li>
+</ol>
+</div>
+
+<p>下一章讨论 Stream 数据类型,该结构提供持久化的消息日志、消费者组与 PEL 机制,与 Pub/Sub 形成 Redis 消息能力的完整光谱。</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script>hljs.highlightAll();</script>
+</body>
+</html>

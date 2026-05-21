@@ -1,0 +1,2055 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.26 Sentinel 哨兵 — 图解 Redis</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="d-purple" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-purple-fill-start)"/><stop offset="100%" stop-color="var(--diagram-purple-fill-end)"/></linearGradient>
+    <linearGradient id="d-green" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-green-fill-start)"/><stop offset="100%" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    <linearGradient id="d-blue" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-blue-fill-start)"/><stop offset="100%" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <linearGradient id="d-orange" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-orange-fill-start)"/><stop offset="100%" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+    <linearGradient id="d-red" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-red-fill-start)"/><stop offset="100%" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+    <filter id="d-shadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="var(--diagram-text)" flood-opacity="0.4"/></filter>
+    <marker id="d-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-muted)"/></marker>
+    <marker id="d-arr-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-green-stroke)"/></marker>
+    <marker id="d-arr-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-red-stroke)"/></marker>
+    <marker id="d-arr-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-blue-stroke)"/></marker>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Redis</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="25-replication.html">上一章</a>
+  <a href="27-cluster.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s26-1">26.1 三项设计目标</a>
+  <a href="#s26-2">26.2 节点角色与配置</a>
+  <a href="#s26-3">26.3 自动发现 hello</a>
+  <a href="#s26-4">26.4 SDOWN 主观下线</a>
+  <a href="#s26-5">26.5 ODOWN 客观下线</a>
+  <a href="#s26-6">26.6 故障判定状态机</a>
+  <a href="#s26-7">26.7 Leader 选举</a>
+  <a href="#s26-8">26.8 故障转移五阶段</a>
+  <a href="#s26-9">26.9 副本选择规则</a>
+  <a href="#s26-10">26.10 多部署模式</a>
+  <a href="#s26-11">26.11 性能基准</a>
+  <a href="#s26-12">26.12 已知陷阱与诊断</a>
+  <a href="#s26-13">26.13 源码深潜</a>
+  <a href="#s26-summary">26.14 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 26 章 · Sentinel 哨兵</h1>
+<p class="subtitle">独立进程 · Pub/Sub 自动发现 · SDOWN/ODOWN 两阶段判定 · epoch + Raft 风格 Leader 选举 · 故障转移五阶段 · 副本三层排序 · 脑裂保护</p>
+
+<div class="chapter-intro">
+  <p class="lead">Sentinel 是一组独立部署的进程,负责对一组 Redis 主从节点执行三项任务:<strong>监控存活、触发故障转移、向客户端通告新主节点地址</strong>。其设计核心包括:基于 <strong>Pub/Sub 的拓扑自动发现</strong>、<strong>SDOWN/ODOWN 两阶段故障判定</strong>、<strong>Raft 风格的 Leader 选举</strong>、<strong>epoch 单调递增</strong>的版本号机制。Sentinel 自身保持无共享状态,仅通过 Pub/Sub 与 INFO 命令收集信息。</p>
+  <p>本章按"拓扑发现 → 故障判定 → 选举转移 → 生产实践"四层组织,聚焦 Sentinel 在第 25 章主从复制基础上构建的<strong>故障检测与自动切换</strong>机制。读完本章你应当能够看着 <code>SENTINEL master mymaster</code> 输出说出每一项的含义、为什么 quorum 必须过半、以及 epoch 单调递增如何配合 quorum 防止脑裂。</p>
+  <ul class="will-learn">
+    <li>仅主从复制 vs 主从+Sentinel 在七个维度上的能力差异</li>
+    <li>Sentinel 通过 <code>__sentinel__:hello</code> 频道<strong>自动发现</strong>集群成员的协议细节</li>
+    <li>SDOWN(单 Sentinel 视角)与 ODOWN(集体仲裁)的关系与时序</li>
+    <li>quorum 与 N/2+1 的关系:为什么 quorum 必须严格过半才能避免脑裂</li>
+    <li>实例状态机 UP / SDOWN / ODOWN / FAILOVER 五状态与转换条件</li>
+    <li>Sentinel 选举与 Raft 在 7 个维度上的<strong>异同</strong></li>
+    <li>epoch 单调递增 + 同 epoch 1 票约束如何保证选举安全</li>
+    <li>故障转移五阶段(选副本 → 提升 → 重定向 → 广播 → 旧主降级)的耗时分布</li>
+    <li>副本选择三层排序(priority / offset / runid)的判定优先级</li>
+    <li>三机房五 Sentinel 的部署模式与脑裂保护机制</li>
+    <li>10 类生产陷阱(quorum 过低、down-after-ms 过小、THP、客户端硬编码等)</li>
+  </ul>
+  <p class="prereq">前置知识:第 24 章 PubSub(理解 <code>__sentinel__:hello</code> 频道工作原理);第 25 章主从复制(理解 <code>REPLICAOF</code>、PSYNC、复制 offset);分布式共识基础(Raft 的 term + leader election 概念,后续会与 Sentinel 的 epoch 机制对照)。读者最好亲手跑过三 Sentinel 监控一主两从的拓扑并触发过一次故障转移。</p>
+</div>
+
+<h3>本章全景图</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 26-0 · 本章导览 — 4 大模块 14 节</div>
+  <svg viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="460" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="380" y="18" width="180" height="46" rx="10" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="470" y="42" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">Sentinel 哨兵</text>
+      <text x="470" y="58" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">4 大模块 · 14 节</text>
+
+      <line x1="470" y1="64" x2="120" y2="100" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <line x1="470" y1="64" x2="370" y2="100" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <line x1="470" y1="64" x2="600" y2="100" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+      <line x1="470" y1="64" x2="850" y2="100" stroke="var(--diagram-red-stroke)" marker-end="url(#d-arr-r)"/>
+
+      <rect x="20" y="100" width="200" height="40" rx="6" fill="url(#d-blue)"/>
+      <text x="120" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">P1 · 拓扑与发现</text>
+      <rect x="20" y="156" width="200" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="120" y="176" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">§26.1 设计目标 监控+转移+通告</text>
+      <rect x="20" y="194" width="200" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="120" y="214" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">§26.2 节点角色 三类</text>
+      <rect x="20" y="232" width="200" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="120" y="252" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">§26.3 自动发现 hello</text>
+
+      <rect x="270" y="100" width="200" height="40" rx="6" fill="url(#d-green)"/>
+      <text x="370" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">P2 · 故障判定</text>
+      <rect x="270" y="156" width="200" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="370" y="176" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">§26.4 SDOWN down-after-ms</text>
+      <rect x="270" y="194" width="200" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="370" y="214" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">§26.5 ODOWN quorum 仲裁</text>
+      <rect x="270" y="232" width="200" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="370" y="252" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">§26.6 状态机 UP→SDOWN→ODOWN</text>
+
+      <rect x="520" y="100" width="200" height="40" rx="6" fill="url(#d-orange)"/>
+      <text x="620" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">P3 · 选举与转移</text>
+      <rect x="520" y="156" width="200" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="620" y="176" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">§26.7 Leader 选举 epoch</text>
+      <rect x="520" y="194" width="200" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="620" y="214" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">§26.8 转移五阶段</text>
+      <rect x="520" y="232" width="200" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="620" y="252" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">§26.9 副本选择 三层排序</text>
+
+      <rect x="770" y="100" width="160" height="40" rx="6" fill="url(#d-red)"/>
+      <text x="850" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">P4 · 生产实践</text>
+      <rect x="770" y="156" width="160" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="850" y="176" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">§26.10 多部署 3/5 节点</text>
+      <rect x="770" y="194" width="160" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="850" y="214" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">§26.11 性能基准</text>
+      <rect x="770" y="232" width="160" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="850" y="252" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">§26.12 陷阱与诊断</text>
+      <rect x="770" y="270" width="160" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="850" y="290" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">§26.13/14 源码 + 速查</text>
+
+      <rect x="40" y="340" width="860" height="100" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="60" y="364" fill="var(--diagram-blue-text)" font-size="13" font-weight="800">★ 阅读路径</text>
+      <text x="60" y="386" fill="var(--diagram-muted)" font-size="10">· 入门:1→2→6(理解 Sentinel 在拓扑中的位置 + 状态机骨架)</text>
+      <text x="60" y="404" fill="var(--diagram-muted)" font-size="10">· 故障判定:4→5(SDOWN 是单 Sentinel 主观判定,ODOWN 才是过半客观下线)</text>
+      <text x="60" y="422" fill="var(--diagram-muted)" font-size="10">· 选举与切换:7→8→9(epoch 单调递增 + Raft 风格 + 副本选择三层排序)</text>
+      <text x="60" y="436" fill="var(--diagram-muted)" font-size="10">· 生产:10→11→12(3 节点最小可用,5 节点跨机房,陷阱重点看脑裂/误判)</text>
+    </g>
+  </svg>
+</div>
+
+<p>本章按拓扑发现、故障判定、选举转移、生产实践四层组织,聚焦 Sentinel 在复制基础上构建的故障检测与自动切换机制。</p>
+
+<!-- ============================================================ -->
+<h2 id="s26-1">26.1 Sentinel 的三项设计目标</h2>
+<!-- ============================================================ -->
+
+<p>第 25 章的主从复制解决了"读扩展"与"数据冗余",但<strong>主节点崩溃后客户端如何切到新主</strong>这个问题没有答案 — 仍需运维介入手动 <code>REPLICAOF NO ONE</code>。Sentinel 正是为此而生:它独立于 Redis 数据进程运行,持续监控主从拓扑,在主节点不可用时自动选出新主,并向客户端通告新地址。</p>
+
+<h3>26.1.1 与单纯主从复制的能力对比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 26-1-1 · Sentinel 与单纯主从复制在七个维度上的能力对比</div>
+  <table>
+    <thead><tr><th>维度</th><th>仅主从复制</th><th>主从 + Sentinel</th></tr></thead>
+    <tbody>
+      <tr><td>主节点崩溃</td><td>服务中断,需手动 <code>REPLICAOF</code></td><td><strong>自动选举新主</strong></td></tr>
+      <tr><td>故障检测</td><td>无内置机制</td><td><code>down-after-ms</code> + quorum</td></tr>
+      <tr><td>客户端发现</td><td>静态配置主节点地址</td><td>通过 Sentinel 解析当前主节点</td></tr>
+      <tr><td>拓扑变更通知</td><td>无</td><td>Pub/Sub <code>+switch-master</code> 事件</td></tr>
+      <tr><td>误判/脑裂保护</td><td>无</td><td>quorum + epoch 二重保护</td></tr>
+      <tr><td>适用规模</td><td>小规模/手动管理</td><td>中等规模(单分片可用性)</td></tr>
+      <tr><td>横向扩展</td><td>不支持</td><td>不支持(需 Cluster)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>26.1.2 Sentinel 在拓扑中的角色</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 26-1-1 · Sentinel 集群、Redis 数据节点、客户端三层关系</div>
+  <svg viewBox="0 0 940 380" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="380" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="20" y="40" width="280" height="240" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="1.5"/>
+      <text x="160" y="62" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="13" font-weight="800">Sentinel 集群(独立进程)</text>
+      <rect x="80" y="84" width="160" height="40" rx="8" fill="url(#d-purple)"/>
+      <text x="160" y="108" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Sentinel-1</text>
+      <rect x="80" y="138" width="160" height="40" rx="8" fill="url(#d-purple)"/>
+      <text x="160" y="162" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Sentinel-2</text>
+      <rect x="80" y="192" width="160" height="40" rx="8" fill="url(#d-purple)"/>
+      <text x="160" y="216" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Sentinel-3</text>
+      <text x="160" y="266" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">仅监控,不存数据</text>
+
+      <rect x="350" y="40" width="280" height="240" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)" stroke-width="1.5"/>
+      <text x="490" y="62" text-anchor="middle" fill="var(--diagram-green-text)" font-size="13" font-weight="800">Redis 数据节点</text>
+      <rect x="410" y="84" width="160" height="40" rx="8" fill="url(#d-purple)"/>
+      <text x="490" y="108" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Master</text>
+      <rect x="410" y="138" width="160" height="40" rx="8" fill="url(#d-green)"/>
+      <text x="490" y="162" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Replica-1</text>
+      <rect x="410" y="192" width="160" height="40" rx="8" fill="url(#d-green)"/>
+      <text x="490" y="216" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Replica-2</text>
+
+      <line x1="490" y1="124" x2="490" y2="138" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <line x1="490" y1="124" x2="490" y2="192" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+
+      <rect x="680" y="40" width="240" height="240" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)" stroke-width="1.5"/>
+      <text x="800" y="62" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="13" font-weight="800">客户端</text>
+      <rect x="730" y="138" width="140" height="40" rx="8" fill="url(#d-blue)"/>
+      <text x="800" y="162" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">业务进程</text>
+
+      <line x1="300" y1="160" x2="350" y2="160" stroke="var(--diagram-purple-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
+      <text x="325" y="152" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9" font-weight="700">INFO/PING</text>
+      <text x="325" y="180" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9" font-weight="700">PSUB hello</text>
+
+      <path d="M 50,124 Q 20,158 50,194" fill="none" stroke="var(--diagram-purple-stroke)" stroke-width="2" stroke-dasharray="4,3" marker-end="url(#d-arr)"/>
+      <path d="M 60,194 Q 90,158 60,124" fill="none" stroke="var(--diagram-purple-stroke)" stroke-width="2" stroke-dasharray="4,3" marker-end="url(#d-arr)"/>
+      <text x="20" y="160" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9" font-weight="700" transform="rotate(-90 20 160)">__sentinel__:hello</text>
+
+      <line x1="730" y1="158" x2="300" y2="200" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" stroke-dasharray="3,3" marker-end="url(#d-arr-b)"/>
+      <text x="500" y="195" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9" font-weight="700">SENTINEL get-master-addr-by-name</text>
+
+      <line x1="730" y1="158" x2="570" y2="108" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#d-arr-b)"/>
+      <text x="650" y="120" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9" font-weight="700">读写</text>
+
+      <rect x="20" y="300" width="900" height="60" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="40" y="322" fill="var(--diagram-blue-text)" font-size="11" font-weight="800">★ 三层关系</text>
+      <text x="40" y="340" fill="var(--diagram-muted)" font-size="10">· Sentinel ↔ Redis: 监控通道(INFO 拓扑 + PING 健康 + PSUB 发现)</text>
+      <text x="40" y="354" fill="var(--diagram-muted)" font-size="10">· Sentinel ↔ Sentinel: 通过 Redis 的 hello 频道相互发现 · Client → Sentinel: 解析 master 地址 · Client → Redis: 读写</text>
+    </g>
+  </svg>
+</div>
+
+<p>Sentinel 进程与数据进程是<strong>分离</strong>的:Sentinel 不存储用户数据,Redis 数据节点不参与故障判定决策。Sentinel 通过订阅数据节点的 <code>__sentinel__:hello</code> 频道相互发现,通过 INFO 命令收集复制拓扑。</p>
+
+<div class="key-insight">
+  <strong>为什么独立部署</strong>:Sentinel 选择"独立进程而非内嵌共识"是有意为之。代价是部署复杂度增加(需额外维护 N+M 个进程),收益是<strong>故障域隔离</strong> — 数据节点可保持单线程简洁性,Sentinel 可独立升级,主节点崩溃不会拖垮 Sentinel 本身。第 27 章 Cluster 走另一条路:把判定与选举内嵌到数据节点,代价是数据节点协议复杂度上升。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s26-2">26.2 节点角色与配置</h2>
+<!-- ============================================================ -->
+
+<p>Sentinel 拓扑中存在三类角色:<strong>Master(写)、Replica(读 + 复制)、Sentinel(监控)</strong>。它们由两个不同二进制(<code>redis-server</code> / <code>redis-sentinel</code>)启动,职责互不重叠。</p>
+
+<h3>26.2.1 三类角色的职责划分</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 26-2-1 · Sentinel 拓扑中的三类角色</div>
+  <table>
+    <thead><tr><th>角色</th><th>进程</th><th>主要任务</th><th>配置文件示例</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Master</strong></td><td><code>redis-server</code></td><td>接受写,异步复制</td><td><code>bind</code> + <code>port</code> + <code>replicaof</code> 不设置</td></tr>
+      <tr><td><strong>Replica</strong></td><td><code>redis-server</code></td><td>接受读,从 Master 复制</td><td><code>replicaof master 6379</code></td></tr>
+      <tr><td><strong>Sentinel</strong></td><td><code>redis-sentinel</code></td><td>监控 + 故障转移 + 通告</td><td><code>sentinel monitor mymaster ...</code></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>26.2.2 Sentinel 最小配置</h3>
+
+<pre><code class="language-properties"># sentinel.conf — 最小可用配置
+port 26379
+sentinel monitor mymaster 192.168.1.10 6379 2
+sentinel down-after-milliseconds mymaster 5000
+sentinel failover-timeout mymaster 60000
+sentinel parallel-syncs mymaster 1</code></pre>
+
+<div class="diagram">
+  <div class="diagram-title">表 26-2-2 · 核心配置项语义</div>
+  <table>
+    <thead><tr><th>配置项</th><th>默认值</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td><code>sentinel monitor</code></td><td>-</td><td><code>&lt;master-name&gt; &lt;ip&gt; &lt;port&gt; &lt;quorum&gt;</code>,quorum = ODOWN 阈值</td></tr>
+      <tr><td><code>down-after-milliseconds</code></td><td>30,000 ms</td><td>持续 ping 失败时长后判 SDOWN</td></tr>
+      <tr><td><code>failover-timeout</code></td><td>180,000 ms</td><td>故障转移最大耗时,超时即放弃</td></tr>
+      <tr><td><code>parallel-syncs</code></td><td>1</td><td>提升后允许多少个 replica 同时全量同步新主</td></tr>
+      <tr><td><code>auth-pass</code></td><td>-</td><td>数据节点的认证密码</td></tr>
+      <tr><td><code>notification-script</code></td><td>-</td><td>重大事件触发的外部脚本</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>26.2.3 启动后的拓扑稳定状态</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 26-2-1 · Sentinel 启动 → 发现 → 周期任务的状态序列</div>
+  <svg viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="460" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="320" y="20" width="300" height="44" rx="8" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="470" y="44" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">A · redis-sentinel 启动</text>
+      <text x="470" y="58" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">redis-sentinel sentinel.conf</text>
+      <line x1="470" y1="64" x2="470" y2="80" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="320" y="80" width="300" height="40" rx="8" fill="url(#d-blue)"/>
+      <text x="470" y="104" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">B · 读取 sentinel monitor 配置</text>
+      <line x1="470" y1="120" x2="470" y2="136" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+
+      <rect x="320" y="136" width="300" height="40" rx="8" fill="url(#d-blue)"/>
+      <text x="470" y="160" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">C · 连接 master 执行 INFO</text>
+      <line x1="470" y1="176" x2="470" y2="192" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+
+      <rect x="320" y="192" width="300" height="40" rx="8" fill="url(#d-blue)"/>
+      <text x="470" y="216" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">D · 发现 replica 列表</text>
+      <line x1="470" y1="232" x2="470" y2="248" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+
+      <rect x="280" y="248" width="380" height="40" rx="8" fill="url(#d-orange)"/>
+      <text x="470" y="272" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">E · 订阅 master + 每个 replica 的 __sentinel__:hello</text>
+      <line x1="470" y1="288" x2="470" y2="304" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="280" y="304" width="380" height="40" rx="8" fill="url(#d-orange)"/>
+      <text x="470" y="328" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">F · 发布自身存在到 hello 频道</text>
+      <line x1="470" y1="344" x2="470" y2="360" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="280" y="360" width="380" height="40" rx="8" fill="url(#d-orange)"/>
+      <text x="470" y="384" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">G/H · 收他人 hello → 维护 known_sentinels</text>
+      <line x1="470" y1="400" x2="470" y2="416" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="170" y="416" width="600" height="34" rx="8" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="470" y="438" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">★ J · 稳态:1s PING + 10s INFO + 2s hello(三周期)</text>
+
+      <rect x="20" y="80" width="240" height="320" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="40" y="102" fill="var(--diagram-blue-text)" font-size="11" font-weight="800">★ 三个独立周期</text>
+      <text x="40" y="124" fill="var(--diagram-muted)" font-size="10">每个 Sentinel 维护:</text>
+      <rect x="36" y="138" width="208" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="50" y="156" fill="var(--diagram-green-text)" font-size="10" font-weight="800">PING · 1 秒</text>
+      <text x="50" y="172" fill="var(--diagram-green-text)" font-size="9">检活 → 触发 SDOWN 判定</text>
+      <rect x="36" y="190" width="208" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="50" y="208" fill="var(--diagram-blue-text)" font-size="10" font-weight="800">INFO · 10 秒</text>
+      <text x="50" y="224" fill="var(--diagram-blue-text)" font-size="9">刷新 replica 列表 + offset</text>
+      <rect x="36" y="242" width="208" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="50" y="260" fill="var(--diagram-orange-text)" font-size="10" font-weight="800">hello · 2 秒</text>
+      <text x="50" y="276" fill="var(--diagram-orange-text)" font-size="9">通告自身 + 发现他人</text>
+
+      <text x="40" y="310" fill="var(--diagram-muted)" font-size="10">这三个周期决定了:</text>
+      <text x="40" y="328" fill="var(--diagram-muted)" font-size="9">· 检测延迟下界 ≈ 1s</text>
+      <text x="40" y="346" fill="var(--diagram-muted)" font-size="9">· 拓扑感知滞后 ≈ 10s</text>
+      <text x="40" y="364" fill="var(--diagram-muted)" font-size="9">· Sentinel 互识 ≈ 2-4s</text>
+
+      <rect x="690" y="80" width="240" height="320" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="710" y="102" fill="var(--diagram-blue-text)" font-size="11" font-weight="800">★ 关键观察</text>
+      <text x="710" y="124" fill="var(--diagram-muted)" font-size="10">配置中只写 master,</text>
+      <text x="710" y="140" fill="var(--diagram-muted)" font-size="10">不需列出 replica 与</text>
+      <text x="710" y="156" fill="var(--diagram-muted)" font-size="10">其他 Sentinel:</text>
+      <text x="710" y="180" fill="var(--diagram-green-text)" font-size="10">+ replica 通过 INFO 自动发现</text>
+      <text x="710" y="200" fill="var(--diagram-green-text)" font-size="10">+ Sentinel 通过 hello 频道</text>
+      <text x="710" y="216" fill="var(--diagram-green-text)" font-size="10">  自动相互发现</text>
+      <text x="710" y="240" fill="var(--diagram-muted)" font-size="10">→ 减少静态配置错误</text>
+      <text x="710" y="256" fill="var(--diagram-muted)" font-size="10">→ 新增节点零运维介入</text>
+      <text x="710" y="280" fill="var(--diagram-orange-text)" font-size="10">★ 代价:首次启动延迟</text>
+      <text x="710" y="296" fill="var(--diagram-orange-text)" font-size="10">  ≈ 2-3 个 hello 周期(4-6s)</text>
+      <text x="710" y="320" fill="var(--diagram-muted)" font-size="10">→ 完全发现需 master 在</text>
+      <text x="710" y="336" fill="var(--diagram-muted)" font-size="10">  线;若 master 已宕机,</text>
+      <text x="710" y="352" fill="var(--diagram-muted)" font-size="10">  仅靠 replica 发现也 OK</text>
+    </g>
+  </svg>
+</div>
+
+<p>稳定后,每个 Sentinel 维护三个独立周期循环:<strong>1 秒 PING</strong>(检活)、<strong>10 秒 INFO</strong>(刷新拓扑)、<strong>2 秒 hello</strong>(发现并通告自身)。这三个周期决定了 Sentinel 检测延迟与发现速度的下界。</p>
+
+<!-- ============================================================ -->
+<h2 id="s26-3">26.3 自动发现:__sentinel__:hello</h2>
+<!-- ============================================================ -->
+
+<p>Sentinel 不要求在配置中显式列出其他 Sentinel 的地址,而是通过订阅数据节点上的特殊频道 <code>__sentinel__:hello</code> 自动发现。这是"<strong>master 充当消息总线</strong>"的精妙设计:Sentinel 间无直接连接,所有发现消息都经过数据节点中转。</p>
+
+<h3>26.3.1 自动发现时序</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 26-3-1 · 三个 Sentinel 通过 master 互相发现的时序</div>
+  <svg viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="460" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="40" y="14" width="160" height="34" rx="6" fill="url(#d-purple)"/>
+      <text x="120" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Sentinel-1</text>
+      <rect x="240" y="14" width="160" height="34" rx="6" fill="url(#d-purple)"/>
+      <text x="320" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Sentinel-2</text>
+      <rect x="440" y="14" width="160" height="34" rx="6" fill="url(#d-purple)"/>
+      <text x="520" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Sentinel-3</text>
+      <rect x="700" y="14" width="200" height="34" rx="6" fill="url(#d-green)"/>
+      <text x="800" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Master(消息总线)</text>
+
+      <line x1="120" y1="48" x2="120" y2="440" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="320" y1="48" x2="320" y2="440" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="520" y1="48" x2="520" y2="440" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="800" y1="48" x2="800" y2="440" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+
+      <rect x="40" y="58" width="860" height="36" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-dasharray="3,3"/>
+      <text x="470" y="78" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">Note: 配置中仅指定 master 地址,无需预先列出其他 Sentinel</text>
+
+      <line x1="120" y1="106" x2="800" y2="106" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="460" y="100" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">① S1 SUBSCRIBE __sentinel__:hello</text>
+      <line x1="320" y1="124" x2="800" y2="124" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="560" y="118" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">② S2 SUBSCRIBE</text>
+      <line x1="520" y1="142" x2="800" y2="142" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="660" y="136" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">③ S3 SUBSCRIBE</text>
+
+      <rect x="40" y="160" width="860" height="180" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="60" y="180" fill="var(--diagram-orange-text)" font-size="12" font-weight="800">loop · 每 2 秒一次</text>
+
+      <line x1="120" y1="206" x2="800" y2="206" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+      <text x="460" y="200" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">④ S1 PUBLISH "S1_ip,S1_port,S1_runid,..."</text>
+
+      <line x1="800" y1="226" x2="320" y2="226" stroke="var(--diagram-purple-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr)"/>
+      <text x="560" y="220" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">⑤ 转发 → S2</text>
+      <line x1="800" y1="246" x2="520" y2="246" stroke="var(--diagram-purple-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr)"/>
+      <text x="660" y="240" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">⑥ 转发 → S3</text>
+
+      <line x1="320" y1="270" x2="800" y2="270" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+      <text x="560" y="264" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">⑦ S2 PUBLISH "S2_ip,..."</text>
+
+      <line x1="800" y1="290" x2="120" y2="290" stroke="var(--diagram-purple-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr)"/>
+      <text x="460" y="284" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">⑧ 转发 → S1</text>
+      <line x1="800" y1="310" x2="520" y2="310" stroke="var(--diagram-purple-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr)"/>
+      <text x="660" y="304" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">⑨ 转发 → S3</text>
+
+      <text x="60" y="332" fill="var(--diagram-muted)" font-size="10">⋮ S3 同样发布,经 master 转发到 S1、S2(略)</text>
+
+      <rect x="40" y="356" width="860" height="36" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3"/>
+      <text x="470" y="378" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">Note: 三个 Sentinel 自动维护 known_sentinels 列表(三方对称)</text>
+
+      <rect x="40" y="402" width="860" height="42" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="60" y="422" fill="var(--diagram-blue-text)" font-size="11" font-weight="800">★ 设计精妙处</text>
+      <text x="60" y="438" fill="var(--diagram-muted)" font-size="10">Sentinel 间无直接 TCP 连接 → master 充当中转 → 减少 N×N 连接数为 N(对每个 master)</text>
+    </g>
+  </svg>
+</div>
+
+<h3>26.3.2 hello 消息字段结构</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 26-3-2 · __sentinel__:hello 消息的 8 字段格式</div>
+  <svg viewBox="0 0 920 300" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:920px;width:100%;margin:8px auto;height:auto;">
+    <defs>
+      <linearGradient id="hello-self" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+      <linearGradient id="hello-mst" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-purple-fill-start)"/><stop offset="1" stop-color="var(--diagram-purple-fill-end)"/></linearGradient>
+    </defs>
+    <rect x="0" y="0" width="920" height="300" fill="var(--diagram-panel)" rx="10"/>
+    <text x="460" y="22" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="13" font-weight="700" font-family="monospace">__sentinel__:hello 消息(逗号分隔 8 字段)</text>
+
+    <!-- 8 fields -->
+    <g transform="translate(40, 50)" font-family="monospace" font-size="11">
+      <rect x="0" y="0" width="100" height="34" fill="url(#hello-self)"/><text x="50" y="20" text-anchor="middle" fill="var(--diagram-text)">IP</text>
+      <rect x="100" y="0" width="100" height="34" fill="url(#hello-self)"/><text x="150" y="20" text-anchor="middle" fill="var(--diagram-text)">PORT</text>
+      <rect x="200" y="0" width="100" height="34" fill="url(#hello-self)"/><text x="250" y="20" text-anchor="middle" fill="var(--diagram-text)">RUNID</text>
+      <rect x="300" y="0" width="100" height="34" fill="url(#hello-self)"/><text x="350" y="20" text-anchor="middle" fill="var(--diagram-text)">EPOCH</text>
+      <rect x="420" y="0" width="100" height="34" fill="url(#hello-mst)"/><text x="470" y="20" text-anchor="middle" fill="var(--diagram-text)">MASTER_NAME</text>
+      <rect x="520" y="0" width="100" height="34" fill="url(#hello-mst)"/><text x="570" y="20" text-anchor="middle" fill="var(--diagram-text)">MASTER_IP</text>
+      <rect x="620" y="0" width="100" height="34" fill="url(#hello-mst)"/><text x="670" y="20" text-anchor="middle" fill="var(--diagram-text)">MASTER_PORT</text>
+      <rect x="720" y="0" width="100" height="34" fill="url(#hello-mst)"/><text x="770" y="20" text-anchor="middle" fill="var(--diagram-text)">MASTER_EPOCH</text>
+
+      <text x="200" y="58" text-anchor="middle" fill="var(--diagram-blue-text)">前 4 字段 → Sentinel 自身信息</text>
+      <text x="620" y="58" text-anchor="middle" fill="var(--diagram-purple-text)">后 4 字段 → 当前已知主节点信息</text>
+    </g>
+
+    <!-- 示例 -->
+    <g transform="translate(40, 130)">
+      <rect x="0" y="0" width="840" height="50" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="20" y="22" fill="var(--diagram-orange-text)" font-size="11" font-weight="700" font-family="monospace">示例:</text>
+      <text x="20" y="42" fill="var(--diagram-orange-text)" font-size="11" font-family="monospace">192.168.1.5,26379,8b7f5df...,12,mymaster,192.168.1.10,6379,12</text>
+    </g>
+
+    <!-- 字段用途 -->
+    <g transform="translate(40, 200)">
+      <rect x="0" y="0" width="840" height="80" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="20" y="22" fill="var(--diagram-purple-text)" font-size="12" font-weight="700">字段用途</text>
+      <text x="20" y="44" fill="var(--diagram-blue-text)" font-size="11">• 前 4 字段 → 发现新 Sentinel + 同步 epoch (Raft 风格的视图版本号)</text>
+      <text x="20" y="64" fill="var(--diagram-blue-text)" font-size="11">• 后 4 字段 → 检测拓扑分歧(谁认为谁是 master),触发"配置共享"协议</text>
+    </g>
+  </svg>
+</div>
+
+<h3>26.3.3 ASCII 拓扑视图</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 26-3-3 · master 充当消息总线的发现拓扑</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:920px;width:100%;margin:8px auto;height:auto;">
+    <defs>
+      <linearGradient id="bus-m" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-purple-fill-start)"/><stop offset="1" stop-color="var(--diagram-purple-fill-end)"/></linearGradient>
+      <linearGradient id="bus-s" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+      <marker id="bus-sub" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-green-stroke)"/></marker>
+      <marker id="bus-pub" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-orange-stroke)"/></marker>
+    </defs>
+    <rect x="0" y="0" width="920" height="380" fill="var(--diagram-panel)" rx="10"/>
+
+    <!-- Master -->
+    <rect x="360" y="40" width="200" height="60" rx="10" fill="url(#bus-m)"/>
+    <text x="460" y="64" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="700">Master (6379)</text>
+    <text x="460" y="84" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-family="monospace">__sentinel__:hello</text>
+
+    <!-- Sentinels -->
+    <rect x="80" y="200" width="180" height="60" rx="10" fill="url(#bus-s)"/>
+    <text x="170" y="224" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">Sentinel-1</text>
+    <text x="170" y="244" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-family="monospace">26379</text>
+
+    <rect x="370" y="200" width="180" height="60" rx="10" fill="url(#bus-s)"/>
+    <text x="460" y="224" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">Sentinel-2</text>
+    <text x="460" y="244" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-family="monospace">26380</text>
+
+    <rect x="660" y="200" width="180" height="60" rx="10" fill="url(#bus-s)"/>
+    <text x="750" y="224" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="700">Sentinel-3</text>
+    <text x="750" y="244" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-family="monospace">26381</text>
+
+    <!-- PUBLISH (上) -->
+    <path d="M 170 200 L 360 100" stroke="var(--diagram-orange-stroke)" stroke-width="1.8" stroke-dasharray="5,3" marker-end="url(#bus-pub)" fill="none"/>
+    <path d="M 460 200 L 460 100" stroke="var(--diagram-orange-stroke)" stroke-width="1.8" stroke-dasharray="5,3" marker-end="url(#bus-pub)" fill="none"/>
+    <path d="M 750 200 L 560 100" stroke="var(--diagram-orange-stroke)" stroke-width="1.8" stroke-dasharray="5,3" marker-end="url(#bus-pub)" fill="none"/>
+    <text x="270" y="160" fill="var(--diagram-orange-text)" font-size="11">PUBLISH</text>
+
+    <!-- SUBSCRIBE (下) -->
+    <path d="M 380 100 L 200 200" stroke="var(--diagram-green-stroke)" stroke-width="1.8" marker-end="url(#bus-sub)" fill="none"/>
+    <path d="M 480 100 L 480 200" stroke="var(--diagram-green-stroke)" stroke-width="1.8" marker-end="url(#bus-sub)" fill="none"/>
+    <path d="M 540 100 L 720 200" stroke="var(--diagram-green-stroke)" stroke-width="1.8" marker-end="url(#bus-sub)" fill="none"/>
+    <text x="660" y="160" fill="var(--diagram-green-text)" font-size="11">SUBSCRIBE</text>
+
+    <text x="460" y="290" text-anchor="middle" fill="var(--diagram-orange-text)" font-family="monospace" font-size="11">每 2 秒,Sentinel 各自 PUBLISH 到 master,通过 master 把消息广播给所有订阅者</text>
+
+    <!-- 性质 -->
+    <g transform="translate(40, 310)">
+      <rect x="0" y="0" width="840" height="60" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="20" y="22" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">★ 仅需配置 master 地址,Sentinel 集群成员自动发现 · Sentinel 间无直接连接 · master 故障后频道短暂失效,故障转移完成后在新主上恢复</text>
+    </g>
+  </svg>
+</div>
+
+<h3>26.3.4 发现机制的边界条件</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 26-3-1 · 4 类边界条件下的发现行为</div>
+  <table>
+    <thead><tr><th>边界条件</th><th>行为</th><th>影响</th></tr></thead>
+    <tbody>
+      <tr><td>Master 不可达</td><td>hello 频道暂时失效</td><td>已发现的 Sentinel 仍维持 <code>known_sentinels</code></td></tr>
+      <tr><td>新 Sentinel 加入</td><td>2 秒后被其他 Sentinel 发现</td><td>quorum 计算自动更新</td></tr>
+      <tr><td>Sentinel 长时间失联</td><td>超过 <code>sentinel-down-after</code> 阈值后被标记</td><td>quorum 投票时不计入</td></tr>
+      <tr><td>Sentinel 配置不一致</td><td>不同 Sentinel 的 quorum 值可能冲突</td><td>配置必须在所有 Sentinel 上一致</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>26.3.5 hello 消息处理源码</h3>
+
+<pre><code class="language-c">/* sentinel.c — hello 消息处理(简化) */
+void sentinelProcessHelloMessage(char *hello, int hello_len) {
+    int numtokens = sdssplit(hello, ',', &amp;tokens);
+    if (numtokens != 8) goto cleanup;
+
+    /* 字段 0-3: 发送方信息 */
+    char *ip = tokens[0];
+    int port = atoi(tokens[1]);
+    char *runid = tokens[2];
+    uint64_t current_epoch = strtoull(tokens[3], NULL, 10);
+
+    /* 检查或新增 known_sentinel */
+    sentinelRedisInstance *si = getSentinelByRunid(runid);
+    if (!si) {
+        si = createSentinelRedisInstance(runid, SRI_SENTINEL, ip, port,
+                                         master->quorum, master);
+    }
+    /* 字段 4-7: 当前主节点信息(用于检测拓扑分歧) */
+    /* ... */
+}</code></pre>
+
+<div class="key-insight">
+  <strong>为什么不让 Sentinel 互相直连</strong>:让 master 充当消息总线避免了"发现协议本身需要发现"的循环。Sentinel 启动时只需要 1 个外部输入(master 地址),其余成员通过订阅同一频道自然汇聚。NAT/防火墙环境下只需开放 Sentinel → master 的 TCP 与 PUBSUB 通道,无需 Sentinel 之间两两可达。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s26-4">26.4 SDOWN 主观下线判定</h2>
+<!-- ============================================================ -->
+
+<p>SDOWN(Subjectively Down,主观下线)是<strong>单个 Sentinel</strong> 基于自身 PING 视角做出的本地判断。它仅触发"询问其他 Sentinel"的动作,不直接触发故障转移。</p>
+
+<h3>26.4.1 SDOWN 判定流程</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 26-4-1 · 从 PING 失败到标记 SDOWN 的判定循环</div>
+  <svg viewBox="0 0 940 360" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="360" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="20" y="20" width="240" height="46" rx="8" fill="url(#d-blue)" filter="url(#d-shadow)"/>
+      <text x="140" y="44" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">A · Sentinel 每 1 秒 PING</text>
+      <text x="140" y="60" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">sentinelSendPing()</text>
+
+      <line x1="260" y1="42" x2="300" y2="42" stroke="var(--diagram-border)" marker-end="url(#d-arr)"/>
+
+      <polygon points="300,42 400,12 500,42 400,72" fill="url(#d-purple)"/>
+      <text x="400" y="38" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">B · 收到 +PONG?</text>
+      <text x="400" y="54" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">decision</text>
+
+      <line x1="500" y1="42" x2="540" y2="42" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="520" y="34" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10" font-weight="800">是</text>
+
+      <rect x="540" y="20" width="200" height="46" rx="8" fill="url(#d-green)"/>
+      <text x="640" y="44" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">C · 重置 last_avail_time</text>
+      <text x="640" y="60" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">→ 回到 A</text>
+
+      <path d="M 740,40 Q 880,40 880,160 Q 880,180 460,180 Q 140,180 140,82" fill="none" stroke="var(--diagram-green-stroke)" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#d-arr-g)"/>
+
+      <line x1="400" y1="72" x2="400" y2="100" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+      <text x="416" y="92" fill="var(--diagram-orange-text)" font-size="10" font-weight="800">否</text>
+
+      <polygon points="400,100 580,140 400,180 220,140" fill="url(#d-orange)" filter="url(#d-shadow)"/>
+      <text x="400" y="138" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">D · now - last_avail_time</text>
+      <text x="400" y="154" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">≥ down-after-ms ?</text>
+      <text x="400" y="170" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">默认 30000ms</text>
+
+      <path d="M 220,140 Q 100,140 100,82" fill="none" stroke="var(--diagram-border)" stroke-width="1.5" stroke-dasharray="3,3" marker-end="url(#d-arr)"/>
+      <text x="106" y="118" fill="var(--diagram-muted)" font-size="10" font-weight="800">否 → 回 A</text>
+
+      <line x1="400" y1="180" x2="400" y2="218" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+      <text x="416" y="206" fill="var(--diagram-orange-text)" font-size="10" font-weight="800">是</text>
+
+      <rect x="240" y="218" width="320" height="50" rx="8" fill="url(#d-orange)" filter="url(#d-shadow)"/>
+      <text x="400" y="240" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">E · 标记 SRI_S_DOWN</text>
+      <text x="400" y="258" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">该实例进入 SDOWN(单 Sentinel 主观)</text>
+
+      <line x1="400" y1="268" x2="400" y2="288" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="20" y="288" width="440" height="50" rx="8" fill="url(#d-purple)"/>
+      <text x="240" y="310" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">F · 发 +sdown 事件 → __sentinel__:hello</text>
+      <text x="240" y="328" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">通告所有订阅者</text>
+
+      <line x1="460" y1="313" x2="500" y2="313" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+
+      <rect x="500" y="288" width="420" height="50" rx="8" fill="url(#d-blue)" filter="url(#d-shadow)"/>
+      <text x="710" y="310" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">G · 主动询问其他 Sentinel</text>
+      <text x="710" y="328" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">SENTINEL is-master-down-by-addr ip port 0 * (→ 触发 ODOWN)</text>
+    </g>
+  </svg>
+</div>
+
+<h3>26.4.2 SDOWN 判定时间线</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 26-4-2 · down-after-milliseconds=5000 ms PING 时间线</div>
+  <svg viewBox="0 0 920 320" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:920px;width:100%;margin:8px auto;height:auto;">
+    <defs>
+      <linearGradient id="ping-ok" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+      <linearGradient id="ping-fail" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+      <linearGradient id="ping-down" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-orange-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+    </defs>
+    <rect x="0" y="0" width="920" height="320" fill="var(--diagram-panel)" rx="10"/>
+    <text x="460" y="22" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="13" font-weight="700" font-family="monospace">PING 时间线 · 连续 5 秒失败 → SDOWN (t=8)</text>
+
+    <!-- timeline base -->
+    <line x1="50" y1="170" x2="870" y2="170" stroke="var(--diagram-blue-stroke)" stroke-width="2"/>
+
+    <!-- ping ticks -->
+    <g font-family="monospace" font-size="11">
+      <g transform="translate(80, 170)"><rect x="-10" y="-40" width="20" height="34" fill="url(#ping-ok)"/><text x="0" y="-22" text-anchor="middle" fill="var(--diagram-text)">P</text><text x="0" y="-50" text-anchor="middle" fill="var(--diagram-green-text)">PONG</text><circle r="4" fill="var(--diagram-green-fill)"/><text x="0" y="20" text-anchor="middle" fill="var(--diagram-blue-text)">t=0</text></g>
+      <g transform="translate(180, 170)"><rect x="-10" y="-40" width="20" height="34" fill="url(#ping-ok)"/><text x="0" y="-22" text-anchor="middle" fill="var(--diagram-text)">P</text><circle r="4" fill="var(--diagram-green-fill)"/><text x="0" y="20" text-anchor="middle" fill="var(--diagram-blue-text)">t=1</text></g>
+      <g transform="translate(280, 170)"><rect x="-10" y="-40" width="20" height="34" fill="url(#ping-ok)"/><text x="0" y="-22" text-anchor="middle" fill="var(--diagram-text)">P</text><circle r="4" fill="var(--diagram-green-fill)"/><text x="0" y="20" text-anchor="middle" fill="var(--diagram-blue-text)">t=2</text></g>
+      <g transform="translate(380, 170)"><rect x="-10" y="-40" width="20" height="34" fill="url(#ping-fail)"/><text x="0" y="-22" text-anchor="middle" fill="var(--diagram-text)">✗</text><text x="0" y="-50" text-anchor="middle" fill="var(--diagram-red-text)">timeout</text><circle r="4" fill="var(--diagram-red-fill)"/><text x="0" y="20" text-anchor="middle" fill="var(--diagram-blue-text)">t=3</text></g>
+      <g transform="translate(460, 170)"><rect x="-10" y="-40" width="20" height="34" fill="url(#ping-fail)"/><text x="0" y="-22" text-anchor="middle" fill="var(--diagram-text)">✗</text><circle r="4" fill="var(--diagram-red-fill)"/><text x="0" y="20" text-anchor="middle" fill="var(--diagram-blue-text)">t=4</text></g>
+      <g transform="translate(540, 170)"><rect x="-10" y="-40" width="20" height="34" fill="url(#ping-fail)"/><text x="0" y="-22" text-anchor="middle" fill="var(--diagram-text)">✗</text><circle r="4" fill="var(--diagram-red-fill)"/><text x="0" y="20" text-anchor="middle" fill="var(--diagram-blue-text)">t=5</text></g>
+      <g transform="translate(620, 170)"><rect x="-10" y="-40" width="20" height="34" fill="url(#ping-fail)"/><text x="0" y="-22" text-anchor="middle" fill="var(--diagram-text)">✗</text><circle r="4" fill="var(--diagram-red-fill)"/><text x="0" y="20" text-anchor="middle" fill="var(--diagram-blue-text)">t=6</text></g>
+      <g transform="translate(700, 170)"><rect x="-10" y="-40" width="20" height="34" fill="url(#ping-fail)"/><text x="0" y="-22" text-anchor="middle" fill="var(--diagram-text)">✗</text><circle r="4" fill="var(--diagram-red-fill)"/><text x="0" y="20" text-anchor="middle" fill="var(--diagram-blue-text)">t=7</text></g>
+      <g transform="translate(800, 170)"><rect x="-30" y="-50" width="60" height="44" rx="6" fill="url(#ping-down)"/><text x="0" y="-22" text-anchor="middle" fill="var(--diagram-text)" font-weight="700">SDOWN</text><circle r="6" fill="var(--diagram-orange-fill)"/><text x="0" y="20" text-anchor="middle" fill="var(--diagram-orange-text)" font-weight="700">t=8</text></g>
+    </g>
+
+    <!-- 标尺 -->
+    <path d="M 380 110 L 700 110" stroke="var(--diagram-red-stroke)" stroke-width="1.5"/>
+    <path d="M 380 100 L 380 120" stroke="var(--diagram-red-stroke)" stroke-width="1.5"/>
+    <path d="M 700 100 L 700 120" stroke="var(--diagram-red-stroke)" stroke-width="1.5"/>
+    <text x="540" y="100" text-anchor="middle" fill="var(--diagram-red-text)" font-family="monospace" font-size="11" font-weight="700">连续 5 秒未收 PONG &gt; 5000ms</text>
+
+    <!-- 关键点 -->
+    <g transform="translate(40, 230)">
+      <rect x="0" y="0" width="840" height="80" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="20" y="22" fill="var(--diagram-purple-text)" font-size="12" font-weight="700">★ 关键点</text>
+      <text x="20" y="44" fill="var(--diagram-blue-text)" font-size="11">• last_avail_time 在每次 PING+PONG 成功后刷新</text>
+      <text x="20" y="62" fill="var(--diagram-blue-text)" font-size="11">• 中间任何一次 +PONG 都会清零计数,需要"持续"失败 · 网络抖动 1-2 秒不会触发 SDOWN</text>
+    </g>
+  </svg>
+</div>
+
+<h3>26.4.3 SDOWN 判定的输入信号</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 26-4-1 · 4 类输入信号触发 SDOWN 的阈值</div>
+  <table>
+    <thead><tr><th>信号源</th><th>检测内容</th><th>阈值</th></tr></thead>
+    <tbody>
+      <tr><td><code>PING</code> 命令超时</td><td>持续无 +PONG</td><td><code>down-after-milliseconds</code></td></tr>
+      <tr><td><code>PING</code> 返回非 +PONG</td><td>例如 <code>-LOADING</code>、<code>-MASTERDOWN</code></td><td>立即 SDOWN(<code>-LOADING</code> 除外)</td></tr>
+      <tr><td>INFO 命令拒绝</td><td>主节点显式拒绝服务</td><td>立即 SDOWN</td></tr>
+      <tr><td>TCP 连接断开</td><td>重连失败次数累计</td><td><code>down-after-milliseconds</code></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>26.4.4 SDOWN 判定源码</h3>
+
+<pre><code class="language-c">/* sentinel.c — SDOWN 判定(简化) */
+void sentinelCheckSubjectivelyDown(sentinelRedisInstance *ri) {
+    mstime_t elapsed = 0;
+    if (ri->link->act_ping_time)
+        elapsed = mstime() - ri->link->act_ping_time;
+    else if (ri->link->disconnected)
+        elapsed = mstime() - ri->link->last_avail_time;
+
+    if (elapsed > ri->down_after_period) {
+        if (!(ri->flags &amp; SRI_S_DOWN)) {
+            sentinelEvent(LL_WARNING, "+sdown", ri, "%@");
+            ri->flags |= SRI_S_DOWN;
+            ri->s_down_since_time = mstime();
+        }
+    } else {
+        if (ri->flags &amp; SRI_S_DOWN) {
+            sentinelEvent(LL_WARNING, "-sdown", ri, "%@");
+            ri->flags &amp;= ~SRI_S_DOWN;
+        }
+    }
+}</code></pre>
+
+<p>SDOWN 仅是单个 Sentinel 的本地判断。同一时刻不同 Sentinel 对同一实例的判断可能不同,网络分区或 Sentinel 自身的 GC 暂停均可能导致误判。<strong>SDOWN 不直接触发故障转移,必须经 ODOWN 集体仲裁</strong>。</p>
+
+<!-- ============================================================ -->
+<h2 id="s26-5">26.5 ODOWN 客观下线仲裁</h2>
+<!-- ============================================================ -->
+
+<p>ODOWN(Objectively Down,客观下线)是 Sentinel 集群通过投票达成的<strong>集体共识</strong>:至少 quorum 个 Sentinel 都认为 master 不可达。它是触发 Leader 选举与故障转移的前置条件。</p>
+
+<h3>26.5.1 ODOWN 投票时序</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 26-5-1 · 从 SDOWN 到 ODOWN 的投票仲裁时序</div>
+  <svg viewBox="0 0 940 480" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="480" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="40" y="14" width="160" height="34" rx="6" fill="url(#d-purple)"/>
+      <text x="120" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Sentinel-1</text>
+      <rect x="240" y="14" width="160" height="34" rx="6" fill="url(#d-purple)"/>
+      <text x="320" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Sentinel-2</text>
+      <rect x="440" y="14" width="160" height="34" rx="6" fill="url(#d-purple)"/>
+      <text x="520" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Sentinel-3</text>
+      <rect x="700" y="14" width="200" height="34" rx="6" fill="url(#d-red)"/>
+      <text x="800" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Master(已宕机)</text>
+
+      <line x1="120" y1="48" x2="120" y2="460" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="320" y1="48" x2="320" y2="460" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="520" y1="48" x2="520" y2="460" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="800" y1="48" x2="800" y2="460" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+
+      <rect x="40" y="60" width="200" height="38" rx="6" fill="url(#d-orange)" filter="url(#d-shadow)"/>
+      <text x="140" y="80" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">① t=8 S1 标记 SDOWN</text>
+      <text x="140" y="94" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">(单 Sentinel 主观)</text>
+
+      <line x1="120" y1="118" x2="320" y2="118" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <text x="220" y="112" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10" font-weight="700">② is-master-down-by-addr ip port 0 *</text>
+      <line x1="120" y1="138" x2="520" y2="138" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <text x="320" y="132" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10" font-weight="700">③ is-master-down-by-addr (S3)</text>
+
+      <rect x="240" y="156" width="280" height="60" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="380" y="176" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="800">S2 / S3 自查</text>
+      <text x="380" y="194" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">④ 各自 PING master 已发现 SDOWN</text>
+      <text x="380" y="208" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">(各 Sentinel 独立判定 master 状态)</text>
+
+      <line x1="320" y1="180" x2="800" y2="180" stroke="var(--diagram-red-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-r)"/>
+      <text x="640" y="174" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10" font-weight="700">PING(超时)</text>
+
+      <line x1="320" y1="232" x2="120" y2="232" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="220" y="226" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10" font-weight="700">⑤ 1 (down) leader_runid leader_epoch</text>
+      <line x1="520" y1="252" x2="120" y2="252" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="320" y="246" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10" font-weight="700">⑥ 1 (down) leader_runid leader_epoch</text>
+
+      <rect x="40" y="270" width="860" height="36" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-dasharray="3,3"/>
+      <text x="470" y="292" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">Note: S1 收到 quorum=2 个 down 投票(自己 1 票 + S2/S3 各 1 票)</text>
+
+      <rect x="40" y="316" width="200" height="40" rx="6" fill="url(#d-red)" filter="url(#d-shadow)"/>
+      <text x="140" y="340" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">⑦ 标记 ODOWN</text>
+      <text x="140" y="352" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">SRI_O_DOWN flag</text>
+
+      <line x1="140" y1="356" x2="140" y2="378" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="40" y="378" width="200" height="36" rx="6" fill="url(#d-purple)"/>
+      <text x="140" y="400" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">⑧ 发 +odown 事件</text>
+
+      <line x1="140" y1="414" x2="140" y2="436" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="40" y="436" width="200" height="34" rx="6" fill="url(#d-orange)"/>
+      <text x="140" y="458" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">⑨ 启动 Leader 选举</text>
+
+      <rect x="280" y="316" width="620" height="154" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="300" y="338" fill="var(--diagram-blue-text)" font-size="12" font-weight="800">★ ODOWN 仲裁的关键设计</text>
+      <text x="300" y="358" fill="var(--diagram-muted)" font-size="11">· 单个 Sentinel 的 SDOWN 永远无法直接触发 failover</text>
+      <text x="300" y="376" fill="var(--diagram-muted)" font-size="11">· 必须通过 quorum 个 Sentinel 都同意 → 容忍单个 Sentinel 误判 / GC pause / 网络抖动</text>
+      <text x="300" y="394" fill="var(--diagram-muted)" font-size="11">· 投票请求里带 epoch=0 表示"只问下线状态,不竞选 Leader"</text>
+      <text x="300" y="412" fill="var(--diagram-muted)" font-size="11">· 投票响应里返回 leader_runid + epoch → 同一报文复用为 Leader 选举的"投票"通道</text>
+      <text x="300" y="436" fill="var(--diagram-muted)" font-size="11">· quorum 必须严格过半(&gt; N/2),否则网络分区两侧均可独立达成 ODOWN → 脑裂</text>
+      <text x="300" y="456" fill="var(--diagram-red-text)" font-size="11">⚠ ODOWN 仅对 master 有效;对 replica/sentinel 不做客观下线投票</text>
+    </g>
+  </svg>
+</div>
+
+<h3>26.5.2 ODOWN 与 quorum 的关系</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 26-5-2 · 不同 N / quorum 配置下的仲裁结果</div>
+  <svg viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:920px;width:100%;margin:8px auto;height:auto;">
+    <defs>
+      <linearGradient id="q-down" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+      <linearGradient id="q-up" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+      <linearGradient id="q-maj" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-orange-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+    </defs>
+    <rect x="0" y="0" width="920" height="360" fill="var(--diagram-panel)" rx="10"/>
+
+    <!-- 场景 1: N=3 quorum=2 -->
+    <text x="40" y="30" fill="var(--diagram-purple-text)" font-size="12" font-weight="700" font-family="monospace">场景 1: N=3 quorum=2</text>
+    <g transform="translate(40, 40)" font-family="monospace" font-size="11">
+      <circle cx="40" cy="40" r="30" fill="url(#q-down)"/><text x="40" y="44" text-anchor="middle" fill="var(--diagram-text)" font-weight="700">S1 ✗</text>
+      <circle cx="140" cy="40" r="30" fill="url(#q-down)"/><text x="140" y="44" text-anchor="middle" fill="var(--diagram-text)" font-weight="700">S2 ✗</text>
+      <circle cx="240" cy="40" r="30" fill="url(#q-up)"/><text x="240" y="44" text-anchor="middle" fill="var(--diagram-text)" font-weight="700">S3 ✓</text>
+      <text x="0" y="100" fill="var(--diagram-blue-text)">down 票数 = 2 ≥ quorum=2</text>
+      <text x="0" y="120" fill="var(--diagram-orange-text)" font-weight="700">→ ODOWN 成立</text>
+    </g>
+
+    <!-- 场景 2: N=5 quorum=3 -->
+    <text x="380" y="30" fill="var(--diagram-purple-text)" font-size="12" font-weight="700" font-family="monospace">场景 2: N=5 quorum=3</text>
+    <g transform="translate(380, 40)" font-family="monospace" font-size="11">
+      <circle cx="30" cy="40" r="24" fill="url(#q-down)"/><text x="30" y="44" text-anchor="middle" fill="var(--diagram-text)" font-weight="700">S1✗</text>
+      <circle cx="90" cy="40" r="24" fill="url(#q-down)"/><text x="90" y="44" text-anchor="middle" fill="var(--diagram-text)" font-weight="700">S2✗</text>
+      <circle cx="150" cy="40" r="24" fill="url(#q-down)"/><text x="150" y="44" text-anchor="middle" fill="var(--diagram-text)" font-weight="700">S3✗</text>
+      <circle cx="210" cy="40" r="24" fill="url(#q-up)"/><text x="210" y="44" text-anchor="middle" fill="var(--diagram-text)" font-weight="700">S4✓</text>
+      <circle cx="270" cy="40" r="24" fill="url(#q-up)"/><text x="270" y="44" text-anchor="middle" fill="var(--diagram-text)" font-weight="700">S5✓</text>
+      <text x="0" y="100" fill="var(--diagram-blue-text)">down 票数 = 3 ≥ quorum=3 · 容忍 2 误判/离线</text>
+      <text x="0" y="120" fill="var(--diagram-orange-text)" font-weight="700">→ ODOWN 成立</text>
+    </g>
+
+    <!-- 场景 3: 网络分区 -->
+    <g transform="translate(40, 200)">
+      <rect x="0" y="0" width="840" height="140" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="20" y="22" fill="var(--diagram-orange-text)" font-size="13" font-weight="700">场景 3: 网络分区 N=5 split [3 | 2]</text>
+      <g transform="translate(20, 40)" font-family="monospace" font-size="11">
+        <rect x="0" y="0" width="380" height="80" rx="8" fill="url(#q-maj)" opacity="0.2" stroke="var(--diagram-orange-stroke)"/>
+        <text x="20" y="22" fill="var(--diagram-orange-text)" font-weight="700">分区 A (3 个 Sentinel)</text>
+        <text x="20" y="44" fill="var(--diagram-green-text)">3 ≥ quorum=3 → 可 ODOWN + 选举 + 提升新主</text>
+
+        <rect x="420" y="0" width="380" height="80" rx="8" fill="url(#q-down)" opacity="0.2" stroke="var(--diagram-red-stroke)"/>
+        <text x="440" y="22" fill="var(--diagram-red-text)" font-weight="700">分区 B (2 个 Sentinel)</text>
+        <text x="440" y="44" fill="var(--diagram-red-text)">2 &lt; quorum=3 → 卡死,无法 ODOWN(避免脑裂)</text>
+      </g>
+    </g>
+  </svg>
+</div>
+
+<h3>26.5.3 quorum 选取建议</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 26-5-1 · quorum 选取与脑裂保护</div>
+  <table>
+    <thead><tr><th>Sentinel 总数 N</th><th>quorum</th><th>容忍 Sentinel 故障数</th><th>是否避免脑裂</th></tr></thead>
+    <tbody>
+      <tr><td>3</td><td>2</td><td>1</td><td><span style="color:var(--green)">是(过半)</span></td></tr>
+      <tr><td>5</td><td>3</td><td>2</td><td><span style="color:var(--green)">是(过半)</span></td></tr>
+      <tr><td>7</td><td>4</td><td>3</td><td><span style="color:var(--green)">是(过半)</span></td></tr>
+      <tr><td>3</td><td>1</td><td>2</td><td><span style="color:var(--red)">否(可能脑裂)</span></td></tr>
+      <tr><td>5</td><td>2</td><td>3</td><td><span style="color:var(--red)">否(可能脑裂)</span></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="warning">
+  <strong>quorum 必须严格过半</strong>:quorum 必须严格大于 N/2 才能保证故障转移在分区场景下不会同时在两个分区触发(脑裂)。配置 quorum &lt; ⌈(N+1)/2⌉ 等同于<strong>放弃脑裂保护</strong>。例如 N=3, quorum=1 时,网络一分为二的两侧都能各自达成 ODOWN,各自选 Leader,各自提升新主 — 分区恢复后两个"新主"互相覆盖,数据丢失不可逆。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s26-6">26.6 故障判定状态机</h2>
+<!-- ============================================================ -->
+
+<p>把 §26.4 的 SDOWN 与 §26.5 的 ODOWN 串起来,得到 Sentinel 视角下"主节点实例"的<strong>四状态机</strong>:UP → SDOWN → ODOWN → FAILOVER。</p>
+
+<h3>26.6.1 实例状态机</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 26-6-1 · 实例 4 状态 + 终态的转换图</div>
+  <svg viewBox="0 0 940 380" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="380" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <circle cx="50" cy="200" r="12" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)" stroke-width="2"/>
+      <text x="50" y="226" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">init</text>
+
+      <line x1="62" y1="200" x2="100" y2="200" stroke="var(--diagram-border)" marker-end="url(#d-arr)"/>
+
+      <rect x="100" y="160" width="180" height="80" rx="10" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="190" y="184" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">UP</text>
+      <text x="190" y="202" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">PING 正常</text>
+      <text x="190" y="218" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">SRI_S_DOWN=0</text>
+      <text x="190" y="232" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">SRI_O_DOWN=0</text>
+
+      <line x1="280" y1="200" x2="324" y2="200" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+      <text x="302" y="190" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9" font-weight="800">PING 失败</text>
+      <text x="302" y="218" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9" font-weight="800">≥ down-after-ms</text>
+
+      <rect x="324" y="160" width="180" height="80" rx="10" fill="url(#d-orange)" filter="url(#d-shadow)"/>
+      <text x="414" y="184" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">SDOWN</text>
+      <text x="414" y="202" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">本机视角下线</text>
+      <text x="414" y="218" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">SRI_S_DOWN=1</text>
+      <text x="414" y="232" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">SRI_O_DOWN=0</text>
+
+      <path d="M 414,160 Q 414,100 280,100 Q 190,100 190,160" fill="none" stroke="var(--diagram-green-stroke)" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#d-arr-g)"/>
+      <text x="302" y="92" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9" font-weight="800">PING 恢复</text>
+
+      <line x1="504" y1="200" x2="548" y2="200" stroke="var(--diagram-red-stroke)" stroke-width="1.5" marker-end="url(#d-arr-r)"/>
+      <text x="526" y="190" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9" font-weight="800">≥ quorum 个</text>
+      <text x="526" y="218" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9" font-weight="800">down 投票</text>
+
+      <rect x="548" y="160" width="180" height="80" rx="10" fill="url(#d-red)" filter="url(#d-shadow)"/>
+      <text x="638" y="184" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">ODOWN</text>
+      <text x="638" y="202" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">客观下线</text>
+      <text x="638" y="218" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">SRI_S_DOWN=1</text>
+      <text x="638" y="232" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">SRI_O_DOWN=1</text>
+
+      <line x1="728" y1="200" x2="772" y2="200" stroke="var(--diagram-purple-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+      <text x="750" y="190" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9" font-weight="800">选举 Leader</text>
+      <text x="750" y="218" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9" font-weight="800">成功</text>
+
+      <rect x="772" y="160" width="160" height="80" rx="10" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="852" y="184" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">FAILOVER</text>
+      <text x="852" y="202" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">故障转移中</text>
+      <text x="852" y="220" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">5 阶段进行中</text>
+
+      <path d="M 852,240 Q 852,310 470,310 Q 190,310 190,240" fill="none" stroke="var(--diagram-green-stroke)" stroke-width="1.5" marker-end="url(#d-arr-g)"/>
+      <text x="470" y="328" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="800">提升新主成功 → UP(旧 master 清除 ODOWN)</text>
+
+      <line x1="852" y1="240" x2="852" y2="290" stroke="var(--diagram-red-stroke)" stroke-width="1.5" marker-end="url(#d-arr-r)"/>
+      <circle cx="852" cy="305" r="14" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)" stroke-width="2"/>
+      <circle cx="852" cy="305" r="8" fill="var(--diagram-red-fill)"/>
+      <text x="852" y="338" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9" font-weight="800">failover-timeout</text>
+      <text x="852" y="352" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9" font-weight="800">→ end</text>
+
+      <text x="40" y="362" fill="var(--diagram-muted)" font-size="10">★ 双层判定:SDOWN(单 Sentinel 主观) → ODOWN(quorum 客观) → 防止单点误判触发 failover</text>
+    </g>
+  </svg>
+</div>
+
+<h3>26.6.2 状态转换条件矩阵</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 26-6-1 · 7 条状态转换的触发条件与动作</div>
+  <table>
+    <thead><tr><th>当前状态</th><th>触发条件</th><th>新状态</th><th>动作</th></tr></thead>
+    <tbody>
+      <tr><td>UP</td><td>持续 PING 失败 ≥ <code>down-after-ms</code></td><td>SDOWN</td><td>发布 <code>+sdown</code></td></tr>
+      <tr><td>SDOWN</td><td>PING 恢复</td><td>UP</td><td>发布 <code>-sdown</code></td></tr>
+      <tr><td>SDOWN</td><td>收到 ≥ quorum 个 down 投票</td><td>ODOWN</td><td>发布 <code>+odown</code>,启动选举</td></tr>
+      <tr><td>ODOWN</td><td>选举 Leader 成功</td><td>FAILOVER</td><td>选副本→提升→重定向</td></tr>
+      <tr><td>ODOWN</td><td>失败投票超时</td><td>UP/SDOWN</td><td>等待下次轮询</td></tr>
+      <tr><td>FAILOVER</td><td>提升新主完成</td><td>UP</td><td>发布 <code>+switch-master</code></td></tr>
+      <tr><td>FAILOVER</td><td><code>failover-timeout</code> 超时</td><td>UP</td><td>放弃,等待下次重试</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>26.6.3 状态转换的时间维度</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 26-6-2 · 故障转移完整时间线</div>
+  <svg viewBox="0 0 920 320" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:920px;width:100%;margin:8px auto;height:auto;">
+    <defs>
+      <linearGradient id="tl-down" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+      <linearGradient id="tl-detect" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-orange-fill-start)"/><stop offset="1" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+      <linearGradient id="tl-elect" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-purple-fill-start)"/><stop offset="1" stop-color="var(--diagram-purple-fill-end)"/></linearGradient>
+      <linearGradient id="tl-promote" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+    </defs>
+    <rect x="0" y="0" width="920" height="320" fill="var(--diagram-panel)" rx="10"/>
+    <text x="460" y="22" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="13" font-weight="700" font-family="monospace">P50 ≈ 13 秒 · P99 ≤ 30 秒</text>
+
+    <!-- timeline -->
+    <line x1="50" y1="160" x2="870" y2="160" stroke="var(--diagram-blue-stroke)" stroke-width="2"/>
+
+    <g font-family="monospace" font-size="11">
+      <g transform="translate(80, 160)"><circle r="8" fill="url(#tl-down)"/><text x="0" y="30" text-anchor="middle" fill="var(--diagram-red-text)" font-weight="700">t=0</text><text x="0" y="48" text-anchor="middle" fill="var(--diagram-red-text)">Master 失联</text></g>
+      <g transform="translate(280, 160)"><circle r="8" fill="url(#tl-detect)"/><text x="0" y="30" text-anchor="middle" fill="var(--diagram-orange-text)" font-weight="700">t=8s</text><text x="0" y="48" text-anchor="middle" fill="var(--diagram-orange-text)">SDOWN (S1)</text></g>
+      <g transform="translate(380, 160)"><circle r="6" fill="var(--diagram-orange-fill)"/><text x="0" y="30" text-anchor="middle" fill="var(--diagram-orange-text)">t=8.5</text><text x="0" y="48" text-anchor="middle" fill="var(--diagram-orange-text)">询问其他</text></g>
+      <g transform="translate(500, 160)"><circle r="8" fill="url(#tl-elect)"/><text x="0" y="30" text-anchor="middle" fill="var(--diagram-purple-text)" font-weight="700">t=9s</text><text x="0" y="48" text-anchor="middle" fill="var(--diagram-purple-text)">ODOWN + 选举</text></g>
+      <g transform="translate(800, 160)"><circle r="10" fill="url(#tl-promote)"/><text x="0" y="30" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="700">t=14s</text><text x="0" y="48" text-anchor="middle" fill="var(--diagram-green-text)">新主上线 ✓</text></g>
+    </g>
+
+    <!-- bars on top -->
+    <g transform="translate(80, 90)" font-family="monospace" font-size="11">
+      <rect x="0" y="0" width="200" height="34" fill="url(#tl-down)" opacity="0.6"/>
+      <text x="100" y="22" text-anchor="middle" fill="var(--diagram-text)" font-weight="700">8s · down-after-ms</text>
+
+      <rect x="200" y="0" width="220" height="34" fill="url(#tl-elect)" opacity="0.6"/>
+      <text x="310" y="22" text-anchor="middle" fill="var(--diagram-text)" font-weight="700">1s · 仲裁 + 选举</text>
+
+      <rect x="420" y="0" width="300" height="34" fill="url(#tl-promote)" opacity="0.6"/>
+      <text x="570" y="22" text-anchor="middle" fill="var(--diagram-text)" font-weight="700">5s · failover 阶段(promote + slaveof)</text>
+    </g>
+
+    <!-- 三个旋钮 -->
+    <g transform="translate(40, 230)">
+      <rect x="0" y="0" width="840" height="80" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="20" y="22" fill="var(--diagram-purple-text)" font-size="12" font-weight="700">★ 影响时间线的 3 个旋钮</text>
+      <text x="20" y="42" fill="var(--diagram-blue-text)" font-size="11">1. <tspan font-weight="700" fill="var(--diagram-orange-text)">down-after-ms</tspan> → 影响 t=0 → t=8 段(检测延迟)</text>
+      <text x="20" y="58" fill="var(--diagram-blue-text)" font-size="11">2. <tspan font-weight="700">quorum 与可达性</tspan> → 影响 t=8 → t=9 段(仲裁速度)</text>
+      <text x="20" y="74" fill="var(--diagram-blue-text)" font-size="11">3. <tspan font-weight="700" fill="var(--diagram-orange-text)">parallel-syncs</tspan> → 影响 t=9 → t=14 段(切流速度)</text>
+    </g>
+  </svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s26-7">26.7 Leader 选举</h2>
+<!-- ============================================================ -->
+
+<p>ODOWN 成立后,所有 Sentinel 都可能想发起故障转移。为避免多个 Sentinel 同时执行造成冲突,Sentinel 采用 <strong>Raft 风格的 Leader 选举</strong>:每次故障转移都需要先选出唯一 Leader,只有 Leader 才能执行后续提升与广播。</p>
+
+<h3>26.7.1 Leader 选举时序</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 26-7-1 · Sentinel-1 自增 epoch 并赢得选举的过程</div>
+  <svg viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="460" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="100" y="14" width="200" height="34" rx="6" fill="url(#d-purple)"/>
+      <text x="200" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Sentinel-1(候选)</text>
+      <rect x="380" y="14" width="200" height="34" rx="6" fill="url(#d-purple)"/>
+      <text x="480" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Sentinel-2</text>
+      <rect x="660" y="14" width="200" height="34" rx="6" fill="url(#d-purple)"/>
+      <text x="760" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Sentinel-3</text>
+
+      <line x1="200" y1="48" x2="200" y2="440" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="480" y1="48" x2="480" y2="440" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="760" y1="48" x2="760" y2="440" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+
+      <rect x="40" y="58" width="860" height="34" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-dasharray="3,3"/>
+      <text x="470" y="80" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">Note: 三个 Sentinel 都检测到 ODOWN, 同时尝试发起选举</text>
+
+      <rect x="100" y="100" width="200" height="36" rx="6" fill="url(#d-blue)"/>
+      <text x="200" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">① 自增 epoch → e+1</text>
+
+      <line x1="200" y1="158" x2="480" y2="158" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#d-arr-b)"/>
+      <text x="340" y="152" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10" font-weight="700">② is-master-down-by-addr ip port e+1 S1_runid</text>
+
+      <line x1="200" y1="178" x2="760" y2="178" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#d-arr-b)"/>
+      <text x="480" y="172" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10" font-weight="700">③ 同样请求 → S3</text>
+
+      <rect x="380" y="190" width="200" height="40" rx="6" fill="url(#d-green)"/>
+      <text x="480" y="214" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">④ epoch≤e+1 且未投</text>
+      <text x="480" y="226" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">→ 投给 S1, flush 配置</text>
+
+      <line x1="480" y1="240" x2="200" y2="240" stroke="var(--diagram-green-stroke)" stroke-width="1.5" marker-end="url(#d-arr-g)"/>
+      <text x="340" y="234" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">⑤ 1 (down) S1_runid e+1</text>
+
+      <rect x="660" y="252" width="200" height="40" rx="6" fill="url(#d-green)"/>
+      <text x="760" y="276" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">⑥ epoch≤e+1 且未投</text>
+      <text x="760" y="288" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">→ 投给 S1</text>
+
+      <line x1="760" y1="302" x2="200" y2="302" stroke="var(--diagram-green-stroke)" stroke-width="1.5" marker-end="url(#d-arr-g)"/>
+      <text x="480" y="296" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">⑦ 1 (down) S1_runid e+1</text>
+
+      <rect x="40" y="316" width="860" height="34" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3"/>
+      <text x="470" y="338" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">Note: S1 收到自己 1 票 + S2 + S3 = 3 票 ≥ quorum</text>
+
+      <rect x="100" y="358" width="200" height="40" rx="6" fill="url(#d-orange)" filter="url(#d-shadow)"/>
+      <text x="200" y="382" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">⑧ S1 当选 Leader</text>
+      <text x="200" y="394" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">启动故障转移</text>
+
+      <rect x="320" y="358" width="580" height="80" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="340" y="376" fill="var(--diagram-blue-text)" font-size="11" font-weight="800">★ 双重保护</text>
+      <text x="340" y="394" fill="var(--diagram-muted)" font-size="10">· epoch 单调递增 + flush 持久化 → 重启后不会重复投票</text>
+      <text x="340" y="412" fill="var(--diagram-muted)" font-size="10">· 同 epoch 内每个 Sentinel 至多 1 票 → 同 epoch 最多 1 个 Leader</text>
+      <text x="340" y="430" fill="var(--diagram-red-text)" font-size="10">⚠ 若没拿到 quorum,等待下一轮(epoch 继续递增)直至成功或 failover-timeout 超时</text>
+    </g>
+  </svg>
+</div>
+
+<h3>26.7.2 Sentinel 选举与 Raft 的差异</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 26-7-1 · Sentinel 与 Raft 在 7 个维度上的对照</div>
+  <table>
+    <thead><tr><th>维度</th><th>Raft</th><th>Sentinel</th></tr></thead>
+    <tbody>
+      <tr><td>选举触发</td><td>Follower 超时未收到心跳</td><td>检测到 ODOWN</td></tr>
+      <tr><td>投票门槛</td><td>多数派(N/2 + 1)</td><td>quorum(配置项)</td></tr>
+      <tr><td>任期编号</td><td>term</td><td>epoch</td></tr>
+      <tr><td>同 term 投票约束</td><td>每节点至多 1 票</td><td>同左</td></tr>
+      <tr><td>Leader 角色</td><td>处理所有写入,后续日志复制</td><td>仅执行单次故障转移,转移完成后回归普通 Sentinel</td></tr>
+      <tr><td>日志复制</td><td>必须</td><td>不需要(无持久日志)</td></tr>
+      <tr><td>状态持久化</td><td>currentTerm + votedFor + log</td><td>currentEpoch(写入磁盘)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>26.7.3 epoch 单调递增机制</h3>
+
+<pre><code class="language-c">/* sentinel.c — epoch 相关字段 */
+struct sentinelState {
+    uint64_t current_epoch;      /* 全局递增 epoch */
+    /* ... */
+};
+struct sentinelRedisInstance {
+    uint64_t leader_epoch;       /* 该实例最近一次故障转移的 epoch */
+    char *leader;                /* 该 epoch 内投给的 leader runid */
+    uint64_t failover_epoch;     /* 当前正在执行的故障转移 epoch */
+};</code></pre>
+
+<h3>26.7.4 epoch 投票约束矩阵</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 26-7-2 · 收到投票请求时的 epoch 决策流程</div>
+  <svg viewBox="0 0 940 480" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="480" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="280" y="14" width="380" height="56" rx="10" fill="url(#d-blue)" filter="url(#d-shadow)"/>
+      <text x="470" y="38" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">A · 收到 is-master-down-by-addr</text>
+      <text x="470" y="56" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">(epoch=E, candidate=C)</text>
+
+      <line x1="470" y1="70" x2="470" y2="98" stroke="var(--diagram-border)" marker-end="url(#d-arr)"/>
+
+      <polygon points="470,98 620,140 470,182 320,140" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="470" y="138" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">B · E ≥ current_epoch ?</text>
+      <text x="470" y="154" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">epoch 单调约束</text>
+
+      <line x1="320" y1="140" x2="180" y2="180" stroke="var(--diagram-red-stroke)" marker-end="url(#d-arr-r)"/>
+      <text x="220" y="156" fill="var(--diagram-red-text)" font-size="10" font-weight="800">否</text>
+      <rect x="20" y="180" width="280" height="60" rx="8" fill="url(#d-red)" filter="url(#d-shadow)"/>
+      <text x="160" y="204" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">F · 拒绝投票</text>
+      <text x="160" y="220" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">返回当前 leader_epoch</text>
+      <text x="160" y="234" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">候选人 epoch 落后 → 重试</text>
+
+      <line x1="470" y1="182" x2="470" y2="206" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="488" y="200" fill="var(--diagram-green-text)" font-size="10" font-weight="800">是</text>
+
+      <polygon points="470,206 620,238 470,270 320,238" fill="url(#d-purple)"/>
+      <text x="470" y="238" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">C · 该 epoch 已投过?</text>
+
+      <line x1="320" y1="240" x2="180" y2="290" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+      <text x="220" y="262" fill="var(--diagram-orange-text)" font-size="10" font-weight="800">是</text>
+      <polygon points="60,290 200,316 60,342 -80,316" fill="url(#d-orange)"/>
+
+      <rect x="20" y="290" width="280" height="60" rx="8" fill="url(#d-orange)"/>
+      <text x="160" y="314" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">D · 投给同一候选 C?</text>
+      <text x="160" y="332" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">幂等性检查</text>
+
+      <line x1="60" y1="350" x2="40" y2="386" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="20" y="372" fill="var(--diagram-green-text)" font-size="10" font-weight="800">是</text>
+      <rect x="20" y="386" width="160" height="68" rx="8" fill="url(#d-green)"/>
+      <text x="100" y="408" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">E · 幂等返回 1 票</text>
+      <text x="100" y="424" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">网络重传场景</text>
+      <text x="100" y="440" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">允许重复请求</text>
+
+      <line x1="240" y1="346" x2="160" y2="370" stroke="var(--diagram-red-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-r)"/>
+      <line x1="220" y1="386" x2="180" y2="376" stroke="var(--diagram-red-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-r)"/>
+      <text x="270" y="370" fill="var(--diagram-red-text)" font-size="10" font-weight="800">否 → F (上面)</text>
+
+      <line x1="470" y1="270" x2="470" y2="294" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="488" y="288" fill="var(--diagram-green-text)" font-size="10" font-weight="800">否</text>
+
+      <rect x="320" y="294" width="320" height="80" rx="8" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="480" y="318" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">G · 接受投票</text>
+      <text x="480" y="336" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">current_epoch = E</text>
+      <text x="480" y="352" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">leader_epoch = E, leader = C</text>
+      <text x="480" y="366" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">同 epoch 后续请求只能投同一候选</text>
+
+      <line x1="480" y1="374" x2="480" y2="394" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+
+      <rect x="320" y="394" width="320" height="60" rx="8" fill="url(#d-green)"/>
+      <text x="480" y="418" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">H · sentinelFlushConfig()</text>
+      <text x="480" y="434" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">持久化到 sentinel.conf → 返回 1 票</text>
+
+      <rect x="680" y="200" width="240" height="200" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="700" y="222" fill="var(--diagram-purple-text)" font-size="12" font-weight="800">★ 关键不变量</text>
+      <text x="700" y="244" fill="var(--diagram-muted)" font-size="10">每个 Sentinel 在每个 epoch</text>
+      <text x="700" y="260" fill="var(--diagram-muted)" font-size="10">最多投 1 票:</text>
+      <text x="700" y="282" fill="var(--diagram-green-text)" font-size="10">→ 同 epoch 至多 1 个</text>
+      <text x="700" y="298" fill="var(--diagram-green-text)" font-size="10">  Leader 当选</text>
+      <text x="700" y="320" fill="var(--diagram-orange-text)" font-size="10">→ 配 quorum &gt; N/2 即</text>
+      <text x="700" y="336" fill="var(--diagram-orange-text)" font-size="10">  保证脑裂不脑裂</text>
+      <text x="700" y="358" fill="var(--diagram-red-text)" font-size="10">⚠ flush 必须先于回复</text>
+      <text x="700" y="374" fill="var(--diagram-red-text)" font-size="10">  否则崩溃后丢失 vote</text>
+      <text x="700" y="390" fill="var(--diagram-red-text)" font-size="10">  状态 → 同 epoch 二次投票</text>
+    </g>
+  </svg>
+</div>
+
+<p>epoch 单调递增 + 同 epoch 内每节点至多 1 票的<strong>两条约束</strong>,共同保证同一 epoch 内最多产生 1 个 Leader。配合 quorum 过半的要求,即使发生网络分区,任意时刻最多只有一个分区能选出 Leader 执行故障转移。</p>
+
+<h3>26.7.5 投票路径源码</h3>
+
+<pre><code class="language-c">/* sentinel.c — 投票路径(简化) */
+char *sentinelVoteLeader(sentinelRedisInstance *master,
+                          uint64_t req_epoch,
+                          char *req_runid,
+                          uint64_t *leader_epoch) {
+    if (req_epoch > sentinel.current_epoch) {
+        sentinel.current_epoch = req_epoch;
+        sentinelFlushConfig();
+        sentinelEvent(LL_WARNING, "+new-epoch", master, "%llu",
+                      (unsigned long long)sentinel.current_epoch);
+    }
+
+    if (master->leader_epoch &lt; req_epoch &amp;&amp;
+        sentinel.current_epoch &lt;= req_epoch)
+    {
+        sdsfree(master->leader);
+        master->leader = sdsnew(req_runid);
+        master->leader_epoch = sentinel.current_epoch;
+        sentinelFlushConfig();
+        sentinelEvent(LL_WARNING, "+vote-for-leader", master, "%s %llu",
+                      master->leader, (unsigned long long)master->leader_epoch);
+    }
+    *leader_epoch = master->leader_epoch;
+    return master->leader ? sdsdup(master->leader) : NULL;
+}</code></pre>
+
+<div class="key-insight">
+  <strong>为什么 epoch 必须持久化</strong>:<code>sentinelFlushConfig()</code> 会把 <code>current_epoch</code> 与 <code>leader_epoch</code> 写入 <code>sentinel.conf</code>。这是关键 — 如果 Sentinel 重启,它必须记住"我在 epoch=12 已经投给了 X",否则可能在重启后又把同 epoch 的票投给 Y,破坏"同 epoch 1 票"的安全性。Raft 的 <code>votedFor</code> 持久化要求是同一道理。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s26-8">26.8 故障转移五阶段</h2>
+<!-- ============================================================ -->
+
+<p>选出 Leader 后,故障转移按 <strong>5 个有序阶段</strong> 推进:选副本 → 提升新主 → 重定向兄弟副本 → 广播新拓扑 → 旧主降级。每个阶段都有明确的成功/超时条件。</p>
+
+<h3>26.8.1 五阶段完整流程</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 26-8-1 · Leader Sentinel 协调故障转移的完整时序</div>
+  <svg viewBox="0 0 940 580" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="580" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="20" y="14" width="160" height="34" rx="6" fill="url(#d-purple)"/>
+      <text x="100" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">Leader Sentinel</text>
+      <rect x="200" y="14" width="140" height="34" rx="6" fill="url(#d-green)"/>
+      <text x="270" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">Replica-1</text>
+      <rect x="360" y="14" width="140" height="34" rx="6" fill="url(#d-green)"/>
+      <text x="430" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">Replica-2</text>
+      <rect x="520" y="14" width="160" height="34" rx="6" fill="url(#d-red)"/>
+      <text x="600" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">Old Master</text>
+      <rect x="700" y="14" width="220" height="34" rx="6" fill="url(#d-blue)"/>
+      <text x="810" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">其他 Sentinel</text>
+
+      <line x1="100" y1="48" x2="100" y2="560" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="270" y1="48" x2="270" y2="560" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="430" y1="48" x2="430" y2="560" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="600" y1="48" x2="600" y2="560" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="810" y1="48" x2="810" y2="560" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+
+      <rect x="20" y="58" width="900" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="470" y="74" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">阶段 1:选副本(收集 INFO + 三层排序)</text>
+
+      <line x1="100" y1="92" x2="270" y2="92" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <text x="170" y="86" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9" font-weight="700">① INFO replication</text>
+      <line x1="100" y1="106" x2="430" y2="106" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <text x="240" y="100" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9" font-weight="700">② INFO replication</text>
+
+      <line x1="270" y1="124" x2="100" y2="124" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-g)"/>
+      <text x="180" y="118" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">③ priority=100, offset=15820</text>
+      <line x1="430" y1="138" x2="100" y2="138" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-g)"/>
+      <text x="240" y="132" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">④ priority=100, offset=15892</text>
+
+      <rect x="20" y="146" width="160" height="34" rx="6" fill="url(#d-orange)"/>
+      <text x="100" y="168" text-anchor="middle" fill="var(--diagram-text)" font-size="10" font-weight="800">⑤ 选 R2(offset 高)</text>
+
+      <rect x="20" y="190" width="900" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="470" y="206" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">阶段 2:提升新主</text>
+
+      <line x1="100" y1="226" x2="430" y2="226" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+      <text x="240" y="220" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">⑥ REPLICAOF NO ONE</text>
+
+      <rect x="350" y="240" width="160" height="32" rx="6" fill="url(#d-purple)"/>
+      <text x="430" y="260" text-anchor="middle" fill="var(--diagram-text)" font-size="10" font-weight="800">⑦ 切换 master 角色</text>
+
+      <rect x="20" y="282" width="900" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="470" y="298" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">阶段 3:重定向兄弟副本</text>
+
+      <line x1="100" y1="316" x2="270" y2="316" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="170" y="310" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10" font-weight="700">⑧ REPLICAOF R2_ip R2_port</text>
+
+      <line x1="270" y1="334" x2="430" y2="334" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+      <text x="350" y="328" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">⑨ PSYNC replid2 offset</text>
+      <line x1="430" y1="350" x2="270" y2="350" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-g)"/>
+      <text x="350" y="344" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">⑩ +CONTINUE 或 +FULLRESYNC</text>
+
+      <rect x="20" y="364" width="900" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="470" y="380" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">阶段 4:广播新拓扑</text>
+
+      <line x1="100" y1="398" x2="810" y2="398" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+      <text x="455" y="392" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">⑪ PUBLISH +switch-master mymaster &lt;old&gt; &lt;new&gt;</text>
+
+      <rect x="710" y="412" width="200" height="34" rx="6" fill="url(#d-blue)"/>
+      <text x="810" y="432" text-anchor="middle" fill="var(--diagram-text)" font-size="10" font-weight="800">⑫ 更新本地配置 + 持久化</text>
+
+      <rect x="20" y="456" width="900" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="470" y="472" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="700">阶段 5:旧主复活后自动降级为副本</text>
+
+      <rect x="520" y="488" width="160" height="32" rx="6" fill="url(#d-red)"/>
+      <text x="600" y="508" text-anchor="middle" fill="var(--diagram-text)" font-size="10" font-weight="800">⑬ 重启或网络恢复</text>
+
+      <line x1="600" y1="530" x2="100" y2="530" stroke="var(--diagram-purple-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr)"/>
+      <text x="350" y="524" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">⑭ 收到 +switch-master 通告</text>
+
+      <line x1="600" y1="552" x2="430" y2="552" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+      <text x="510" y="546" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">⑮ REPLICAOF R2_ip R2_port</text>
+    </g>
+  </svg>
+</div>
+
+<h3>26.8.2 五阶段耗时分布</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 26-8-1 · 五阶段在生产中的典型耗时</div>
+  <table>
+    <thead><tr><th>阶段</th><th>主要操作</th><th>典型耗时</th></tr></thead>
+    <tbody>
+      <tr><td>1. 选副本</td><td>收集所有 replica 的 INFO,排序</td><td>100-500 ms</td></tr>
+      <tr><td>2. 提升新主</td><td><code>REPLICAOF NO ONE</code></td><td>&lt; 100 ms</td></tr>
+      <tr><td>3. 重定向副本</td><td>旧 replica 接 <code>REPLICAOF</code> 新主</td><td>1-5 s(可能含部分同步)</td></tr>
+      <tr><td>4. 广播新拓扑</td><td>发布 <code>+switch-master</code> 事件</td><td>&lt; 500 ms</td></tr>
+      <tr><td>5. 客户端重连</td><td>客户端重新查询 Sentinel 获取主地址</td><td>1-10 s(取决于客户端)</td></tr>
+      <tr><td><strong>总计</strong></td><td>-</td><td><strong>~10 s 中位数</strong></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>26.8.3 旧主恢复后的角色切换</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 26-8-2 · 旧 master 复活后被自动降为新主的副本</div>
+  <svg viewBox="0 0 940 320" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="320" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <circle cx="40" cy="160" r="12" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)" stroke-width="2"/>
+      <text x="40" y="186" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">init</text>
+
+      <line x1="52" y1="160" x2="80" y2="160" stroke="var(--diagram-border)" marker-end="url(#d-arr)"/>
+
+      <rect x="80" y="120" width="150" height="80" rx="10" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="155" y="146" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">OldMaster</text>
+      <text x="155" y="166" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">故障前角色</text>
+      <text x="155" y="182" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">role = master</text>
+
+      <line x1="230" y1="160" x2="270" y2="160" stroke="var(--diagram-red-stroke)" stroke-width="1.5" marker-end="url(#d-arr-r)"/>
+      <text x="250" y="150" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9" font-weight="800">进程崩溃/</text>
+      <text x="250" y="178" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9" font-weight="800">网络分区</text>
+
+      <rect x="270" y="120" width="150" height="80" rx="10" fill="url(#d-red)" filter="url(#d-shadow)"/>
+      <text x="345" y="146" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">Failed</text>
+      <text x="345" y="166" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">无法响应 PING</text>
+      <text x="345" y="182" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">已被 ODOWN</text>
+
+      <line x1="420" y1="160" x2="460" y2="160" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+      <text x="440" y="150" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9" font-weight="800">重启 OR</text>
+      <text x="440" y="178" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9" font-weight="800">网络恢复</text>
+
+      <rect x="460" y="120" width="150" height="80" rx="10" fill="url(#d-orange)"/>
+      <text x="535" y="146" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">Recovered</text>
+      <text x="535" y="166" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">连接 Sentinel</text>
+      <text x="535" y="182" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">收 +switch-master</text>
+
+      <line x1="610" y1="160" x2="650" y2="160" stroke="var(--diagram-purple-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+      <text x="630" y="150" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9" font-weight="800">REPLICAOF</text>
+      <text x="630" y="178" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9" font-weight="800">new_master</text>
+
+      <rect x="650" y="120" width="150" height="80" rx="10" fill="url(#d-blue)"/>
+      <text x="725" y="146" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">Demoting</text>
+      <text x="725" y="166" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">PSYNC 同步中</text>
+      <text x="725" y="182" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">通常 +FULLRESYNC</text>
+
+      <line x1="800" y1="160" x2="840" y2="160" stroke="var(--diagram-green-stroke)" stroke-width="1.5" marker-end="url(#d-arr-g)"/>
+      <text x="820" y="150" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9" font-weight="800">完成</text>
+      <text x="820" y="178" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9" font-weight="800">同步</text>
+
+      <rect x="840" y="120" width="80" height="80" rx="10" fill="url(#d-green)"/>
+      <text x="880" y="146" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">NewReplica</text>
+      <text x="880" y="164" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">role = replica</text>
+      <text x="880" y="180" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">从新主复制</text>
+
+      <rect x="40" y="240" width="860" height="60" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="60" y="264" fill="var(--diagram-blue-text)" font-size="11" font-weight="800">★ 自动降级的优雅之处</text>
+      <text x="60" y="282" fill="var(--diagram-muted)" font-size="10">运维不需在故障节点恢复后手动 REPLICAOF — Sentinel 通过 +switch-master 通告让旧主自动加入新拓扑</text>
+      <text x="60" y="296" fill="var(--diagram-red-text)" font-size="10">⚠ 前提:旧主必须能收到 Sentinel 通告。长期分区的旧主在恢复连接前会自认仍是 master(脑裂)</text>
+    </g>
+  </svg>
+</div>
+
+<p>旧主"自动降级"是 Sentinel 设计的优雅之处:运维不需要在故障节点恢复后手动介入,Sentinel 通过 <code>+switch-master</code> 事件让旧主无缝加入新拓扑作为副本。但这要求旧主必须能接收到事件 — 网络长期分区的旧主在恢复连接前仍认为自己是 master,这是 §26.10 脑裂保护要解决的问题。</p>
+
+<!-- ============================================================ -->
+<h2 id="s26-9">26.9 副本选择规则</h2>
+<!-- ============================================================ -->
+
+<p>故障转移阶段 1"选副本"是决定<strong>哪个 replica 被提升为新主</strong>的关键步骤。Sentinel 用三层排序保证选择确定且尽可能保留数据。</p>
+
+<h3>26.9.1 三层排序流程</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 26-9-1 · 副本选择从过滤到排序的完整流程</div>
+  <svg viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="460" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="320" y="14" width="300" height="50" rx="10" fill="url(#d-blue)" filter="url(#d-shadow)"/>
+      <text x="470" y="34" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">A · 所有候选 replica</text>
+      <text x="470" y="52" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">从 INFO replication 收集</text>
+
+      <line x1="470" y1="64" x2="470" y2="86" stroke="var(--diagram-border)" marker-end="url(#d-arr)"/>
+
+      <polygon points="470,86 660,128 470,170 280,128" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="470" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">B · 过滤一:断线/链路不健康</text>
+      <text x="470" y="142" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">master_link_down_time &gt; threshold ?</text>
+
+      <line x1="280" y1="128" x2="120" y2="160" stroke="var(--diagram-red-stroke)" marker-end="url(#d-arr-r)"/>
+      <text x="180" y="146" fill="var(--diagram-red-text)" font-size="11" font-weight="800">是</text>
+      <rect x="20" y="160" width="200" height="46" rx="8" fill="url(#d-red)"/>
+      <text x="120" y="184" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Z · 剔除</text>
+      <text x="120" y="200" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">不参与排序</text>
+
+      <line x1="470" y1="170" x2="470" y2="194" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="488" y="188" fill="var(--diagram-green-text)" font-size="10" font-weight="800">否</text>
+
+      <polygon points="470,194 660,232 470,270 280,232" fill="url(#d-purple)"/>
+      <text x="470" y="228" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">C · 过滤二:slave-priority == 0?</text>
+      <text x="470" y="246" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">显式禁用故障转移参选</text>
+
+      <line x1="280" y1="232" x2="220" y2="200" stroke="var(--diagram-red-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-r)"/>
+      <text x="220" y="220" fill="var(--diagram-red-text)" font-size="10" font-weight="800">是 → Z</text>
+
+      <line x1="470" y1="270" x2="470" y2="294" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="488" y="288" fill="var(--diagram-green-text)" font-size="10" font-weight="800">否</text>
+
+      <rect x="280" y="294" width="380" height="34" rx="6" fill="url(#d-orange)"/>
+      <text x="470" y="316" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">D · 第 1 层排序:priority 升序(小者优先)</text>
+
+      <line x1="470" y1="328" x2="470" y2="346" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="280" y="346" width="380" height="34" rx="6" fill="url(#d-orange)"/>
+      <text x="470" y="368" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">E · 第 2 层排序:replica_offset 降序(offset 大数据新)</text>
+
+      <line x1="470" y1="380" x2="470" y2="398" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="280" y="398" width="380" height="34" rx="6" fill="url(#d-orange)"/>
+      <text x="470" y="420" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">F · 第 3 层排序:runid 字典序升序(确定性回退)</text>
+
+      <line x1="660" y1="415" x2="700" y2="415" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+
+      <rect x="700" y="396" width="200" height="40" rx="8" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="800" y="418" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">G · 选取首位为新主</text>
+      <text x="800" y="432" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">REPLICAOF NO ONE</text>
+
+      <rect x="700" y="220" width="220" height="160" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="720" y="244" fill="var(--diagram-purple-text)" font-size="12" font-weight="800">★ 三层 lexicographic</text>
+      <text x="720" y="262" fill="var(--diagram-muted)" font-size="10">priority &lt; offset &lt; runid</text>
+      <text x="720" y="284" fill="var(--diagram-orange-text)" font-size="10">priority 优先级最高:</text>
+      <text x="720" y="298" fill="var(--diagram-orange-text)" font-size="9">业务可控的"指定接管者"</text>
+      <text x="720" y="320" fill="var(--diagram-green-text)" font-size="10">offset 次之:</text>
+      <text x="720" y="334" fill="var(--diagram-green-text)" font-size="9">数据完整性优先</text>
+      <text x="720" y="356" fill="var(--diagram-blue-text)" font-size="10">runid 兜底:</text>
+      <text x="720" y="370" fill="var(--diagram-blue-text)" font-size="9">前两条相等时确定性选择</text>
+    </g>
+  </svg>
+</div>
+
+<h3>26.9.2 三层排序示例</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 26-9-1 · 候选 replica 列表(过滤后)</div>
+  <table>
+    <thead><tr><th>Replica</th><th>priority</th><th>offset</th><th>runid</th></tr></thead>
+    <tbody>
+      <tr><td>Replica-1</td><td>100</td><td>15,892,400</td><td><code>aaaa1111…</code></td></tr>
+      <tr><td>Replica-2</td><td>100</td><td>15,820,800</td><td><code>bbbb2222…</code></td></tr>
+      <tr><td>Replica-3</td><td>50</td><td>14,200,000</td><td><code>cccc3333…</code></td></tr>
+      <tr><td>Replica-4</td><td>100</td><td>15,892,400</td><td><code>dddd4444…</code></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">表 26-9-2 · 排序后的入选顺序</div>
+  <table>
+    <thead><tr><th>排名</th><th>Replica</th><th>选中原因</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><strong>Replica-3</strong></td><td>priority=50 最小,优先入选(尽管 offset 落后)</td></tr>
+      <tr><td>2</td><td>Replica-1</td><td>priority=100 中 offset 最大且 runid 字典序最小</td></tr>
+      <tr><td>3</td><td>Replica-4</td><td>priority=100 中 offset 最大但 runid 字典序大于 Replica-1</td></tr>
+      <tr><td>4</td><td>Replica-2</td><td>priority=100 中 offset 最小</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>26.9.3 slave-priority 配置策略</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 26-9-3 · slave-priority 取值与典型用途</div>
+  <table>
+    <thead><tr><th>配置值</th><th>含义</th><th>典型用途</th></tr></thead>
+    <tbody>
+      <tr><td><strong>100(默认)</strong></td><td>标准副本,参与故障转移</td><td>大多数副本</td></tr>
+      <tr><td>0</td><td>永不参与故障转移</td><td>备份副本、跨机房延迟过高的副本</td></tr>
+      <tr><td>10-50</td><td>高优先级,优先成为新主</td><td>同机房高配机器</td></tr>
+      <tr><td>200+</td><td>低优先级,仅在其他副本不可用时入选</td><td>异地副本、低配机器</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>26.9.4 副本选择源码</h3>
+
+<pre><code class="language-c">/* sentinel.c — 副本选择(简化) */
+int compareSlavesForPromotion(const void *a, const void *b) {
+    sentinelRedisInstance **sa = (sentinelRedisInstance **)a;
+    sentinelRedisInstance **sb = (sentinelRedisInstance **)b;
+
+    if ((*sa)->slave_priority != (*sb)->slave_priority)
+        return (*sa)->slave_priority - (*sb)->slave_priority;
+
+    /* offset 大者优先(数据更新) */
+    if ((*sa)->slave_repl_offset > (*sb)->slave_repl_offset) return -1;
+    else if ((*sa)->slave_repl_offset &lt; (*sb)->slave_repl_offset) return 1;
+
+    /* runid 字典序回退 */
+    return strcasecmp((*sa)->runid, (*sb)->runid);
+}</code></pre>
+
+<div class="key-insight">
+  <strong>为什么 priority 优先于 offset</strong>:运维侧应有最终决定权。设想一台跨机房高延迟副本即使 offset 最高,也不应当成为新主(网络抖动会让它看起来"领先"但实际写延迟高)。priority 给运维一个"硬性偏好"通道,offset 仅在 priority 相同时作为客观指标使用,runid 则保证排序结果稳定可重现。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s26-10">26.10 多部署模式</h2>
+<!-- ============================================================ -->
+
+<h3>26.10.1 常见部署拓扑</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 26-10-1 · 4 种 Sentinel 部署拓扑</div>
+  <table>
+    <thead><tr><th>拓扑</th><th>Sentinel 数</th><th>quorum</th><th>数据节点</th><th>适用场景</th><th>容错能力</th></tr></thead>
+    <tbody>
+      <tr><td>三节点同机房</td><td>3</td><td>2</td><td>1 主 1 从</td><td>中小规模、单机房</td><td>容忍 1 Sentinel + 主节点同时故障</td></tr>
+      <tr><td>三机房分散</td><td>3</td><td>2</td><td>1 主 2 从</td><td>跨机房高可用</td><td>容忍单机房故障</td></tr>
+      <tr><td>五节点跨机房</td><td>5</td><td>3</td><td>1 主 4 从</td><td>大规模生产</td><td>容忍 2 节点 + 主同时故障</td></tr>
+      <tr><td>Cluster 内嵌</td><td>-</td><td>-</td><td>6+</td><td>横向扩展场景</td><td>见下章 Cluster</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>26.10.2 三机房五 Sentinel 部署</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 26-10-1 · 跨三机房 5 Sentinel 部署:机房 C 仅做仲裁</div>
+  <svg viewBox="0 0 940 360" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="360" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="20" y="20" width="320" height="240" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)" stroke-width="1.5"/>
+      <text x="180" y="44" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="13" font-weight="800">机房 A · 主写入</text>
+      <rect x="40" y="60" width="130" height="36" rx="6" fill="url(#d-blue)"/>
+      <text x="105" y="82" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">Sentinel-1</text>
+      <rect x="190" y="60" width="130" height="36" rx="6" fill="url(#d-blue)"/>
+      <text x="255" y="82" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">Sentinel-2</text>
+      <rect x="40" y="120" width="280" height="40" rx="8" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="180" y="144" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">Master</text>
+      <rect x="40" y="180" width="280" height="36" rx="6" fill="url(#d-green)"/>
+      <text x="180" y="202" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">Replica-1</text>
+      <text x="40" y="240" fill="var(--diagram-blue-text)" font-size="10">2 个 Sentinel + 主 + 1 副本</text>
+
+      <rect x="360" y="20" width="280" height="240" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)" stroke-width="1.5"/>
+      <text x="500" y="44" text-anchor="middle" fill="var(--diagram-green-text)" font-size="13" font-weight="800">机房 B · 异地副本</text>
+      <rect x="380" y="60" width="240" height="36" rx="6" fill="url(#d-blue)"/>
+      <text x="500" y="82" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">Sentinel-3</text>
+      <rect x="380" y="120" width="240" height="36" rx="6" fill="url(#d-green)"/>
+      <text x="500" y="142" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">Replica-2(候选新主)</text>
+      <text x="380" y="200" fill="var(--diagram-green-text)" font-size="10">1 个 Sentinel + 1 副本</text>
+      <text x="380" y="218" fill="var(--diagram-muted)" font-size="9">机房 A 整体故障时这里成新主</text>
+
+      <rect x="660" y="20" width="260" height="240" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)" stroke-width="1.5"/>
+      <text x="790" y="44" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="13" font-weight="800">机房 C · 仅做仲裁</text>
+      <rect x="680" y="60" width="220" height="36" rx="6" fill="url(#d-orange)"/>
+      <text x="790" y="82" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">Sentinel-4</text>
+      <rect x="680" y="106" width="220" height="36" rx="6" fill="url(#d-orange)"/>
+      <text x="790" y="128" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">Sentinel-5</text>
+      <text x="680" y="170" fill="var(--diagram-orange-text)" font-size="10">2 个 Sentinel,无数据节点</text>
+      <text x="680" y="188" fill="var(--diagram-orange-text)" font-size="10">承担"打破平局"角色</text>
+      <text x="680" y="220" fill="var(--diagram-red-text)" font-size="10">★ 任意机房断链后</text>
+      <text x="680" y="236" fill="var(--diagram-red-text)" font-size="10">  剩余两机房合力 ≥ 3 票</text>
+
+      <line x1="180" y1="160" x2="180" y2="180" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <line x1="320" y1="142" x2="380" y2="142" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-g)"/>
+      <text x="350" y="135" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9" font-weight="700">复制</text>
+
+      <rect x="40" y="280" width="860" height="60" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="60" y="304" fill="var(--diagram-blue-text)" font-size="11" font-weight="800">★ 5 节点跨三机房的安全性</text>
+      <text x="60" y="322" fill="var(--diagram-muted)" font-size="10">A 整机房宕(2 票丢)→ B+C 仍有 3 票 ≥ quorum=3 → 提升 R2 成功 · A↔B 断链 → A+C/B+C 任意侧合 3 票胜出</text>
+      <text x="60" y="336" fill="var(--diagram-red-text)" font-size="10">⚠ 必须严格奇数机房;两机房 5 票拆 [3|2] 时小侧仍合 quorum=3 与大侧争夺 → 失败</text>
+    </g>
+  </svg>
+</div>
+
+<h3>26.10.3 脑裂保护机制</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 26-10-2 · 网络分区下"过半 quorum"如何阻止脑裂</div>
+  <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:920px;width:100%;margin:8px auto;height:auto;">
+    <defs>
+      <linearGradient id="dc-a" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+      <linearGradient id="dc-bc" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+      <linearGradient id="dc-s" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    </defs>
+    <rect x="0" y="0" width="920" height="380" fill="var(--diagram-panel)" rx="10"/>
+    <text x="460" y="22" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="13" font-weight="700" font-family="monospace">机房 A vs B+C 网络分区 · quorum=3</text>
+
+    <!-- 分区 1: 机房 A -->
+    <g transform="translate(40, 50)">
+      <rect x="0" y="0" width="380" height="180" rx="10" fill="url(#dc-a)" opacity="0.15" stroke="var(--diagram-red-stroke)" stroke-width="2"/>
+      <text x="20" y="22" fill="var(--diagram-red-text)" font-size="13" font-weight="700">分区 A(机房 A · 2 票)</text>
+
+      <rect x="20" y="40" width="80" height="36" rx="6" fill="url(#dc-s)"/><text x="60" y="62" text-anchor="middle" fill="var(--diagram-text)" font-family="monospace">S1</text>
+      <rect x="110" y="40" width="80" height="36" rx="6" fill="url(#dc-s)"/><text x="150" y="62" text-anchor="middle" fill="var(--diagram-text)" font-family="monospace">S2</text>
+      <rect x="200" y="40" width="80" height="36" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/><text x="240" y="62" text-anchor="middle" fill="var(--diagram-red-text)" font-family="monospace">M (旧)</text>
+      <rect x="290" y="40" width="80" height="36" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/><text x="330" y="62" text-anchor="middle" fill="var(--diagram-blue-text)" font-family="monospace">R1</text>
+
+      <text x="20" y="110" fill="var(--diagram-red-text)" font-family="monospace" font-size="11">投票:2 票 &lt; quorum=3</text>
+      <text x="20" y="130" fill="var(--diagram-red-text)" font-family="monospace" font-size="11" font-weight="700">→ 无法 ODOWN</text>
+      <text x="20" y="150" fill="var(--diagram-red-text)" font-family="monospace" font-size="11">→ 无法选举,旧 M 仍尝试服务但被孤立</text>
+      <text x="20" y="170" fill="var(--diagram-red-text)" font-family="monospace" font-size="11">→ ★ 避免脑裂的关键</text>
+    </g>
+
+    <!-- 分区 2: 机房 B+C -->
+    <g transform="translate(500, 50)">
+      <rect x="0" y="0" width="380" height="180" rx="10" fill="url(#dc-bc)" opacity="0.15" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
+      <text x="20" y="22" fill="var(--diagram-green-text)" font-size="13" font-weight="700">分区 B+C(机房 B+C · 3 票)</text>
+
+      <rect x="20" y="40" width="60" height="36" rx="6" fill="url(#dc-s)"/><text x="50" y="62" text-anchor="middle" fill="var(--diagram-text)" font-family="monospace">S3</text>
+      <rect x="90" y="40" width="60" height="36" rx="6" fill="url(#dc-s)"/><text x="120" y="62" text-anchor="middle" fill="var(--diagram-text)" font-family="monospace">S4</text>
+      <rect x="160" y="40" width="60" height="36" rx="6" fill="url(#dc-s)"/><text x="190" y="62" text-anchor="middle" fill="var(--diagram-text)" font-family="monospace">S5</text>
+      <rect x="240" y="40" width="100" height="36" rx="6" fill="url(#dc-bc)"/><text x="290" y="62" text-anchor="middle" fill="var(--diagram-text)" font-family="monospace" font-weight="700">R2 → 新主</text>
+
+      <text x="20" y="110" fill="var(--diagram-green-text)" font-family="monospace" font-size="11">投票:3 票 ≥ quorum=3</text>
+      <text x="20" y="130" fill="var(--diagram-green-text)" font-family="monospace" font-size="11" font-weight="700">→ ODOWN 成立</text>
+      <text x="20" y="150" fill="var(--diagram-green-text)" font-family="monospace" font-size="11">→ 选 Leader → 提升 R2 → 广播 +switch-master</text>
+      <text x="20" y="170" fill="var(--diagram-green-text)" font-family="monospace" font-size="11">→ ★ 单一新主,无脑裂</text>
+    </g>
+
+    <!-- 分区恢复 -->
+    <g transform="translate(40, 250)">
+      <rect x="0" y="0" width="840" height="110" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="20" y="22" fill="var(--diagram-orange-text)" font-size="12" font-weight="700">★ 分区恢复后</text>
+      <text x="20" y="44" fill="var(--diagram-blue-text)" font-size="11">• 旧 M 收到 +switch-master 通告 → 自动 SLAVEOF R2 降级为副本</text>
+      <text x="20" y="64" fill="var(--diagram-blue-text)" font-size="11">• 旧 M 在分区前未同步到任何 R2 的写入将<tspan font-weight="700" fill="var(--diagram-red-text)">丢失</tspan></text>
+      <text x="20" y="86" fill="var(--diagram-orange-text)" font-size="11">• 控制丢失窗口需配置 <tspan font-family="ui-monospace, monospace" fill="var(--diagram-orange-text)">min-replicas-to-write</tspan> + <tspan font-family="ui-monospace, monospace" fill="var(--diagram-orange-text)">min-replicas-max-lag</tspan></text>
+    </g>
+  </svg>
+</div>
+
+<div class="warning">
+  <strong>仲裁机房不是装饰</strong>:把第 5 个 Sentinel 放在"仲裁机房 C"是有意为之 — 当机房 A 与机房 B 之间网络断开时,仍由机房 C 决定哪一侧拥有过半票数。如果只有机房 A、B 两个机房各放 2-3 个 Sentinel,跨机房断链时双方都没有过半票数,故障转移直接卡死。<strong>奇数机房 + 奇数 Sentinel</strong> 是跨机房部署的硬要求。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s26-11">26.11 性能基准</h2>
+<!-- ============================================================ -->
+
+<h3>26.11.1 故障转移耗时分布</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 26-11-1 · 不同 down-after-ms 与 failover-timeout 配置下的转移耗时</div>
+  <table>
+    <thead><tr><th>配置</th><th>down-after-ms</th><th>failover-timeout</th><th>P50 转移耗时</th><th>P99 转移耗时</th></tr></thead>
+    <tbody>
+      <tr><td>默认</td><td>30,000</td><td>180,000</td><td>30 + 4 s</td><td>30 + 8 s</td></tr>
+      <tr><td><strong>推荐</strong></td><td><strong>5,000</strong></td><td><strong>60,000</strong></td><td><strong>5 + 4 s</strong></td><td><strong>5 + 10 s</strong></td></tr>
+      <tr><td>激进</td><td>2,000</td><td>30,000</td><td>2 + 4 s</td><td>2 + 12 s</td></tr>
+      <tr><td>激进 + 误判风险</td><td>500</td><td>30,000</td><td>0.5 + 4 s</td><td>0.5 + 30 s(可能误判)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p>测试条件:Redis 7.2,3 Sentinel,1 主 2 从,千兆内网。</p>
+
+<h3>26.11.2 down-after-ms 与误判率</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 26-11-1 · down-after-ms vs 误判率</div>
+  <p style="color:var(--text-muted);font-size:13px;margin:8px 0 12px 0;">假设网络抖动持续时间服从对数正态分布,平均 100 ms,P99 = 800 ms:</p>
+  <table>
+    <thead><tr><th>down-after-ms</th><th>单 Sentinel 误判率</th><th>需要 quorum 抵消</th></tr></thead>
+    <tbody>
+      <tr><td>500</td><td>~25%</td><td>≥ 3</td></tr>
+      <tr><td>1,000</td><td>~10%</td><td>≥ 2</td></tr>
+      <tr><td>2,000</td><td>~3%</td><td>≥ 2</td></tr>
+      <tr><td><strong>5,000(生产建议)</strong></td><td><strong>~0.5%</strong></td><td><strong>≥ 2</strong></td></tr>
+      <tr><td>10,000</td><td>~0.05%</td><td>≥ 2</td></tr>
+      <tr><td>30,000(默认)</td><td>~0.001%</td><td>≥ 2</td></tr>
+    </tbody>
+  </table>
+  <div class="key-insight" style="margin-top:12px;">
+    <strong>关键观察</strong>:单 Sentinel 误判率<strong>指数下降</strong>;quorum 过半后集体误判率 ≈ 单误判率<sup>quorum</sup>;<strong>5000 ms 是"误判率与转移速度"的拐点</strong>(再小不显著提速,再大转移延迟过高)。
+  </div>
+</div>
+
+<h3>26.11.3 Sentinel 自身资源开销</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 26-11-2 · 单个 Sentinel 监控 1 主 5 从的资源占用</div>
+  <table>
+    <thead><tr><th>指标</th><th>单 Sentinel(监控 1 主 5 从)</th></tr></thead>
+    <tbody>
+      <tr><td>内存占用</td><td>~3-5 MiB</td></tr>
+      <tr><td>CPU 占用</td><td>&lt; 0.1 核</td></tr>
+      <tr><td>网络带宽</td><td>~10 KiB/s(PING/INFO/hello)</td></tr>
+      <tr><td>磁盘 I/O</td><td>极少(仅 epoch 持久化)</td></tr>
+      <tr><td>对数据节点的额外负载</td><td>&lt; 0.1% QPS</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p>Sentinel 资源占用极低 — 一台 4G 内存机器可同时运行 100+ Sentinel 实例监控不同集群。生产中常把 Sentinel 与运维监控、CI 等"轻量服务"混部,而非与数据节点同机部署。</p>
+
+<!-- ============================================================ -->
+<h2 id="s26-12">26.12 已知陷阱与诊断</h2>
+<!-- ============================================================ -->
+
+<h3>26.12.1 陷阱分类</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 26-12-1 · 10 类常见 Sentinel 陷阱按四大类划分</div>
+  <svg viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="460" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="380" y="14" width="180" height="44" rx="8" fill="url(#d-red)" filter="url(#d-shadow)"/>
+      <text x="470" y="40" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">Sentinel 陷阱</text>
+      <text x="470" y="54" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">4 类 · 10 项</text>
+
+      <line x1="470" y1="58" x2="120" y2="92" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <line x1="470" y1="58" x2="370" y2="92" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <line x1="470" y1="58" x2="600" y2="92" stroke="var(--diagram-red-stroke)" marker-end="url(#d-arr-r)"/>
+      <line x1="470" y1="58" x2="850" y2="92" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="20" y="92" width="200" height="40" rx="6" fill="url(#d-blue)"/>
+      <text x="120" y="118" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">P1 · 配置类</text>
+
+      <rect x="20" y="148" width="200" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="120" y="168" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">P11 · quorum &lt; N/2 → 脑裂</text>
+      <rect x="20" y="186" width="200" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="120" y="206" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">P12 · down-after-ms 过小</text>
+      <rect x="20" y="224" width="200" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="120" y="244" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">P13 · parallel-syncs 过大</text>
+
+      <line x1="120" y1="132" x2="120" y2="148" stroke="var(--diagram-blue-stroke)"/>
+      <line x1="120" y1="180" x2="120" y2="186" stroke="var(--diagram-blue-stroke)"/>
+      <line x1="120" y1="218" x2="120" y2="224" stroke="var(--diagram-blue-stroke)"/>
+
+      <rect x="270" y="92" width="200" height="40" rx="6" fill="url(#d-green)"/>
+      <text x="370" y="118" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">P2 · 网络类</text>
+
+      <rect x="270" y="148" width="200" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="370" y="168" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">P21 · Sentinel 与数据节点隔离</text>
+      <rect x="270" y="186" width="200" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="370" y="206" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">P22 · NAT/防火墙阻断 hello</text>
+
+      <line x1="370" y1="132" x2="370" y2="148" stroke="var(--diagram-green-stroke)"/>
+      <line x1="370" y1="180" x2="370" y2="186" stroke="var(--diagram-green-stroke)"/>
+
+      <rect x="500" y="92" width="200" height="40" rx="6" fill="url(#d-red)"/>
+      <text x="600" y="118" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">P3 · 脑裂类</text>
+
+      <rect x="500" y="148" width="200" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="600" y="168" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">P31 · 偶数 Sentinel</text>
+      <rect x="500" y="186" width="200" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="600" y="206" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">P32 · 跨机房带宽不足</text>
+      <rect x="500" y="224" width="200" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="600" y="244" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">P33 · 未配 min-replicas</text>
+
+      <line x1="600" y1="132" x2="600" y2="148" stroke="var(--diagram-red-stroke)"/>
+      <line x1="600" y1="180" x2="600" y2="186" stroke="var(--diagram-red-stroke)"/>
+      <line x1="600" y1="218" x2="600" y2="224" stroke="var(--diagram-red-stroke)"/>
+
+      <rect x="730" y="92" width="190" height="40" rx="6" fill="url(#d-orange)"/>
+      <text x="825" y="118" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">P4 · 客户端类</text>
+
+      <rect x="730" y="148" width="190" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="825" y="168" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">P41 · 不支持 Sentinel</text>
+      <rect x="730" y="186" width="190" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="825" y="206" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">P42 · 静态 master 地址</text>
+
+      <line x1="825" y1="132" x2="825" y2="148" stroke="var(--diagram-orange-stroke)"/>
+      <line x1="825" y1="180" x2="825" y2="186" stroke="var(--diagram-orange-stroke)"/>
+
+      <rect x="40" y="290" width="860" height="160" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="60" y="316" fill="var(--diagram-blue-text)" font-size="13" font-weight="800">★ 命中规律</text>
+      <text x="60" y="338" fill="var(--diagram-muted)" font-size="11">· 配置类(P1):quorum/down-after-ms 必须按业务定;parallel-syncs 太大会让所有副本同时全量阻塞读</text>
+      <text x="60" y="358" fill="var(--diagram-muted)" font-size="11">· 网络类(P2):Sentinel 必须能直接 PING 数据节点;hello 频道走 Pub/Sub,NAT 后端易丢</text>
+      <text x="60" y="378" fill="var(--diagram-muted)" font-size="11">· 脑裂类(P3):奇数 N + 严格 quorum &gt; N/2 + 配 min-replicas-to-write 三层防护缺一不可</text>
+      <text x="60" y="398" fill="var(--diagram-muted)" font-size="11">· 客户端类(P4):必须用支持 Sentinel 协议的 client(jedis-sentinel/lettuce-sentinel/redis-py-sentinel)</text>
+      <text x="60" y="418" fill="var(--diagram-red-text)" font-size="11">⚠ 最常见的故障来自硬编码 master:port — 故障转移成功后客户端仍写旧主,直到客户端重启</text>
+      <text x="60" y="438" fill="var(--diagram-green-text)" font-size="11">✓ 防御:client 用 master_name 通过 Sentinel 解析当前主,并订阅 +switch-master 事件即时更新</text>
+    </g>
+  </svg>
+</div>
+
+<h3>26.12.2 陷阱明细与修复</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 26-12-1 · 10 类陷阱的症状、根因、监控指标与修复</div>
+  <table>
+    <thead><tr><th>#</th><th>陷阱</th><th>症状</th><th>根因</th><th>监控指标</th><th>修复</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>quorum 设置不足</td><td>同时多个分区触发 failover</td><td>quorum &lt; N/2 + 1</td><td><code>+sdown</code> 事件计数</td><td>改为过半阈值</td></tr>
+      <tr><td>2</td><td><code>down-after-ms</code> 过小</td><td>频繁误判触发故障转移</td><td>网络抖动超过阈值</td><td><code>+sdown</code> 与 <code>-sdown</code> 配对率</td><td>设置 5,000-10,000 ms</td></tr>
+      <tr><td>3</td><td><code>parallel-syncs</code> 过大</td><td>提升后多 replica 同时全量同步压垮新主</td><td>默认 1 已合理</td><td><code>+sync-progress</code></td><td>保持 1</td></tr>
+      <tr><td>4</td><td>Sentinel 与数据节点同机部署</td><td>主节点崩溃可能拖垮 Sentinel</td><td>资源争用</td><td>OS 层 OOM kill</td><td>独立部署</td></tr>
+      <tr><td>5</td><td>NAT/防火墙阻断 hello 频道</td><td>Sentinel 间无法发现</td><td>TCP 26379 端口或 PUBSUB 受限</td><td><code>SENTINEL sentinels</code></td><td>开放 Sentinel 端口与 PUBSUB</td></tr>
+      <tr><td>6</td><td>偶数 Sentinel 数量</td><td>分区时双方均无法过半</td><td>4 节点 → 2 vs 2 平局</td><td>-</td><td>改用奇数(3/5/7)</td></tr>
+      <tr><td>7</td><td>跨机房网络抖动</td><td>频繁 SDOWN 但未达 ODOWN</td><td>心跳延迟接近 down-after-ms</td><td>跨机房 RTT P99</td><td><code>down-after-ms</code> ≥ RTT P99 × 5</td></tr>
+      <tr><td>8</td><td>旧主分区脑裂</td><td>旧主 + 新主同时接受写入</td><td>未配置 <code>min-replicas-to-write</code></td><td>旧主写入计数</td><td>配置 <code>min-replicas-to-write 1</code></td></tr>
+      <tr><td>9</td><td>客户端不支持 Sentinel</td><td>故障转移后仍连旧主</td><td>使用普通 redis-cli 连接</td><td>业务报错率</td><td>切换到支持 Sentinel 的客户端 SDK</td></tr>
+      <tr><td>10</td><td>客户端缓存主地址</td><td>切换后客户端长时间连旧主</td><td>未订阅 <code>+switch-master</code></td><td>客户端日志</td><td>SDK 应订阅 sentinel pubsub</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>26.12.3 反/正例对照</h3>
+
+<pre><code class="language-bash"># 反模式:quorum 过低
+sentinel monitor mymaster 192.168.1.10 6379 1
+# Sentinel 总数 3,quorum=1
+# 任一 Sentinel 误判都可触发 ODOWN
+# 网络分区时两个分区均可能选出 Leader → 脑裂
+
+# 正模式:quorum 过半
+sentinel monitor mymaster 192.168.1.10 6379 2
+# Sentinel 总数 3,quorum=2
+# 至少 2 个 Sentinel 同意才进入 ODOWN
+# 满足分区分割时仅多数派一侧可选举</code></pre>
+
+<pre><code class="language-bash"># 反模式:旧主分区未启用写保护
+# 旧主在分区期间继续接受写入,分区恢复后被覆盖
+config get min-replicas-to-write
+1) "min-replicas-to-write"
+2) "0"
+
+# 正模式:配置写保护
+CONFIG SET min-replicas-to-write 1
+CONFIG SET min-replicas-max-lag 10
+# 分区导致 replica 全部失联时,旧主拒绝写入,避免脑裂数据</code></pre>
+
+<h3>26.12.4 订阅 Sentinel 事件</h3>
+
+<pre><code class="language-bash">redis-cli -p 26379 PSUBSCRIBE '*'</code></pre>
+
+<pre><code class="language-bash">1) "psubscribe"  2) "*"  3) (integer) 1
+1) "pmessage"  2) "*"  3) "+sdown"        4) "master mymaster 192.168.1.10 6379"
+1) "pmessage"  2) "*"  3) "+odown"        4) "master mymaster 192.168.1.10 6379 #quorum 2/2"
+1) "pmessage"  2) "*"  3) "+new-epoch"    4) "13"
+1) "pmessage"  2) "*"  3) "+vote-for-leader"  4) "S1_runid 13"
+1) "pmessage"  2) "*"  3) "+elected-leader"   4) "master mymaster 192.168.1.10 6379"
+1) "pmessage"  2) "*"  3) "+failover-state-select-slave"  4) "..."
+1) "pmessage"  2) "*"  3) "+selected-slave"  4) "slave 192.168.1.21:6379"
+1) "pmessage"  2) "*"  3) "+failover-state-send-slaveof-noone" 4) "..."
+1) "pmessage"  2) "*"  3) "+promoted-slave"   4) "slave 192.168.1.21:6379"
+1) "pmessage"  2) "*"  3) "+switch-master"    4) "mymaster 192.168.1.10 6379 192.168.1.21 6379"</code></pre>
+
+<p>事件序列与状态机一一对应,运维侧应将 <code>+switch-master</code> 事件接入告警系统,作为故障转移完成的<strong>权威信号</strong>。</p>
+
+<!-- ============================================================ -->
+<h2 id="s26-13">26.13 源码深潜与设计取舍</h2>
+<!-- ============================================================ -->
+
+<h3>26.13.1 Sentinel 源码调用链</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 26-13-1 · 从 100ms 主循环到 +switch-master 的完整调用链</div>
+  <svg viewBox="0 0 940 580" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="580" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="280" y="20" width="380" height="56" rx="10" fill="url(#d-blue)" filter="url(#d-shadow)"/>
+      <text x="470" y="44" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">A · src/sentinel.c</text>
+      <text x="470" y="62" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">sentinelTimer() · 每 100ms 触发</text>
+      <text x="470" y="74" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">主事件循环入口</text>
+
+      <line x1="470" y1="76" x2="470" y2="100" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+
+      <rect x="280" y="100" width="380" height="40" rx="8" fill="url(#d-blue)"/>
+      <text x="470" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">B · sentinelHandleRedisInstance()</text>
+
+      <line x1="280" y1="140" x2="200" y2="170" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <line x1="470" y1="140" x2="470" y2="170" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <line x1="660" y1="140" x2="740" y2="170" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+
+      <rect x="40" y="170" width="290" height="40" rx="6" fill="url(#d-purple)"/>
+      <text x="185" y="194" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">C · sentinelReconnectInstance()</text>
+
+      <rect x="350" y="170" width="290" height="40" rx="6" fill="url(#d-purple)"/>
+      <text x="495" y="190" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">D · sentinelSendPeriodicCommands()</text>
+      <text x="495" y="204" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">PING / INFO / PSUB hello</text>
+
+      <rect x="660" y="170" width="240" height="40" rx="6" fill="url(#d-orange)"/>
+      <text x="780" y="194" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">E · CheckSubjectivelyDown</text>
+
+      <line x1="780" y1="210" x2="780" y2="232" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="660" y="232" width="240" height="40" rx="6" fill="url(#d-orange)"/>
+      <text x="780" y="256" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">F · CheckObjectivelyDown</text>
+
+      <line x1="780" y1="272" x2="780" y2="296" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+
+      <polygon points="780,296 900,328 780,360 660,328" fill="url(#d-orange)" filter="url(#d-shadow)"/>
+      <text x="780" y="324" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">G · is-master-down</text>
+      <text x="780" y="338" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">投票 ≥ quorum?</text>
+
+      <line x1="780" y1="360" x2="780" y2="382" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="640" y="382" width="280" height="40" rx="6" fill="url(#d-purple)"/>
+      <text x="780" y="406" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">H · StartFailoverIfNeeded()</text>
+
+      <line x1="780" y1="422" x2="780" y2="444" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="640" y="444" width="280" height="40" rx="6" fill="url(#d-purple)"/>
+      <text x="780" y="468" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">I · StartFailover()</text>
+
+      <line x1="640" y1="464" x2="350" y2="500" stroke="var(--diagram-red-stroke)" marker-end="url(#d-arr-r)"/>
+
+      <rect x="40" y="500" width="320" height="60" rx="8" fill="url(#d-red)" filter="url(#d-shadow)"/>
+      <text x="200" y="522" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">J · FailoverStateMachine()</text>
+      <text x="200" y="538" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">五阶段调度</text>
+      <text x="200" y="552" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">每 100ms 推进一阶段</text>
+
+      <line x1="360" y1="530" x2="404" y2="530" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="404" y="500" width="240" height="60" rx="8" fill="url(#d-orange)"/>
+      <text x="524" y="522" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">K · 选副本→提升→重定向</text>
+      <text x="524" y="540" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">compareSlavesForPromotion</text>
+      <text x="524" y="554" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">REPLICAOF NO ONE</text>
+
+      <line x1="644" y1="530" x2="688" y2="530" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+
+      <rect x="688" y="500" width="240" height="60" rx="8" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="808" y="522" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">L · sentinelEvent</text>
+      <text x="808" y="540" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">'+switch-master'</text>
+      <text x="808" y="554" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">广播给所有订阅者 + client</text>
+
+      <rect x="40" y="232" width="600" height="170" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="60" y="256" fill="var(--diagram-blue-text)" font-size="12" font-weight="800">★ 100ms 主循环的设计</text>
+      <text x="60" y="276" fill="var(--diagram-muted)" font-size="11">· sentinelTimer 是 Sentinel 唯一的"心跳"</text>
+      <text x="60" y="294" fill="var(--diagram-muted)" font-size="11">· 每个监控对象(master/replica/sentinel)都被 sentinelHandleRedisInstance() 处理一遍</text>
+      <text x="60" y="312" fill="var(--diagram-muted)" font-size="11">· 周期任务在循环内通过"上次执行时间"判断是否到期</text>
+      <text x="60" y="330" fill="var(--diagram-green-text)" font-size="11">  → PING 1s · INFO 10s · hello 2s · 状态检查每 100ms</text>
+      <text x="60" y="354" fill="var(--diagram-orange-text)" font-size="11">★ FailoverStateMachine 也由这个循环驱动:每 100ms 检查阶段 → 推进或超时</text>
+      <text x="60" y="374" fill="var(--diagram-orange-text)" font-size="11">  这就是为什么故障转移耗时是"down-after + ~5s"的级别</text>
+      <text x="60" y="392" fill="var(--diagram-red-text)" font-size="11">⚠ Sentinel 不是真正的实时系统,所有时间精度都是 ~100ms</text>
+    </g>
+  </svg>
+</div>
+
+<h3>26.13.2 核心源码入口</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 26-13-1 · 9 个关键函数与其职责</div>
+  <table>
+    <thead><tr><th>源码文件</th><th>关键函数</th><th>职责</th></tr></thead>
+    <tbody>
+      <tr><td><code>src/sentinel.c</code></td><td><code>sentinelTimer()</code></td><td>100 ms 定时主循环</td></tr>
+      <tr><td><code>src/sentinel.c</code></td><td><code>sentinelSendPeriodicCommands()</code></td><td>PING/INFO/hello 发布</td></tr>
+      <tr><td><code>src/sentinel.c</code></td><td><code>sentinelProcessHelloMessage()</code></td><td>处理 hello 消息</td></tr>
+      <tr><td><code>src/sentinel.c</code></td><td><code>sentinelCheckSubjectivelyDown()</code></td><td>SDOWN 判定</td></tr>
+      <tr><td><code>src/sentinel.c</code></td><td><code>sentinelCheckObjectivelyDown()</code></td><td>ODOWN 判定</td></tr>
+      <tr><td><code>src/sentinel.c</code></td><td><code>sentinelVoteLeader()</code></td><td>投票路径</td></tr>
+      <tr><td><code>src/sentinel.c</code></td><td><code>sentinelFailoverStateMachine()</code></td><td>故障转移五阶段调度</td></tr>
+      <tr><td><code>src/sentinel.c</code></td><td><code>compareSlavesForPromotion()</code></td><td>副本选择三层排序</td></tr>
+      <tr><td><code>src/sentinel.c</code></td><td><code>sentinelFlushConfig()</code></td><td>epoch 持久化</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>26.13.3 设计取舍</h3>
+
+<h4>取舍 1:独立进程 vs 内嵌共识</h4>
+
+<p>Sentinel 选择独立进程而非将共识算法嵌入 Redis 数据节点。<strong>代价</strong>是部署复杂度增加(需额外维护 N+M 个进程)。<strong>收益</strong>是数据节点保持单线程简洁性,Sentinel 可独立升级,故障域隔离。第 27 章 Cluster 走另一条路 — 把判定与选举内嵌进数据节点,因此 Cluster 节点的协议复杂度显著上升。</p>
+
+<h4>取舍 2:Pub/Sub 自动发现 vs 静态配置</h4>
+
+<p>Sentinel 通过 <code>__sentinel__:hello</code> 频道自动发现集群成员,不需要在配置中显式列出每个 Sentinel 地址。<strong>代价</strong>是 master 故障时 hello 频道短暂失效(已发现的成员仍可工作)。<strong>收益</strong>是动态扩缩容无需重启,部署成本低。</p>
+
+<h4>取舍 3:quorum + epoch 双约束 vs 仅过半</h4>
+
+<p>ODOWN 使用 quorum 配置项(可独立调节),故障转移使用 epoch 单调递增 + 同 epoch 1 票限制。<strong>代价</strong>是配置项增加。<strong>收益</strong>是允许细粒度调节:可设置 quorum &lt; 过半实现"激进检测",或 quorum = 过半实现"保守检测",epoch 机制始终保证选举正确性。</p>
+
+<h4>取舍 4:不提供强一致 vs 提供 min-replicas 边界</h4>
+
+<p>Sentinel 故障转移过程仍是异步的,不保证零数据丢失。<strong>代价</strong>是分区场景下旧主可能丢失分区前的写入。Redis 通过 <code>min-replicas-to-write</code> + <code>min-replicas-max-lag</code> 提供事后边界,而非引入完整的 Paxos/Raft 数据共识。这与 Redis 整体"AP 优先"的设计哲学一致。</p>
+
+<!-- ============================================================ -->
+<h2 id="s26-summary">26.14 本章要点</h2>
+<!-- ============================================================ -->
+
+<div class="chapter-summary">
+
+<h3>关键事实</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 26-14-1 · Sentinel 关键事实速查</div>
+  <table>
+    <thead><tr><th>要点</th><th>源码/命令依据</th><th>易错点</th></tr></thead>
+    <tbody>
+      <tr><td>Sentinel 是独立进程,不存储数据</td><td><code>redis-sentinel</code> 二进制</td><td>与数据节点同机部署有故障域风险</td></tr>
+      <tr><td>自动发现通过 <code>__sentinel__:hello</code> Pub/Sub</td><td><code>sentinelProcessHelloMessage()</code></td><td>NAT/防火墙阻断时发现失败</td></tr>
+      <tr><td>SDOWN 是单 Sentinel 判定</td><td><code>down-after-milliseconds</code></td><td>网络抖动可触发误判</td></tr>
+      <tr><td>ODOWN 必须达到 quorum 阈值</td><td><code>sentinelCheckObjectivelyDown()</code></td><td>quorum 必须过半才能避免脑裂</td></tr>
+      <tr><td>Leader 选举使用 epoch + 同 epoch 1 票</td><td><code>sentinelVoteLeader()</code></td><td>与 Raft 类似但门槛是 quorum 而非过半</td></tr>
+      <tr><td>副本选择按 priority/offset/runid 三层排序</td><td><code>compareSlavesForPromotion()</code></td><td>priority=0 表示永不参与</td></tr>
+      <tr><td>故障转移五阶段:选副本→提升→重定向→广播→旧主降级</td><td><code>sentinelFailoverStateMachine()</code></td><td>旧主恢复后自动转为新主的 replica</td></tr>
+      <tr><td>客户端必须订阅 <code>+switch-master</code> 事件</td><td><code>PSUBSCRIBE '*'</code> 或 SDK 内置</td><td>静态硬编码 master 地址会导致切换后连不上</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>最小回归测试</h3>
+
+<pre><code class="language-bash"># 启动 Sentinel
+redis-sentinel sentinel.conf
+
+# 验证发现
+redis-cli -p 26379 SENTINEL sentinels mymaster
+redis-cli -p 26379 SENTINEL get-master-addr-by-name mymaster
+redis-cli -p 26379 SENTINEL master mymaster
+
+# 模拟主节点故障
+redis-cli -p 6379 DEBUG SLEEP 30
+
+# 观察事件流
+redis-cli -p 26379 PSUBSCRIBE '+switch-master'</code></pre>
+
+<pre><code class="language-bash">1) "sentinels"
+2) (count > 1)
+1) "192.168.1.10"
+2) "6379"
+... master 详情 ...
+
+1) "psubscribe"  2) "+switch-master"  3) (integer) 1
+1) "message"  2) "+switch-master"  3) "mymaster 192.168.1.10 6379 192.168.1.21 6379"</code></pre>
+
+<h3>章末总结</h3>
+
+<p>第 26 章把第 25 章的"主从复制"提升到"高可用":通过<strong>独立部署的 Sentinel 进程</strong>把"主节点崩溃"从需要人工介入的事故转化为可在十秒级自动恢复的事件。本章的四层结构对应了一条清晰的因果链:</p>
+
+<ul>
+  <li><strong>§26.1-26.3 拓扑与发现</strong> — Sentinel 通过 <code>__sentinel__:hello</code> 自动发现集群成员,master 充当消息总线让 Sentinel 间无需直接连接;</li>
+  <li><strong>§26.4-26.6 故障判定</strong> — SDOWN 是单 Sentinel 视角的本地判断,ODOWN 是 ≥ quorum 的集体共识,两阶段判定通过 quorum 配置项调节灵敏度;</li>
+  <li><strong>§26.7-26.9 选举与转移</strong> — Raft 风格的 epoch + 同 epoch 1 票约束保证选举安全,五阶段故障转移在 ~10 秒内把流量切到新主,副本选择三层排序保证选择确定且尽可能保留数据;</li>
+  <li><strong>§26.10-26.13 生产实践</strong> — 多机房部署、quorum 必须过半、客户端订阅 <code>+switch-master</code> 是三条不可妥协的生产红线。</li>
+</ul>
+
+<h3>下一章预告</h3>
+
+<p>Sentinel 解决了<strong>单分片的可用性</strong>,但容量与吞吐仍受限于单主节点。下一章 <strong>Cluster 集群</strong>通过 16384 个哈希槽将 keyspace 切分到多个分片,每个分片独立运行主从复制,通过 <strong>Gossip 协议</strong>维护拓扑,使用 <strong>MOVED/ASK 重定向</strong>实现客户端路由,并将故障检测与选举<strong>内嵌到数据节点本身</strong>。理解 Sentinel 的 epoch 与 Leader 选举之后,Cluster 的 <code>configEpoch</code>、<code>currentEpoch</code> 与 slot 迁移协议会有<strong>共同的语言</strong>。</p>
+
+</div>
+
+<p class="footer">&copy; 2026 图解 Redis &middot; 第 26 章 &middot; Sentinel 哨兵</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/c.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){document.querySelectorAll('.diagram svg').forEach(function(svg){var h=parseInt(svg.getAttribute('height')||svg.getBoundingClientRect().height);if(h>500){svg.style.maxHeight='500px';svg.style.width='auto';var p=svg.closest('.diagram');if(p)p.style.overflowX='auto';}});});</script>
+</body>
+</html>

@@ -1,0 +1,1887 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ch.27 Cluster 集群 — 图解 Redis</title>
+<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="d-purple" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-purple-fill-start)"/><stop offset="100%" stop-color="var(--diagram-purple-fill-end)"/></linearGradient>
+    <linearGradient id="d-green" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-cyan-fill-start)"/><stop offset="100%" stop-color="var(--diagram-cyan-fill-end)"/></linearGradient>
+    <linearGradient id="d-blue" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-blue-fill-start)"/><stop offset="100%" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+    <linearGradient id="d-orange" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-orange-fill-start)"/><stop offset="100%" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+    <linearGradient id="d-red" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="var(--diagram-red-fill-start)"/><stop offset="100%" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+    <filter id="d-shadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="var(--diagram-text)" flood-opacity="0.4"/></filter>
+    <marker id="d-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-muted)"/></marker>
+    <marker id="d-arr-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-green-stroke)"/></marker>
+    <marker id="d-arr-r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-red-stroke)"/></marker>
+    <marker id="d-arr-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--diagram-blue-stroke)"/></marker>
+  </defs>
+</svg>
+
+<nav class="topnav">
+  <span class="brand">📖 图解 Redis</span>
+  <span class="sep">|</span>
+  <a href="index.html">首页</a>
+  <a href="26-sentinel.html">上一章</a>
+  <a href="28-transaction.html">下一章</a>
+</nav>
+
+<aside class="toc">
+  <a href="#s27-1">27.1 为什么需要 Cluster</a>
+  <a href="#s27-2">27.2 16384 个 Hash Slot</a>
+  <a href="#s27-3">27.3 Gossip 协议</a>
+  <a href="#s27-4">27.4 PFAIL 与 FAIL 故障检测</a>
+  <a href="#s27-5">27.5 MOVED 重定向</a>
+  <a href="#s27-6">27.6 ASK 重定向</a>
+  <a href="#s27-7">27.7 Slot 迁移机制</a>
+  <a href="#s27-8">27.8 在线 Resharding</a>
+  <a href="#s27-9">27.9 Gossip 收敛速度</a>
+  <a href="#s27-10">27.10 部署模式对比</a>
+  <a href="#s27-11">27.11 性能基准</a>
+  <a href="#s27-12">27.12 陷阱与限制</a>
+  <a href="#s27-13">27.13 源码深潜</a>
+  <a href="#s27-summary">27.14 本章要点</a>
+</aside>
+
+<div class="article">
+
+<h1>第 27 章 · Cluster 集群</h1>
+<p class="subtitle">16384 hash slot · CRC16 路由 · Gossip 协议 · PFAIL/FAIL 多数派 · MOVED/ASK 重定向 · 在线 reshard · 去中心化 failover</p>
+
+<div class="chapter-intro">
+  <p class="lead">单节点 Redis 的容量与吞吐受限于单机硬件:内存上限取决于物理 RAM,写吞吐上限取决于单核 CPU。<strong>主从复制与 Sentinel</strong> 提供高可用,但不解决水平扩展问题:所有节点存储相同数据,内存与写吞吐上限不变。<strong>Redis Cluster</strong> 通过 16384 个 hash slot 将 keyspace 分散到多个 master 节点,每个节点独立处理一部分 slot 的读写,实现存储与吞吐的水平扩展。</p>
+  <p>Cluster 的核心设计选择有四:其一,<strong>固定 16384 个 slot</strong> 替代一致性 hash,bitmap 仅 2 KB 可塞入 Gossip 包;其二,<strong>Gossip 协议</strong>替代中心化协调器,无单点故障且消息复杂度 O(N);其三,<strong>PFAIL → FAIL 多数派投票</strong>替代外部 Sentinel,故障检测内置;其四,<strong>ASK + MIGRATE</strong> 实现在线 reshard,扩缩容期间服务不中断。这些选择共同形成"足够强大且足够简洁"的分布式方案,代价是多 key 命令、Lua 脚本、事务必须确保所有 key 在同一 slot。</p>
+  <p>本章按"<strong>分片 → Gossip → 故障检测 → 重定向 → 在线迁移 → 部署适配</strong>"组织,聚焦 Cluster 的工程语义边界与生产可观测性。读完后,你应能解释 MOVED 与 ASK 的差异、cluster-node-timeout 的取舍、为何不能把 Cluster 节点同时交给 Sentinel 监控。</p>
+  <ul class="will-learn">
+    <li>16384 slot 与 CRC16 路由:<code>slot = CRC16(key) &amp; 0x3FFF</code>,bitmap 大小如何决定集群规模</li>
+    <li>hash tag <code>{tag}</code> 强制相关 key 落同 slot,粒度过粗导致热点、过细失去意义</li>
+    <li>Gossip 协议 PING/PONG 周期性传播,O(log N) 收敛,1000 节点约 14 秒达成共识</li>
+    <li>PFAIL 单点判定 vs FAIL 多数派(<code>⌊N/2⌋+1</code>)确认,网络分区下的安全性证明</li>
+    <li>MOVED(永久迁移,更新缓存)vs ASK(临时跳转,需先发 ASKING)的语义差异</li>
+    <li>SETSLOT MIGRATING/IMPORTING + MIGRATE 三步骤完成在线 reshard</li>
+    <li>MIGRATE 单 key 原子性(DUMP+RESTORE+DEL),大 key 阻塞主线程的工程后果</li>
+    <li>Failover 流程:PFAIL → FAIL → 投票 → replica 提升,configEpoch 递增防脑裂</li>
+    <li>cluster-node-timeout 的取舍:5-10 秒平衡故障检测速度与误判风险</li>
+    <li>10 大陷阱:CROSSSLOT、hash tag 过粗、cluster-require-full-coverage、failover 过慢、大 key 迁移、Cluster 与 Sentinel 共用</li>
+  </ul>
+  <p class="prereq">前置知识:第 24 章主从复制(replica 提升机制);第 26 章 Sentinel(对比 Cluster 的内置 failover);CRC16 算法基础;TCP/网络分区基础概念。读者需要熟悉 redis-cli <code>--cluster</code> 命令族。</p>
+</div>
+
+<h3>章首速览</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 27-0 · Cluster 全景 — 数据/控制/故障/迁移四条链路</div>
+  <svg viewBox="0 0 940 540" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="540" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="20" y="20" width="200" height="50" rx="10" fill="url(#d-blue)" filter="url(#d-shadow)"/>
+      <text x="120" y="44" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">应用 / Smart Client</text>
+      <text x="120" y="60" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">读写入口</text>
+
+      <line x1="220" y1="45" x2="260" y2="45" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+
+      <rect x="260" y="20" width="180" height="50" rx="10" fill="url(#d-blue)"/>
+      <text x="350" y="42" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">本地 slot 缓存</text>
+      <text x="350" y="58" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">CLUSTER SLOTS / SHARDS</text>
+
+      <line x1="350" y1="70" x2="350" y2="98" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+
+      <polygon points="350,98 530,140 350,182 170,140" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="350" y="138" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">CRC16(key) % 16384</text>
+      <text x="350" y="154" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">slot 路由</text>
+
+      <line x1="225" y1="155" x2="80" y2="220" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <line x1="350" y1="182" x2="350" y2="220" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <line x1="475" y1="155" x2="620" y2="220" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+
+      <rect x="20" y="220" width="180" height="60" rx="8" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="110" y="242" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Master A</text>
+      <text x="110" y="258" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">slot 0-5460</text>
+      <text x="110" y="272" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">5461 个</text>
+
+      <rect x="260" y="220" width="180" height="60" rx="8" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="350" y="242" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Master B</text>
+      <text x="350" y="258" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">slot 5461-10922</text>
+      <text x="350" y="272" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">5462 个</text>
+
+      <rect x="500" y="220" width="180" height="60" rx="8" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="590" y="242" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Master C</text>
+      <text x="590" y="258" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">slot 10923-16383</text>
+      <text x="590" y="272" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">5461 个</text>
+
+      <line x1="110" y1="280" x2="110" y2="304" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-g)"/>
+      <line x1="350" y1="280" x2="350" y2="304" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-g)"/>
+      <line x1="590" y1="280" x2="590" y2="304" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-g)"/>
+
+      <rect x="20" y="304" width="180" height="36" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="110" y="326" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="800">Replica A1</text>
+
+      <rect x="260" y="304" width="180" height="36" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="350" y="326" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="800">Replica B1</text>
+
+      <rect x="500" y="304" width="180" height="36" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="590" y="326" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="800">Replica C1</text>
+
+      <path d="M 200,250 Q 230,196 260,250" fill="none" stroke="var(--diagram-purple-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+      <path d="M 440,250 Q 470,196 500,250" fill="none" stroke="var(--diagram-purple-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+      <path d="M 200,266 Q 350,360 500,266" fill="none" stroke="var(--diagram-red-stroke)" stroke-width="1.5" stroke-dasharray="3,3" marker-end="url(#d-arr-r)"/>
+      <text x="350" y="356" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10" font-weight="700">FAIL 广播 + Cluster Bus Gossip</text>
+
+      <rect x="700" y="20" width="220" height="320" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="720" y="44" fill="var(--diagram-purple-text)" font-size="13" font-weight="800">★ 4 条独立链路</text>
+
+      <text x="720" y="74" fill="var(--diagram-blue-text)" font-size="11" font-weight="800">① 数据 Data</text>
+      <text x="720" y="90" fill="var(--diagram-blue-text)" font-size="9">CRC16 → slot → master</text>
+
+      <text x="720" y="114" fill="var(--diagram-green-text)" font-size="11" font-weight="800">② 控制 Control</text>
+      <text x="720" y="130" fill="var(--diagram-green-text)" font-size="9">Cluster Bus Gossip</text>
+      <text x="720" y="144" fill="var(--diagram-green-text)" font-size="9">PING/PONG 周期 1s</text>
+
+      <text x="720" y="170" fill="var(--diagram-red-text)" font-size="11" font-weight="800">③ 故障 Failure</text>
+      <text x="720" y="186" fill="var(--diagram-red-text)" font-size="9">PFAIL → FAIL → failover</text>
+      <text x="720" y="200" fill="var(--diagram-red-text)" font-size="9">多数派投票</text>
+
+      <text x="720" y="226" fill="var(--diagram-orange-text)" font-size="11" font-weight="800">④ 迁移 Migration</text>
+      <text x="720" y="242" fill="var(--diagram-orange-text)" font-size="9">SETSLOT MIGRATING /</text>
+      <text x="720" y="256" fill="var(--diagram-orange-text)" font-size="9">IMPORTING + MIGRATE</text>
+      <text x="720" y="270" fill="var(--diagram-orange-text)" font-size="9">触发 ASK 临时跳转</text>
+
+      <rect x="710" y="290" width="200" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="810" y="310" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="800">理解 Cluster 的关键</text>
+      <text x="810" y="326" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">这 4 条链路如何运行时交织</text>
+
+      <rect x="20" y="370" width="900" height="160" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="40" y="394" fill="var(--diagram-blue-text)" font-size="13" font-weight="800">★ 客户端响应处理</text>
+      <text x="40" y="416" fill="var(--diagram-muted)" font-size="11">· MOVED &lt;slot&gt; &lt;node&gt; → 永久 slot 归属变化(reshard 后) → 客户端更新本地 slot 缓存</text>
+      <text x="40" y="436" fill="var(--diagram-muted)" font-size="11">· ASK &lt;slot&gt; &lt;node&gt; → 临时跳转(slot 正在迁移中) → 客户端发 ASKING + 重发命令,不更新缓存</text>
+      <text x="40" y="460" fill="var(--diagram-orange-text)" font-size="11">★ 设计精妙:MOVED 永久,ASK 临时,二者职责完全分开 → 客户端逻辑简单可证</text>
+      <text x="40" y="480" fill="var(--diagram-orange-text)" font-size="11">  迁移期间命令到达旧节点 → 旧节点已无该 key → 回 ASK → 客户端跳到新节点 → 仅本次跳转</text>
+      <text x="40" y="504" fill="var(--diagram-red-text)" font-size="11">⚠ 多 key 命令(MGET, MSET, Lua, transactions)必须确保所有 key 都在同一 slot,否则 CROSSSLOT 报错</text>
+      <text x="40" y="522" fill="var(--diagram-green-text)" font-size="11">✓ 解决:用 hash tag {tag} 显式指定:`SET {user:1}:profile ...` + `SET {user:1}:settings ...` 同 slot</text>
+    </g>
+  </svg>
+</div>
+
+<p>Cluster 的运行时由四条独立链路构成:<strong>数据路径</strong>(slot 路由 + MOVED/ASK 重定向)、<strong>控制路径</strong>(Gossip 状态传播)、<strong>故障路径</strong>(PFAIL → FAIL → failover)、<strong>迁移路径</strong>(SETSLOT MIGRATING/IMPORTING + MIGRATE)。理解 Cluster 的关键是理解这四条链路如何在运行时交织。</p>
+
+<div class="diagram">
+  <div class="diagram-title">图 27-0-2 · 本章内容地图 — 6 大模块 14 节</div>
+  <svg viewBox="0 0 940 320" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="320" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="380" y="14" width="180" height="46" rx="10" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="470" y="38" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">Cluster</text>
+      <text x="470" y="54" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">6 大模块 · 14 节</text>
+
+      <line x1="470" y1="60" x2="100" y2="100" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <line x1="470" y1="60" x2="280" y2="100" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+      <line x1="470" y1="60" x2="470" y2="100" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <line x1="470" y1="60" x2="660" y2="100" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+      <line x1="470" y1="60" x2="840" y2="100" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="20" y="100" width="160" height="50" rx="8" fill="url(#d-blue)"/>
+      <text x="100" y="122" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">P1 · 分片</text>
+      <text x="100" y="140" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">§27.1-27.2</text>
+
+      <rect x="200" y="100" width="160" height="50" rx="8" fill="url(#d-purple)"/>
+      <text x="280" y="122" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">P2 · Gossip + 故障</text>
+      <text x="280" y="140" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">§27.3-27.4</text>
+
+      <rect x="380" y="100" width="180" height="50" rx="8" fill="url(#d-green)"/>
+      <text x="470" y="122" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">P3 · 重定向 + 迁移</text>
+      <text x="470" y="140" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">§27.5-27.7</text>
+
+      <rect x="580" y="100" width="160" height="50" rx="8" fill="url(#d-purple)"/>
+      <text x="660" y="122" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">P4 · 在线 reshard</text>
+      <text x="660" y="140" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">§27.8</text>
+
+      <rect x="760" y="100" width="160" height="50" rx="8" fill="url(#d-orange)"/>
+      <text x="840" y="122" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">P5 · 数学 + 边界</text>
+      <text x="840" y="140" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">§27.9-27.10</text>
+
+      <rect x="280" y="170" width="380" height="50" rx="8" fill="url(#d-red)"/>
+      <text x="470" y="192" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">P6 · 性能 + 陷阱 + 源码 + 速查</text>
+      <text x="470" y="210" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">§27.11-27.14</text>
+
+      <rect x="40" y="240" width="860" height="60" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="60" y="262" fill="var(--diagram-blue-text)" font-size="12" font-weight="800">★ 推荐阅读路径</text>
+      <text x="60" y="280" fill="var(--diagram-muted)" font-size="10">入门: §27.1-2 (为什么 + slot 分片)→ §27.5-7 (重定向)→ §27.4 (故障)→ §27.11-12 (性能/陷阱)</text>
+      <text x="60" y="296" fill="var(--diagram-muted)" font-size="10">深潜: §27.3 (Gossip)→ §27.8 (reshard)→ §27.9 (数学)→ §27.13 (源码)</text>
+    </g>
+  </svg>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s27-1">27.1 为什么需要 Cluster</h2>
+<!-- ============================================================ -->
+
+<p>主从 + Sentinel 解决"故障切换",但所有 master 拥有完整 keyspace,容量上限不变。Cluster 通过分片解决"容量与吞吐"问题,代价是多 key 操作的 slot 约束。这一节先把三种部署模式的能力差异铺平,再讲清楚 Cluster 实际解决的四个核心问题。</p>
+
+<h3>27.1.1 三种部署模式的能力对比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 27-1-1 · 单节点 / 主从+Sentinel / Cluster 能力矩阵</div>
+  <table>
+    <thead><tr><th>维度</th><th>单节点</th><th>主从 + Sentinel</th><th>Cluster</th></tr></thead>
+    <tbody>
+      <tr><td>存储容量</td><td>单机 RAM</td><td>单机 RAM (复制)</td><td><strong>N × 单机 RAM</strong></td></tr>
+      <tr><td>写吞吐</td><td>单 CPU 核</td><td>单 CPU 核 (复制)</td><td><strong>N × 单 CPU 核</strong></td></tr>
+      <tr><td>读吞吐</td><td>单核</td><td>1 master + N replica 读</td><td>N × 单核</td></tr>
+      <tr><td>高可用</td><td>无</td><td>Sentinel 仲裁 failover</td><td>集群内置投票</td></tr>
+      <tr><td>水平扩展</td><td>无</td><td>无</td><td><strong>在线 reshard</strong></td></tr>
+      <tr><td>多 key 命令</td><td>全部支持</td><td>全部支持</td><td>仅同 slot</td></tr>
+      <tr><td>多数据库 (SELECT)</td><td>DB 0-15</td><td>DB 0-15</td><td><strong>仅 DB 0</strong></td></tr>
+      <tr><td>Lua 脚本</td><td>无限制</td><td>无限制</td><td>所有 key 同 slot</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>27.1.2 Cluster 解决的四个核心问题</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 27-1-1 · 问题 → 设计决策的映射</div>
+  <svg viewBox="0 0 940 320" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="320" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="20" y="40" width="280" height="50" rx="8" fill="url(#d-red)"/>
+      <text x="160" y="62" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">P1 · 单机内存上限</text>
+      <text x="160" y="80" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">数据集 &gt; 单机 RAM 时无法服务</text>
+
+      <line x1="300" y1="65" x2="380" y2="65" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+      <text x="340" y="58" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="800">→</text>
+
+      <rect x="380" y="40" width="540" height="50" rx="8" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="650" y="62" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">S1 · 分片到 N 节点 · 容量 = N × 单机 RAM</text>
+      <text x="650" y="80" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">→ 100 节点 = 100 × 单机容量(线性)</text>
+
+      <rect x="20" y="100" width="280" height="50" rx="8" fill="url(#d-red)"/>
+      <text x="160" y="122" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">P2 · 单核写吞吐上限</text>
+      <text x="160" y="140" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">Redis 单线程,写 ≤ 100K QPS</text>
+
+      <line x1="300" y1="125" x2="380" y2="125" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
+
+      <rect x="380" y="100" width="540" height="50" rx="8" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="650" y="122" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">S2 · 每 master 独立写 · 吞吐 = N × 单核</text>
+      <text x="650" y="140" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">→ N 个分片并行接受写入,无单点瓶颈</text>
+
+      <rect x="20" y="160" width="280" height="50" rx="8" fill="url(#d-red)"/>
+      <text x="160" y="182" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">P3 · Sentinel 外部依赖</text>
+      <text x="160" y="200" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">需额外维护 N+M 个进程</text>
+
+      <line x1="300" y1="185" x2="380" y2="185" stroke="var(--diagram-blue-stroke)" stroke-width="2" marker-end="url(#d-arr-b)"/>
+
+      <rect x="380" y="160" width="540" height="50" rx="8" fill="url(#d-blue)" filter="url(#d-shadow)"/>
+      <text x="650" y="182" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">S3 · 集群内置 PFAIL/FAIL · 无外部协调器</text>
+      <text x="650" y="200" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">→ 故障检测 + 选举 + 提升一体化在数据节点完成</text>
+
+      <rect x="20" y="220" width="280" height="50" rx="8" fill="url(#d-red)"/>
+      <text x="160" y="242" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">P4 · 扩缩容停机</text>
+      <text x="160" y="260" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">迁移期间客户端必须暂停</text>
+
+      <line x1="300" y1="245" x2="380" y2="245" stroke="var(--diagram-purple-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
+
+      <rect x="380" y="220" width="540" height="50" rx="8" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="650" y="242" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">S4 · ASK + MIGRATE · 在线 reshard</text>
+      <text x="650" y="260" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">→ 客户端跟随 ASK 临时跳转,迁移完成后改 MOVED 永久</text>
+
+      <text x="40" y="298" fill="var(--diagram-muted)" font-size="10">★ 4 个问题 → 4 项设计决策。复杂度提升的代价 vs 单机硬件无限扩展的成本 → Cluster 在很多场景是更优解</text>
+    </g>
+  </svg>
+</div>
+
+<div class="key-insight">
+  四个问题对应四项设计决策。每项决策都引入新的工程复杂度,但相比"单机扩展到 1 TB 内存 + 100 核 CPU"的硬件成本,分布式方案的复杂度是更优解。Cluster 的存在不是为了"通用最优",而是为了"<strong>当单机不够用时,用最少的额外认知负担拿到水平扩展能力</strong>"。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s27-2">27.2 16384 个 Hash Slot</h2>
+<!-- ============================================================ -->
+
+<p>Cluster 不直接 hash key 到节点,而是先把 key hash 到 <strong>16384 个 slot</strong>,再把 slot 分配给节点。这一层间接性是 reshard、扩容、迁移都能"按 slot 粒度"工作的关键。这一节拆开 slot 分配算法、为什么是 16384、以及 clusterState 中的 slot 映射结构。</p>
+
+<h3>27.2.1 Slot 分配算法 keyHashSlot</h3>
+
+<pre><code class="language-c">/* src/cluster.c */
+unsigned int keyHashSlot(char *key, int keylen) {
+    int s, e;
+
+    /* 检查 hash tag {...} */
+    for (s = 0; s &lt; keylen; s++)
+        if (key[s] == '{') break;
+
+    if (s == keylen) return crc16(key, keylen) &amp; 0x3FFF;
+
+    for (e = s + 1; e &lt; keylen; e++)
+        if (key[e] == '}') break;
+
+    if (e == keylen || e == s + 1)
+        return crc16(key, keylen) &amp; 0x3FFF;
+
+    /* hash tag 存在,仅对 {...} 内容计算 */
+    return crc16(key + s + 1, e - s - 1) &amp; 0x3FFF;
+}</code></pre>
+
+<div class="diagram">
+  <div class="diagram-title">表 27-2-2 · slot 计算与 hash tag 语义示例</div>
+  <table>
+    <thead><tr><th>KEY</th><th>CRC16 输入</th><th>slot</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>order:O1001</code></td><td><code>order:O1001</code></td><td><strong>217</strong></td><td>无 hash tag → 整 key</td></tr>
+      <tr><td><code>order:O1002</code></td><td><code>order:O1002</code></td><td>12474</td><td>另一个 slot</td></tr>
+      <tr><td><code>payment:{O1001}</code></td><td><code>O1001</code></td><td style="color:var(--green);"><strong>2190</strong></td><td>用 hash tag</td></tr>
+      <tr><td><code>shipment:{O1001}</code></td><td><code>O1001</code></td><td style="color:var(--green);"><strong>2190</strong></td><td>共享 → 同 slot</td></tr>
+      <tr><td><code>user:{O1001}:profile</code></td><td><code>O1001</code></td><td style="color:var(--green);"><strong>2190</strong></td><td>共享 → 同 slot</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key-insight">
+  <strong>hash tag 语义</strong>:
+  <ul style="margin:8px 0 0 18px;color:var(--text);">
+    <li><code>{}</code> 内的字符串作为 CRC16 输入</li>
+    <li>多个 key 共享同一个 hash tag → 落入同一 slot(MULTI / Lua / mget 可跨 key 操作)</li>
+    <li><code>{}</code> 缺失或空 → 整个 key 作为 CRC16 输入</li>
+    <li>slot 范围:<code>0 – 16383</code>(<code>2<sup>14</sup></code> 个)</li>
+    <li>分配方式:每个 master 持有一段或多段连续 slot</li>
+  </ul>
+</div>
+
+<p><code>&amp; 0x3FFF</code> 是 <code>% 16384</code> 的位运算等价。CRC16 是 16-bit 输出,与 <code>0x3FFF</code> 与运算后保留低 14 位,即得到 0-16383 范围内的 slot 编号。</p>
+
+<h3>27.2.2 为什么是 16384 而非 65536</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 27-2-1 · 16384 vs 65536 slot 的工程对比</div>
+  <table>
+    <thead><tr><th>维度</th><th>16384 slot</th><th>65536 slot (假设)</th></tr></thead>
+    <tbody>
+      <tr><td>bitmap 大小</td><td>16384/8 = <strong>2 KB</strong></td><td>65536/8 = 8 KB</td></tr>
+      <tr><td>Gossip PING 大小</td><td>~3 KB (含其他字段)</td><td>~9 KB</td></tr>
+      <tr><td>100 节点集群每秒带宽</td><td>~3 MB/s</td><td>~9 MB/s</td></tr>
+      <tr><td>1000 节点集群每秒带宽</td><td>~30 MB/s</td><td>~90 MB/s</td></tr>
+      <tr><td>实际规模上限</td><td><strong>~1000 节点</strong></td><td>~250 节点 (带宽瓶颈)</td></tr>
+      <tr><td>slot/node (1000 节点)</td><td>16 slot/node</td><td>65 slot/node</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key-insight">
+  <strong>关键约束:Gossip 包大小</strong>。每个 PING 携带发送者的 myslots bitmap,bitmap 越大 → 单包越大 → 集群总带宽越大。16384 是"<strong>足够细粒度</strong>"与"<strong>Gossip 带宽可控</strong>"的平衡点。reshard 时迁移单位是 slot,100 万 keys 时每 slot ~61 keys,迁移粒度合理;扩容到 65536 后,集群规模反而下降。Antirez 在 GitHub issue 中明确说明该决策依据。
+</div>
+
+<h3>27.2.3 clusterState 中的 slot 映射</h3>
+
+<pre><code class="language-c">/* src/cluster.h */
+typedef struct clusterState {
+    clusterNode *myself;
+    uint64_t currentEpoch;
+    int state;                                  /* CLUSTER_OK / FAIL */
+    int size;                                   /* master 节点数 */
+    clusterNode *slots[CLUSTER_SLOTS];          /* slot → 主节点指针 */
+    rax *slots_to_keys;                         /* slot → keys 索引 */
+    clusterNode *migrating_slots_to[CLUSTER_SLOTS];
+    clusterNode *importing_slots_from[CLUSTER_SLOTS];
+    /* ... */
+} clusterState;
+
+#define CLUSTER_SLOTS 16384</code></pre>
+
+<p><code>clusterState.slots[]</code> 是 16384 长度的指针数组,每个元素指向负责该 slot 的 master 节点。命令路由时通过 <code>slot = keyHashSlot(key)</code> 计算 slot,再 <code>clusterState.slots[slot]</code> 查找节点,<strong>O(1)</strong> 完成路由决策。<code>migrating_slots_to[]</code> 与 <code>importing_slots_from[]</code> 标记正在迁移的 slot,迁移期间用于决定返回 ASK 重定向。</p>
+
+<!-- ============================================================ -->
+<h2 id="s27-3">27.3 Gossip 协议</h2>
+<!-- ============================================================ -->
+
+<p>Cluster 节点之间没有 leader,也没有中心化协调器。它们通过 <strong>Gossip 协议</strong>(每节点定期把自己以及部分其他节点的状态摘要,随机播给一个对端)实现"最终一致的全局视图"。这一节先列出消息类型,再讲端口模型与 clusterMsg 结构,最后看 clusterCron 如何驱动整个心跳调度。</p>
+
+<h3>27.3.1 三类核心消息</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 27-3-1 · Cluster Bus 消息类型</div>
+  <table>
+    <thead><tr><th>消息类型</th><th>方向</th><th>触发时机</th><th>作用</th></tr></thead>
+    <tbody>
+      <tr><td>MEET</td><td>A → B</td><td><code>CLUSTER MEET</code> 命令</td><td>新节点加入,建立握手</td></tr>
+      <tr><td>PING</td><td>A → B</td><td>clusterCron 周期性</td><td>心跳 + 状态摘要</td></tr>
+      <tr><td>PONG</td><td>B → A</td><td>收到 PING/MEET</td><td>回复自身状态</td></tr>
+      <tr><td>FAIL</td><td>A → 全网</td><td>多数派判定 PFAIL → FAIL</td><td>广播节点故障</td></tr>
+      <tr><td>PUBLISH</td><td>A → 全网</td><td><code>PUBLISH</code> 命令</td><td>跨节点 pub/sub</td></tr>
+      <tr><td>AUTH_REQ / AUTH_ACK</td><td>Replica ↔ Master</td><td>failover 投票</td><td>选举授权</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>27.3.2 集群总线端口</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 27-3-1 · Redis 节点的双端口模型</div>
+  <svg class="svg-diagram" viewBox="0 0 920 340" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <linearGradient id="g-cl-client" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="var(--diagram-blue-fill-start)"/><stop offset="100%" stop-color="var(--diagram-blue-fill-end)"/>
+      </linearGradient>
+      <linearGradient id="g-cl-bus" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="var(--diagram-purple-fill-start)"/><stop offset="100%" stop-color="var(--diagram-purple-fill-end)"/>
+      </linearGradient>
+      <marker id="arr-cl" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto">
+        <path d="M0,0 L9,5 L0,10 z" fill="var(--diagram-blue-stroke)"/>
+      </marker>
+    </defs>
+
+    <!-- Node 1 -->
+    <g transform="translate(60,40)" font-family="monospace" font-size="11" fill="var(--diagram-blue-text)">
+      <rect x="0" y="0" width="320" height="200" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/>
+      <text x="160" y="25" text-anchor="middle" fill="var(--diagram-blue-text)" font-weight="bold" font-size="13">Redis Node A</text>
+      <!-- Client port -->
+      <rect x="20" y="50" width="280" height="55" rx="6" fill="url(#g-cl-client)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="160" y="70" text-anchor="middle" fill="var(--diagram-blue-text)" font-weight="bold">数据端口 (Client Port)</text>
+      <text x="30" y="88" fill="var(--diagram-blue-text)">默认 <tspan fill="var(--diagram-green-text)" font-weight="bold">6379</tspan> · 协议 RESP</text>
+      <text x="30" y="102" fill="var(--diagram-muted)">客户端命令连接</text>
+      <!-- Bus port -->
+      <rect x="20" y="120" width="280" height="65" rx="6" fill="url(#g-cl-bus)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="160" y="140" text-anchor="middle" fill="var(--diagram-purple-text)" font-weight="bold">集群总线 (Cluster Bus)</text>
+      <text x="30" y="158" fill="var(--diagram-blue-text)">默认 <tspan fill="var(--diagram-purple-text)" font-weight="bold">16379</tspan> = client + 10000</text>
+      <text x="30" y="172" fill="var(--diagram-muted)">7.0+ 可用 cluster-port 自定义</text>
+    </g>
+
+    <!-- Node 2 -->
+    <g transform="translate(540,40)" font-family="monospace" font-size="11" fill="var(--diagram-blue-text)">
+      <rect x="0" y="0" width="320" height="200" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)" stroke-width="2"/>
+      <text x="160" y="25" text-anchor="middle" fill="var(--diagram-blue-text)" font-weight="bold" font-size="13">Redis Node B</text>
+      <rect x="20" y="50" width="280" height="55" rx="6" fill="url(#g-cl-client)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="160" y="70" text-anchor="middle" fill="var(--diagram-blue-text)" font-weight="bold">6379 (Client)</text>
+      <text x="30" y="88" fill="var(--diagram-blue-text)">RESP 协议</text>
+      <rect x="20" y="120" width="280" height="65" rx="6" fill="url(#g-cl-bus)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="160" y="140" text-anchor="middle" fill="var(--diagram-purple-text)" font-weight="bold">16379 (Bus)</text>
+      <text x="30" y="158" fill="var(--diagram-blue-text)">二进制 clusterMsg</text>
+    </g>
+
+    <!-- Client arrow into 6379 -->
+    <text x="60" y="20" font-family="monospace" font-size="11" fill="var(--diagram-green-text)">Client → 6379</text>
+    <path d="M 60 28 L 80 70" stroke="var(--diagram-green-stroke)" stroke-width="1.5" marker-end="url(#arr-cl)"/>
+
+    <!-- Bus arrow between nodes -->
+    <path d="M 380 165 L 540 165" stroke="var(--diagram-purple-stroke)" stroke-width="2" marker-end="url(#arr-cl)"/>
+    <path d="M 540 175 L 380 175" stroke="var(--diagram-purple-stroke)" stroke-width="2" marker-end="url(#arr-cl)"/>
+    <text x="460" y="160" text-anchor="middle" font-family="monospace" font-size="11" fill="var(--diagram-purple-text)" font-weight="bold">Gossip</text>
+
+    <!-- Bottom: notes -->
+    <g transform="translate(60,260)" font-family="monospace" font-size="11" fill="var(--diagram-blue-text)">
+      <rect x="0" y="0" width="800" height="65" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="10" y="20" fill="var(--diagram-orange-text)" font-weight="bold">⚠ 防火墙必须同时开放:6379 (客户端) 与 16379 (仅节点互通)</text>
+      <text x="10" y="40">  诊断:<tspan fill="var(--diagram-blue-text)">ss -tan | grep -E '6379|16379'</tspan></text>
+      <text x="10" y="55">  失败计数:<tspan fill="var(--diagram-blue-text)">redis-cli CLUSTER COUNT-FAILURE-REPORTS &lt;node-id&gt;</tspan></text>
+    </g>
+  </svg>
+</div>
+
+<h3>27.3.3 clusterMsg 消息结构</h3>
+
+<pre><code class="language-c">/* src/cluster.h: 简化 */
+typedef struct {
+    char sig[4];                      /* "RCmb" */
+    uint32_t totlen;                  /* 消息总长度 */
+    uint16_t type;                    /* PING/PONG/MEET/FAIL... */
+    uint16_t count;                   /* gossip 段携带节点数 */
+    uint64_t currentEpoch;
+    uint64_t configEpoch;
+    char sender[CLUSTER_NAMELEN];     /* 40 bytes node ID */
+    unsigned char myslots[CLUSTER_SLOTS / 8];  /* 2 KB bitmap */
+    char slaveof[CLUSTER_NAMELEN];
+    uint16_t port;
+    uint16_t flags;
+    unsigned char state;
+    /* 后跟 count 个 clusterMsgDataGossip 结构 */
+    union clusterMsgData data;
+} clusterMsg;</code></pre>
+
+<div class="diagram">
+  <div class="diagram-title">表 27-3-2 · clusterMsg 关键字段含义</div>
+  <table>
+    <thead><tr><th>字段</th><th>大小</th><th>用途</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>myslots</code></td>
+        <td><strong>2 KB</strong></td>
+        <td>sender 负责的 slot bitmap, 每 bit 对应一个 slot · <span style="color:var(--orange)">占消息主要空间, 是"为何 16384"的根因</span></td>
+      </tr>
+      <tr>
+        <td><code>configEpoch</code></td>
+        <td>8 B</td>
+        <td>sender 当前的配置版本号, failover/reshard 都会递增 · 用于解决"两个节点都声称负责同一 slot"冲突</td>
+      </tr>
+      <tr>
+        <td><code>gossip section</code></td>
+        <td>~104 B × count</td>
+        <td>其他节点摘要(node ID/IP/port/flags/ping&amp;pong 时间戳)· 每次 PING 随机选 ~1/10 节点摘要, 指数传播 → <strong>O(log N) 收敛</strong></td>
+      </tr>
+      <tr>
+        <td><code>flags</code></td>
+        <td>2 B</td>
+        <td><code>FAIL</code> / <code>PFAIL</code> / <code>MASTER</code> / <code>SLAVE</code> / <code>NOFAILOVER</code> / <code>NOADDR</code> · 收到 PING 时按 flags 更新本地视图</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>27.3.4 clusterCron 心跳调度</h3>
+
+<pre><code class="language-c">/* src/cluster.c (简化) */
+void clusterCron(void) {
+    /* 每 100ms 一轮,根据 cluster-node-timeout 选择目标 */
+
+    /* 1. 随机选 1 个节点发 PING (保证活跃度) */
+    static long long iteration = 0;
+    iteration++;
+    if (!(iteration % 10)) {  /* 每秒一次 */
+        clusterNode *target = pickRandomNode();
+        clusterSendPing(target, CLUSTERMSG_TYPE_PING);
+    }
+
+    /* 2. 检查所有节点,超时未收到 PONG 则立即 PING */
+    di = dictGetSafeIterator(server.cluster-&gt;nodes);
+    while ((de = dictNext(di))) {
+        clusterNode *node = dictGetVal(de);
+        if (node-&gt;flags &amp; (CLUSTER_NODE_MYSELF | CLUSTER_NODE_NOADDR))
+            continue;
+
+        mstime_t since_last_pong = mstime() - node-&gt;pong_received;
+        if (since_last_pong &gt; server.cluster_node_timeout / 2) {
+            clusterSendPing(node-&gt;link, CLUSTERMSG_TYPE_PING);
+        }
+
+        /* 3. 超过 cluster-node-timeout 标记 PFAIL */
+        if (since_last_pong &gt; server.cluster_node_timeout) {
+            if (!(node-&gt;flags &amp; CLUSTER_NODE_PFAIL)) {
+                node-&gt;flags |= CLUSTER_NODE_PFAIL;
+                serverLog(LL_WARNING, "Marking node %.40s as PFAIL",
+                          node-&gt;name);
+            }
+        }
+    }
+}</code></pre>
+
+<p>clusterCron 是 Cluster 的核心定时器,频率 <strong>100 ms</strong>,主要任务包括:周期性 PING、超时检测、PFAIL 标记、failover 仲裁、连接重建。所有 Cluster 状态变更都源自 clusterCron 的触发或 PING/PONG 消息处理。</p>
+
+<!-- ============================================================ -->
+<h2 id="s27-4">27.4 PFAIL 与 FAIL 故障检测</h2>
+<!-- ============================================================ -->
+
+<p>"是否有节点宕机"在分布式系统里没有简单答案 — 网络抖动、GC 卡顿、负载尖刺都会让节点短暂"失联"但实际仍活着。Cluster 用 <strong>两阶段判定</strong>(主观 PFAIL → 多数派 FAIL)来兼顾"快"与"准":单节点的怀疑只在本地视图里传播,只有 <code>⌊N/2⌋+1</code> 个 master 都怀疑时才升级为 FAIL,触发 failover。</p>
+
+<h3>27.4.1 两阶段故障判定</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 27-4-1 · PFAIL ↔ FAIL 状态机</div>
+  <svg viewBox="0 0 940 280" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="280" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <circle cx="40" cy="140" r="12" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)" stroke-width="2"/>
+      <text x="40" y="166" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">init</text>
+
+      <line x1="52" y1="140" x2="100" y2="140" stroke="var(--diagram-border)" marker-end="url(#d-arr)"/>
+      <text x="76" y="132" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">PONG</text>
+
+      <rect x="100" y="100" width="200" height="80" rx="10" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="200" y="128" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">Healthy</text>
+      <text x="200" y="148" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">持续收到 PONG</text>
+      <text x="200" y="166" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">无故障标记</text>
+
+      <path d="M 200,100 Q 200,60 200,100" fill="none" stroke="var(--diagram-green-stroke)" stroke-width="1.5"/>
+      <path d="M 220,100 Q 270,70 240,100" fill="none" stroke="var(--diagram-green-stroke)" stroke-width="1.5" stroke-dasharray="3,3" marker-end="url(#d-arr-g)"/>
+      <text x="240" y="78" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">收 PONG 自循环</text>
+
+      <line x1="300" y1="140" x2="350" y2="140" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+      <text x="325" y="130" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9" font-weight="800">超时 T 内</text>
+      <text x="325" y="156" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9" font-weight="800">未 PONG</text>
+
+      <rect x="350" y="100" width="220" height="80" rx="10" fill="url(#d-orange)" filter="url(#d-shadow)"/>
+      <text x="460" y="128" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">PFAIL</text>
+      <text x="460" y="148" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">主观下线(本地视图)</text>
+      <text x="460" y="166" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">通过 Gossip 传播</text>
+
+      <path d="M 460,100 Q 460,40 200,40 Q 100,40 130,100" fill="none" stroke="var(--diagram-green-stroke)" stroke-width="1.5" stroke-dasharray="3,3" marker-end="url(#d-arr-g)"/>
+      <text x="300" y="32" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9" font-weight="800">收到 PONG → 取消 PFAIL</text>
+
+      <line x1="570" y1="140" x2="620" y2="140" stroke="var(--diagram-red-stroke)" stroke-width="1.5" marker-end="url(#d-arr-r)"/>
+      <text x="595" y="130" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9" font-weight="800">≥⌊N/2⌋+1 个</text>
+      <text x="595" y="156" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9" font-weight="800">master 报 PFAIL</text>
+
+      <rect x="620" y="100" width="200" height="80" rx="10" fill="url(#d-red)" filter="url(#d-shadow)"/>
+      <text x="720" y="128" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">FAIL</text>
+      <text x="720" y="148" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">客观下线(全网共识)</text>
+      <text x="720" y="166" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">广播 FAIL 触发 failover</text>
+
+      <line x1="820" y1="140" x2="860" y2="140" stroke="var(--diagram-purple-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
+      <circle cx="880" cy="140" r="14" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="2"/>
+      <circle cx="880" cy="140" r="8" fill="var(--diagram-purple-fill)"/>
+      <text x="845" y="170" fill="var(--diagram-purple-text)" font-size="9" font-weight="800">replica 提升</text>
+
+      <text x="40" y="232" fill="var(--diagram-muted)" font-size="11">★ 两阶段判定:PFAIL 单方面判断不触发 failover · FAIL 必须多数派 master 共识 → 防误报 + 防脑裂</text>
+      <text x="40" y="252" fill="var(--diagram-muted)" font-size="11">★ Cluster 与 Sentinel 的对比:Sentinel SDOWN/ODOWN 来自外部独立进程 · Cluster PFAIL/FAIL 来自数据节点本身(内嵌共识)</text>
+    </g>
+  </svg>
+</div>
+
+<div class="compare-grid">
+  <div class="compare-bad" style="border-color:var(--orange);">
+    <h4 style="color:var(--orange);">PFAIL · Probable FAIL · 主观下线</h4>
+    <ul style="color:var(--text);font-size:13px;line-height:1.7;margin:8px 0 0 18px;">
+      <li><strong>触发</strong>:单个节点判定某节点 <code>cluster-node-timeout</code> 未响应</li>
+      <li><strong>作用</strong>:标记本地视图, 通过 Gossip 传播给其他节点</li>
+      <li><strong>含义</strong>:"我认为该节点可能故障"</li>
+      <li><strong>特点</strong>:单方面判定, <span style="color:var(--orange)">不触发 failover</span></li>
+    </ul>
+  </div>
+  <div class="compare-good">
+    <h4 style="color:var(--green);">FAIL · Confirmed FAIL · 客观下线</h4>
+    <ul style="color:var(--text);font-size:13px;line-height:1.7;margin:8px 0 0 18px;">
+      <li><strong>触发</strong>:半数以上 master 在 <code>2 × cluster-node-timeout</code> 内都报同一节点 PFAIL</li>
+      <li><strong>作用</strong>:广播 FAIL 给全网, 触发 replica 提升</li>
+      <li><strong>含义</strong>:"集群多数派认定该节点故障"</li>
+      <li><strong>特点</strong>:多数派共识, <span style="color:var(--green)">触发 failover</span></li>
+    </ul>
+  </div>
+</div>
+
+<div class="key-insight">
+  <strong>为何需要两阶段</strong>:PFAIL 单点判定避免误报扩散;FAIL 多数派投票防止网络分区下的脑裂。两阶段共同保证 <strong>安全性优于活性</strong>。
+</div>
+
+<h3>27.4.2 多数派投票的安全性证明</h3>
+
+<div class="key-insight">
+  <strong>FAIL 判定形式化</strong> · 设 <code>N</code> = master 总数, <code>T</code> = cluster-node-timeout
+  <p style="font-family:monospace;color:var(--accent);text-align:center;margin:10px 0;font-size:12px;">
+    FAIL(B) ⟺ |{ M ∈ Masters : M.pfail_report(B, t) = true, t ∈ [now − 2T, now] }| ≥ ⌊N/2⌋ + 1
+  </p>
+</div>
+
+<div class="compare-grid">
+  <div class="compare-bad" style="border-color:var(--red);">
+    <h4 style="color:var(--red);">分区 B · 少数派(|B| &lt; N/2)</h4>
+    <ul style="color:var(--text);font-size:12px;line-height:1.7;margin:8px 0 0 18px;">
+      <li>B 内节点会把所有 A 内节点标记 PFAIL</li>
+      <li>但 B 内 master 数 <code>|B|<sub>m</sub> &lt; ⌊N/2⌋ + 1</code></li>
+      <li><strong style="color:var(--red)">无法升级为 FAIL → 不触发 failover</strong></li>
+      <li>少数派分区"沉默",对外不可用</li>
+    </ul>
+  </div>
+  <div class="compare-good">
+    <h4 style="color:var(--green);">分区 A · 多数派(|A| &gt; N/2)</h4>
+    <ul style="color:var(--text);font-size:12px;line-height:1.7;margin:8px 0 0 18px;">
+      <li>A 内 master 数 <code>|A|<sub>m</sub> &gt; N/2</code></li>
+      <li>可正确将 B 内节点标记 FAIL</li>
+      <li><strong style="color:var(--green)">A 内 replica 提升为新 master, 继续服务</strong></li>
+      <li>客户端只连得到 A → 服务持续</li>
+    </ul>
+  </div>
+</div>
+
+<div class="key-insight" style="border-left-color:var(--green);">
+  <strong>结论</strong>:网络分区时, 少数派分区<strong>无法错误标记多数派为故障</strong>, 多数派分区可正确隔离少数派, 保证 failover <strong>不会同时在两个分区发生</strong>(脑裂)。
+</div>
+
+<h3>27.4.3 Failover 流程</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 27-4-4 · Master 故障 → Replica 提升的完整时序</div>
+  <svg viewBox="0 0 940 540" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="540" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="40" y="14" width="180" height="34" rx="6" fill="url(#d-red)"/>
+      <text x="130" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">故障 Master</text>
+      <rect x="260" y="14" width="200" height="34" rx="6" fill="url(#d-purple)"/>
+      <text x="360" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">其他 Masters</text>
+      <rect x="500" y="14" width="180" height="34" rx="6" fill="url(#d-green)"/>
+      <text x="590" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Replica</text>
+      <rect x="720" y="14" width="180" height="34" rx="6" fill="url(#d-blue)"/>
+      <text x="810" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Client</text>
+
+      <line x1="130" y1="48" x2="130" y2="520" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="360" y1="48" x2="360" y2="520" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="590" y1="48" x2="590" y2="520" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="810" y1="48" x2="810" y2="520" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+
+      <rect x="20" y="60" width="900" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="470" y="76" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="700">Note: Master 进程崩溃或网络隔离</text>
+
+      <rect x="270" y="92" width="180" height="38" rx="6" fill="url(#d-orange)"/>
+      <text x="360" y="112" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">① cluster-node-timeout</text>
+      <text x="360" y="126" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">各自标记 PFAIL</text>
+
+      <line x1="360" y1="148" x2="590" y2="148" stroke="var(--diagram-purple-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr)"/>
+      <text x="475" y="142" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">② Gossip 传播 PFAIL</text>
+
+      <path d="M 360,164 Q 460,182 360,200" fill="none" stroke="var(--diagram-purple-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr)"/>
+      <text x="430" y="186" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">③ Gossip 累计 PFAIL 报告</text>
+
+      <rect x="20" y="216" width="900" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="470" y="232" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">Note: 多数派达成 PFAIL 共识</text>
+
+      <rect x="270" y="246" width="180" height="32" rx="6" fill="url(#d-red)"/>
+      <text x="360" y="266" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">④ 升级为 FAIL</text>
+
+      <line x1="360" y1="294" x2="590" y2="294" stroke="var(--diagram-red-stroke)" marker-end="url(#d-arr-r)"/>
+      <text x="475" y="288" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10" font-weight="700">⑤ 广播 FAIL</text>
+
+      <rect x="20" y="306" width="900" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="470" y="322" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">Note: Replica 检测到 master FAIL</text>
+
+      <rect x="500" y="336" width="180" height="32" rx="6" fill="url(#d-green)"/>
+      <text x="590" y="356" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">⑥ 等待延时</text>
+
+      <line x1="590" y1="380" x2="360" y2="380" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+      <text x="475" y="374" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10" font-weight="700">⑦ FAILOVER_AUTH_REQUEST</text>
+
+      <rect x="270" y="394" width="180" height="38" rx="6" fill="url(#d-purple)"/>
+      <text x="360" y="412" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">⑧ 检查投票条件</text>
+      <text x="360" y="426" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">currentEpoch 等</text>
+
+      <line x1="360" y1="446" x2="590" y2="446" stroke="var(--diagram-purple-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr)"/>
+      <text x="475" y="440" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">⑨ FAILOVER_AUTH_ACK</text>
+
+      <rect x="500" y="460" width="180" height="36" rx="6" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="590" y="478" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">⑩ 提升为新 Master</text>
+      <text x="590" y="492" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">configEpoch 递增</text>
+
+      <line x1="590" y1="510" x2="360" y2="510" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-g)"/>
+      <text x="475" y="504" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10" font-weight="700">⑪ PONG(含新 slot 归属)</text>
+
+      <line x1="590" y1="528" x2="810" y2="528" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <text x="700" y="524" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10" font-weight="700">⑫ 接管原 Master 的 slot</text>
+    </g>
+  </svg>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">表 27-4-2 · Failover 总耗时拆解</div>
+  <table>
+    <thead><tr><th>阶段</th><th>耗时(默认配置)</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>PFAIL 触发</td><td><code>cluster-node-timeout</code> = <strong>15 s</strong></td><td>未在窗口内收到 PONG</td></tr>
+      <tr><td>PFAIL → FAIL 收敛</td><td>~1 – 2 s</td><td>Gossip 多数派传播</td></tr>
+      <tr><td>Replica 投票延时</td><td>0.5 – 5 s</td><td>随机退避防同时发起</td></tr>
+      <tr><td>投票完成</td><td>~0.5 s</td><td>新 master 接管 slot</td></tr>
+      <tr><td><strong>默认总计</strong></td><td><strong style="color:var(--orange)">17 – 22 s</strong></td><td>默认 15s timeout</td></tr>
+      <tr style="background:rgba(63,185,80,0.06)"><td><strong>生产推荐</strong>(<code>cluster-node-timeout 5000</code>)</td><td><strong style="color:var(--green)">6 – 10 s</strong></td><td>平衡灵敏度与误判风险</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>27.4.4 cluster-node-timeout 的取舍</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 27-4-1 · cluster-node-timeout 各档位的影响</div>
+  <table>
+    <thead><tr><th>配置值</th><th>故障检测速度</th><th>误判风险</th><th>推荐场景</th></tr></thead>
+    <tbody>
+      <tr><td>1 秒</td><td>极快</td><td>高 (短暂网络抖动即误判)</td><td>不推荐</td></tr>
+      <tr><td><strong>5 秒</strong></td><td>快</td><td>低</td><td><strong>推荐生产</strong></td></tr>
+      <tr><td>15 秒</td><td>中 (默认)</td><td>极低</td><td>默认</td></tr>
+      <tr><td>60 秒</td><td>慢</td><td>几乎零</td><td>不稳定网络</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="key-insight">
+  cluster-node-timeout 同时影响 PFAIL 判定与 Replica 投票延时,过短会因网络抖动误判,过长会延长服务中断窗口。生产环境推荐 <strong>5000-10000 ms (5-10 秒)</strong>,平衡故障检测速度与误判风险。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s27-5">27.5 MOVED 重定向</h2>
+<!-- ============================================================ -->
+
+<p>客户端不会被强制要求"先查路由表再发命令"。它可以盲发,节点收到不属于自己的 slot 时返回 <strong>MOVED</strong>。这种"惰性路由"让客户端实现可以从最简单的"无脑重试"逐步演进到"Smart Client 缓存完整拓扑"。这一节看 MOVED 的字段语义、Smart Client 的缓存策略,以及 <code>CLUSTER SLOTS</code> 命令的输出格式。</p>
+
+<h3>27.5.1 MOVED 错误的语义</h3>
+
+<pre><code class="language-bash">$ redis-cli -p 7000 SET order:O1001 "PAID"
+(error) MOVED 217 192.168.1.102:7002
+
+$ redis-cli -p 7002 SET order:O1001 "PAID"
+OK</code></pre>
+
+<div class="diagram">
+  <div class="diagram-title">图 27-5-1 · MOVED 字段语义</div>
+  <svg class="svg-diagram" viewBox="0 0 920 110" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <linearGradient id="g-mv-tok" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="var(--diagram-blue-fill-start)"/><stop offset="100%" stop-color="var(--diagram-blue-fill-end)"/>
+      </linearGradient>
+    </defs>
+    <g font-family="monospace" font-size="13" fill="var(--diagram-blue-text)">
+      <rect x="40"  y="30" width="120" height="40" fill="url(#g-mv-tok)" stroke="var(--diagram-red-stroke)"/>
+      <text x="100" y="55" text-anchor="middle" fill="var(--diagram-red-text)" font-weight="bold">MOVED</text>
+      <text x="100" y="90" text-anchor="middle" fill="var(--diagram-muted)" font-size="11">错误标识</text>
+
+      <rect x="180" y="30" width="120" height="40" fill="url(#g-mv-tok)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="240" y="55" text-anchor="middle" fill="var(--diagram-blue-text)" font-weight="bold">&lt;slot&gt;</text>
+      <text x="240" y="90" text-anchor="middle" fill="var(--diagram-muted)" font-size="11">key 所属 slot 编号</text>
+
+      <rect x="320" y="30" width="280" height="40" fill="url(#g-mv-tok)" stroke="var(--diagram-green-stroke)"/>
+      <text x="460" y="55" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="bold">&lt;ip&gt;:&lt;port&gt;</text>
+      <text x="460" y="90" text-anchor="middle" fill="var(--diagram-muted)" font-size="11">当前负责该 slot 的 master</text>
+
+      <text x="620" y="55" fill="var(--diagram-orange-text)">例:MOVED 217 192.168.1.102:7002</text>
+    </g>
+  </svg>
+</div>
+
+<div class="compare-grid">
+  <div class="compare-good">
+    <h4 style="color:var(--green);">✓ 正确处理</h4>
+    <ol style="color:var(--text);font-size:13px;line-height:1.7;margin:8px 0 0 18px;">
+      <li>解析 slot 与目标节点</li>
+      <li>更新本地 slot 缓存:<code>slot_cache[slot] = (ip, port)</code></li>
+      <li>重新连接目标节点重发命令</li>
+      <li>后续相同 slot 的命令直接发往新节点</li>
+    </ol>
+  </div>
+  <div class="compare-bad">
+    <h4 style="color:var(--red);">✗ 错误处理(反例)</h4>
+    <ul style="color:var(--text);font-size:13px;line-height:1.7;margin:8px 0 0 18px;">
+      <li>仅重试不刷新缓存 → 每次请求两跳</li>
+      <li>整体清空 slot 缓存 → 后续所有请求需要重新探测</li>
+      <li>阻塞等待 cluster topology 收敛 → 客户端假死</li>
+    </ul>
+  </div>
+</div>
+
+<h3>27.5.2 Smart Client 的 slot 缓存</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 27-5-2 · Smart Client 收到 MOVED 后的缓存更新</div>
+  <svg viewBox="0 0 940 540" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="540" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="20" y="14" width="180" height="34" rx="6" fill="url(#d-blue)"/>
+      <text x="110" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Smart Client</text>
+      <rect x="240" y="14" width="200" height="34" rx="6" fill="url(#d-purple)"/>
+      <text x="340" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">本地 slot 缓存</text>
+      <rect x="480" y="14" width="200" height="34" rx="6" fill="url(#d-green)"/>
+      <text x="580" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Node A (slot 0-5460)</text>
+      <rect x="720" y="14" width="200" height="34" rx="6" fill="url(#d-green)"/>
+      <text x="820" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Node B (5461-10922)</text>
+
+      <line x1="110" y1="48" x2="110" y2="520" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="340" y1="48" x2="340" y2="520" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="580" y1="48" x2="580" y2="520" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="820" y1="48" x2="820" y2="520" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+
+      <rect x="20" y="60" width="900" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="470" y="76" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">阶段 1:启动时初始化拓扑</text>
+
+      <line x1="110" y1="92" x2="580" y2="92" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <text x="345" y="86" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10" font-weight="700">① CLUSTER SLOTS</text>
+      <line x1="580" y1="110" x2="110" y2="110" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-g)"/>
+      <text x="345" y="104" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">② [(0,5460,A),(5461,10922,B),...]</text>
+
+      <line x1="110" y1="128" x2="340" y2="128" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+      <text x="225" y="122" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">③ 写入完整映射</text>
+
+      <rect x="20" y="146" width="900" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="470" y="162" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">阶段 2:命令路由(稳态,本地决策)</text>
+
+      <rect x="20" y="178" width="180" height="32" rx="6" fill="url(#d-blue)"/>
+      <text x="110" y="198" text-anchor="middle" fill="var(--diagram-text)" font-size="10" font-weight="800">④ keyHashSlot(key) = 217</text>
+
+      <line x1="110" y1="218" x2="340" y2="218" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+      <text x="225" y="212" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">⑤ lookup slot=217</text>
+      <line x1="340" y1="234" x2="110" y2="234" stroke="var(--diagram-purple-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr)"/>
+      <text x="225" y="228" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">⑥ Node A</text>
+
+      <line x1="110" y1="252" x2="580" y2="252" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <text x="345" y="246" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10" font-weight="700">⑦ SET key value</text>
+      <line x1="580" y1="270" x2="110" y2="270" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-g)"/>
+      <text x="345" y="264" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">⑧ +OK</text>
+
+      <rect x="20" y="288" width="900" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="470" y="304" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="700">阶段 3:slot 已迁移(reshard 完成),触发 MOVED</text>
+
+      <line x1="110" y1="320" x2="580" y2="320" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <text x="345" y="314" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10" font-weight="700">⑨ GET key(slot 217)</text>
+
+      <line x1="580" y1="338" x2="110" y2="338" stroke="var(--diagram-red-stroke)" marker-end="url(#d-arr-r)"/>
+      <text x="345" y="332" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10" font-weight="700">⑩ MOVED 217 B</text>
+
+      <line x1="110" y1="356" x2="340" y2="356" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+      <text x="225" y="350" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">⑪ 更新 slot_cache[217] = B</text>
+
+      <line x1="110" y1="374" x2="820" y2="374" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <text x="465" y="368" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10" font-weight="700">⑫ GET key(直接发往 B)</text>
+
+      <line x1="820" y1="392" x2="110" y2="392" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-g)"/>
+      <text x="465" y="386" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10" font-weight="700">⑬ value</text>
+
+      <rect x="40" y="420" width="860" height="100" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="60" y="442" fill="var(--diagram-blue-text)" font-size="12" font-weight="800">★ 客户端 slot 缓存的 4 类策略</text>
+      <text x="60" y="462" fill="var(--diagram-muted)" font-size="10">· Jedis: 增量 + 异常全量(MOVED 仅更新单 slot, 异常时 CLUSTER SLOTS)</text>
+      <text x="60" y="478" fill="var(--diagram-muted)" font-size="10">· Lettuce: 全量 + 周期/订阅触发(支持拓扑变更订阅)</text>
+      <text x="60" y="494" fill="var(--diagram-muted)" font-size="10">· redis-py: 增量(每条 MOVED 仅刷新对应 slot)</text>
+      <text x="60" y="510" fill="var(--diagram-green-text)" font-size="10">★ 推荐:增量 + 周期性 fallback,稳态零额外 RTT,异常自愈</text>
+    </g>
+  </svg>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">表 27-5-1 · 主流客户端的 slot 缓存策略</div>
+  <table>
+    <thead><tr><th>客户端</th><th>策略</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>Jedis (Java)</td><td>增量 + 异常时全量</td><td>MOVED 时仅更新单 slot,异常触发全量刷新</td></tr>
+      <tr><td>Lettuce (Java)</td><td>全量 + 配置触发</td><td>支持周期性刷新与拓扑订阅</td></tr>
+      <tr><td>redis-py (Python)</td><td>增量</td><td>每条 MOVED 仅刷新对应 slot</td></tr>
+      <tr><td>ioredis (Node)</td><td>增量 + 周期全量</td><td>结合两种策略,稳态最优</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>27.5.3 CLUSTER SLOTS 命令格式</h3>
+
+<pre><code class="language-bash">127.0.0.1:7000&gt; CLUSTER SLOTS
+1) 1) (integer) 0           ; start slot
+   2) (integer) 5460        ; end slot
+   3) 1) "192.168.1.100"    ; master IP
+      2) (integer) 7000     ; master port
+      3) "5e9c40..."        ; master node ID
+   4) 1) "192.168.1.103"    ; replica 1 IP
+      2) (integer) 7003
+      3) "8a3e21..."
+2) 1) (integer) 5461
+   2) (integer) 10922
+   3) 1) "192.168.1.101"
+   ...</code></pre>
+
+<p>CLUSTER SLOTS 返回的是 <strong>master + replicas 的完整拓扑</strong>。Smart Client 用此构建本地映射,后续命令路由完全本地决策,无需查询任何节点。生产推荐配合服务端 PUBSUB topology change 通知,主动推送拓扑变化。</p>
+
+<!-- ============================================================ -->
+<h2 id="s27-6">27.6 ASK 重定向</h2>
+<!-- ============================================================ -->
+
+<p>reshard 期间,某个 slot 的 keys 分散在源/目标两个节点上 — 既不能"全在源"也不能"全在目标"。如果客户端收到 MOVED 直接更新缓存,后续未迁出的 key 会被错误路由到目标节点;如果不更新缓存,后续已迁出的 key 又会被错误路由回源节点。<strong>ASK 重定向</strong>是这个矛盾的解法:它表示"<strong>这次去那边问问,缓存别动</strong>"。</p>
+
+<h3>27.6.1 ASK 与 MOVED 的差异</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 27-6-1 · ASK vs MOVED 对照</div>
+  <table>
+    <thead><tr><th>维度</th><th>MOVED</th><th>ASK</th></tr></thead>
+    <tbody>
+      <tr><td>含义</td><td>slot 永久属于目标节点</td><td>该 key 可能已迁走,临时跳转</td></tr>
+      <tr><td>客户端缓存更新</td><td>是</td><td>否</td></tr>
+      <tr><td>触发阶段</td><td>reshard 完成后</td><td>reshard 进行中</td></tr>
+      <tr><td>后续请求</td><td>直接发往新节点</td><td>仍发往源节点 (slot 视为未迁)</td></tr>
+      <tr><td>目标节点前置命令</td><td>无</td><td><strong>ASKING</strong></td></tr>
+      <tr><td>持久性</td><td>永久</td><td>一次性</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>27.6.2 ASK 的完整交互流程</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 27-6-1 · 迁移期间的 ASK 跳转</div>
+  <svg viewBox="0 0 940 540" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="540" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="40" y="14" width="160" height="34" rx="6" fill="url(#d-blue)"/>
+      <text x="120" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Client</text>
+      <rect x="320" y="14" width="240" height="34" rx="6" fill="url(#d-orange)"/>
+      <text x="440" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Source A · migrating 12001</text>
+      <rect x="680" y="14" width="240" height="34" rx="6" fill="url(#d-green)"/>
+      <text x="800" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Target B · importing 12001</text>
+
+      <line x1="120" y1="48" x2="120" y2="520" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="440" y1="48" x2="440" y2="520" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="800" y1="48" x2="800" y2="520" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+
+      <rect x="20" y="60" width="900" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="470" y="76" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">Note: slot 12001 正在迁移 A → B; A 已 DEL 部分 keys, B 已 RESTORE 部分 keys</text>
+
+      <line x1="120" y1="98" x2="440" y2="98" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <text x="280" y="92" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">① GET order:42(slot 12001)</text>
+
+      <rect x="20" y="118" width="900" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="470" y="134" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">分支 A · order:42 仍在 A</text>
+
+      <line x1="440" y1="154" x2="120" y2="154" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-g)"/>
+      <text x="280" y="148" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">② value(直接返回)</text>
+
+      <rect x="20" y="180" width="900" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
+      <text x="470" y="196" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">分支 B · order:42 已迁到 B</text>
+
+      <line x1="440" y1="216" x2="120" y2="216" stroke="var(--diagram-orange-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr)"/>
+      <text x="280" y="210" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">③ ASK 12001 B</text>
+
+      <rect x="20" y="232" width="900" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="470" y="248" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">Note: Client 发现 ASK 标记,临时跳转 B(不更新缓存!)</text>
+
+      <line x1="120" y1="272" x2="800" y2="272" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <text x="460" y="266" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">④ ASKING(一次性令牌)</text>
+
+      <line x1="800" y1="290" x2="120" y2="290" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-g)"/>
+      <text x="460" y="284" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10" font-weight="700">⑤ +OK</text>
+
+      <line x1="120" y1="308" x2="800" y2="308" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+      <text x="460" y="302" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">⑥ GET order:42</text>
+
+      <rect x="20" y="324" width="900" height="36" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="470" y="342" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">Note: B 检查到该 slot importing 且本次连接收到 ASKING → 接受请求(否则会回 MOVED)</text>
+      <text x="470" y="356" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">ASKING 是单连接级一次性令牌,只对紧跟的下一条命令生效</text>
+
+      <line x1="800" y1="378" x2="120" y2="378" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-g)"/>
+      <text x="460" y="372" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">⑦ value</text>
+
+      <rect x="40" y="400" width="860" height="120" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="60" y="424" fill="var(--diagram-blue-text)" font-size="13" font-weight="800">★ ASK vs MOVED 的区别</text>
+      <text x="60" y="446" fill="var(--diagram-muted)" font-size="11">· MOVED:slot 永久归属变更 → 客户端必须更新缓存(reshard 完成后)</text>
+      <text x="60" y="464" fill="var(--diagram-muted)" font-size="11">· ASK:slot 仍归原节点,只是这一个 key 已迁走 → 客户端临时跳转,不更新缓存</text>
+      <text x="60" y="486" fill="var(--diagram-orange-text)" font-size="11">★ 设计精妙处:ASKING 必须由客户端主动发,B 仅在收到 ASKING 时才接受 importing slot 的请求</text>
+      <text x="60" y="504" fill="var(--diagram-red-text)" font-size="11">⚠ 没有 ASKING 直接发命令到 B → B 看到 importing 状态会回 MOVED → 客户端误更新缓存 → 后续未迁出的 key 找不到</text>
+    </g>
+  </svg>
+</div>
+
+<div class="key-insight">
+  <strong>ASK 的工程必要性</strong> · reshard 期间 slot 12001 在 A 与 B 之间, 部分 keys 在两侧:
+  <ul style="margin:8px 0 0 18px;color:var(--text);">
+    <li>A 持有<strong>未迁出</strong>的 keys</li>
+    <li>B 持有<strong>已迁入</strong>的 keys</li>
+    <li>A 与 B 都不能完整服务 slot 12001</li>
+  </ul>
+</div>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4 style="color:var(--red);">✗ 错误方式 1:阻塞至 reshard 完成</h4>
+    <p style="color:var(--text);font-size:13px;">服务中断, 违背"零停机"目标</p>
+  </div>
+  <div class="compare-bad">
+    <h4 style="color:var(--red);">✗ 错误方式 2:A 处理所有, B 缓冲</h4>
+    <p style="color:var(--text);font-size:13px;">迁移期间 A 不能 DEL, 迁移无法推进</p>
+  </div>
+  <div class="compare-good">
+    <h4 style="color:var(--green);">✓ Redis 选择:按 key 粒度判断</h4>
+    <ul style="color:var(--text);font-size:12px;line-height:1.6;margin:6px 0 0 18px;">
+      <li>A 收到请求, 检查本地是否还有该 key</li>
+      <li>有 → 直接处理</li>
+      <li>无 → 返回 ASK, 告知客户端去 B 找</li>
+      <li>B 收到 ASKING + 命令, 接受处理</li>
+    </ul>
+  </div>
+</div>
+
+<h3>27.6.3 为什么需要 ASKING</h3>
+
+<pre><code class="language-c">/* src/cluster.c: getNodeByQuery 简化 */
+clusterNode *getNodeByQuery(client *c, ...) {
+    int slot = keyHashSlot(c-&gt;cmd, c-&gt;argv);
+    clusterNode *node = server.cluster-&gt;slots[slot];
+
+    /* slot 不属于本节点 */
+    if (node != myself) {
+        if (server.cluster-&gt;importing_slots_from[slot]) {
+            /* 本节点正在 importing 该 slot */
+            if (c-&gt;flags &amp; CLIENT_ASKING) {
+                /* 客户端发了 ASKING,接受 */
+                return myself;
+            }
+        }
+        /* 否则返回 MOVED */
+        return node;
+    }
+
+    if (server.cluster-&gt;migrating_slots_to[slot]) {
+        /* slot 正在 migrating 出去 */
+        if (lookupKey(c-&gt;db, c-&gt;argv[1]) == NULL) {
+            /* key 不在本节点,返回 ASK */
+            return server.cluster-&gt;migrating_slots_to[slot];
+        }
+    }
+    return myself;
+}</code></pre>
+
+<div class="key-insight">
+  <strong>ASKING 是一次性令牌</strong>:告诉 B "这次请求是从 A 发来的,你接受它",设置 client flag <code>CLIENT_ASKING</code>,一次命令后自动清除。没有 ASKING 时 B 会检查 slot 归属(仍登记在 A),返回 <code>MOVED 12001 A</code>,客户端反复在 A 与 B 之间跳转(死循环)。ASK 是 Redis Cluster 在 reshard 期间维持服务可用的关键机制,核心思想是"<strong>区分临时跳转与永久路由</strong>"。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s27-7">27.7 Slot 迁移机制</h2>
+<!-- ============================================================ -->
+
+<p>Slot 迁移由 5 条命令编排完成:源节点先标记 MIGRATING,目标节点先标记 IMPORTING,然后用 GETKEYSINSLOT 拿 key 列表,MIGRATE 把 key 一批批从源原子搬到目标,最后 SETSLOT NODE 通知集群更新归属。这一节看每条命令的作用,以及 MIGRATE 单 key 的原子性边界。</p>
+
+<h3>27.7.1 迁移涉及的命令</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 27-7-1 · Slot 迁移命令族</div>
+  <table>
+    <thead><tr><th>命令</th><th>目标节点</th><th>作用</th></tr></thead>
+    <tbody>
+      <tr><td><code>CLUSTER SETSLOT &lt;slot&gt; MIGRATING &lt;target-id&gt;</code></td><td>源节点</td><td>slot 标记为"正在迁出"</td></tr>
+      <tr><td><code>CLUSTER SETSLOT &lt;slot&gt; IMPORTING &lt;source-id&gt;</code></td><td>目标节点</td><td>slot 标记为"正在导入"</td></tr>
+      <tr><td><code>CLUSTER GETKEYSINSLOT &lt;slot&gt; &lt;count&gt;</code></td><td>源节点</td><td>列出该 slot 的 keys</td></tr>
+      <tr><td><code>MIGRATE &lt;host&gt; &lt;port&gt; "" 0 5000 KEYS k1 k2 ...</code></td><td>源节点</td><td>原子搬迁 keys</td></tr>
+      <tr><td><code>CLUSTER SETSLOT &lt;slot&gt; NODE &lt;target-id&gt;</code></td><td>所有节点</td><td>迁移完成,更新 slot 归属</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>27.7.2 MIGRATE 的原子性</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 27-7-1 · MIGRATE 单 key 的原子三步</div>
+  <svg viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="460" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="40" y="14" width="200" height="34" rx="6" fill="url(#d-orange)"/>
+      <text x="140" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">源节点 A</text>
+      <rect x="700" y="14" width="200" height="34" rx="6" fill="url(#d-green)"/>
+      <text x="800" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">目标节点 B</text>
+
+      <line x1="140" y1="48" x2="140" y2="440" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+      <line x1="800" y1="48" x2="800" y2="440" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
+
+      <rect x="20" y="60" width="900" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="470" y="76" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">Note: MIGRATE B port "" 0 5000 KEYS k1</text>
+
+      <rect x="40" y="92" width="200" height="32" rx="6" fill="url(#d-orange)"/>
+      <text x="140" y="112" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">① DUMP k1(RDB payload)</text>
+
+      <line x1="140" y1="140" x2="800" y2="140" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+      <text x="470" y="134" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">② RESTORE k1 ttl payload REPLACE</text>
+
+      <rect x="700" y="156" width="200" height="32" rx="6" fill="url(#d-green)"/>
+      <text x="800" y="176" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">③ 反序列化 + 写入 keyspace</text>
+
+      <line x1="800" y1="204" x2="140" y2="204" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-g)"/>
+      <text x="470" y="198" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">④ +OK</text>
+
+      <rect x="40" y="220" width="200" height="32" rx="6" fill="url(#d-orange)"/>
+      <text x="140" y="240" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">⑤ DEL k1(本地删除)</text>
+
+      <rect x="20" y="266" width="900" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
+      <text x="470" y="282" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">→ Caller: +OK(原子三步成功)</text>
+
+      <rect x="20" y="296" width="900" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
+      <text x="470" y="312" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="700">★ 失败分支:任意步骤失败 → 不执行后续 → A 保留 k1,B 不持有(两端一致)</text>
+
+      <rect x="40" y="328" width="860" height="120" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="60" y="350" fill="var(--diagram-blue-text)" font-size="13" font-weight="800">★ 单 key 原子性保证</text>
+      <text x="60" y="372" fill="var(--diagram-green-text)" font-size="11">✓ 要么两端都更新成功(B 有 + A 删除)</text>
+      <text x="60" y="390" fill="var(--diagram-green-text)" font-size="11">✓ 要么两端都未变化(B 无 + A 保留)</text>
+      <text x="60" y="408" fill="var(--diagram-red-text)" font-size="11">✗ 不存在"B 有 + A 也有"或"B 无 + A 删了"</text>
+      <text x="60" y="430" fill="var(--diagram-orange-text)" font-size="11">⚠ 多 key 一次 MIGRATE:每 key 独立保证原子性,但批次不保证;部分成功部分失败可能存在</text>
+    </g>
+  </svg>
+</div>
+
+<div class="key-insight">
+  <strong>MIGRATE 原子性保证</strong> · 对单个 key:
+  <ul style="margin:8px 0 0 18px;color:var(--text);">
+    <li>要么两端都更新成功(B 有 + A 删除)</li>
+    <li>要么两端都未变化(B 无 + A 保留)</li>
+    <li>不存在"B 有 + A 也有"或"B 无 + A 删了"</li>
+  </ul>
+</div>
+
+<div class="compare-grid">
+  <div class="compare-good">
+    <h4 style="color:var(--green);">实现机制</h4>
+    <ul style="color:var(--text);font-size:13px;line-height:1.7;margin:8px 0 0 18px;">
+      <li>源端 <code>DUMP + RESTORE + DEL</code> 在主线程顺序执行</li>
+      <li>任意步骤失败, 不执行后续步骤</li>
+      <li><code>DEL</code> 是 RESTORE 成功后的<strong>最后一步</strong></li>
+    </ul>
+  </div>
+  <div class="compare-bad" style="border-color:var(--orange);">
+    <h4 style="color:var(--orange);">⚠ 注意:MIGRATE 不是分布式事务</h4>
+    <ul style="color:var(--text);font-size:13px;line-height:1.7;margin:8px 0 0 18px;">
+      <li>多 key 一次 MIGRATE 时, 部分成功部分失败<strong>可能存在</strong></li>
+      <li>每 key 独立保证原子性, 但批次不保证</li>
+      <li>失败需要应用层重试或扫描清理</li>
+    </ul>
+  </div>
+</div>
+
+<h3>27.7.3 大 key 迁移的阻塞</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 27-7-2 · MIGRATE 单 key 执行成本与阻塞窗口</div>
+  <table>
+    <thead><tr><th>步骤</th><th>位置</th><th>耗时(100 万元素 hash)</th><th>影响</th></tr></thead>
+    <tbody>
+      <tr><td>DUMP(序列化为 RDB)</td><td>源节点</td><td><strong>数百 ms</strong></td><td>主线程同步, 阻塞所有命令</td></tr>
+      <tr><td>RESTORE(反序列化 + 写入)</td><td>目标节点</td><td><strong>同等耗时</strong></td><td>目标节点主线程阻塞</td></tr>
+      <tr><td>DEL(本地删除)</td><td>源节点</td><td>~ms</td><td>同步删除大对象阻塞</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="warning">
+  <strong>典型现象</strong>:迁移大 key 时, 源 + 目标两侧 P99 延迟从 <code>1 ms</code> 跳到 <code>200 ms+</code>, 持续整个迁移过程(秒级), 所有客户端命令在该期间<strong>排队</strong>。
+  <pre style="font-family:monospace;font-size:11px;color:var(--text);background:var(--surface);padding:8px 10px;border-radius:4px;margin:8px 0 0 0;">redis-cli --latency-history -h $SOURCE
+redis-cli --latency-history -h $TARGET</pre>
+</div>
+
+<div class="key-insight" style="border-left-color:var(--green);">
+  <strong>工程建议</strong>:
+  <ul style="margin:8px 0 0 18px;color:var(--text);">
+    <li><code>MEMORY USAGE</code> 检查目标 key 大小</li>
+    <li><strong>&gt; 100 MB 的单 key</strong> 需要业务层迁移:应用双写至两个 slot, 切流后清理旧 slot</li>
+    <li>常规 reshard:业务低峰期执行, <code>redis-cli --cluster reshard</code> 设置较小 batch, 监控 P99 延迟, 异常时暂停</li>
+  </ul>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s27-8">27.8 在线 Resharding</h2>
+<!-- ============================================================ -->
+
+<p>Cluster 的"零停机扩容"由三层机制共同保证:未迁移 slot 正常服务、已迁移 slot 通过 MOVED 路由、迁移中 slot 通过 ASK 临时跳转。<code>redis-cli --cluster reshard</code> 把上一节那 5 条命令编排成一个全自动的迁移流程。</p>
+
+<h3>27.8.1 添加新节点的完整流程</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 27-8-1 · 新节点加入 + reshard 7 步</div>
+  <svg viewBox="0 0 940 380" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="380" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="20" y="20" width="220" height="44" rx="8" fill="url(#d-purple)" filter="url(#d-shadow)"/>
+      <text x="130" y="42" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Start · 新节点 D 准备好</text>
+      <text x="130" y="56" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">物理机/容器就绪</text>
+
+      <line x1="240" y1="42" x2="280" y2="42" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="280" y="20" width="320" height="44" rx="8" fill="url(#d-blue)"/>
+      <text x="440" y="42" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">① 启动 Redis</text>
+      <text x="440" y="56" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">cluster-enabled yes + cluster.conf</text>
+
+      <line x1="600" y1="42" x2="640" y2="42" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+
+      <rect x="640" y="20" width="280" height="44" rx="8" fill="url(#d-blue)"/>
+      <text x="780" y="42" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">② CLUSTER MEET 加入</text>
+      <text x="780" y="56" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">现有节点发起握手</text>
+
+      <line x1="780" y1="64" x2="780" y2="86" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
+
+      <rect x="640" y="86" width="280" height="44" rx="8" fill="url(#d-green)"/>
+      <text x="780" y="108" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">③ 验证已接入</text>
+      <text x="780" y="122" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">CLUSTER NODES 应含 D</text>
+
+      <line x1="640" y1="108" x2="600" y2="130" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-g)"/>
+
+      <rect x="280" y="130" width="320" height="44" rx="8" fill="url(#d-orange)"/>
+      <text x="440" y="152" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">④ redis-cli --cluster reshard</text>
+      <text x="440" y="166" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">触发自动迁移工具</text>
+
+      <line x1="440" y1="174" x2="440" y2="196" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="40" y="196" width="800" height="64" rx="10" fill="url(#d-orange)" filter="url(#d-shadow)"/>
+      <text x="440" y="220" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">⑤ 工具自动编排迁移</text>
+      <text x="440" y="240" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">SETSLOT MIGRATING(源)+ SETSLOT IMPORTING(目标)+ MIGRATE keys 循环</text>
+      <text x="440" y="256" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">期间客户端继续访问,源/目标节点按 key 状态返回数据或 ASK</text>
+
+      <line x1="440" y1="260" x2="440" y2="282" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="280" y="282" width="320" height="44" rx="8" fill="url(#d-purple)"/>
+      <text x="440" y="304" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">⑥ SETSLOT NODE 更新归属</text>
+      <text x="440" y="318" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">slot 永久归属新节点(MOVED 生效)</text>
+
+      <line x1="600" y1="304" x2="640" y2="304" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="640" y="282" width="280" height="44" rx="8" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="780" y="304" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">⑦ CLUSTER SLOTS 验证</text>
+      <text x="780" y="318" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">最终拓扑确认 ✓</text>
+
+      <text x="20" y="358" fill="var(--diagram-muted)" font-size="10">★ 整个 reshard 期间,客户端无感知 — 未迁移 slot 正常 + 已迁移 MOVED + 迁移中 ASK 三态共同保证零停机</text>
+    </g>
+  </svg>
+</div>
+
+<h3>27.8.2 reshard 命令示例</h3>
+
+<pre><code class="language-bash">$ redis-cli --cluster add-node 192.168.1.104:7003 192.168.1.100:7000
+[OK] New node added to cluster
+
+$ redis-cli --cluster reshard 192.168.1.100:7000 \
+  --cluster-from &lt;node-A-id&gt;,&lt;node-B-id&gt;,&lt;node-C-id&gt; \
+  --cluster-to &lt;node-D-id&gt; \
+  --cluster-slots 4096 \
+  --cluster-yes
+
+&gt;&gt;&gt; Performing Cluster Check
+&gt;&gt;&gt; Reshard plan:
+   Move 4096 slots:
+     - 1366 slots from A
+     - 1365 slots from B
+     - 1365 slots from C
+   To node D
+&gt;&gt;&gt; Moving slots...
+   Moving slot 0 from A to D ... [OK]
+   Moving slot 1 from A to D ... [OK]
+   ...
+[OK] All 16384 slots covered.</code></pre>
+
+<h3>27.8.3 reshard 期间的服务保证</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 27-8-2 · reshard 期间的三类 slot 状态</div>
+  <svg viewBox="0 0 940 320" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
+    <rect width="940" height="320" fill="var(--diagram-panel)" rx="10"/>
+    <g font-family="ui-sans-serif">
+      <rect x="20" y="20" width="280" height="60" rx="10" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="160" y="44" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">① slot 已迁移完成</text>
+      <text x="160" y="62" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">归属新节点(D)</text>
+      <text x="160" y="76" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">所有 key 已转移</text>
+
+      <line x1="160" y1="80" x2="160" y2="110" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+
+      <rect x="20" y="110" width="280" height="80" rx="10" fill="url(#d-green)"/>
+      <text x="160" y="134" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">客户端 → 旧节点</text>
+      <text x="160" y="154" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">回 MOVED slot D</text>
+      <text x="160" y="172" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">客户端永久更新缓存</text>
+      <text x="160" y="184" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">下次直接命中</text>
+
+      <rect x="320" y="20" width="300" height="60" rx="10" fill="url(#d-orange)" filter="url(#d-shadow)"/>
+      <text x="470" y="44" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">② slot 正在迁移</text>
+      <text x="470" y="62" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">SETSLOT MIGRATING/IMPORTING</text>
+      <text x="470" y="76" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">源/目标都可能持有 key</text>
+
+      <line x1="470" y1="80" x2="470" y2="110" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
+
+      <rect x="320" y="110" width="300" height="80" rx="10" fill="url(#d-orange)"/>
+      <text x="470" y="134" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">客户端 → 源节点</text>
+      <text x="470" y="154" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">按 key 状态分支</text>
+      <text x="470" y="172" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">key 还在 → 直接返回</text>
+      <text x="470" y="186" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">key 已迁 → ASK 临时跳转</text>
+
+      <rect x="640" y="20" width="280" height="60" rx="10" fill="url(#d-green)" filter="url(#d-shadow)"/>
+      <text x="780" y="44" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">③ slot 未迁移</text>
+      <text x="780" y="62" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">归属源节点</text>
+      <text x="780" y="76" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">未触发任何迁移命令</text>
+
+      <line x1="780" y1="80" x2="780" y2="110" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
+
+      <rect x="640" y="110" width="280" height="80" rx="10" fill="url(#d-green)"/>
+      <text x="780" y="134" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">客户端 → 源节点</text>
+      <text x="780" y="156" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">正常服务</text>
+      <text x="780" y="174" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">无任何额外开销</text>
+
+      <rect x="40" y="220" width="860" height="80" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
+      <text x="60" y="244" fill="var(--diagram-blue-text)" font-size="13" font-weight="800">★ 三态共存的关键意义</text>
+      <text x="60" y="266" fill="var(--diagram-muted)" font-size="11">reshard 期间集群始终处于"部分 slot 已迁,部分迁移中,部分未迁"的混合状态;客户端透过 MOVED/ASK/正常响应自动适应</text>
+      <text x="60" y="284" fill="var(--diagram-green-text)" font-size="11">★ 客户端感知到的最大开销:迁移中 slot 的 key 偶尔需要 1 次额外跳转(几毫秒) — 稳态下绝大多数请求一次命中</text>
+    </g>
+  </svg>
+</div>
+
+<div class="key-insight">
+  reshard 期间的"零停机"由三层机制共同保证:<strong>未迁移 slot 正常服务、已迁移 slot 通过 MOVED 路由、迁移中 slot 通过 ASK 临时跳转</strong>。客户端感知到的最大开销是 reshard 期间偶尔的额外跳转(毫秒级延迟)。Smart Client 在稳态下绝大多数请求一次命中。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s27-9">27.9 数学分析:Gossip 收敛速度</h2>
+<!-- ============================================================ -->
+
+<p>Gossip 是经典的"流行病传播"模型 — 已知节点每轮再感染一个未知节点,感染数指数增长直到全集群覆盖。这一节给出 Push-Based Gossip 的递推式与连续时间近似,得出 <strong>O(log N)</strong> 收敛的结论,并计算 1000 节点集群的实际收敛时间。</p>
+
+<h3>27.9.1 Push-Based Gossip 的收敛</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 27-9-1 · Gossip 收敛公式推导</div>
+<pre><code class="language-text">设 N 个节点,初始 1 个节点持有信息 (sender)
+每轮每个已知节点随机选一个其他节点发送
+
+  I(t) = 第 t 轮已知节点数
+  E[I(t+1)] = I(t) + I(t) × (N - I(t)) / N
+
+连续时间近似 (logistic 方程):
+  s = I/N  (已知比例)
+  ds/dt = s(1 - s)
+  s(t) = 1 / (1 + (N-1)e^(-t))
+
+求解全集群收敛:
+  令 s(T) = 1 - 1/N (仅剩 1 节点未知)
+  解得 T ≈ 2 ln(N - 1) = O(log N)
+
+更精确的高概率收敛:
+  T = ln N + c · ln(ln N)
+  其中 c 是常数
+  对所有节点以概率 (1 - 1/N) 收敛</code></pre>
+</div>
+
+<h3>27.9.2 实际收敛时间估算</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 27-9-1 · 不同集群规模的收敛时间</div>
+  <table>
+    <thead><tr><th>集群规模 N</th><th>理论轮数 ⌈2 ln N⌉</th><th>心跳周期</th><th>预计收敛时间</th></tr></thead>
+    <tbody>
+      <tr><td>6 节点</td><td>4 轮</td><td>1 秒/轮</td><td>~4 秒</td></tr>
+      <tr><td>50 节点</td><td>8 轮</td><td>1 秒/轮</td><td>~8 秒</td></tr>
+      <tr><td>200 节点</td><td>11 轮</td><td>1 秒/轮</td><td>~11 秒</td></tr>
+      <tr><td>1000 节点</td><td>14 轮</td><td>1 秒/轮</td><td>~14 秒</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">图 27-9-2 · 对数增长的工程意义</div>
+<pre><code class="language-text">对数增长的工程意义:
+
+  集群规模从 6 扩到 1000 (167 倍增长)
+  收敛时间从 4 秒到 14 秒 (3.5 倍增长)
+
+  log N 增长意味着:
+    扩大集群对收敛速度的影响极小
+    Gossip 协议天然支持大规模集群
+    生产环境 ~1000 节点上限主要受 Gossip 带宽 (O(N²))
+    而非收敛速度限制
+
+对比中心化协调:
+  中心化 (Sentinel 单点):
+    所有信息流经协调器
+    协调器带宽 = O(N²)
+    协调器宕机 = 系统不可用
+
+  Gossip (Cluster):
+    每节点带宽 = O(N)
+    总带宽 = O(N²) 但分散到所有节点
+    任意节点宕机不影响系统</code></pre>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s27-10">27.10 部署模式对比</h2>
+<!-- ============================================================ -->
+
+<h3>27.10.1 四种部署模式的全面对比</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 27-10-1 · 单节点 / 主从 / Sentinel / Cluster 全维度对比</div>
+  <table>
+    <thead><tr><th>维度</th><th>单节点</th><th>主从</th><th>Sentinel</th><th>Cluster</th></tr></thead>
+    <tbody>
+      <tr><td>数据分片</td><td>无</td><td>无</td><td>无</td><td><strong>16384 slot</strong></td></tr>
+      <tr><td>水平扩展</td><td>否</td><td>否</td><td>否</td><td>是</td></tr>
+      <tr><td>故障检测</td><td>客户端</td><td>客户端</td><td>Sentinel</td><td>集群内置</td></tr>
+      <tr><td>自动 failover</td><td>否</td><td>否</td><td>是</td><td>是</td></tr>
+      <tr><td>协调者</td><td>无</td><td>无</td><td>Sentinel</td><td><strong>无 (去中心化)</strong></td></tr>
+      <tr><td>多 key 命令</td><td>全支持</td><td>全支持</td><td>全支持</td><td>仅同 slot</td></tr>
+      <tr><td>Lua 脚本</td><td>全支持</td><td>全支持</td><td>全支持</td><td>同 slot</td></tr>
+      <tr><td>MULTI/EXEC</td><td>全支持</td><td>全支持</td><td>全支持</td><td>同 slot</td></tr>
+      <tr><td>多 DB (SELECT)</td><td>0-15</td><td>0-15</td><td>0-15</td><td><strong>仅 0</strong></td></tr>
+      <tr><td>客户端复杂度</td><td>简单</td><td>简单</td><td>中 (感知 Sentinel)</td><td>高 (Smart Client)</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>27.10.2 Cluster 与 Sentinel 不可共用</h3>
+
+<div class="warning">
+  <strong>千万不要把 Cluster 节点交给 Sentinel 监控</strong>:Cluster 通过 PFAIL/FAIL 自行处理 failover,Sentinel 通过 SDOWN/ODOWN 处理 failover。两者同时触发会导致状态不一致 — Cluster 提升新 master 后,Sentinel 也尝试提升,configEpoch 与 Sentinel epoch 冲突,集群进入不可恢复状态。<br><br>
+  正确选择:<strong>需要分片 + 高可用 → Cluster(内置 failover);仅需高可用,无分片需求 → 主从 + Sentinel。不要混用。</strong>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s27-11">27.11 性能基准</h2>
+<!-- ============================================================ -->
+
+<h3>27.11.1 性能基线</h3>
+
+<div class="metric-row">
+  <div class="metric">
+    <div class="value">125K</div>
+    <div class="label">单 master SET ops/s</div>
+  </div>
+  <div class="metric">
+    <div class="value">680K</div>
+    <div class="label">6 master SET ops/s (91%)</div>
+  </div>
+  <div class="metric">
+    <div class="value">~30 MB/s</div>
+    <div class="label">1000 节点 Gossip 带宽</div>
+  </div>
+  <div class="metric">
+    <div class="value">15-30 μs</div>
+    <div class="label">P99 (cache hit)</div>
+  </div>
+</div>
+
+<h3>27.11.2 Cluster 吞吐扩展效率</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 27-11-1 · 节点数 vs 吞吐线性度 (100B value, pipeline=1, 50 并发)</div>
+  <table>
+    <thead><tr><th>master 数</th><th>实测 SET ops/s</th><th>理想线性</th><th>扩展效率</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>~125,000</td><td>125,000</td><td>100%</td></tr>
+      <tr><td>3</td><td>~350,000</td><td>375,000</td><td>93%</td></tr>
+      <tr><td>6</td><td>~680,000</td><td>750,000</td><td>91%</td></tr>
+      <tr><td>9</td><td>~950,000</td><td>1,125,000</td><td>84%</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="diagram">
+  <div class="diagram-title">图 27-11-1 · 效率损失来源分解</div>
+<pre><code class="language-text">效率损失来源:
+  Gossip 通信: 节点间心跳消耗
+  MOVED/ASK 重定向: 客户端缓存未命中
+  客户端路由: 对每条命令计算 slot
+
+  N 节点时总 Gossip 开销: O(N) 消息/秒/节点
+  集群层面: O(N²) 带宽
+  N=1000 时 ~30 MB/s 集群总带宽
+
+读吞吐扩展:
+  读可路由到 replica (READONLY 模式)
+  N master + N replica 时读吞吐 ≈ 2N × 单节点</code></pre>
+</div>
+
+<h3>27.11.3 延迟特性</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 27-11-2 · 延迟分布对比</div>
+  <table>
+    <thead><tr><th>场景</th><th>单节点</th><th>Cluster (cache hit)</th><th>Cluster (MOVED 重定向)</th></tr></thead>
+    <tbody>
+      <tr><td>P50 延迟</td><td>0.4 ms</td><td>0.4 ms</td><td>0.4 ms</td></tr>
+      <tr><td>P95 延迟</td><td>0.7 ms</td><td>0.8 ms</td><td>1.5 ms</td></tr>
+      <tr><td>P99 延迟</td><td>0.8 ms</td><td>0.9 ms</td><td>2.0 ms</td></tr>
+      <tr><td>Failover 期 P99</td><td>N/A</td><td>N/A</td><td><strong>6-22 秒</strong></td></tr>
+    </tbody>
+  </table>
+</div>
+
+<p>Cluster 在 slot 缓存命中时延迟与单节点接近,主要差异在 MOVED 重定向(reshard 后短暂出现)与 failover 期间(数秒不可用)。Smart Client 缓存稳定时,绝大多数请求一次命中。</p>
+
+<!-- ============================================================ -->
+<h2 id="s27-12">27.12 陷阱与限制</h2>
+<!-- ============================================================ -->
+
+<h3>27.12.1 陷阱速查表</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 27-12-1 · Cluster 10 大陷阱</div>
+  <table>
+    <thead><tr><th>#</th><th>陷阱</th><th>症状</th><th>根因</th><th>修复</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>CROSSSLOT 错误</td><td>MGET/MSET 等多 key 命令报错</td><td>多 key 不在同一 slot</td><td>使用 hash tag <code>{}</code></td></tr>
+      <tr><td>2</td><td>hash tag 过粗</td><td>单 slot 热点,该 master CPU 100%</td><td>大量 key 同 hash tag</td><td>拆分 hash tag 粒度</td></tr>
+      <tr><td>3</td><td>cluster-require-full-coverage</td><td>单 master 故障导致全集群拒绝写入</td><td>默认 yes</td><td>缓存型业务设 no</td></tr>
+      <tr><td>4</td><td>failover 过慢</td><td>故障后服务中断 15+ 秒</td><td>cluster-node-timeout 默认 15s</td><td>调至 5000-10000</td></tr>
+      <tr><td>5</td><td>大 key 迁移阻塞</td><td>reshard 期间 P99 飙升秒级</td><td>MIGRATE 同步执行 DUMP/RESTORE</td><td>业务层迁移大 key</td></tr>
+      <tr><td>6</td><td>集群超过 1000 节点</td><td>Gossip 带宽 GB/s 级</td><td>O(N²) 通信复杂度</td><td>拆分多个 Cluster</td></tr>
+      <tr><td>7</td><td>Lua 脚本跨 slot</td><td>NOSCRIPT 或 CROSSSLOT</td><td>脚本访问的 key 不同 slot</td><td>用 hash tag 统一</td></tr>
+      <tr><td>8</td><td>Cluster 与 Sentinel 共用</td><td>failover 状态混乱</td><td>两套机制冲突</td><td>二选一,不混用</td></tr>
+      <tr><td>9</td><td>客户端不缓存 slot</td><td>每次请求两跳</td><td>收到 MOVED 仅重试</td><td>使用 Smart Client</td></tr>
+      <tr><td>10</td><td>多 DB 期望</td><td>SELECT 1 报错</td><td>Cluster 仅支持 DB 0</td><td>用 key 前缀代替 DB 区分</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>27.12.2 反例:CROSSSLOT 与 hash tag 设计</h3>
+
+<div class="compare-grid">
+  <div class="compare-bad">
+    <h4>错误:多 key 不在同一 slot</h4>
+<pre><code class="language-bash"># 多 key 命令直接报错
+$ redis-cli -c MGET order:O1001 order:O1002 order:O1003
+(error) CROSSSLOT Keys in request don't hash to the same slot
+
+# 现象:
+# - MGET / MSET / SUNION 等所有多 key 命令受影响
+# - Lua 脚本访问 KEYS[1] KEYS[2] 落不同 slot 时同样报错
+# - MULTI/EXEC 块内跨 slot 也报错
+# - 业务层临时退化为 N 次单 key 调用 → 性能砍半</code></pre>
+  </div>
+  <div class="compare-good">
+    <h4>修复:用 hash tag 强制同 slot</h4>
+<pre><code class="language-bash"># 显式标记 hash tag
+$ redis-cli -c MSET 'order:{O1001}' "..." \
+                    'payment:{O1001}' "..." \
+                    'shipment:{O1001}' "..."
+OK
+
+$ redis-cli -c MGET 'order:{O1001}' \
+                    'payment:{O1001}' \
+                    'shipment:{O1001}'
+1) "..."
+2) "..."
+3) "..."
+
+# 验证 slot 落点
+$ redis-cli CLUSTER KEYSLOT 'order:{O1001}'
+(integer) 2190
+$ redis-cli CLUSTER KEYSLOT 'payment:{O1001}'
+(integer) 2190</code></pre>
+  </div>
+</div>
+
+<h3>27.12.3 hash tag 设计准则</h3>
+
+<div class="diagram">
+  <div class="diagram-title">图 27-12-1 · hash tag 粒度的取舍</div>
+<pre><code class="language-text">hash tag 设计准则:
+
+  ✓ tag 粒度 = 业务关联粒度
+    订单与其支付/物流: tag = 订单号
+    用户与其购物车/订单: tag = 用户 ID (但要谨慎)
+
+  ✗ tag 过粗 (热点风险)
+    所有用户购物车 → 同一 tag → 单 slot 热点
+    解决: cart:{user-id} 而非 {cart}:user-id
+
+  ✗ tag 过细 (失去意义)
+    单一 key 用 hash tag → 与无 tag 等价
+
+  ✓ 设计验证
+    redis-cli CLUSTER KEYSLOT key1
+    redis-cli CLUSTER KEYSLOT key2
+    确认相关 key 落同 slot</code></pre>
+</div>
+
+<div class="warning">
+  <strong>cluster-require-full-coverage 是缓存型业务的隐形杀手</strong>:默认 <code>yes</code> 时,只要有任何一个 master 故障(且无 replica 接管),<strong>整个集群拒绝所有写入与读取</strong> — 包括其他健康 master 上的 slot。缓存型业务通常不能接受"局部故障 → 全局不可用",生产配置 <code>cluster-require-full-coverage no</code>,让健康 slot 继续服务。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s27-13">27.13 源码深潜</h2>
+<!-- ============================================================ -->
+
+<h3>27.13.1 核心源码入口</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 27-13-1 · Cluster 源码地图</div>
+  <table>
+    <thead><tr><th>文件</th><th>关键函数 / 结构</th><th>运行时职责</th></tr></thead>
+    <tbody>
+      <tr><td><code>src/cluster.h</code></td><td><code>clusterState</code>, <code>clusterNode</code></td><td>Cluster 全局状态</td></tr>
+      <tr><td><code>src/cluster.c</code></td><td><code>keyHashSlot()</code></td><td>CRC16 + hash tag 提取</td></tr>
+      <tr><td><code>src/cluster.c</code></td><td><code>getNodeByQuery()</code></td><td>命令路由,生成 MOVED/ASK</td></tr>
+      <tr><td><code>src/cluster.c</code></td><td><code>clusterCron()</code></td><td>心跳调度,故障检测</td></tr>
+      <tr><td><code>src/cluster.c</code></td><td><code>clusterSendPing()</code></td><td>发送 PING + gossip section</td></tr>
+      <tr><td><code>src/cluster.c</code></td><td><code>clusterProcessPacket()</code></td><td>处理收到的 PING/PONG/MEET</td></tr>
+      <tr><td><code>src/cluster.c</code></td><td><code>markNodeAsFailingIfNeeded()</code></td><td>PFAIL → FAIL 升级</td></tr>
+      <tr><td><code>src/cluster.c</code></td><td><code>clusterHandleSlaveFailover()</code></td><td>replica failover 状态机</td></tr>
+      <tr><td><code>src/cluster.c</code></td><td><code>clusterRequestFailoverAuth()</code></td><td>发起选举投票请求</td></tr>
+      <tr><td><code>src/cluster.c</code></td><td><code>clusterSendFailoverAuthIfNeeded()</code></td><td>投票仲裁</td></tr>
+      <tr><td><code>src/cluster.c</code></td><td><code>clusterCommand()</code></td><td>CLUSTER 子命令分发</td></tr>
+      <tr><td><code>src/cluster.c</code></td><td><code>clusterUpdateSlotsConfigWith()</code></td><td>配置传播与冲突解决</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>27.13.2 getNodeByQuery 完整版</h3>
+
+<pre><code class="language-c">/* src/cluster.c: 路由决策 */
+clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd,
+                             robj **argv, int argc, int *hashslot,
+                             int *error_code) {
+    clusterNode *n = NULL;
+    int slot = 0;
+    int slot_initialized = 0;
+
+    /* 计算 slot (考虑多 key 命令的一致性) */
+    for (int i = 0; i &lt; argc; i++) {
+        if (cmd-&gt;key_specs[i].flags &amp; CMD_KEY_NONE) continue;
+        int s = keyHashSlot(argv[i]-&gt;ptr, sdslen(argv[i]-&gt;ptr));
+        if (!slot_initialized) {
+            slot = s;
+            slot_initialized = 1;
+        } else if (s != slot) {
+            *error_code = CLUSTER_REDIR_CROSS_SLOT;
+            return NULL;
+        }
+    }
+    *hashslot = slot;
+
+    n = server.cluster-&gt;slots[slot];
+    if (n == NULL) {
+        *error_code = CLUSTER_REDIR_DOWN_UNBOUND;
+        return NULL;
+    }
+
+    /* 不属于本节点 */
+    if (n != myself) {
+        if (server.cluster-&gt;importing_slots_from[slot] != NULL) {
+            if (c-&gt;flags &amp; CLIENT_ASKING) return myself;
+        }
+        *error_code = CLUSTER_REDIR_MOVED;
+        return n;
+    }
+
+    /* slot 正在迁出 */
+    if (server.cluster-&gt;migrating_slots_to[slot] != NULL) {
+        if (lookupKey(c-&gt;db, argv[1], LOOKUP_NOTOUCH) == NULL) {
+            *error_code = CLUSTER_REDIR_ASK;
+            return server.cluster-&gt;migrating_slots_to[slot];
+        }
+    }
+
+    return myself;
+}</code></pre>
+
+<h3>27.13.3 PFAIL → FAIL 升级</h3>
+
+<pre><code class="language-c">/* src/cluster.c: 多数派达成时升级为 FAIL */
+void markNodeAsFailingIfNeeded(clusterNode *node) {
+    int failures;
+    int needed_quorum = (server.cluster-&gt;size / 2) + 1;
+
+    if (!nodeTimedOut(node)) return;
+    if (nodeFailed(node)) return;
+
+    failures = clusterNodeFailureReportsCount(node);
+    if (nodeIsMaster(myself)) failures++;
+
+    if (failures &lt; needed_quorum) return;
+
+    serverLog(LL_NOTICE, "Marking node %.40s as FAIL (quorum reached).",
+              node-&gt;name);
+
+    node-&gt;flags &amp;= ~CLUSTER_NODE_PFAIL;
+    node-&gt;flags |= CLUSTER_NODE_FAIL;
+    node-&gt;fail_time = mstime();
+
+    /* 广播 FAIL 消息给全网 */
+    if (nodeIsMaster(myself))
+        clusterSendFail(node-&gt;name);
+}</code></pre>
+
+<h3>27.13.4 设计取舍</h3>
+
+<h4>取舍 1:固定 16384 slot vs 一致性 hash</h4>
+
+<p>Cluster 选择固定 16384 slot 而非一致性 hash 的根本原因是 <strong>Gossip 包大小约束</strong>。一致性 hash 通常通过 virtual nodes 实现细粒度分片,每个 vnode 需要在节点间传播位置信息。Redis Cluster 的 16384 slot 可表示为 2 KB 固定大小 bitmap,直接塞入 PING 消息,集群规模可达 ~1000 节点。一致性 hash 方案下,每节点 256 vnodes 时 1000 节点集群需传播 256,000 vnode 信息,带宽不可控。</p>
+
+<h4>取舍 2:Gossip vs Raft / Paxos</h4>
+
+<p>Cluster 选择 Gossip 而非 Raft / Paxos 的根本原因是 <strong>性能与简单性</strong>。Raft 需要 leader 选举与日志复制,所有写操作经过 leader 串行化。Cluster 的 slot 路由可以完全去中心化:每个客户端缓存完整映射,直接路由到 master,无需 leader 协调。Gossip 仅用于"成员状态最终一致",不要求强一致,这与 Cluster 的实际需求(failover 在秒级完成即可)契合。</p>
+
+<h4>取舍 3:PFAIL → FAIL 两阶段判定</h4>
+
+<p>PFAIL → FAIL 两阶段判定的核心是 <strong>"安全性优于活性"</strong>。如果允许任何单节点判定故障即触发 failover,网络抖动会导致大量误 failover。两阶段确保 failover 仅在多数派确认时触发,网络分区下少数派分区无法触发 failover,自动降级。代价是故障检测窗口约为 cluster-node-timeout × 2,可接受。</p>
+
+<h4>取舍 4:ASK vs MOVED</h4>
+
+<p>ASK 重定向是 reshard 期间维持服务可用的关键。如果不区分 ASK 与 MOVED,客户端会反复在源/目标节点间跳转直至 reshard 完成。ASK 表示"<strong>临时跳转,不更新缓存</strong>",MOVED 表示"<strong>永久迁移,更新缓存</strong>"。该区分使 reshard 对客户端透明,几乎不影响业务。</p>
+
+<div class="real-world">
+  <strong>用例 1:大型电商订单缓存</strong><br>
+  某电商订单系统用 Cluster 6 master + 6 replica 架构,16384 slot 均匀分布。<strong>关键设计</strong>:订单与其支付/物流用 <code>{order_id}</code> hash tag 强制同 slot,MGET 一次拉完;cluster-node-timeout 配置 5000 ms,failover 总时长 6-8 秒;cluster-require-full-coverage 设为 no,单 master 故障期间其他 slot 继续服务。<strong>实际运行</strong>:日均 10 亿写,稳态 P99 0.9 ms,reshard 期间 P99 短暂飙到 2 ms 后回落。
+</div>
+
+<div class="real-world">
+  <strong>用例 2:不要这么用 — 把 Cluster 当 Kafka</strong><br>
+  反例:某团队把所有事件写入一个 Stream,放在 Cluster 单 slot 上。<strong>结果</strong>:该 slot 所在 master CPU 100%,其他 5 个 master 几乎空闲,扩容到 12 节点也没用 — 单 key 是 slot 上限。<strong>正解</strong>:按 key 前缀(<code>events:user:{uid}</code>)分散到多 slot,或直接换 Kafka / Pulsar 这类原生分区的消息系统。Cluster 的水平扩展粒度是 slot,不是 key。
+</div>
+
+<!-- ============================================================ -->
+<h2 id="s27-summary">27.14 本章要点</h2>
+<!-- ============================================================ -->
+
+<div class="chapter-summary">
+
+<h3>关键事实</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 27-14-1 · Cluster 关键事实速查</div>
+  <table>
+    <thead><tr><th>#</th><th>要点</th><th>关键依据</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>16384 hash slot 分片,<code>slot = CRC16(key) &amp; 0x3FFF</code></td><td>bitmap 2 KB 适配 Gossip 包大小</td></tr>
+      <tr><td>2</td><td>hash tag <code>{tag}</code> 强制相关 key 落同 slot</td><td>粒度过粗导致热点,过细失去意义</td></tr>
+      <tr><td>3</td><td>Gossip 协议 PING/PONG 周期性传播,O(log N) 收敛</td><td>1000 节点集群约 14 秒达成共识</td></tr>
+      <tr><td>4</td><td>PFAIL 单节点判定,FAIL 多数派 (<code>⌊N/2⌋+1</code>) 确认</td><td>网络分区时少数派无法误触 failover</td></tr>
+      <tr><td>5</td><td>MOVED 永久 slot 归属,客户端更新本地缓存</td><td><code>MOVED &lt;slot&gt; &lt;ip&gt;:&lt;port&gt;</code></td></tr>
+      <tr><td>6</td><td>ASK 迁移期临时跳转,不更新缓存,需先发 ASKING</td><td>避免源/目标间死循环</td></tr>
+      <tr><td>7</td><td>MIGRATE 单 key 原子 (DUMP+RESTORE+DEL)</td><td>大 key 迁移同步阻塞主线程</td></tr>
+      <tr><td>8</td><td>reshard 通过 SETSLOT MIGRATING/IMPORTING + 批量 MIGRATE</td><td>服务零中断,ASK 跳转</td></tr>
+      <tr><td>9</td><td>Cluster 与 Sentinel 不能混用</td><td>两套故障检测机制冲突</td></tr>
+      <tr><td>10</td><td>多 key 命令、Lua 脚本、MULTI/EXEC 要求所有 key 同 slot</td><td>否则 CROSSSLOT 错误</td></tr>
+      <tr><td>11</td><td>cluster-node-timeout 5-10s,cluster-require-full-coverage no</td><td>缓存场景生产推荐</td></tr>
+      <tr><td>12</td><td>Smart Client 缓存 slot 映射,~1000 节点上限拆多 Cluster</td><td>带宽 O(N²) 是规模瓶颈</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>最小回归测试</h3>
+
+<pre><code class="language-bash"># 1. 验证 slot 计算
+redis-cli CLUSTER KEYSLOT 'order:{O1001}'
+# 期望: 2190
+redis-cli CLUSTER KEYSLOT 'payment:{O1001}'
+# 期望: 2190 (同 hash tag 同 slot)
+
+# 2. 查看完整拓扑
+redis-cli CLUSTER SLOTS
+redis-cli CLUSTER NODES
+
+# 3. 验证 MOVED 重定向
+redis-cli -c -p 7000 SET order:O1001 "PAID"
+# 期望: 自动跳转,返回 OK (不带 -c 会显示 MOVED)
+
+# 4. 验证多 key CROSSSLOT
+redis-cli -c MGET order:O1001 order:O1002
+# 期望: (error) CROSSSLOT
+redis-cli -c MGET 'order:{O1001}' 'payment:{O1001}'
+# 期望: 1) "..." 2) "..."
+
+# 5. 在线 reshard
+redis-cli --cluster reshard 192.168.1.100:7000 \
+  --cluster-from &lt;src-id&gt; --cluster-to &lt;dst-id&gt; \
+  --cluster-slots 1000 --cluster-yes
+
+# 6. 触发手动 failover 演练
+redis-cli -p 7003 CLUSTER FAILOVER
+# 期望: 7003 (replica) 提升为新 master
+
+# 7. 故障检测计数
+redis-cli CLUSTER COUNT-FAILURE-REPORTS &lt;node-id&gt;</code></pre>
+
+<h3>性能速查</h3>
+
+<div class="diagram">
+  <div class="diagram-title">表 27-14-2 · Cluster 性能速查</div>
+  <table>
+    <thead><tr><th>操作</th><th>典型 P99</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>SET / GET (cache hit)</td><td>0.9 ms</td><td>与单节点接近</td></tr>
+      <tr><td>SET / GET (MOVED 重定向)</td><td>2.0 ms</td><td>多一跳网络 RTT</td></tr>
+      <tr><td>MGET 同 hash tag</td><td>1-2 ms</td><td>单节点完成</td></tr>
+      <tr><td>Failover 总耗时 (默认 15s)</td><td>17-22 秒</td><td>不可服务窗口</td></tr>
+      <tr><td>Failover (timeout 5000)</td><td>6-10 秒</td><td>生产推荐配置</td></tr>
+      <tr><td>1000 节点 Gossip 收敛</td><td>~14 秒</td><td>O(log N)</td></tr>
+      <tr><td>1000 节点 Gossip 带宽</td><td>~30 MB/s</td><td>O(N²) 集群总量</td></tr>
+      <tr><td>6 master 吞吐扩展效率</td><td>91%</td><td>~680K SET ops/s</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h3>下一章预告</h3>
+
+<p>本章建立了 Redis Cluster 的工程语义边界 — 16384 slot、Gossip 协议、PFAIL/FAIL、MOVED/ASK、在线 reshard。下一章 <strong><code>28-multi-exec.html</code></strong> 讨论 Redis 的<strong>事务机制 MULTI/EXEC</strong>,该机制在 Cluster 模式下受 slot 一致性约束:事务块内所有 key 必须落在同一 slot,否则 EXEC 直接报错。我们将看 MULTI 如何把命令排队、EXEC 如何原子执行、WATCH 如何实现乐观锁、以及为什么 Redis 事务"<strong>不支持回滚</strong>"是设计选择而不是缺陷。</p>
+
+</div>
+
+<p class="footer">&copy; 2026 图解 Redis &middot; 第 27 章 &middot; Cluster 集群</p>
+
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/c.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/yaml.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/properties.min.js"></script>
+<script>hljs.configure({ignoreUnescapedHTML:true});hljs.highlightAll();document.querySelectorAll('pre code[class*="language-"]').forEach(el=>{var m=el.className.match(/language-(\w+)/);if(m){var s=document.createElement('span');s.className='lang-label';s.textContent=m[1];el.closest('pre').appendChild(s);}});</script>
+<script>document.addEventListener('DOMContentLoaded',function(){setTimeout(function(){document.querySelectorAll('.diagram svg').forEach(function(svg){var h=parseInt(svg.getAttribute('height')||svg.getBoundingClientRect().height);if(h>500){svg.style.maxHeight='500px';svg.style.width='auto';var p=svg.closest('.diagram');if(p)p.style.overflowX='auto';}});},1500);});</script>
+</body>
+</html>
