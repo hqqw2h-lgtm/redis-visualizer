@@ -40,7 +40,7 @@
 
 <div class="chapter-intro">
   <p class="lead">地理坐标 <code>(lon, lat)</code> 是<strong>二维数据</strong>,但 B-tree、跳跃表、哈希表均针对<strong>一维有序键</strong>设计。Redis 通过 <strong>Geohash 编码</strong>将二维坐标映射到一维 <strong>52 位整数</strong>,以 ZSet 的 <code>score</code> 字段存储,使一维有序结构具备空间范围查询能力。<code>GEOADD</code> / <code>GEOSEARCH</code> / <code>GEORADIUS</code> 等命令都构建在该映射之上。</p>
-  <p>Geohash 的核心是 <strong>Z-order(Morton)曲线</strong>:把经度 26 位与纬度 26 位<strong>位交错</strong>(<code>interleave64</code>),让<strong>前缀相同的 hash 值对应几何邻近的点</strong>。这一性质把"求圆形范围内的点"转化为"<strong>查 9 个 Geohash 前缀对应的 score 区间</strong>",再用 <strong>Haversine 公式</strong>精确过滤候选点的真实距离。</p>
+  <p>Geohash 的核心是 <strong>Z-order(Morton)曲线</strong>:把经度 26 位与纬度 26 位<strong>位交错</strong>(<code>interleave64</code>),让<strong>前缀相同的 hash 值大概率对应几何邻近的点</strong>。Redis 会先按半径选择合适步长,再查中心单元和最多 8 个邻居形成候选集,最后用 <strong>Haversine 公式</strong>按真实距离过滤。</p>
   <p>本章描述 Geohash 的位交错构造、Z-order 曲线性质、52 位精度边界、墨卡托投影限制、9 邻居单元搜索策略,以及 Haversine 距离的最终过滤。把整个 GEO 命令族放进 ZSet 的视角下看,你会发现 Redis "<strong>用现有数据结构封装新语义</strong>" 的工程哲学贯彻得多么彻底 — GEO 没有新建任何底层结构,完全是 ZSet 的 score/member 字段被解释为另一种含义。</p>
   <ul class="will-learn">
     <li>为何字典序拼接 <code>"116.0,39.9"</code> 不可行 — 一维线性顺序破坏二维邻近性</li>
@@ -49,7 +49,7 @@
     <li>26+26 = 52 位的精度刚好对齐 IEEE 754 double 的 52 位尾数 — 无精度丢失</li>
     <li>Web 墨卡托纬度边界 <code>[-85.05, 85.05]</code> 的来源与代价</li>
     <li>GEOADD 内部如何转化为 <code>ZADD key (double)hash member</code></li>
-    <li>9 邻居单元(中心 + 8 邻接)为何足以覆盖任意半径的圆形</li>
+    <li>Redis 如何先按半径选步长,再用中心 + 最多 8 个邻居做候选矩形覆盖</li>
     <li>Haversine 公式的几何含义与 Redis 选择它(而非 Vincenty)的原因</li>
     <li>跨经度 180° 与跨步长边界的处理:<code>geohashEstimateStepsByRadius</code> 的 step-1 安全裕量</li>
     <li>典型陷阱:大半径查询 CPU 飙升、半径单位混淆、集群 CROSSSLOT 错误</li>
@@ -248,7 +248,7 @@
     <thead><tr><th>方案</th><th>局部性保留</th><th>编码复杂度</th><th>解码复杂度</th><th>Redis 是否使用</th><th>关键劣势</th></tr></thead>
     <tbody>
       <tr><td>字典序拼接</td><td>极差</td><td>O(1)</td><td>O(1)</td><td>否</td><td>整数跳变破坏邻近性</td></tr>
-      <tr><td><strong>Z-order(Morton)</strong></td><td><strong>良好</strong></td><td><strong>O(p) 位交错</strong></td><td><strong>O(p) 位反交错</strong></td><td><strong>是</strong></td><td><strong>无,本场景最优</strong></td></tr>
+      <tr><td><strong>Z-order(Morton)</strong></td><td><strong>良好</strong></td><td><strong>O(p) 位交错</strong></td><td><strong>O(p) 位反交错</strong></td><td><strong>是</strong></td><td><strong>编码简单且能复用 ZSet;边界仍需邻居补偿</strong></td></tr>
       <tr><td>Hilbert</td><td>优秀</td><td>O(p²) 状态机</td><td>O(p²) 状态机</td><td>否</td><td>编解码常数大 5×</td></tr>
       <tr><td>四叉树(Quadtree)</td><td>优秀</td><td>O(log N) 树深</td><td>O(log N)</td><td>否</td><td>需独立索引结构</td></tr>
       <tr><td>R-tree</td><td>优秀</td><td>O(log N)</td><td>O(log N)</td><td>否</td><td>需 O(N) 内存维护</td></tr>
@@ -463,7 +463,7 @@ uint64_t interleave64(uint32_t xlo, uint32_t ylo) {
     <text x="14" y="124" font-size="12" font-weight="700" fill="var(--diagram-red-text)">② 邻近不一定相邻 — 角落跳跃</text>
     <text x="14" y="144" font-size="11" fill="var(--diagram-red-text)">cell 3 与 cell 4 物理相邻, 但编码差大</text>
     <text x="14" y="162" font-size="11" fill="var(--diagram-red-text)">cell 7 与 cell 8 是另一个跳跃边界</text>
-    <text x="14" y="178" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">→ GEOSEARCH 必须查 3×3 = 9 邻居单元补偿</text>
+    <text x="14" y="178" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">→ GEOSEARCH 需要查中心 + 最多 8 个邻居补偿</text>
 
     <rect x="0" y="196" width="400" height="60" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
     <text x="14" y="216" font-size="12" font-weight="700" fill="var(--diagram-green-text)">③ 同层每加一位精度边长减半</text>
@@ -479,7 +479,7 @@ uint64_t interleave64(uint32_t xlo, uint32_t ylo) {
 </svg>
 
 <div class="key-insight">
-  <strong>Z-order 的"角落跳跃"</strong>:cell 3 (右上角) 到 cell 4 (左下角下一行) 物理上相邻,但 Z-order 编码 3 → 4 跨越很大。这就是为什么 GEOSEARCH 必须查 <strong>3×3 = 9 个邻居单元</strong>,而不是只查目标点所在单元 — 圆可能跨过 Z-order 的"跳跃边界"落入相邻单元。
+  <strong>Z-order 的"角落跳跃"</strong>:cell 3 (右上角) 到 cell 4 (左下角下一行) 物理上相邻,但 Z-order 编码 3 → 4 跨越很大。这就是为什么 GEOSEARCH 需要查<strong>中心单元 + 最多 8 个邻居单元</strong>,而不是只查目标点所在单元 — 圆可能跨过 Z-order 的"跳跃边界"落入相邻单元。
 </div>
 
 <!-- ============================================================ -->
@@ -617,7 +617,7 @@ uint64_t interleave64(uint32_t xlo, uint32_t ylo) {
   <!-- Reasons -->
   <rect x="200" y="40" width="700" height="76" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
   <text x="220" y="62" font-size="13" font-weight="700" fill="var(--diagram-green-text)">✓ 优势</text>
-  <text x="220" y="82" font-size="11" fill="var(--diagram-blue-text)">① 全球瓦片地图(Google/OSM/Mapbox)的标准范围 — GEOHASH 输出可直接用于地图渲染</text>
+  <text x="220" y="82" font-size="11" fill="var(--diagram-blue-text)">① 与 Web 地图常用纬度范围一致 — 便于和地图系统交换坐标,但 GEOHASH 不是瓦片编号</text>
   <text x="220" y="100" font-size="11" fill="var(--diagram-blue-text)">② 墨卡托投影下经纬度比接近 1:1 — Geohash 网格更接近正方形, 误差均匀</text>
 
   <rect x="200" y="124" width="700" height="50" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
@@ -746,7 +746,7 @@ uint64_t interleave64(uint32_t xlo, uint32_t ylo) {
   <rect x="20" y="246" width="880" height="64" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
   <text x="40" y="266" font-size="12" font-weight="700" fill="var(--diagram-orange-text)">★ 命令读取路径:</text>
   <text x="40" y="282" font-size="11" font-family="monospace" fill="var(--diagram-blue-text)">GEOPOS / GEOHASH → ZSCORE → 反解 lon/lat 或 base32 11 字符</text>
-  <text x="40" y="298" font-size="11" font-family="monospace" fill="var(--diagram-blue-text)">GEODIST → 2× ZSCORE → 反解 → Haversine ;  GEOSEARCH → 9× ZRANGEBYSCORE → 二次过滤</text>
+  <text x="40" y="298" font-size="11" font-family="monospace" fill="var(--diagram-blue-text)">GEODIST → 2× ZSCORE → 反解 → Haversine ;  GEOSEARCH → 最多 9 个区域扫描 → 二次过滤</text>
 </svg>
 
 <h3>12.4.3 GEO 命令对应的 ZSet 操作</h3>
@@ -759,7 +759,7 @@ uint64_t interleave64(uint32_t xlo, uint32_t ylo) {
       <tr><td><code>GEOADD</code></td><td><code>ZADD</code></td><td>1 次 geohashEncode</td><td>O(log N)</td></tr>
       <tr><td><code>GEOPOS</code></td><td><code>ZSCORE</code></td><td>1 次 geohashDecode</td><td>O(1)</td></tr>
       <tr><td><code>GEODIST</code></td><td>2 次 <code>ZSCORE</code></td><td>2 次 decode + Haversine</td><td>O(1)</td></tr>
-      <tr><td><code>GEOSEARCH</code></td><td>9 次 <code>ZRANGEBYSCORE</code></td><td>step 推导 + Haversine 过滤</td><td>O(log N + M)</td></tr>
+      <tr><td><code>GEOSEARCH</code></td><td>最多 9 个 geohash 区域扫描</td><td>step 推导 + Haversine 过滤</td><td>O(log N + M)</td></tr>
       <tr><td><code>GEORADIUSBYMEMBER</code></td><td><code>ZSCORE</code> + GEOSEARCH</td><td>同上</td><td>O(log N + M)</td></tr>
       <tr><td><code>GEOHASH</code></td><td><code>ZSCORE</code></td><td>转 11 字符 base32</td><td>O(1)</td></tr>
       <tr><td><code>GEOSEARCHSTORE</code></td><td>GEOSEARCH + <code>ZADD</code></td><td>结果集存到 dst</td><td>O(log N + M)</td></tr>
@@ -773,11 +773,11 @@ uint64_t interleave64(uint32_t xlo, uint32_t ylo) {
 <h2 id="s12-5">12.5 范围查询:9 邻居单元</h2>
 <!-- ============================================================ -->
 
-<p>这一节是 GEOSEARCH 的核心算法。从"圆形范围"转化到"9 个矩形并集",再转化到"9 次 ZRANGEBYSCORE",每一步都有取舍。掌握 step 推导与 9 邻居关系,才能解释为什么大半径查询会慢、为什么 step-1 安全裕量必要。</p>
+<p>这一节是 GEOSEARCH 的核心算法。从"圆形范围"转化到"按半径选出的若干矩形候选",再转化到一组 ZSet score 区间扫描,每一步都有取舍。掌握 step 推导与邻居关系,才能解释为什么大半径查询会慢、为什么 step-1 安全裕量必要。</p>
 
 <h3>12.5.1 为什么需要查 9 个单元</h3>
 
-<p class="svg-title">图 12-5-1 · 圆形范围跨越单元边界 → 必须查 9 个邻居单元</p>
+<p class="svg-title">图 12-5-1 · 圆形范围跨越单元边界 → 需要查中心和最多 8 个邻居</p>
 <svg class="svg-diagram" viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
   <defs>
     <linearGradient id="n9-c" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-green-fill-start)"/><stop offset="1" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
@@ -815,14 +815,14 @@ uint64_t interleave64(uint32_t xlo, uint32_t ylo) {
     <text x="14" y="94" font-size="13" font-weight="700" fill="var(--diagram-blue-text)">8 个邻居单元</text>
     <text x="14" y="114" font-size="11" fill="var(--diagram-blue-text)">N/S/E/W:lon 或 lat ±1</text>
     <text x="14" y="132" font-size="11" fill="var(--diagram-blue-text)">NE/NW/SE/SW:对角线 ±1</text>
-    <text x="14" y="152" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">★ P 越靠近边/角, 圆越可能跨入邻居 — 必须 9 个全查</text>
+    <text x="14" y="152" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">★ P 越靠近边/角, 圆越可能跨入邻居 — Redis 收集中心和有效邻居</text>
 
     <rect x="0" y="180" width="460" height="120" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
     <text x="14" y="200" font-size="13" font-weight="700" fill="var(--diagram-orange-text)">工程取舍 ★ 过覆盖 + 二次过滤</text>
     <text x="14" y="220" font-size="11" fill="var(--diagram-red-text)">9 矩形并集 ⊋ 圆 → 角点会拉进"圆外候选"</text>
     <text x="14" y="240" font-size="11" fill="var(--diagram-blue-text)">→ §12.6 Haversine 精确距离过滤剔除</text>
     <text x="14" y="266" font-size="11" font-weight="700" fill="var(--diagram-purple-text)">总开销:</text>
-    <text x="80" y="266" font-size="11" fill="var(--diagram-blue-text)">9× ZRANGEBYSCORE + M× Haversine</text>
+    <text x="80" y="266" font-size="11" fill="var(--diagram-blue-text)">最多 9 个区域扫描 + M× Haversine</text>
     <text x="14" y="284" font-size="11" fill="var(--diagram-blue-text)">M = 9 矩形并集内候选点数</text>
 
     <rect x="0" y="314" width="460" height="58" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
@@ -1103,7 +1103,7 @@ uint64_t interleave64(uint32_t xlo, uint32_t ylo) {
     <thead><tr><th>公式</th><th>地球假设</th><th>误差(&lt; 1 km)</th><th>误差(&gt; 1000 km)</th><th>计算开销</th></tr></thead>
     <tbody>
       <tr><td>平面欧几里得</td><td>平面</td><td>&lt; 1 m</td><td>数百 km</td><td>1×</td></tr>
-      <tr><td><strong>Haversine</strong></td><td><strong>球面</strong></td><td><strong>&lt; 0.5 m</strong></td><td><strong>&lt; 5 km(地球扁率)</strong></td><td><strong>3×</strong></td></tr>
+      <tr><td><strong>Haversine</strong></td><td><strong>球面</strong></td><td><strong>通常数米内</strong></td><td><strong>可达数 km(地球扁率)</strong></td><td><strong>3×</strong></td></tr>
       <tr><td>Vincenty</td><td>椭球面(WGS84)</td><td>&lt; 0.01 m</td><td>&lt; 1 m</td><td>100× 迭代</td></tr>
       <tr><td>Andoyer-Lambert</td><td>椭球面近似</td><td>&lt; 0.1 m</td><td>&lt; 100 m</td><td>10×</td></tr>
     </tbody>
@@ -1111,7 +1111,12 @@ uint64_t interleave64(uint32_t xlo, uint32_t ylo) {
 </div>
 
 <div class="key-insight">
-  <strong>为什么 Redis 选 Haversine 而非 Vincenty</strong>:① 1 km 内误差 &lt; 1 m,远低于 GPS 自身精度;② Vincenty 需迭代收敛,每次 GEODIST 增加 ~100× CPU,在高频 LBS 场景会拖累 P99;③ 即使长距离 5 km 误差,业务对绝对距离误差容忍度高(找 1000 km 外的设施时,差 5 km 不影响决策)。
+  <strong>为什么 Redis 选 Haversine 而非 Vincenty</strong>:
+  <ul>
+    <li>短距离误差通常在 GPS 和业务容忍范围内。</li>
+    <li>Vincenty 需要迭代收敛,高频 GEODIST 会增加明显 CPU。</li>
+    <li>长距离下球面模型可能有数公里误差,所以 GEO 更适合作候选粗筛;精确路线交给路径规划服务。</li>
+  </ul>
 </div>
 
 <!-- ============================================================ -->
@@ -1193,7 +1198,7 @@ uint64_t interleave64(uint32_t xlo, uint32_t ylo) {
 
   <rect x="20" y="350" width="880" height="40" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
   <text x="40" y="370" font-size="12" font-weight="700" fill="var(--diagram-purple-text)">★ 结论:</text>
-  <text x="120" y="370" font-size="11" fill="var(--diagram-blue-text)">总误差 ≈ max(单元化, 球面假设) — 100 km 内总误差 &lt; 100 m, 远低于 GPS 输入精度 (5-10 m)</text>
+  <text x="120" y="370" font-size="11" fill="var(--diagram-blue-text)">总误差取决于半径、纬度与定位源;GEO 适合粗筛,路线/测绘需专用服务</text>
 </svg>
 
 <h3>12.7.2 不同距离场景的误差预算</h3>
@@ -1203,11 +1208,11 @@ uint64_t interleave64(uint32_t xlo, uint32_t ylo) {
   <table>
     <thead><tr><th>场景</th><th>半径 r</th><th>Geohash 误差</th><th>Haversine 误差</th><th>总误差</th><th>用户感知</th></tr></thead>
     <tbody>
-      <tr><td>找附近 1 km 商家</td><td>1 km</td><td>±0.3 m</td><td>&lt; 1 m</td><td>&lt; 2 m</td><td>无感</td></tr>
-      <tr><td>找附近 10 km 商家</td><td>10 km</td><td>±0.3 m</td><td>&lt; 10 m</td><td>&lt; 11 m</td><td>无感</td></tr>
-      <tr><td>找省内 100 km 设施</td><td>100 km</td><td>±0.3 m</td><td>&lt; 100 m</td><td>&lt; 101 m</td><td>无感</td></tr>
-      <tr><td>跨国 1 000 km</td><td>1 000 km</td><td>±0.3 m</td><td>&lt; 5 km</td><td>&lt; 5 km</td><td>0.5% 误差,业务可接受</td></tr>
-      <tr><td>极端 10 000 km</td><td>10 000 km</td><td>±0.3 m</td><td>&lt; 21 km</td><td>&lt; 21 km</td><td>0.2% 误差(地球半径方向)</td></tr>
+      <tr><td>找附近 1 km 商家</td><td>1 km</td><td>约米级以内</td><td>通常数米内</td><td>业务多无感</td><td>适合粗筛</td></tr>
+      <tr><td>找附近 10 km 商家</td><td>10 km</td><td>约米级以内</td><td>通常数十米内</td><td>业务多无感</td><td>适合粗筛</td></tr>
+      <tr><td>找省内 100 km 设施</td><td>100 km</td><td>约米级以内</td><td>可到数百米</td><td>需看业务</td><td>不要当精确测距</td></tr>
+      <tr><td>跨国 1 000 km</td><td>1 000 km</td><td>约米级以内</td><td>可到数公里</td><td>需看业务</td><td>只适合候选粗筛</td></tr>
+      <tr><td>极端 10 000 km</td><td>10 000 km</td><td>约米级以内</td><td>可到数十公里</td><td>不适合精确距离</td><td>用专业地理库</td></tr>
     </tbody>
   </table>
 </div>
@@ -1417,7 +1422,7 @@ uint64_t interleave64(uint32_t xlo, uint32_t ylo) {
   <text x="780" y="212" text-anchor="middle" font-family="monospace" font-size="10" fill="var(--diagram-green-text)">BYRADIUS | BYBOX</text>
   <text x="780" y="226" text-anchor="middle" font-family="monospace" font-size="10" fill="var(--diagram-green-text)">[ASC|DESC] [COUNT n]</text>
   <text x="780" y="240" text-anchor="middle" font-family="monospace" font-size="10" fill="var(--diagram-green-text)">[WITHCOORD][WITHDIST][WITHHASH]</text>
-  <text x="780" y="262" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">★ 7.0+ 推荐</text>
+  <text x="780" y="262" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">★ 6.2+ 推荐</text>
 
   <rect x="660" y="295" width="240" height="50" rx="6" fill="url(#gx-leaf)" stroke="var(--diagram-green-stroke)"/>
   <text x="780" y="316" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="var(--diagram-green-text)">GEOSEARCHSTORE dst src ...</text>
@@ -1425,7 +1430,7 @@ uint64_t interleave64(uint32_t xlo, uint32_t ylo) {
 
   <rect x="660" y="358" width="240" height="58" rx="6" fill="url(#gx-dep)" stroke="var(--diagram-red-stroke)"/>
   <text x="780" y="378" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="var(--diagram-red-text)">GEORADIUS / BYMEMBER</text>
-  <text x="780" y="396" text-anchor="middle" font-size="10" fill="var(--diagram-red-text)">7.0 标记 deprecated</text>
+  <text x="780" y="396" text-anchor="middle" font-size="10" fill="var(--diagram-red-text)">6.2+ 标记 deprecated</text>
   <text x="780" y="410" text-anchor="middle" font-size="10" fill="var(--diagram-red-text)">迁移至 GEOSEARCH</text>
 </svg>
 
@@ -1437,8 +1442,8 @@ uint64_t interleave64(uint32_t xlo, uint32_t ylo) {
     116.3219 39.8991 "fuxingmen"
 (integer) 4
 
-# 以 (116.4, 39.9) 为中心,半径 5 km,按距离升序,带坐标 + 距离,只返回前 3 个
-127.0.0.1:6379&gt; GEOSEARCH store FROMLONLAT 116.4 39.9 BYRADIUS 5 km ASC \
+# 以 (116.4, 39.9) 为中心,半径 8 km,按距离升序,带坐标 + 距离,只返回前 3 个
+127.0.0.1:6379&gt; GEOSEARCH store FROMLONLAT 116.4 39.9 BYRADIUS 8 km ASC \
     WITHCOORD WITHDIST COUNT 3
 1) 1) "wangfujing"
    2) "0.7042"
@@ -1576,7 +1581,7 @@ uint64_t interleave64(uint32_t xlo, uint32_t ylo) {
   <text x="560" y="196" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">⑤ 半径单位默认 m</text>
   <text x="560" y="216" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">5 → 5 m 而非 5 km</text>
   <rect x="460" y="242" width="200" height="60" rx="6" fill="url(#pit-leaf)" stroke="var(--diagram-orange-stroke)"/>
-  <text x="560" y="266" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">⑥ GEORADIUS deprecated</text>
+  <text x="560" y="266" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">⑥ GEORADIUS deprecated(6.2+)</text>
   <text x="560" y="286" text-anchor="middle" font-size="10" fill="var(--diagram-blue-text)">7.x+ 用 GEOSEARCH</text>
 
   <path d="M760,142 L760,170" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#pit-arr)"/>
@@ -1601,7 +1606,7 @@ uint64_t interleave64(uint32_t xlo, uint32_t ylo) {
       <tr><td>3</td><td>大半径(&gt; 1000 km)查询慢</td><td>GEOSEARCH 耗时 100+ ms</td><td>9 单元覆盖范围大,ZRANGEBYSCORE 扫描多</td><td>限制查询半径,或预过滤行政区</td></tr>
       <tr><td>4</td><td>ZRANGEBYSCORE 候选过多</td><td>RDB / AOF 慢,内存放大</td><td>M 大,Haversine 二次过滤 CPU 高</td><td>缩小半径或加 <code>COUNT</code></td></tr>
       <tr><td>5</td><td>半径单位混淆</td><td>半径写 5 实际是 5 m,业务以为 5 km</td><td>GEOSEARCH 默认 m,GEORADIUS 同</td><td>显式写 unit,如 <code>BYRADIUS 5 km</code></td></tr>
-      <tr><td>6</td><td>旧命令 GEORADIUS</td><td>7.x 后已 deprecated 警告</td><td>命令拆分简化为 GEOSEARCH</td><td>迁移到 GEOSEARCH</td></tr>
+      <tr><td>6</td><td>旧命令 GEORADIUS</td><td>6.2+ 已 deprecated</td><td>命令拆分简化为 GEOSEARCH</td><td>迁移到 GEOSEARCH</td></tr>
       <tr><td>7</td><td>集群下 GEOSEARCHSTORE 失败</td><td>CROSSSLOT error</td><td>dst 与 src 不在同 slot</td><td>用 hash tag 强制同 slot</td></tr>
       <tr><td>8</td><td>多 GEO key 不在同 slot</td><td>同上</td><td>默认按 key 计算 slot</td><td>用 <code>{geo}:cn</code>、<code>{geo}:us</code></td></tr>
     </tbody>
@@ -1642,8 +1647,8 @@ for shop in candidates:
       <li><strong>阶段 2</strong>:导航 API 只算 ≤ 50 次, 而非全表</li>
       <li><strong>排序</strong>:按真实驾车距离排序, 用户体验贴近现实</li>
       <li><strong>降级</strong>:导航 API 故障时退回 Haversine, 在 UI 提示"估算"</li>
-  - 真实距离展示准确
-  - 用户体验提升</code></pre>
+      <li><strong>结果</strong>:真实距离展示准确,用户体验提升</li>
+    </ul>
   </div>
 </div>
 
@@ -1976,10 +1981,10 @@ double geohashGetDistance(double lon1d, double lat1d,
       <tr><td>52 位完美装入 double 尾数</td><td>IEEE 754 double 尾数 52 位</td><td>无精度损失</td></tr>
       <tr><td>纬度限制 ±85.05° (Web 墨卡托)</td><td><code>GEO_LAT_MIN/MAX</code></td><td>极地坐标无法 GEOADD</td></tr>
       <tr><td>GEO 完全复用 ZSet 存储</td><td><code>geoaddCommand → zsetAdd</code></td><td><code>OBJECT ENCODING</code> 返回 listpack/skiplist</td></tr>
-      <tr><td>9 邻居单元覆盖圆形范围</td><td><code>membersOfAllNeighbors</code></td><td>需 step-1 安全裕量</td></tr>
+      <tr><td>中心 + 邻居单元给出候选覆盖</td><td><code>membersOfAllNeighbors</code></td><td>还需 Haversine 过滤与 step 安全裕量</td></tr>
       <tr><td>Haversine 二次距离过滤</td><td><code>geoAppendIfWithinShape</code></td><td>精确圆形 ≠ Geohash 矩形</td></tr>
       <tr><td>Haversine 选用 WGS84 平均半径</td><td><code>EARTH_RADIUS_IN_METERS = 6372797.560856</code></td><td>1 km 内误差 &lt; 1 m</td></tr>
-      <tr><td>GEORADIUS 已 deprecated</td><td>7.0 命令拆分</td><td>迁移到 GEOSEARCH</td></tr>
+      <tr><td>GEORADIUS 已 deprecated</td><td>6.2 引入 GEOSEARCH 后标记</td><td>迁移到 GEOSEARCH</td></tr>
       <tr><td>集群下需 hash tag</td><td>CROSSSLOT 错误</td><td>用 <code>{geo}:cn</code> 强制同 slot</td></tr>
       <tr><td>大半径(&gt; 1000 km)性能下降</td><td>9 单元覆盖巨大</td><td>限制半径或换 PostGIS</td></tr>
       <tr><td>GEODIST 是球面直线,非道路</td><td>Haversine 公式</td><td>需路径规划服务做精算</td></tr>
@@ -2041,10 +2046,10 @@ redis-cli OBJECT ENCODING geo:test
 </div>
 
 <div class="key-insight">
-  <strong>教学结论(生产可直接借用)</strong>:<br>
+  <strong>诊断结论(生产要结合业务半径和路线服务)</strong>:<br>
   ① GEO 完全是 ZSet 的语义皮 — <strong>持久化 / 复制 / cluster 自动支持</strong>;<br>
   ② 52 位精度 = 0.6 m,<strong>高于消费 GPS 自身误差</strong>,无需提高;<br>
-  ③ <strong>GEOSEARCH 半径 ≤ 100 km 时性能优秀</strong>(&lt; 1 ms),超大半径请评估业务必要性;<br>
+  ③ <strong>GEOSEARCH 延迟取决于候选点数量</strong>,半径越大越要评估业务必要性和 COUNT/ANY;<br>
   ④ <strong>必须显式写半径单位</strong>(<code>5 km</code> 而非 <code>5</code>),省略默认 m 是常见 bug 源;<br>
   ⑤ 集群下 GEO 多 key 操作必须 <strong>hash tag</strong>(<code>{geo}:xx</code>);<br>
   ⑥ <strong>GEODIST 不是路径距离</strong>,UI 显示需要路径规划服务二次计算。

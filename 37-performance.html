@@ -64,20 +64,10 @@
   <p class="lead">Redis 性能优化的目标<strong>不是抬高单次 <code>redis-benchmark</code> 的吞吐数字</strong>,而是把端到端延迟分解到具体源头:主线程是否被慢命令占住、网络是否在 RTT 空等、连接池是否积压、持久化是否引入 fork 毛刺、内存编码是否将对象撑胖。优化的每一步都必须能用<strong>"指标 → 源码入口 → 修复手段"</strong>的因果链解释清楚。</p>
   <p>诊断框架可概括为"<strong>先找等待,再找放大器</strong>":先确认延迟来自 Redis 内部还是外部,再确认内部延迟由哪类操作放大。本章按命令路径(socket → 解析 → 执行 → 持久化 → 回复)展开,逐段给出指标、源码入口、修复工具。</p>
   <ul class="will-learn">
-    <li>一次命令从 socket 到 P99 的完整路径:<code>aeApiPoll</code> → <code>readQueryFromClient</code> → <code>processInputBuffer</code> → <code>processCommand</code> → <code>call()</code> → <code>addReply</code></li>
-    <li>基线必填五维:吞吐、延迟分位数、副作用计数、负载形状、数据形状,以及 <code>redis-benchmark</code> 标准命令</li>
-    <li>单线程事件循环阻塞路径,以及 <code>KEYS</code> / <code>HGETALL</code> / <code>SMEMBERS</code> / <code>DEL</code> 的替代方案</li>
-    <li><code>DEL</code> 与 <code>UNLINK</code> 在主线程释放路径上的差异,以及 <code>lazyfree-lazy-user-del</code> 配置语义</li>
-    <li>延迟 taxonomy:客户端 / 网络 / Redis 服务端 / OS 四段拆分,以及 <code>--latency</code> / <code>SLOWLOG</code> / <code>LATENCY</code> 三件套的边界</li>
-    <li>Pipeline 深度 1 / 4 / 16 / 64 / 256 / 1024 实测吞吐与 P99 抖动曲线,以及"甜点 16-64"经验值的依据</li>
-    <li>编码切换点 listpack ↔ hashtable 对 <code>HGET</code> 路径的影响,以及 Big Key 阈值与排查命令</li>
-    <li><code>BGSAVE</code> 期间 CoW 内存增长曲线,以及 <code>latest_fork_usec</code> / <code>aof_delayed_fsync</code> 的告警阈值</li>
-    <li>输出缓冲区监控指标 <code>omem</code> / <code>obl</code> / <code>oll</code> 与慢消费者故障树</li>
-    <li>P99 抖动 → 处置动作的决策树:网络 → SLOWLOG → LATENCY → 连接池 → Hot key → 火焰图</li>
-    <li>发布护栏矩阵:基线可复现 / 延迟分布完整 / Redis 内外拆分 / 副作用可控 / 回滚明确</li>
-    <li><code>perf record</code> + flame graph + bpftrace 的进阶诊断梯度,以及典型热点函数解读</li>
-    <li>源码入口表:<code>ae.c</code> / <code>networking.c</code> / <code>server.c</code> / <code>slowlog.c</code> / <code>latency.c</code> 的关键函数</li>
-    <li>四条设计取舍:命令单线程、I/O threads 仅做读写、Pipeline 不改变命令复杂度、LATENCY 采样不全量直方图</li>
+    <li>如何把一次命令拆成网络、解析、执行、持久化和回复五段来看 P99</li>
+    <li>为什么优化前必须先建立包含分位数、副作用和数据形状的基线</li>
+    <li>哪些问题用 SCAN/UNLINK/Pipeline 能缓解,哪些只是把成本换了位置</li>
+    <li>何时从内建命令升级到 perf、flame graph 与 bpftrace</li>
   </ul>
   <p class="prereq">前置知识:第 5 章字符串与编码(理解 listpack / hashtable 切换);第 17-18 章 RDB/AOF(理解 fork / fsync 物理成本);第 21 章 RESP 协议(理解 <code>processInputBuffer</code>);第 28 章 Lua / Functions(理解脚本阻塞主线程);第 34 章 ACL(理解命令权限校验在 <code>call()</code> 前);Linux 性能分析基础(perf / bpftrace / 火焰图阅读)。</p>
 </div>
@@ -177,11 +167,11 @@
 <h2 id="s37-0">37.0 端到端命令路径与源码入口</h2>
 
 <div class="key-insight">
-  <strong>核心结论:</strong> 一次 Redis 请求穿过的源码路径决定了性能问题的<strong>诊断起点</strong>。理解每段代码对应的指标,可避免"端到端慢"被误判为"命令慢"。<strong>定位顺序永远是:网络 → 命令 → 内部事件 → 客户端 → 系统调用 → 火焰图。</strong>
+  <strong>核心结论:</strong> 一次 Redis 请求穿过的源码路径决定了性能问题的<strong>诊断起点</strong>。理解每段代码对应的指标,可避免"端到端慢"被误判为"命令慢"。<strong>推荐定位顺序是:网络 → 命令 → 内部事件 → 客户端 → 系统调用 → 火焰图。</strong>
 </div>
 
 <div class="real-world">
-  <strong>真实事故:</strong> 某团队接到告警"Redis P99 抖动到 80 ms",立刻把 <code>SLOWLOG</code> 全员调阈值到 1 ms,结果只看到几条 <code>HGETALL</code> 在 3 ms 左右。继续追 <code>LATENCY DOCTOR</code> 才发现是 <code>fork</code> 事件 850 ms — 业务在凌晨低峰窗口触发了 <code>BGSAVE</code>,服务端的 <code>SLOWLOG</code> 不会记录这种<strong>非命令延迟</strong>。<strong>教训:</strong>慢日志只看命令执行时间,不包括 fork、fsync、过期、淘汰、复制等内部事件,排查时必须把 <code>SLOWLOG</code>、<code>LATENCY</code>、<code>--latency</code> 三件套<strong>并列拉一遍</strong>。
+  <strong>案例化场景:</strong> 某团队接到告警"Redis P99 抖动到 80 ms",立刻把 <code>SLOWLOG</code> 全员调阈值到 1 ms,结果只看到几条 <code>HGETALL</code> 在 3 ms 左右。继续追 <code>LATENCY DOCTOR</code> 才发现是 <code>fork</code> 事件 850 ms — 业务在凌晨低峰窗口触发了 <code>BGSAVE</code>,服务端的 <code>SLOWLOG</code> 不会记录这种<strong>非命令延迟</strong>。<strong>教训:</strong>慢日志只看命令执行时间,不包括 fork、fsync、过期、淘汰、复制等内部事件,排查时必须把 <code>SLOWLOG</code>、<code>LATENCY</code>、<code>--latency</code> 三件套<strong>并列拉一遍</strong>。
 </div>
 
 <p class="svg-title">图 37-0-1 · 从 socket 到 P99 的源码地图</p>
@@ -529,7 +519,7 @@ real    0m0.012s
 $ redis-cli INFO memory | grep lazyfree_pending_objects
 lazyfree_pending_objects:1</code></pre>
 
-<p><code>DEL</code> 1.8 秒占用主线程,期间所有命令排队。<code>UNLINK</code> 仅 12 毫秒,后台线程异步释放。<strong>生产建议默认开 <code>lazyfree-lazy-user-del yes</code></strong>,使 <code>DEL</code> 自动走异步路径,业务代码不需要全量改写为 <code>UNLINK</code>。</p>
+<p><code>DEL</code> 1.8 秒占用主线程,期间所有命令排队。<code>UNLINK</code> 仅 12 毫秒,后台线程异步释放。生产更稳妥的做法是<strong>先把大 key 删除路径显式改为 <code>UNLINK</code></strong>;若要开启 <code>lazyfree-lazy-user-del yes</code>,需评估监控、容量与客户端语义,因为所有 <code>DEL</code> 都会变成异步释放。</p>
 
 <h2 id="s37-3">37.3 延迟来源分类</h2>
 
@@ -635,7 +625,7 @@ Customer C1004, I have observed latency spikes in this Redis instance.
 - fork: check THP, overcommit and dataset size.</code></pre>
 
 <div class="key-insight">
-  <code>--latency</code> 平均 0.18 ms 而业务慢 → 问题不在网络。<code>LATENCY LATEST</code> 显示 fork 事件 141 微秒 → 提示检查持久化路径。两个工具<strong>结论方向相反</strong>,但都来自服务端自省,可靠性高于客户端 trace。
+  <code>--latency</code> 平均 0.18 ms 而业务慢 → 问题不在网络。<code>LATENCY LATEST</code> 显示 fork 事件 141 毫秒 → 提示检查持久化路径。两个工具<strong>结论方向相反</strong>,但都来自服务端自省,可靠性高于单点客户端 trace。
 </div>
 
 <h2 id="s37-4">37.4 Pipeline 与网络往返</h2>
@@ -738,7 +728,7 @@ Customer C1004, I have observed latency spikes in this Redis instance.
   <!-- P99 注释 -->
   <text x="640" y="265" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="700">P99 ↗</text>
   <text x="760" y="265" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="700">P99 ↗↗</text>
-  <text x="460" y="318" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">甜点 16-64 · 吞吐高 + P99 低</text>
+  <text x="460" y="318" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">本样例甜点区 16-64 · 实际需按负载重测</text>
   <text x="760" y="318" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">&gt; 256 吞吐增益微小 · P99 显著恶化</text>
 </svg>
 
@@ -875,7 +865,7 @@ $ redis-cli --bigkeys -i 0.05
 [12.51%] Biggest string found 'rate:checkout:C1001' has 524288 bytes</code></pre>
 
 <div class="warning">
-  <code>-i 0.05</code> 在每条命令后睡眠 50 毫秒,<strong>避免扫描自身制造延迟</strong>。生产应在低峰期执行 <code>--bigkeys</code>,且必须搭配 <code>-i</code>。直接 <code>--bigkeys</code> 在大库上等价于 <code>KEYS *</code>。
+  <code>-i 0.05</code> 在每条扫描命令后睡眠 50 毫秒,<strong>降低排查本身制造的延迟</strong>。<code>--bigkeys</code> 基于 SCAN 游标,不是一次性 <code>KEYS *</code>;但它仍会遍历 keyspace 并占用主线程,大库应在低峰期执行,并搭配 <code>-i</code> 与限时窗口。
 </div>
 
 <h2 id="s37-6">37.6 持久化副作用</h2>
@@ -919,8 +909,8 @@ $ redis-cli --bigkeys -i 0.05
 <thead><tr><th><code>appendfsync</code></th><th>行为</th><th>单写延迟</th><th>数据丢失上限</th><th>适用场景</th></tr></thead>
 <tbody>
 <tr><td><code>always</code></td><td>每次 write 后 fsync</td><td>高(磁盘 IOPS)</td><td>0</td><td>强一致性要求</td></tr>
-<tr><td><code>everysec</code></td><td>每秒后台 fsync</td><td>低</td><td>≤ 1 秒</td><td>默认推荐</td></tr>
-<tr><td><code>no</code></td><td>交给内核(通常 30 秒)</td><td>极低</td><td>≤ 30 秒</td><td>缓存场景</td></tr>
+<tr><td><code>everysec</code></td><td>每秒后台 fsync</td><td>低</td><td>通常约 1 秒,异常 I/O 下可能更长</td><td>默认推荐</td></tr>
+<tr><td><code>no</code></td><td>交给内核回写策略</td><td>极低</td><td>不保证固定上限,可能数十秒或更长</td><td>仅可丢数据的缓存场景</td></tr>
 </tbody>
 </table>
 
@@ -1320,7 +1310,7 @@ redis-cli LATENCY LATEST > post-latency.txt</code></pre>
   <path d="M440,105 L460,105" stroke="var(--diagram-border)" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
   <path d="M620,105 L640,105" stroke="var(--diagram-border)" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
   <path d="M800,105 L820,105" stroke="var(--diagram-border)" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
-  <text x="460" y="175" text-anchor="middle" fill="var(--diagram-muted)" font-size="11">每环节都可在线诊断 · 全程不需要重启 Redis · 仅 99 Hz 采样不影响 P99</text>
+  <text x="460" y="175" text-anchor="middle" fill="var(--diagram-muted)" font-size="11">每环节都可在线诊断 · 通常无需重启 Redis · 采样开销仍需短窗口验证</text>
 </svg>
 
 <pre><code class="language-bash">$ pid=$(pgrep -f redis-server | head -n 1)

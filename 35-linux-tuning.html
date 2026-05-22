@@ -57,18 +57,10 @@
   <p class="lead">Redis 主线程在用户态执行命令,但其性能与可用性<strong>大量依赖内核行为</strong>:<code>fork()</code> 系统调用是否被 overcommit 策略拒绝、Transparent Huge Pages 是否放大写时复制、<code>somaxconn</code> 是否截断 accept 队列、<code>fdatasync</code> 是否被 I/O 调度延迟、<code>setrlimit</code> 是否被 systemd 覆盖。这些边界决定了相同 Redis 二进制在不同宿主机上呈现差异显著的吞吐与尾延迟。</p>
   <p>本章按内核子系统组织:<strong>内存</strong>(overcommit、THP、swappiness)、<strong>网络</strong>(somaxconn、tcp-backlog)、<strong>CPU</strong>(affinity、NUMA)、<strong>文件描述符</strong>(ulimit、systemd)、<strong>I/O 调度</strong>(块设备 scheduler)。每个参数与 Redis 源码路径绑定,并给出验证命令与发布阈值。</p>
   <ul class="will-learn">
-    <li>三种 <code>vm.overcommit_memory</code> 策略对 Redis fork 可用性的影响</li>
-    <li>Transparent Huge Pages 将 CoW 复制粒度放大 <strong>512 倍</strong>的根因与禁用方法</li>
-    <li>fork 期间内存容量预算公式(数据集 + CoW + buffer + backlog + 碎片 + OS)</li>
-    <li>实际 accept 队列长度为 <code>min(tcp-backlog, somaxconn)</code> 的截断规则</li>
-    <li>NUMA 拓扑下 cpunodebind / interleave 两种策略的选型决策</li>
-    <li>systemd 服务<strong>不继承 <code>/etc/security/limits.conf</code></strong>,必须用 <code>LimitNOFILE</code></li>
-    <li>cgroup v2 <code>memory.max</code> 必须 ≥ <code>maxmemory × 1.5</code> 才能容纳 CoW 与 buffer</li>
-    <li><code>vm.swappiness=1</code> 比 <code>0</code> 更安全(0 在某些内核版本仍触发 OOM)</li>
-    <li>NVMe 用 <code>none</code> scheduler、SATA SSD 用 <code>mq-deadline</code> 的选型依据</li>
-    <li>容器内改宿主机 sysctl 无效的命名空间隔离原理</li>
-    <li><code>mem_fragmentation_ratio &lt; 1.0</code> 通常是 swap 而非低碎片的诊断方法</li>
-    <li>调优闭环验证:Redis 指标 + 系统指标 + 发布阈值矩阵</li>
+    <li>为什么 Redis 的 <code>fork()</code>、CoW 和 THP 会把"内存够不够"变成内核问题</li>
+    <li>怎样用容量模型而不是固定倍数评估 <code>maxmemory</code>、cgroup 与客户端缓冲</li>
+    <li>网络 backlog、systemd nofile、NUMA 与 I/O scheduler 哪些值得调,哪些必须先压测</li>
+    <li>每个调优项如何回到 Redis 指标与系统指标做闭环验证</li>
   </ul>
   <p class="prereq">前置知识:第 17 章 RDB(理解 fork + CoW);第 18 章 AOF(理解 <code>fsync</code> 三策略);第 22 章 jemalloc(理解 <code>mem_fragmentation_ratio</code>);第 23 章淘汰(理解 maxmemory 容量预算);Linux 内核基础(虚拟内存、page cache、cgroup v2、systemd、NUMA、块设备调度器)。读者最好亲手跑过 <code>sysctl -a</code> 并查过几个内核参数的含义。</p>
 </div>
@@ -238,7 +230,7 @@
     </thead>
     <tbody>
       <tr><td><code>0</code>(默认启发式)</td><td>估算可用内存,大进程 fork 可能被拒</td><td>大数据集 BGSAVE 间歇性失败</td><td>❌ 不推荐</td></tr>
-      <tr><td><code>1</code>(始终允许)</td><td>总是允许 fork,延迟到实际写入</td><td>fork 必然成功,CoW 余量需自行保证</td><td>✅ 推荐</td></tr>
+      <tr><td><code>1</code>(始终允许)</td><td>放宽 fork 准入,延迟到实际写入</td><td>更不易被预先拒绝,但物理内存/cgroup 余量仍需保证</td><td>✅ Redis 常见建议</td></tr>
       <tr><td><code>2</code>(严格记账)</td><td>限制总虚拟内存 ≤ 物理内存 + swap × ratio</td><td>Redis fork 经常被拒</td><td>❌ 不推荐</td></tr>
     </tbody>
   </table>
@@ -285,7 +277,7 @@
       <text x="760" y="204" text-anchor="middle" fill="var(--diagram-red-text)" font-size="13" font-weight="800">strict(严格记账)</text>
       <text x="760" y="220" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">committed ≤ swap + RAM × ratio</text>
       <text x="760" y="236" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">overcommit_kbytes / _ratio</text>
-      <text x="760" y="250" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">⚠ fork 几乎必然 ENOMEM</text>
+      <text x="760" y="250" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">⚠ 大数据集更易 ENOMEM</text>
 
       <line x1="180" y1="254" x2="180" y2="290" stroke="var(--diagram-orange-stroke)" marker-end="url(#d-arr)"/>
       <line x1="470" y1="254" x2="470" y2="290" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
@@ -295,12 +287,12 @@
       <text x="180" y="314" text-anchor="middle" fill="var(--diagram-red-text)" font-size="12" font-weight="800">空闲不足 → 返回 ENOMEM</text>
 
       <rect x="350" y="290" width="240" height="40" rx="8" fill="url(#d-green)" filter="url(#d-shadow)"/>
-      <text x="470" y="314" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">fork 成功 → 子进程开始</text>
+      <text x="470" y="314" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">准入通过 → 仍看内存余量</text>
 
       <rect x="640" y="290" width="240" height="40" rx="8" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
       <text x="760" y="314" text-anchor="middle" fill="var(--diagram-red-text)" font-size="12" font-weight="800">RAM 不足 → 立即 ENOMEM</text>
 
-      <text x="20" y="350" fill="var(--diagram-muted)" font-size="11">★ Redis 生产推荐:vm.overcommit_memory=1 — 结合 §35.3 容量预算保证物理内存充足</text>
+      <text x="20" y="350" fill="var(--diagram-muted)" font-size="11">★ Redis 常见建议:vm.overcommit_memory=1 — 但必须结合 §35.3 容量预算和 cgroup 限额</text>
     </g>
   </svg>
 </div>
@@ -397,18 +389,18 @@ rdb_last_bgsave_status:ok</code></pre>
     </thead>
     <tbody>
       <tr><td><code>always</code></td><td>所有匿名映射均尝试合并大页</td><td>CoW 放大严重</td></tr>
-      <tr><td><code>madvise</code></td><td>仅 <code>madvise(MADV_HUGEPAGE)</code> 区域使用大页</td><td>Redis 不主动 advise,但仍可能被 khugepaged 后台合并</td></tr>
+      <tr><td><code>madvise</code></td><td>仅显式建议的区域使用大页</td><td>Redis 通常不主动请求,但仍应核验发行版与依赖库行为</td></tr>
       <tr><td><code>never</code></td><td>完全禁用</td><td>CoW 粒度恒为 4 KiB</td></tr>
     </tbody>
   </table>
 </div>
 
-<p><code>madvise</code> 下 khugepaged 后台扫描线程仍可能将连续 4 KiB 页面合并为大页,fork 行为不确定。<strong>生产应统一为 <code>never</code></strong>。</p>
+<p><code>madvise</code> 不是"一定会合并",但也不应只看配置名做假设。生产基线通常把 Redis 所在宿主机统一设为 <code>never</code>,并用 <code>/sys/kernel/mm/transparent_hugepage/enabled</code> 与 fork 延迟指标复核。</p>
 
 <h3>35.2.3 fork 期间 RSS 增长曲线对比</h3>
 
 <div class="diagram">
-  <div class="diagram-title">图 35-2-1 · BGSAVE 期间 RSS 增长 — THP=always vs never</div>
+  <div class="diagram-title">图 35-2-3 · BGSAVE 期间 RSS 增长 — THP=always vs never</div>
 <svg viewBox="0 0 940 360" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
   <defs>
     <linearGradient id="rss-bad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
@@ -449,7 +441,7 @@ rdb_last_bgsave_status:ok</code></pre>
   <text x="80" y="314" font-size="12" font-weight="700" fill="var(--diagram-purple-text)">数据来源</text>
   <text x="170" y="314" font-size="11" fill="var(--diagram-blue-text)">Redis 32 GiB · BGSAVE 30 s 窗口 · 8% 写脏率</text>
   <text x="80" y="332" font-size="11" font-weight="700" fill="var(--diagram-orange-text)">★ 结论:</text>
-  <text x="150" y="332" font-size="11" fill="var(--diagram-blue-text)">生产必须 THP=never, 否则 BGSAVE 触发 OOM 概率随数据集线性放大</text>
+  <text x="150" y="332" font-size="11" fill="var(--diagram-blue-text)">生产通常建议 THP=never, 并用 BGSAVE/fork 指标确认 CoW 毛刺是否下降</text>
 </svg>
 </div>
 
@@ -635,7 +627,7 @@ print(f"Required free   : {required_free_gb:.1f} GiB")
 
       <text x="20" y="40" fill="var(--diagram-blue-text)" font-size="13" font-weight="800">★ 双队列结构 — 半连接队列 + accept 队列</text>
       <text x="20" y="60" fill="var(--diagram-muted)" font-size="11">★ 高 QPS 短连接场景:somaxconn=128 默认值会让 accept 队列被截断,业务侧表现为偶发 connect timeout</text>
-      <text x="20" y="80" fill="var(--diagram-red-text)" font-size="11">★ 修复:sysctl -w net.core.somaxconn=65535 + net.ipv4.tcp_max_syn_backlog=65535</text>
+      <text x="20" y="80" fill="var(--diagram-red-text)" font-size="11">★ 修复:按压测容量同步提高 tcp-backlog、somaxconn 与 tcp_max_syn_backlog,不要只改一处</text>
     </g>
   </svg>
 </div>
@@ -673,9 +665,9 @@ LISTEN 0 128 0.0.0.0:6379 0.0.0.0:*
 $ netstat -s | grep -i 'listen queue'
 1832 times the listen queue of a socket overflowed
 
-# 修复
-$ sudo sysctl -w net.core.somaxconn=65535
-$ sudo sysctl -w net.ipv4.tcp_max_syn_backlog=65535
+# 示例修复:按连接峰值与压测结果设置,不是所有实例都需要 65535
+$ sudo sysctl -w net.core.somaxconn=4096
+$ sudo sysctl -w net.ipv4.tcp_max_syn_backlog=8192
 $ ss -ltn 'sport = :6379'
 LISTEN 0 511 0.0.0.0:6379 0.0.0.0:*</code></pre>
 
@@ -955,8 +947,8 @@ Max open files            65535                65535                files</code>
       <line x1="470" y1="180" x2="470" y2="210" stroke="var(--diagram-purple-stroke)" marker-end="url(#d-arr)"/>
 
       <polygon points="470,210 660,260 470,310 280,260" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="2"/>
-      <text x="470" y="252" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="13" font-weight="800">memory.max ≥ maxmemory × 1.5?</text>
-      <text x="470" y="268" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11">含 ②③④⑤⑥ 总和</text>
+      <text x="470" y="252" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="13" font-weight="800">容量模型是否留足余量?</text>
+      <text x="470" y="268" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11">含 ②③④⑤⑥,1.5× 只是常见起点</text>
 
       <line x1="280" y1="260" x2="180" y2="340" stroke="var(--diagram-red-stroke)" marker-end="url(#d-arr-r)"/>
       <text x="200" y="304" text-anchor="middle" fill="var(--diagram-red-text)" font-size="12" font-weight="700">否</text>
@@ -969,7 +961,7 @@ Max open files            65535                65535                files</code>
 
       <rect x="620" y="340" width="280" height="50" rx="10" fill="url(#d-green)" filter="url(#d-shadow)"/>
       <text x="760" y="362" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">★ 余量充足</text>
-      <text x="760" y="378" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">推荐 MemoryHigh=×1.4 + MemoryMax=×1.5</text>
+      <text x="760" y="378" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">按数据集、写脏率、client buffer 与 backlog 估算</text>
     </g>
   </svg>
 </div>
@@ -983,8 +975,8 @@ Max open files            65535                65535                files</code>
       <tr><th>配置</th><th>含义</th><th>建议值</th></tr>
     </thead>
     <tbody>
-      <tr><td><code>MemoryHigh</code></td><td>软限制,超过后内核回收</td><td>maxmemory × 1.4</td></tr>
-      <tr><td><code>MemoryMax</code></td><td>硬限制,超过 OOM kill</td><td>maxmemory × 1.5</td></tr>
+      <tr><td><code>MemoryHigh</code></td><td>软限制,超过后内核回收</td><td>由容量模型决定,可从 maxmemory × 1.3-1.4 起测</td></tr>
+      <tr><td><code>MemoryMax</code></td><td>硬限制,超过 OOM kill</td><td>由容量模型决定,常见起点约 maxmemory × 1.5</td></tr>
       <tr><td><code>MemoryEvents</code></td><td>计数 high/oom_kill 次数</td><td>监控对象</td></tr>
     </tbody>
   </table>
@@ -1005,15 +997,15 @@ Max open files            65535                65535                files</code>
       <tr><th>取值</th><th>行为</th><th>Redis 建议</th></tr>
     </thead>
     <tbody>
-      <tr><td>0</td><td>仅 OOM 时使用 swap</td><td>单实例机器</td></tr>
-      <tr><td>1</td><td>极少使用 swap</td><td>✅ 推荐</td></tr>
+      <tr><td>0</td><td>尽量避免匿名页换出,具体语义随内核变化</td><td>可选,需和 OOM 策略一起验证</td></tr>
+      <tr><td>1</td><td>极少使用 swap</td><td>常见保守值</td></tr>
       <tr><td>60(默认)</td><td>平衡 page cache 与匿名页</td><td>❌ 不推荐</td></tr>
       <tr><td>100</td><td>倾向 swap</td><td>❌ 不推荐</td></tr>
     </tbody>
   </table>
 </div>
 
-<p><code>vm.swappiness=0</code> 在某些内核版本下"完全不使用 swap"会触发 OOM,<strong>推荐使用 <code>1</code> 作为安全下限</strong>。</p>
+<p><code>vm.swappiness</code> 没有跨内核的唯一安全值。很多 Redis 基线会从 <code>1</code> 开始,但是否使用 <code>0</code>、是否禁用 swap,应结合 OOM 策略、cgroup、监控与故障演练决定。</p>
 
 <h3>35.7.2 swap 触发延迟放大</h3>
 
@@ -1385,9 +1377,9 @@ Swap:                   0 kB</code></pre>
       <tr><td>2</td><td>THP madvise 残留</td><td>BGSAVE RSS 暴涨</td><td>khugepaged 后台合并</td><td>THP enabled 字段</td><td>持久化为 never</td></tr>
       <tr><td>3</td><td>systemd 未继承 limits</td><td>maxclients 启动降级</td><td>systemd 不读 limits.conf</td><td>启动日志、<code>/proc/&lt;pid&gt;/limits</code></td><td>drop-in 加 LimitNOFILE</td></tr>
       <tr><td>4</td><td>容器内改宿主机 sysctl</td><td>容器内成功宿主未生效</td><td>容器命名空间隔离</td><td>宿主机 <code>/proc/sys</code></td><td>节点初始化 DaemonSet</td></tr>
-      <tr><td>5</td><td>cgroup memory.max = maxmemory</td><td>BGSAVE 期间 OOM kill</td><td>CoW 与 buffer 在 maxmemory 外</td><td><code>memory.events</code> oom_kill</td><td>memory.max ≥ maxmemory × 1.5</td></tr>
-      <tr><td>6</td><td>swappiness 60</td><td>偶发百毫秒延迟</td><td>内核倾向 swap 匿名页</td><td>smaps Swap 非零</td><td>设为 1</td></tr>
-      <tr><td>7</td><td>碎片率 &lt; 1 误判</td><td>看似无碎片实为 swap</td><td>RSS &lt; used_memory</td><td>smaps_rollup Swap</td><td>查 swap 而非看 INFO</td></tr>
+      <tr><td>5</td><td>cgroup memory.max = maxmemory</td><td>BGSAVE 期间 OOM kill</td><td>CoW 与 buffer 在 maxmemory 外</td><td><code>memory.events</code> oom_kill</td><td>按容量模型给 CoW/buffer/backlog 留余量</td></tr>
+      <tr><td>6</td><td>swappiness 60</td><td>偶发百毫秒延迟</td><td>内核倾向 swap 匿名页</td><td>smaps Swap 非零</td><td>从 1 等保守值起测并监控</td></tr>
+      <tr><td>7</td><td>碎片率 &lt; 1 误判</td><td>看似无碎片,可能是 swap 或记账差异</td><td>RSS &lt; used_memory</td><td>smaps_rollup Swap</td><td>查 smaps/容器记账而非只看 INFO</td></tr>
     </tbody>
   </table>
 </div>
@@ -1404,13 +1396,13 @@ MemoryMax=32G
     <p>cgroup 边界与 Redis 数据集大小重合,CoW + buffer + 子进程内存无处可放,fork 期间必然被 cgroup OOM Killer 杀掉。</p>
   </div>
   <div class="compare-card good">
-    <h4>✅ 正例 · 留出 50% 余量</h4>
+    <h4>✅ 正例 · 按容量模型留余量</h4>
 <pre><code class="language-properties">[Service]
 MemoryHigh=42G
 MemoryMax=48G
 # Redis maxmemory 32gb
 # 余量覆盖 CoW + buffer + 子进程</code></pre>
-    <p>memory.max 设为 maxmemory × 1.5,留出 16 GiB 容纳 CoW 与子进程,fork 期间不会撞墙。</p>
+    <p>这里的 48G 是由写脏率、客户端缓冲、backlog、碎片和子进程开销估算得出;在别的实例上应重新建模并用 BGSAVE/AOF rewrite 压测验证。</p>
   </div>
 </div>
 
@@ -1531,7 +1523,7 @@ MemoryMax=48G
     </thead>
     <tbody>
       <tr><td><code>vm.overcommit_memory=2</code></td><td>严格限制内存超卖</td><td>Redis fork 频繁被拒,持久化可用性下降</td></tr>
-      <tr><td>THP 设为 <code>madvise</code></td><td>比 <code>never</code> 温和</td><td>khugepaged 仍可能合并,行为不确定</td></tr>
+      <tr><td>THP 设为 <code>madvise</code></td><td>比 <code>never</code> 温和</td><td>不能只凭配置名判断,仍需验证实际 THP 与 fork 指标</td></tr>
       <tr><td>backlog 一律设最大</td><td>重启风暴不丢连接</td><td>掩盖客户端连接池泄漏</td></tr>
       <tr><td><code>memory.max = maxmemory</code></td><td>预算清晰</td><td>CoW + buffer 不计入,触发 OOM</td></tr>
       <tr><td>给 Redis 绑满一组 CPU</td><td>看似更多核</td><td>主线程 cache locality 下降,IRQ 未隔离</td></tr>
@@ -1551,15 +1543,15 @@ MemoryMax=48G
     </thead>
     <tbody>
       <tr><td>Redis fork 依赖 overcommit</td><td><code>vm.overcommit_memory=1</code></td><td>启发式策略下大数据集 fork 被拒</td></tr>
-      <tr><td>THP 将 CoW 复制粒度放大 512 倍</td><td><code>transparent_hugepage=never</code></td><td>madvise 仍被 khugepaged 合并</td></tr>
-      <tr><td>实际 backlog = min(tcp-backlog, somaxconn)</td><td><code>somaxconn 65535 + tcp-backlog 65535</code></td><td>仅改 Redis 配置无效</td></tr>
+      <tr><td>THP 可能将 CoW 复制粒度放大 512 倍</td><td><code>transparent_hugepage=never</code> + fork 指标</td><td>只看配置不看实际效果</td></tr>
+      <tr><td>实际 backlog = min(tcp-backlog, somaxconn)</td><td>按连接峰值设置 somaxconn/tcp-backlog</td><td>仅改 Redis 配置无效</td></tr>
       <tr><td>systemd 不继承 limits.conf</td><td><code>LimitNOFILE</code> drop-in</td><td>maxclients 静默降级</td></tr>
-      <tr><td>cgroup memory.max 必须 ≥ maxmemory × 1.5</td><td><code>MemoryMax</code></td><td>OOM kill 风险</td></tr>
-      <tr><td>swappiness 1 比 0 更安全</td><td><code>vm.swappiness=1</code></td><td>部分内核 0 触发 OOM</td></tr>
+      <tr><td>cgroup memory.max 要覆盖 maxmemory 外成本</td><td><code>MemoryMax</code> + 容量模型</td><td>固定倍数替代建模</td></tr>
+      <tr><td>swappiness 要与 OOM 策略一起验证</td><td><code>vm.swappiness</code> + smaps</td><td>跨内核照搬固定值</td></tr>
       <tr><td>NVMe 用 none scheduler</td><td><code>/sys/block/.../scheduler</code></td><td>mq-deadline 在 NVMe 引入额外延迟</td></tr>
       <tr><td>容器内改宿主机 sysctl 无效</td><td>DaemonSet 节点初始化</td><td>命名空间隔离</td></tr>
       <tr><td>调优必须闭环验证</td><td>变更前后 INFO + sysctl + smaps</td><td>参数改了不代表 Redis 改善</td></tr>
-      <tr><td><code>mem_fragmentation_ratio &lt; 1</code> 通常是 swap</td><td><code>/proc/&lt;pid&gt;/smaps_rollup Swap</code></td><td>误判为低碎片</td></tr>
+      <tr><td><code>mem_fragmentation_ratio &lt; 1</code> 需二次确认</td><td><code>/proc/&lt;pid&gt;/smaps_rollup Swap</code> + cgroup 指标</td><td>误判为低碎片</td></tr>
     </tbody>
   </table>
 </div>
@@ -1567,7 +1559,7 @@ MemoryMax=48G
 <h3>最小回归测试</h3>
 
 <pre><code class="language-bash">sudo sysctl -w vm.overcommit_memory=1 vm.swappiness=1
-sudo sysctl -w net.core.somaxconn=65535 net.ipv4.tcp_max_syn_backlog=65535
+sudo sysctl -w net.core.somaxconn=4096 net.ipv4.tcp_max_syn_backlog=8192
 echo never | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
 sudo systemctl restart redis
 
@@ -1582,8 +1574,6 @@ cat /proc/$(pgrep -n redis-server)/limits | grep 'Max open files'</code></pre>
 </div>
 
 <p class="footer">&copy; 2026 图解 Redis &middot; 第 35 章 &middot; Linux 内核调优</p>
-
-</div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/c.min.js"></script>

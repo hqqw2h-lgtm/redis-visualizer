@@ -52,25 +52,25 @@
 <div class="article">
 
 <h1>第 26 章 · Sentinel 哨兵</h1>
-<p class="subtitle">独立进程 · Pub/Sub 自动发现 · SDOWN/ODOWN 两阶段判定 · epoch + Raft 风格 Leader 选举 · 故障转移五阶段 · 副本三层排序 · 脑裂保护</p>
+<p class="subtitle">独立进程 · Pub/Sub 自动发现 · SDOWN/ODOWN 两阶段判定 · epoch + 单票 Leader 选举 · 故障转移五阶段 · 副本三层排序 · 脑裂保护</p>
 
 <div class="chapter-intro">
-  <p class="lead">Sentinel 是一组独立部署的进程,负责对一组 Redis 主从节点执行三项任务:<strong>监控存活、触发故障转移、向客户端通告新主节点地址</strong>。其设计核心包括:基于 <strong>Pub/Sub 的拓扑自动发现</strong>、<strong>SDOWN/ODOWN 两阶段故障判定</strong>、<strong>Raft 风格的 Leader 选举</strong>、<strong>epoch 单调递增</strong>的版本号机制。Sentinel 自身保持无共享状态,仅通过 Pub/Sub 与 INFO 命令收集信息。</p>
-  <p>本章按"拓扑发现 → 故障判定 → 选举转移 → 生产实践"四层组织,聚焦 Sentinel 在第 25 章主从复制基础上构建的<strong>故障检测与自动切换</strong>机制。读完本章你应当能够看着 <code>SENTINEL master mymaster</code> 输出说出每一项的含义、为什么 quorum 必须过半、以及 epoch 单调递增如何配合 quorum 防止脑裂。</p>
+  <p class="lead">Sentinel 是一组独立部署的进程,负责对一组 Redis 主从节点执行三项任务:<strong>监控存活、触发故障转移、向客户端通告新主节点地址</strong>。其设计核心包括:基于 <strong>Pub/Sub 的拓扑自动发现</strong>、<strong>SDOWN/ODOWN 两阶段故障判定</strong>、<strong>epoch + 同 epoch 单票的 Leader 选举</strong>。Sentinel 自身保持无共享状态,通过 Pub/Sub 与 INFO 命令收集信息。</p>
+  <p>本章按"拓扑发现 → 故障判定 → 选举转移 → 生产实践"四层组织,聚焦 Sentinel 在第 25 章主从复制基础上构建的<strong>故障检测与自动切换</strong>机制。读完本章你应当能够看着 <code>SENTINEL master mymaster</code> 输出说出每一项的含义、区分 quorum 的 ODOWN 门槛与故障转移授权所需的多数派,以及 epoch 如何避免同轮多个 Leader。</p>
   <ul class="will-learn">
     <li>仅主从复制 vs 主从+Sentinel 在七个维度上的能力差异</li>
     <li>Sentinel 通过 <code>__sentinel__:hello</code> 频道<strong>自动发现</strong>集群成员的协议细节</li>
     <li>SDOWN(单 Sentinel 视角)与 ODOWN(集体仲裁)的关系与时序</li>
-    <li>quorum 与 N/2+1 的关系:为什么 quorum 必须严格过半才能避免脑裂</li>
+    <li>quorum 与多数派的关系:ODOWN 使用 quorum,failover 授权还需要多数 Sentinel 同意</li>
     <li>实例状态机 UP / SDOWN / ODOWN / FAILOVER 五状态与转换条件</li>
-    <li>Sentinel 选举与 Raft 在 7 个维度上的<strong>异同</strong></li>
+    <li>Sentinel 选举与 Raft 的相似点和关键差异,避免把 Sentinel 误解为完整共识系统</li>
     <li>epoch 单调递增 + 同 epoch 1 票约束如何保证选举安全</li>
     <li>故障转移五阶段(选副本 → 提升 → 重定向 → 广播 → 旧主降级)的耗时分布</li>
     <li>副本选择三层排序(priority / offset / runid)的判定优先级</li>
     <li>三机房五 Sentinel 的部署模式与脑裂保护机制</li>
     <li>10 类生产陷阱(quorum 过低、down-after-ms 过小、THP、客户端硬编码等)</li>
   </ul>
-  <p class="prereq">前置知识:第 24 章 PubSub(理解 <code>__sentinel__:hello</code> 频道工作原理);第 25 章主从复制(理解 <code>REPLICAOF</code>、PSYNC、复制 offset);分布式共识基础(Raft 的 term + leader election 概念,后续会与 Sentinel 的 epoch 机制对照)。读者最好亲手跑过三 Sentinel 监控一主两从的拓扑并触发过一次故障转移。</p>
+  <p class="prereq">前置知识:第 30 章 Pub/Sub(理解 <code>__sentinel__:hello</code> 频道工作原理);第 25 章主从复制(理解 <code>REPLICAOF</code>、PSYNC、复制 offset);分布式选举基础(Raft 的 term + leader election 概念,后续会与 Sentinel 的 epoch 机制对照)。读者最好亲手跑过三 Sentinel 监控一主两从的拓扑并触发过一次故障转移。</p>
 </div>
 
 <h3>本章全景图</h3>
@@ -130,8 +130,8 @@
       <rect x="40" y="340" width="860" height="100" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
       <text x="60" y="364" fill="var(--diagram-blue-text)" font-size="13" font-weight="800">★ 阅读路径</text>
       <text x="60" y="386" fill="var(--diagram-muted)" font-size="10">· 入门:1→2→6(理解 Sentinel 在拓扑中的位置 + 状态机骨架)</text>
-      <text x="60" y="404" fill="var(--diagram-muted)" font-size="10">· 故障判定:4→5(SDOWN 是单 Sentinel 主观判定,ODOWN 才是过半客观下线)</text>
-      <text x="60" y="422" fill="var(--diagram-muted)" font-size="10">· 选举与切换:7→8→9(epoch 单调递增 + Raft 风格 + 副本选择三层排序)</text>
+      <text x="60" y="404" fill="var(--diagram-muted)" font-size="10">· 故障判定:4→5(SDOWN 是单 Sentinel 主观判定,ODOWN 是 quorum 仲裁)</text>
+      <text x="60" y="422" fill="var(--diagram-muted)" font-size="10">· 选举与切换:7→8→9(epoch 单调递增 + 单票约束 + 副本选择三层排序)</text>
       <text x="60" y="436" fill="var(--diagram-muted)" font-size="10">· 生产:10→11→12(3 节点最小可用,5 节点跨机房,陷阱重点看脑裂/误判)</text>
     </g>
   </svg>
@@ -222,7 +222,7 @@
 <p>Sentinel 进程与数据进程是<strong>分离</strong>的:Sentinel 不存储用户数据,Redis 数据节点不参与故障判定决策。Sentinel 通过订阅数据节点的 <code>__sentinel__:hello</code> 频道相互发现,通过 INFO 命令收集复制拓扑。</p>
 
 <div class="key-insight">
-  <strong>为什么独立部署</strong>:Sentinel 选择"独立进程而非内嵌共识"是有意为之。代价是部署复杂度增加(需额外维护 N+M 个进程),收益是<strong>故障域隔离</strong> — 数据节点可保持单线程简洁性,Sentinel 可独立升级,主节点崩溃不会拖垮 Sentinel 本身。第 27 章 Cluster 走另一条路:把判定与选举内嵌到数据节点,代价是数据节点协议复杂度上升。
+  <strong>为什么独立部署</strong>:Sentinel 选择"独立进程而非把故障判定内嵌到数据节点"是有意为之。代价是部署复杂度增加(需额外维护 N+M 个进程),收益是<strong>故障域隔离</strong> — 数据节点可保持单线程简洁性,Sentinel 可独立升级,主节点崩溃不会拖垮 Sentinel 本身。第 27 章 Cluster 走另一条路:把判定与选举内嵌到数据节点,代价是数据节点协议复杂度上升。
 </div>
 
 <!-- ============================================================ -->
@@ -453,7 +453,7 @@ sentinel parallel-syncs mymaster 1</code></pre>
     <g transform="translate(40, 200)">
       <rect x="0" y="0" width="840" height="80" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
       <text x="20" y="22" fill="var(--diagram-purple-text)" font-size="12" font-weight="700">字段用途</text>
-      <text x="20" y="44" fill="var(--diagram-blue-text)" font-size="11">• 前 4 字段 → 发现新 Sentinel + 同步 epoch (Raft 风格的视图版本号)</text>
+      <text x="20" y="44" fill="var(--diagram-blue-text)" font-size="11">• 前 4 字段 → 发现新 Sentinel + 同步 epoch (视图版本号)</text>
       <text x="20" y="64" fill="var(--diagram-blue-text)" font-size="11">• 后 4 字段 → 检测拓扑分歧(谁认为谁是 master),触发"配置共享"协议</text>
     </g>
   </svg>
@@ -709,7 +709,7 @@ void sentinelCheckSubjectivelyDown(sentinelRedisInstance *ri) {
 <h2 id="s26-5">26.5 ODOWN 客观下线仲裁</h2>
 <!-- ============================================================ -->
 
-<p>ODOWN(Objectively Down,客观下线)是 Sentinel 集群通过投票达成的<strong>集体共识</strong>:至少 quorum 个 Sentinel 都认为 master 不可达。它是触发 Leader 选举与故障转移的前置条件。</p>
+<p>ODOWN(Objectively Down,客观下线)是 Sentinel 基于投票得到的<strong>quorum 仲裁结果</strong>:至少 quorum 个 Sentinel 都认为 master 不可达。它是触发 Leader 选举的前置条件,但真正执行 failover 还需要获得足够 Sentinel 的授权(通常至少多数派,并且不少于 quorum)。</p>
 
 <h3>26.5.1 ODOWN 投票时序</h3>
 
@@ -773,11 +773,11 @@ void sentinelCheckSubjectivelyDown(sentinelRedisInstance *ri) {
 
       <rect x="280" y="316" width="620" height="154" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
       <text x="300" y="338" fill="var(--diagram-blue-text)" font-size="12" font-weight="800">★ ODOWN 仲裁的关键设计</text>
-      <text x="300" y="358" fill="var(--diagram-muted)" font-size="11">· 单个 Sentinel 的 SDOWN 永远无法直接触发 failover</text>
+      <text x="300" y="358" fill="var(--diagram-muted)" font-size="11">· 单个 Sentinel 的 SDOWN 不能直接触发 failover</text>
       <text x="300" y="376" fill="var(--diagram-muted)" font-size="11">· 必须通过 quorum 个 Sentinel 都同意 → 容忍单个 Sentinel 误判 / GC pause / 网络抖动</text>
       <text x="300" y="394" fill="var(--diagram-muted)" font-size="11">· 投票请求里带 epoch=0 表示"只问下线状态,不竞选 Leader"</text>
       <text x="300" y="412" fill="var(--diagram-muted)" font-size="11">· 投票响应里返回 leader_runid + epoch → 同一报文复用为 Leader 选举的"投票"通道</text>
-      <text x="300" y="436" fill="var(--diagram-muted)" font-size="11">· quorum 必须严格过半(&gt; N/2),否则网络分区两侧均可独立达成 ODOWN → 脑裂</text>
+      <text x="300" y="436" fill="var(--diagram-muted)" font-size="11">· ODOWN 看 quorum;failover 授权还需多数派,不要把二者混为一个阈值</text>
       <text x="300" y="456" fill="var(--diagram-red-text)" font-size="11">⚠ ODOWN 仅对 master 有效;对 replica/sentinel 不做客观下线投票</text>
     </g>
   </svg>
@@ -824,11 +824,11 @@ void sentinelCheckSubjectivelyDown(sentinelRedisInstance *ri) {
       <g transform="translate(20, 40)" font-family="monospace" font-size="11">
         <rect x="0" y="0" width="380" height="80" rx="8" fill="url(#q-maj)" opacity="0.2" stroke="var(--diagram-orange-stroke)"/>
         <text x="20" y="22" fill="var(--diagram-orange-text)" font-weight="700">分区 A (3 个 Sentinel)</text>
-        <text x="20" y="44" fill="var(--diagram-green-text)">3 ≥ quorum=3 → 可 ODOWN + 选举 + 提升新主</text>
+        <text x="20" y="44" fill="var(--diagram-green-text)">3 ≥ quorum=3 且为多数派 → 可 ODOWN + 授权 failover</text>
 
         <rect x="420" y="0" width="380" height="80" rx="8" fill="url(#q-down)" opacity="0.2" stroke="var(--diagram-red-stroke)"/>
         <text x="440" y="22" fill="var(--diagram-red-text)" font-weight="700">分区 B (2 个 Sentinel)</text>
-        <text x="440" y="44" fill="var(--diagram-red-text)">2 &lt; quorum=3 → 卡死,无法 ODOWN(避免脑裂)</text>
+        <text x="440" y="44" fill="var(--diagram-red-text)">2 &lt; quorum=3 且非多数派 → 不能授权 failover</text>
       </g>
     </g>
   </svg>
@@ -837,21 +837,21 @@ void sentinelCheckSubjectivelyDown(sentinelRedisInstance *ri) {
 <h3>26.5.3 quorum 选取建议</h3>
 
 <div class="diagram">
-  <div class="diagram-title">表 26-5-1 · quorum 选取与脑裂保护</div>
+  <div class="diagram-title">表 26-5-1 · quorum 选取与 failover 授权</div>
   <table>
-    <thead><tr><th>Sentinel 总数 N</th><th>quorum</th><th>容忍 Sentinel 故障数</th><th>是否避免脑裂</th></tr></thead>
+    <thead><tr><th>Sentinel 总数 N</th><th>quorum</th><th>ODOWN 容忍误判/离线</th><th>failover 授权说明</th></tr></thead>
     <tbody>
-      <tr><td>3</td><td>2</td><td>1</td><td><span style="color:var(--green)">是(过半)</span></td></tr>
-      <tr><td>5</td><td>3</td><td>2</td><td><span style="color:var(--green)">是(过半)</span></td></tr>
-      <tr><td>7</td><td>4</td><td>3</td><td><span style="color:var(--green)">是(过半)</span></td></tr>
-      <tr><td>3</td><td>1</td><td>2</td><td><span style="color:var(--red)">否(可能脑裂)</span></td></tr>
-      <tr><td>5</td><td>2</td><td>3</td><td><span style="color:var(--red)">否(可能脑裂)</span></td></tr>
+      <tr><td>3</td><td>2</td><td>1</td><td><span style="color:var(--green)">quorum=多数派,最直观</span></td></tr>
+      <tr><td>5</td><td>3</td><td>2</td><td><span style="color:var(--green)">quorum=多数派,常用</span></td></tr>
+      <tr><td>7</td><td>4</td><td>3</td><td><span style="color:var(--green)">quorum=多数派,常用</span></td></tr>
+      <tr><td>3</td><td>1</td><td>2</td><td><span style="color:var(--orange)">ODOWN 过敏;failover 仍需多数授权</span></td></tr>
+      <tr><td>5</td><td>2</td><td>3</td><td><span style="color:var(--orange)">可用但要理解与多数授权的区别</span></td></tr>
     </tbody>
   </table>
 </div>
 
 <div class="warning">
-  <strong>quorum 必须严格过半</strong>:quorum 必须严格大于 N/2 才能保证故障转移在分区场景下不会同时在两个分区触发(脑裂)。配置 quorum &lt; ⌈(N+1)/2⌉ 等同于<strong>放弃脑裂保护</strong>。例如 N=3, quorum=1 时,网络一分为二的两侧都能各自达成 ODOWN,各自选 Leader,各自提升新主 — 分区恢复后两个"新主"互相覆盖,数据丢失不可逆。
+  <strong>不要把 quorum 与多数授权混为一谈</strong>:quorum 决定 ODOWN 判定灵敏度;failover 授权还要求获得足够 Sentinel 的投票(通常至少多数派,并且不少于 quorum)。把 quorum 设为多数派最容易理解和运维;设得过低会让 ODOWN 过敏,但并不意味着两个少数分区都能各自完成合法 failover。脑裂防护还需要客户端正确发现新主、旧主写保护(<code>min-replicas-*</code>)与网络分区策略共同完成。
 </div>
 
 <!-- ============================================================ -->
@@ -994,7 +994,7 @@ void sentinelCheckSubjectivelyDown(sentinelRedisInstance *ri) {
 <h2 id="s26-7">26.7 Leader 选举</h2>
 <!-- ============================================================ -->
 
-<p>ODOWN 成立后,所有 Sentinel 都可能想发起故障转移。为避免多个 Sentinel 同时执行造成冲突,Sentinel 采用 <strong>Raft 风格的 Leader 选举</strong>:每次故障转移都需要先选出唯一 Leader,只有 Leader 才能执行后续提升与广播。</p>
+<p>ODOWN 成立后,所有 Sentinel 都可能想发起故障转移。为避免多个 Sentinel 同时执行造成冲突,Sentinel 使用 <strong>epoch + 同 epoch 单票</strong>的 Leader 选举:每次故障转移都需要先选出唯一 Leader,只有 Leader 才能执行后续提升与广播。它与 Raft 选举有相似约束,但不是完整 Raft 共识。</p>
 
 <h3>26.7.1 Leader 选举时序</h3>
 
@@ -1059,12 +1059,12 @@ void sentinelCheckSubjectivelyDown(sentinelRedisInstance *ri) {
 <h3>26.7.2 Sentinel 选举与 Raft 的差异</h3>
 
 <div class="diagram">
-  <div class="diagram-title">表 26-7-1 · Sentinel 与 Raft 在 7 个维度上的对照</div>
+  <div class="diagram-title">表 26-7-1 · Sentinel 选举与 Raft 的相似点/差异</div>
   <table>
     <thead><tr><th>维度</th><th>Raft</th><th>Sentinel</th></tr></thead>
     <tbody>
       <tr><td>选举触发</td><td>Follower 超时未收到心跳</td><td>检测到 ODOWN</td></tr>
-      <tr><td>投票门槛</td><td>多数派(N/2 + 1)</td><td>quorum(配置项)</td></tr>
+      <tr><td>投票门槛</td><td>多数派(N/2 + 1)</td><td>ODOWN 用 quorum;failover 授权需足够投票(通常多数派且不少于 quorum)</td></tr>
       <tr><td>任期编号</td><td>term</td><td>epoch</td></tr>
       <tr><td>同 term 投票约束</td><td>每节点至多 1 票</td><td>同左</td></tr>
       <tr><td>Leader 角色</td><td>处理所有写入,后续日志复制</td><td>仅执行单次故障转移,转移完成后回归普通 Sentinel</td></tr>
@@ -1157,8 +1157,8 @@ struct sentinelRedisInstance {
       <text x="700" y="260" fill="var(--diagram-muted)" font-size="10">最多投 1 票:</text>
       <text x="700" y="282" fill="var(--diagram-green-text)" font-size="10">→ 同 epoch 至多 1 个</text>
       <text x="700" y="298" fill="var(--diagram-green-text)" font-size="10">  Leader 当选</text>
-      <text x="700" y="320" fill="var(--diagram-orange-text)" font-size="10">→ 配 quorum &gt; N/2 即</text>
-      <text x="700" y="336" fill="var(--diagram-orange-text)" font-size="10">  保证脑裂不脑裂</text>
+      <text x="700" y="320" fill="var(--diagram-orange-text)" font-size="10">→ 结合多数授权,同一轮</text>
+      <text x="700" y="336" fill="var(--diagram-orange-text)" font-size="10">  只能有一个合法 Leader</text>
       <text x="700" y="358" fill="var(--diagram-red-text)" font-size="10">⚠ flush 必须先于回复</text>
       <text x="700" y="374" fill="var(--diagram-red-text)" font-size="10">  否则崩溃后丢失 vote</text>
       <text x="700" y="390" fill="var(--diagram-red-text)" font-size="10">  状态 → 同 epoch 二次投票</text>
@@ -1166,7 +1166,7 @@ struct sentinelRedisInstance {
   </svg>
 </div>
 
-<p>epoch 单调递增 + 同 epoch 内每节点至多 1 票的<strong>两条约束</strong>,共同保证同一 epoch 内最多产生 1 个 Leader。配合 quorum 过半的要求,即使发生网络分区,任意时刻最多只有一个分区能选出 Leader 执行故障转移。</p>
+<p>epoch 单调递增 + 同 epoch 内每节点至多 1 票的<strong>两条约束</strong>,再加上 failover 授权所需的多数投票,共同保证同一 epoch 内最多产生一个合法 Leader。quorum 决定 ODOWN 灵敏度,多数授权决定谁能真正执行故障转移。</p>
 
 <h3>26.7.5 投票路径源码</h3>
 
@@ -1574,7 +1574,7 @@ int compareSlavesForPromotion(const void *a, const void *b) {
       <rect x="40" y="280" width="860" height="60" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
       <text x="60" y="304" fill="var(--diagram-blue-text)" font-size="11" font-weight="800">★ 5 节点跨三机房的安全性</text>
       <text x="60" y="322" fill="var(--diagram-muted)" font-size="10">A 整机房宕(2 票丢)→ B+C 仍有 3 票 ≥ quorum=3 → 提升 R2 成功 · A↔B 断链 → A+C/B+C 任意侧合 3 票胜出</text>
-      <text x="60" y="336" fill="var(--diagram-red-text)" font-size="10">⚠ 必须严格奇数机房;两机房 5 票拆 [3|2] 时小侧仍合 quorum=3 与大侧争夺 → 失败</text>
+      <text x="60" y="336" fill="var(--diagram-red-text)" font-size="10">⚠ 两机房容易在链路故障时把业务与投票绑死;第三仲裁域能让多数授权更清晰</text>
     </g>
   </svg>
 </div>
@@ -1582,7 +1582,7 @@ int compareSlavesForPromotion(const void *a, const void *b) {
 <h3>26.10.3 脑裂保护机制</h3>
 
 <div class="diagram">
-  <div class="diagram-title">图 26-10-2 · 网络分区下"过半 quorum"如何阻止脑裂</div>
+  <div class="diagram-title">图 26-10-2 · 网络分区下 quorum=多数派 + 写保护如何降低脑裂风险</div>
   <svg viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:920px;width:100%;margin:8px auto;height:auto;">
     <defs>
       <linearGradient id="dc-a" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
@@ -1604,8 +1604,8 @@ int compareSlavesForPromotion(const void *a, const void *b) {
 
       <text x="20" y="110" fill="var(--diagram-red-text)" font-family="monospace" font-size="11">投票:2 票 &lt; quorum=3</text>
       <text x="20" y="130" fill="var(--diagram-red-text)" font-family="monospace" font-size="11" font-weight="700">→ 无法 ODOWN</text>
-      <text x="20" y="150" fill="var(--diagram-red-text)" font-family="monospace" font-size="11">→ 无法选举,旧 M 仍尝试服务但被孤立</text>
-      <text x="20" y="170" fill="var(--diagram-red-text)" font-family="monospace" font-size="11">→ ★ 避免脑裂的关键</text>
+      <text x="20" y="150" fill="var(--diagram-red-text)" font-family="monospace" font-size="11">→ 无法授权 failover,旧 M 可能仍本地服务</text>
+      <text x="20" y="170" fill="var(--diagram-red-text)" font-family="monospace" font-size="11">→ 需 min-replicas 限制旧主写入</text>
     </g>
 
     <!-- 分区 2: 机房 B+C -->
@@ -1620,8 +1620,8 @@ int compareSlavesForPromotion(const void *a, const void *b) {
 
       <text x="20" y="110" fill="var(--diagram-green-text)" font-family="monospace" font-size="11">投票:3 票 ≥ quorum=3</text>
       <text x="20" y="130" fill="var(--diagram-green-text)" font-family="monospace" font-size="11" font-weight="700">→ ODOWN 成立</text>
-      <text x="20" y="150" fill="var(--diagram-green-text)" font-family="monospace" font-size="11">→ 选 Leader → 提升 R2 → 广播 +switch-master</text>
-      <text x="20" y="170" fill="var(--diagram-green-text)" font-family="monospace" font-size="11">→ ★ 单一新主,无脑裂</text>
+      <text x="20" y="150" fill="var(--diagram-green-text)" font-family="monospace" font-size="11">→ 获得多数授权 → 提升 R2 → 广播 +switch-master</text>
+      <text x="20" y="170" fill="var(--diagram-green-text)" font-family="monospace" font-size="11">→ 合法新主在多数侧</text>
     </g>
 
     <!-- 分区恢复 -->
@@ -1636,7 +1636,7 @@ int compareSlavesForPromotion(const void *a, const void *b) {
 </div>
 
 <div class="warning">
-  <strong>仲裁机房不是装饰</strong>:把第 5 个 Sentinel 放在"仲裁机房 C"是有意为之 — 当机房 A 与机房 B 之间网络断开时,仍由机房 C 决定哪一侧拥有过半票数。如果只有机房 A、B 两个机房各放 2-3 个 Sentinel,跨机房断链时双方都没有过半票数,故障转移直接卡死。<strong>奇数机房 + 奇数 Sentinel</strong> 是跨机房部署的硬要求。
+  <strong>仲裁机房不是装饰</strong>:把第 5 个 Sentinel 放在"仲裁机房 C"是有意为之 — 当机房 A 与机房 B 之间网络断开时,仍由机房 C 决定哪一侧拥有多数票。如果只有两个机房对称部署,跨机房断链时容易出现 2 vs 2 平局或业务侧旧主继续写入的风险。<strong>奇数 Sentinel + 清晰的多数授权域</strong> 是跨机房部署的硬要求。
 </div>
 
 <!-- ============================================================ -->
@@ -1677,7 +1677,7 @@ int compareSlavesForPromotion(const void *a, const void *b) {
     </tbody>
   </table>
   <div class="key-insight" style="margin-top:12px;">
-    <strong>关键观察</strong>:单 Sentinel 误判率<strong>指数下降</strong>;quorum 过半后集体误判率 ≈ 单误判率<sup>quorum</sup>;<strong>5000 ms 是"误判率与转移速度"的拐点</strong>(再小不显著提速,再大转移延迟过高)。
+    <strong>关键观察</strong>:在误判近似独立的理想模型下,quorum 提高后集体误判率会快速下降(约为单点误判率<sup>quorum</sup>);<strong>5000 ms 是示例中的"误判率与转移速度"折中点</strong>,实际应按 RTT P99 与业务恢复目标校准。
   </div>
 </div>
 
@@ -1723,7 +1723,7 @@ int compareSlavesForPromotion(const void *a, const void *b) {
       <text x="120" y="118" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">P1 · 配置类</text>
 
       <rect x="20" y="148" width="200" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
-      <text x="120" y="168" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">P11 · quorum &lt; N/2 → 脑裂</text>
+      <text x="120" y="168" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">P11 · quorum 过低/写保护缺失</text>
       <rect x="20" y="186" width="200" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
       <text x="120" y="206" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">P12 · down-after-ms 过小</text>
       <rect x="20" y="224" width="200" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
@@ -1773,7 +1773,7 @@ int compareSlavesForPromotion(const void *a, const void *b) {
       <text x="60" y="316" fill="var(--diagram-blue-text)" font-size="13" font-weight="800">★ 命中规律</text>
       <text x="60" y="338" fill="var(--diagram-muted)" font-size="11">· 配置类(P1):quorum/down-after-ms 必须按业务定;parallel-syncs 太大会让所有副本同时全量阻塞读</text>
       <text x="60" y="358" fill="var(--diagram-muted)" font-size="11">· 网络类(P2):Sentinel 必须能直接 PING 数据节点;hello 频道走 Pub/Sub,NAT 后端易丢</text>
-      <text x="60" y="378" fill="var(--diagram-muted)" font-size="11">· 脑裂类(P3):奇数 N + 严格 quorum &gt; N/2 + 配 min-replicas-to-write 三层防护缺一不可</text>
+      <text x="60" y="378" fill="var(--diagram-muted)" font-size="11">· 脑裂类(P3):奇数 N + 合理 quorum + 多数授权 + min-replicas 写保护缺一不可</text>
       <text x="60" y="398" fill="var(--diagram-muted)" font-size="11">· 客户端类(P4):必须用支持 Sentinel 协议的 client(jedis-sentinel/lettuce-sentinel/redis-py-sentinel)</text>
       <text x="60" y="418" fill="var(--diagram-red-text)" font-size="11">⚠ 最常见的故障来自硬编码 master:port — 故障转移成功后客户端仍写旧主,直到客户端重启</text>
       <text x="60" y="438" fill="var(--diagram-green-text)" font-size="11">✓ 防御:client 用 master_name 通过 Sentinel 解析当前主,并订阅 +switch-master 事件即时更新</text>
@@ -1788,7 +1788,7 @@ int compareSlavesForPromotion(const void *a, const void *b) {
   <table>
     <thead><tr><th>#</th><th>陷阱</th><th>症状</th><th>根因</th><th>监控指标</th><th>修复</th></tr></thead>
     <tbody>
-      <tr><td>1</td><td>quorum 设置不足</td><td>同时多个分区触发 failover</td><td>quorum &lt; N/2 + 1</td><td><code>+sdown</code> 事件计数</td><td>改为过半阈值</td></tr>
+      <tr><td>1</td><td>quorum 设置过低</td><td>ODOWN 过敏,误触发选举流程</td><td>把 quorum 当作唯一安全阈值</td><td><code>+sdown</code>/<code>+odown</code> 事件计数</td><td>优先使用多数派 quorum,并确认多数授权与 min-replicas</td></tr>
       <tr><td>2</td><td><code>down-after-ms</code> 过小</td><td>频繁误判触发故障转移</td><td>网络抖动超过阈值</td><td><code>+sdown</code> 与 <code>-sdown</code> 配对率</td><td>设置 5,000-10,000 ms</td></tr>
       <tr><td>3</td><td><code>parallel-syncs</code> 过大</td><td>提升后多 replica 同时全量同步压垮新主</td><td>默认 1 已合理</td><td><code>+sync-progress</code></td><td>保持 1</td></tr>
       <tr><td>4</td><td>Sentinel 与数据节点同机部署</td><td>主节点崩溃可能拖垮 Sentinel</td><td>资源争用</td><td>OS 层 OOM kill</td><td>独立部署</td></tr>
@@ -1808,13 +1808,13 @@ int compareSlavesForPromotion(const void *a, const void *b) {
 sentinel monitor mymaster 192.168.1.10 6379 1
 # Sentinel 总数 3,quorum=1
 # 任一 Sentinel 误判都可触发 ODOWN
-# 网络分区时两个分区均可能选出 Leader → 脑裂
+# 但合法 failover 仍需多数授权;低 quorum 的问题是过敏和误切风险
 
-# 正模式:quorum 过半
+# 正模式:quorum 取多数派
 sentinel monitor mymaster 192.168.1.10 6379 2
 # Sentinel 总数 3,quorum=2
 # 至少 2 个 Sentinel 同意才进入 ODOWN
-# 满足分区分割时仅多数派一侧可选举</code></pre>
+# 分区时只有多数派一侧可能获得 failover 授权</code></pre>
 
 <pre><code class="language-bash"># 反模式:旧主分区未启用写保护
 # 旧主在分区期间继续接受写入,分区恢复后被覆盖
@@ -1957,21 +1957,21 @@ CONFIG SET min-replicas-max-lag 10
 
 <h3>26.13.3 设计取舍</h3>
 
-<h4>取舍 1:独立进程 vs 内嵌共识</h4>
+<h4>取舍 1:独立进程 vs 内嵌故障判定</h4>
 
-<p>Sentinel 选择独立进程而非将共识算法嵌入 Redis 数据节点。<strong>代价</strong>是部署复杂度增加(需额外维护 N+M 个进程)。<strong>收益</strong>是数据节点保持单线程简洁性,Sentinel 可独立升级,故障域隔离。第 27 章 Cluster 走另一条路 — 把判定与选举内嵌进数据节点,因此 Cluster 节点的协议复杂度显著上升。</p>
+<p>Sentinel 选择独立进程而非将故障判定与选举逻辑嵌入 Redis 数据节点。<strong>代价</strong>是部署复杂度增加(需额外维护 N+M 个进程)。<strong>收益</strong>是数据节点保持单线程简洁性,Sentinel 可独立升级,故障域隔离。第 27 章 Cluster 走另一条路 — 把判定与选举内嵌进数据节点,因此 Cluster 节点的协议复杂度显著上升。</p>
 
 <h4>取舍 2:Pub/Sub 自动发现 vs 静态配置</h4>
 
 <p>Sentinel 通过 <code>__sentinel__:hello</code> 频道自动发现集群成员,不需要在配置中显式列出每个 Sentinel 地址。<strong>代价</strong>是 master 故障时 hello 频道短暂失效(已发现的成员仍可工作)。<strong>收益</strong>是动态扩缩容无需重启,部署成本低。</p>
 
-<h4>取舍 3:quorum + epoch 双约束 vs 仅过半</h4>
+<h4>取舍 3:quorum + 多数授权 + epoch</h4>
 
-<p>ODOWN 使用 quorum 配置项(可独立调节),故障转移使用 epoch 单调递增 + 同 epoch 1 票限制。<strong>代价</strong>是配置项增加。<strong>收益</strong>是允许细粒度调节:可设置 quorum &lt; 过半实现"激进检测",或 quorum = 过半实现"保守检测",epoch 机制始终保证选举正确性。</p>
+<p>ODOWN 使用 quorum 配置项(可独立调节),故障转移授权还需要足够投票,并用 epoch 单调递增 + 同 epoch 1 票限制避免同轮多个 Leader。<strong>代价</strong>是概念增加。<strong>收益</strong>是允许细粒度调节:quorum 可影响检测灵敏度,多数授权与 epoch 约束负责选举安全。</p>
 
 <h4>取舍 4:不提供强一致 vs 提供 min-replicas 边界</h4>
 
-<p>Sentinel 故障转移过程仍是异步的,不保证零数据丢失。<strong>代价</strong>是分区场景下旧主可能丢失分区前的写入。Redis 通过 <code>min-replicas-to-write</code> + <code>min-replicas-max-lag</code> 提供事后边界,而非引入完整的 Paxos/Raft 数据共识。这与 Redis 整体"AP 优先"的设计哲学一致。</p>
+<p>Sentinel 故障转移过程仍是异步的,不保证零数据丢失。<strong>代价</strong>是分区场景下旧主可能接收随后被覆盖的写入。Redis 通过 <code>min-replicas-to-write</code> + <code>min-replicas-max-lag</code> 提供写入前健康边界,而非引入完整的 Paxos/Raft 数据共识。这与 Redis 整体偏可用、低延迟的设计哲学一致。</p>
 
 <!-- ============================================================ -->
 <h2 id="s26-summary">26.14 本章要点</h2>
@@ -1989,8 +1989,8 @@ CONFIG SET min-replicas-max-lag 10
       <tr><td>Sentinel 是独立进程,不存储数据</td><td><code>redis-sentinel</code> 二进制</td><td>与数据节点同机部署有故障域风险</td></tr>
       <tr><td>自动发现通过 <code>__sentinel__:hello</code> Pub/Sub</td><td><code>sentinelProcessHelloMessage()</code></td><td>NAT/防火墙阻断时发现失败</td></tr>
       <tr><td>SDOWN 是单 Sentinel 判定</td><td><code>down-after-milliseconds</code></td><td>网络抖动可触发误判</td></tr>
-      <tr><td>ODOWN 必须达到 quorum 阈值</td><td><code>sentinelCheckObjectivelyDown()</code></td><td>quorum 必须过半才能避免脑裂</td></tr>
-      <tr><td>Leader 选举使用 epoch + 同 epoch 1 票</td><td><code>sentinelVoteLeader()</code></td><td>与 Raft 类似但门槛是 quorum 而非过半</td></tr>
+      <tr><td>ODOWN 必须达到 quorum 阈值</td><td><code>sentinelCheckObjectivelyDown()</code></td><td>quorum 是 ODOWN 门槛,不是 failover 唯一安全阈值</td></tr>
+      <tr><td>Leader 选举使用 epoch + 同 epoch 1 票</td><td><code>sentinelVoteLeader()</code></td><td>与 Raft 选举相似,但不提供数据日志共识</td></tr>
       <tr><td>副本选择按 priority/offset/runid 三层排序</td><td><code>compareSlavesForPromotion()</code></td><td>priority=0 表示永不参与</td></tr>
       <tr><td>故障转移五阶段:选副本→提升→重定向→广播→旧主降级</td><td><code>sentinelFailoverStateMachine()</code></td><td>旧主恢复后自动转为新主的 replica</td></tr>
       <tr><td>客户端必须订阅 <code>+switch-master</code> 事件</td><td><code>PSUBSCRIBE '*'</code> 或 SDK 内置</td><td>静态硬编码 master 地址会导致切换后连不上</td></tr>
@@ -2009,7 +2009,7 @@ redis-cli -p 26379 SENTINEL get-master-addr-by-name mymaster
 redis-cli -p 26379 SENTINEL master mymaster
 
 # 模拟主节点故障
-redis-cli -p 6379 DEBUG SLEEP 30
+redis-cli -p 6379 DEBUG SLEEP 30  # 仅本地实验;线上演练用停进程或网络隔离
 
 # 观察事件流
 redis-cli -p 26379 PSUBSCRIBE '+switch-master'</code></pre>
@@ -2029,9 +2029,9 @@ redis-cli -p 26379 PSUBSCRIBE '+switch-master'</code></pre>
 
 <ul>
   <li><strong>§26.1-26.3 拓扑与发现</strong> — Sentinel 通过 <code>__sentinel__:hello</code> 自动发现集群成员,master 充当消息总线让 Sentinel 间无需直接连接;</li>
-  <li><strong>§26.4-26.6 故障判定</strong> — SDOWN 是单 Sentinel 视角的本地判断,ODOWN 是 ≥ quorum 的集体共识,两阶段判定通过 quorum 配置项调节灵敏度;</li>
-  <li><strong>§26.7-26.9 选举与转移</strong> — Raft 风格的 epoch + 同 epoch 1 票约束保证选举安全,五阶段故障转移在 ~10 秒内把流量切到新主,副本选择三层排序保证选择确定且尽可能保留数据;</li>
-  <li><strong>§26.10-26.13 生产实践</strong> — 多机房部署、quorum 必须过半、客户端订阅 <code>+switch-master</code> 是三条不可妥协的生产红线。</li>
+  <li><strong>§26.4-26.6 故障判定</strong> — SDOWN 是单 Sentinel 视角的本地判断,ODOWN 是 ≥ quorum 的仲裁结果,两阶段判定通过 quorum 配置项调节灵敏度;</li>
+  <li><strong>§26.7-26.9 选举与转移</strong> — epoch + 同 epoch 1 票 + 多数授权保证同轮只有一个合法 Leader,五阶段故障转移把流量切到新主,副本选择三层排序保证选择确定且尽可能保留数据;</li>
+  <li><strong>§26.10-26.13 生产实践</strong> — 多机房部署、合理 quorum/多数授权/min-replicas 写保护、客户端订阅 <code>+switch-master</code> 是生产红线。</li>
 </ul>
 
 <h3>下一章预告</h3>

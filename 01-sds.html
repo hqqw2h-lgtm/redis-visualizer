@@ -35,33 +35,25 @@
 <div class="article">
 
 <h1>第 1 章 · SDS 动态字符串</h1>
-<p class="subtitle">header + buf 双段布局 · 五种 sdshdr 分级 · O(1) len 查询 · 双倍/+1MiB 预分配 · 惰性释放 · 二进制安全 · int/embstr/raw 三种编码</p>
+<p class="subtitle">Redis 为什么不用裸 C 字符串 · header 如何藏在 char* 前面 · len / alloc 如何解决长度和追加</p>
 
 <div class="chapter-intro">
-  <p class="lead">C 字符串以 <code>\0</code> 字符标记终止,长度信息<strong>不存储在结构内</strong>。Redis 作为内存数据库,该约定带来三处约束:<strong>长度查询为 O(n) 扫描</strong>、<strong>NUL 字节作为终止符导致无法存储二进制数据</strong>、<strong>容量信息不可见使追加操作的安全性由调用者保证</strong>。</p>
-  <p>SDS(<strong>S</strong>imple <strong>D</strong>ynamic <strong>S</strong>tring)在 <code>char *</code> 之前置入结构化 header,记录 <code>len</code> / <code>alloc</code> / <code>flags</code> 三个字段,同时保留指向数据区(<code>buf</code>)的指针以兼容 C 标准库。该设计同时获得 <strong>O(1) 长度查询</strong>、<strong>二进制安全</strong>、<strong>可控扩容</strong>三项能力。</p>
-  <p>本章按 <strong>SDS 库层 → 对象层 → 生产诊断</strong>三层组织。1.1-1.7 节聚焦 SDS 自身机制(数据结构 + 长度 + header 分级 + 预分配 + 惰性释放 + 二进制安全);1.8 节切到 Redis 对象层(<code>int</code> / <code>embstr</code> / <code>raw</code> 三种字符串编码与 44 字节阈值);1.9-1.10 节落地到生产诊断(<code>MEMORY USAGE</code> 放大比、<code>--bigkeys</code>、7 类陷阱);1.11-1.12 节回到源码与设计取舍。</p>
+  <p class="lead">Redis 里到处都是字符串:key 是字符串,很多 value 也是字符串。问题是,C 原生字符串只给你一个起点指针,它不知道自己有多长,也不知道后面还剩多少空间。</p>
+  <p>所以每次求长度,C 字符串都要一路扫到 <code>\0</code>;如果内容里本来就有 <code>0x00</code>,很多字符串函数会提前停;如果要追加内容,还得调用者自己保证空间够。Redis 不能把这些成本和风险放在高频读写路径里。</p>
+  <p>SDS(<strong>S</strong>imple <strong>D</strong>ynamic <strong>S</strong>tring)的做法很直接:数据还是从 <code>char *</code> 指向的位置开始,但在数据前面藏一个 header,记录 <code>len</code>、<code>alloc</code>、<code>flags</code>。这样外面看起来仍然像 C 字符串,Redis 内部却能 O(1) 拿长度、保存任意字节,并且知道什么时候该扩容。</p>
+  <p>先抓住一句话:<strong>SDS = 兼容 <code>char *</code> 的外壳 + 可管理长度和容量的 header</strong>。后面所有 header 分级、预分配、embstr/raw、MEMORY USAGE 诊断,都是从这句话展开。</p>
   <ul class="will-learn">
-    <li>C 字符串的三处约束(长度 O(n) 扫描 / NUL 截断 / 容量不可见)与 SDS 如何各破其一</li>
-    <li><code>sdshdr8</code> 字节布局:<code>len</code> / <code>alloc</code> / <code>flags</code> + <code>buf</code> + <code>\0</code>,sds 指针指向 buf 而非 header</li>
-    <li>双重身份:<code>printf("%s", s)</code> 兼容 C,<code>s[-1]</code> 取 flags 反向访问 header</li>
-    <li>五种 header(<code>sdshdr5/8/16/32/64</code>)按字符串长度分级,1B / 3B / 5B / 9B / 17B header 开销</li>
-    <li>预分配两阶段策略:<code>&lt; 1 MiB</code> 双倍预留,<code>≥ 1 MiB</code> 线性 +1 MiB</li>
-    <li>APPEND 操作的 5 帧字节级状态变化与三条路径(原地写 / 同 type 扩容 / 跨 type 升级)</li>
-    <li>惰性释放语义:<code>sdstrim</code> 仅缩 <code>len</code>,<code>alloc</code> 保留;命令层 <code>SET</code> 走对象重建</li>
-    <li>二进制安全的字节边界来源(<code>header.len</code> vs 扫描 <code>\0</code>)</li>
-    <li>对象层三种字符串编码 <code>int</code> / <code>embstr</code> / <code>raw</code>,以及 <strong>44 字节阈值</strong>的 jemalloc size class 推导</li>
-    <li><code>embstr</code> 不可变性 + 单向转 <code>raw</code> 设计动机</li>
-    <li>大 key 诊断:<code>STRLEN</code> / <code>MEMORY USAGE</code> / <code>OBJECT ENCODING</code> / <code>--bigkeys</code> 组合 + 放大比</li>
-    <li>7 类陷阱:超长 JSON / 频繁 APPEND / URL 作 key / 误判 embstr / 文本工具看二进制 / 仅用 STRLEN 估内存 / 高峰大扫描</li>
+    <li><strong>长度从哪来:</strong>C 字符串靠扫描 <code>\0</code>,SDS 直接读 <code>header.len</code>。</li>
+    <li><strong>容量谁来管:</strong>C 字符串把空间管理留给调用者,SDS 用 <code>alloc</code> 记录剩余空间并按规则扩容。</li>
+    <li><strong>为什么还像 C 字符串:</strong>SDS 指针仍指向数据区 <code>buf</code>,所以 <code>printf("%s", s)</code> 这类代码还能直接用。</li>
   </ul>
-  <p class="prereq">前置知识:C 语言指针与结构体基础(<code>char *</code> / 结构体偏移 / <code>__attribute__((packed))</code>);<code>malloc/realloc</code> 与内存分配器概念(jemalloc size class 简介);Redis 命令基础(<code>SET</code> / <code>GET</code> / <code>STRLEN</code> / <code>APPEND</code> / <code>OBJECT ENCODING</code> / <code>MEMORY USAGE</code>)。</p>
+  <p class="prereq">如果你熟悉 <code>char *</code>、结构体内存布局和 <code>malloc/realloc</code>,可以直接看图;如果不熟,先记住“指针指向数据,header 藏在前面”即可。</p>
 </div>
 
 <h3>本章全景图</h3>
 
 <div class="diagram">
-  <div class="diagram-title">图 1-0 · 本章导览 — 3 大模块 12 节</div>
+  <div class="diagram-title">图 1-0 · 本章导览 — 先抓三条主线,再看细节</div>
   <svg viewBox="0 0 920 480" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
     <defs>
       <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--diagram-blue-fill-start)"/><stop offset="100%" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
@@ -128,9 +120,9 @@
     </g>
     <g font-size="11" fill="var(--diagram-blue-text)">
       <rect x="580" y="155" width="280" height="40" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
-      <text x="720" y="171" text-anchor="middle" fill="var(--diagram-orange-text)" font-weight="bold">MEMORY USAGE 放大比</text><text x="720" y="186" text-anchor="middle">逻辑 len vs 实际 RSS</text>
+      <text x="720" y="171" text-anchor="middle" fill="var(--diagram-orange-text)" font-weight="bold">MEMORY USAGE 放大比</text><text x="720" y="186" text-anchor="middle">业务字节 vs Redis 归因内存</text>
       <rect x="580" y="200" width="280" height="40" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
-      <text x="720" y="216" text-anchor="middle" fill="var(--diagram-orange-text)" font-weight="bold">--bigkeys 大 key 定位</text><text x="720" y="231" text-anchor="middle">扫描采样 + TOP-N</text>
+      <text x="720" y="216" text-anchor="middle" fill="var(--diagram-orange-text)" font-weight="bold">--bigkeys 大 key 定位</text><text x="720" y="231" text-anchor="middle">SCAN 巡检 + 每类型最大值</text>
       <rect x="580" y="245" width="280" height="40" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
       <text x="720" y="261" text-anchor="middle" fill="var(--diagram-orange-text)" font-weight="bold">7 类陷阱</text><text x="720" y="276" text-anchor="middle">超长 JSON / 频繁 APPEND / URL 作 key …</text>
     </g>
@@ -146,105 +138,96 @@
   </svg>
 </div>
 
-<p>本章按 SDS 库层 → 对象层 → 生产诊断三层组织。每节先给出图示,后给出代码与规则说明。</p>
+<p>读这一章不用先背 API。先看三件事:长度从哪里来、容量怎么增长、对象层为什么还要分 <code>int/embstr/raw</code>。生产诊断部分只围绕一个问题展开:一个 String key 到底花了多少内存。</p>
 
 <!-- ============================================================ -->
 <h2 id="s1-1">1.1 C 字符串的三处约束</h2>
 <!-- ============================================================ -->
 
-<p>C 标准的字符串约定可以一句话概括:<strong>把"长度"信息留在数据流里(以首个 0x00 字节作为终止符),把"容量"信息留给调用者管理</strong>。这种设计在原生 C 代码中工作得很好——但在 Redis 这种"高频字符串读写 + 大量小 value + 二进制可能性"的场景下,三处约束会立即变成性能与正确性问题。</p>
+<p>C 字符串的规则很朴素:从指针开始往后读,读到第一个 <code>0x00</code> 就认为字符串结束。这个规则足够简单,但它也意味着两件事:长度要扫出来,容量没人替你记。Redis 的 key 和 value 会被频繁读写、追加、复制,还可能保存图片头、压缩包、序列化结果这类二进制数据,所以这两个"没人记"会变成真实成本。</p>
 
 <div class="diagram">
-  <div class="diagram-title">图 1-1-1 · C 字符串与 SDS 的指针定位差异</div>
+  <div class="diagram-title">图 1-1-1 · 同一个 hello:C 与 SDS 分别怎么知道长度</div>
   <svg viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
     <defs>
-      <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--diagram-blue-fill-start)"/><stop offset="100%" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
-      <linearGradient id="g-red"    x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--diagram-red-fill-start)"/><stop offset="100%" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
-      <linearGradient id="g-green"  x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--diagram-green-fill-start)"/><stop offset="100%" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
-      <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="var(--diagram-blue-stroke)"/></marker>
-      <marker id="arr-d" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="var(--diagram-orange-stroke)"/></marker>
+      <linearGradient id="len-blue" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--diagram-blue-fill-start)"/><stop offset="100%" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
+      <linearGradient id="len-red" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--diagram-red-fill-start)"/><stop offset="100%" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
+      <linearGradient id="len-green" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--diagram-green-fill-start)"/><stop offset="100%" stop-color="var(--diagram-green-fill-end)"/></linearGradient>
+      <linearGradient id="len-orange" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--diagram-orange-fill-start)"/><stop offset="100%" stop-color="var(--diagram-orange-fill-end)"/></linearGradient>
+      <marker id="len-arr-blue" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="var(--diagram-blue-stroke)"/></marker>
+      <marker id="len-arr-green" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L9,5 L0,10 z" fill="var(--diagram-green-stroke)"/></marker>
     </defs>
 
-    <!-- ============ Top: C string ============ -->
-    <text x="20" y="28" font-size="13" font-weight="bold" fill="var(--diagram-red-text)">C 字符串 · char *s = "hello"</text>
-    <text x="280" y="28" font-size="11" fill="var(--diagram-muted)">— 长度信息留在数据流中, \0 = 终止符</text>
+    <rect x="0" y="0" width="920" height="360" fill="var(--diagram-panel)" rx="10"/>
+    <text x="460" y="30" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="14" font-weight="700">同一个 "hello":C 靠扫描,SDS 靠 header.len</text>
 
-    <g transform="translate(20,46)">
-      <!-- pointer s -->
-      <rect x="0" y="14" width="64" height="36" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
-      <text x="32" y="28" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="bold">指针 s</text>
-      <text x="32" y="44" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">char *</text>
-      <!-- arrow s → first byte -->
-      <path d="M 64 32 L 110 32" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
-      <!-- 6 byte cells (hello + \0) -->
-      <g transform="translate(120,14)" font-size="13" font-weight="bold">
-        <rect x="0"   y="0" width="40" height="40" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/><text x="20"  y="25" text-anchor="middle" fill="var(--diagram-blue-text)">h</text>
-        <rect x="40"  y="0" width="40" height="40" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/><text x="60"  y="25" text-anchor="middle" fill="var(--diagram-blue-text)">e</text>
-        <rect x="80"  y="0" width="40" height="40" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/><text x="100" y="25" text-anchor="middle" fill="var(--diagram-blue-text)">l</text>
-        <rect x="120" y="0" width="40" height="40" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/><text x="140" y="25" text-anchor="middle" fill="var(--diagram-blue-text)">l</text>
-        <rect x="160" y="0" width="40" height="40" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/><text x="180" y="25" text-anchor="middle" fill="var(--diagram-blue-text)">o</text>
-        <rect x="200" y="0" width="40" height="40" fill="url(#g-red)"  stroke="var(--diagram-red-stroke)" stroke-width="2"/><text x="220" y="25" text-anchor="middle" fill="var(--diagram-red-text)">\0</text>
-        <!-- pos axis -->
-        <text x="20"  y="56" text-anchor="middle" font-size="10" fill="var(--diagram-muted)">0</text>
-        <text x="60"  y="56" text-anchor="middle" font-size="10" fill="var(--diagram-muted)">1</text>
-        <text x="100" y="56" text-anchor="middle" font-size="10" fill="var(--diagram-muted)">2</text>
-        <text x="140" y="56" text-anchor="middle" font-size="10" fill="var(--diagram-muted)">3</text>
-        <text x="180" y="56" text-anchor="middle" font-size="10" fill="var(--diagram-muted)">4</text>
-        <text x="220" y="56" text-anchor="middle" font-size="10" fill="var(--diagram-red-text)" font-weight="bold">5</text>
-      </g>
-      <!-- 终止符标注 -->
-      <text x="370" y="32" font-size="11" fill="var(--diagram-red-text)" font-weight="bold">↑ 终止符</text>
-      <text x="370" y="48" font-size="10" fill="var(--diagram-muted)">strlen 扫描到这里停 → O(n)</text>
-    </g>
+    <!-- Left: C string -->
+    <g transform="translate(30,60)">
+      <rect x="0" y="0" width="400" height="230" rx="12" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)" stroke-width="2"/>
+      <text x="20" y="28" fill="var(--diagram-red-text)" font-size="13" font-weight="700">C 字符串:长度藏在数据里</text>
+      <text x="20" y="50" fill="var(--diagram-muted)" font-size="11">指针只知道起点,不知道总长度。</text>
 
-    <!-- ============ Bottom: SDS ============ -->
-    <text x="20" y="170" font-size="13" font-weight="bold" fill="var(--diagram-green-text)">SDS · sds s = sdsnew("hello")</text>
-    <text x="280" y="170" font-size="11" fill="var(--diagram-muted)">— header 前置 + s 指针仍指向数据区, 与 C 兼容</text>
+      <rect x="20" y="84" width="66" height="34" rx="6" fill="var(--diagram-surface)" stroke="var(--diagram-blue-stroke)"/>
+      <text x="53" y="105" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">char *s</text>
+      <path d="M 86 101 L 126 101" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" fill="none" marker-end="url(#len-arr-blue)"/>
 
-    <g transform="translate(20,188)">
-      <!-- header block -->
-      <rect x="0"   y="14" width="180" height="64" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
-      <text x="90"  y="32" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">struct sdshdr8 (header)</text>
-      <text x="14"  y="50" font-size="11" fill="var(--diagram-blue-text)">len = <tspan fill="var(--diagram-green-text)" font-weight="bold">5</tspan>   alloc = <tspan fill="var(--diagram-green-text)" font-weight="bold">5</tspan></text>
-      <text x="14"  y="68" font-size="11" fill="var(--diagram-blue-text)">flags = <tspan fill="var(--diagram-orange-text)" font-weight="bold">0x01</tspan>   <tspan fill="var(--diagram-muted)" font-size="10">(SDS_TYPE_8)</tspan></text>
-
-      <!-- pointer s -->
-      <rect x="200" y="14" width="64" height="36" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
-      <text x="232" y="28" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="bold">sds s</text>
-      <text x="232" y="44" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">= char *</text>
-
-      <!-- buf cells -->
-      <g transform="translate(300,14)" font-size="13" font-weight="bold">
-        <rect x="0"   y="0" width="40" height="40" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/><text x="20"  y="25" text-anchor="middle" fill="var(--diagram-green-text)">h</text>
-        <rect x="40"  y="0" width="40" height="40" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/><text x="60"  y="25" text-anchor="middle" fill="var(--diagram-green-text)">e</text>
-        <rect x="80"  y="0" width="40" height="40" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/><text x="100" y="25" text-anchor="middle" fill="var(--diagram-green-text)">l</text>
-        <rect x="120" y="0" width="40" height="40" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/><text x="140" y="25" text-anchor="middle" fill="var(--diagram-green-text)">l</text>
-        <rect x="160" y="0" width="40" height="40" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/><text x="180" y="25" text-anchor="middle" fill="var(--diagram-green-text)">o</text>
-        <rect x="200" y="0" width="40" height="40" fill="url(#g-blue)"  stroke="var(--diagram-blue-stroke)"/><text x="220" y="25" text-anchor="middle" fill="var(--diagram-blue-text)">\0</text>
-        <text x="20"  y="56" text-anchor="middle" font-size="10" fill="var(--diagram-muted)">0</text>
-        <text x="100" y="56" text-anchor="middle" font-size="10" fill="var(--diagram-muted)">2</text>
-        <text x="180" y="56" text-anchor="middle" font-size="10" fill="var(--diagram-muted)">4</text>
+      <g transform="translate(130,78)" font-size="13" font-weight="700">
+        <rect x="0" y="0" width="36" height="42" fill="url(#len-blue)" stroke="var(--diagram-blue-stroke)"/><text x="18" y="26" text-anchor="middle" fill="var(--diagram-blue-text)">h</text>
+        <rect x="36" y="0" width="36" height="42" fill="url(#len-blue)" stroke="var(--diagram-blue-stroke)"/><text x="54" y="26" text-anchor="middle" fill="var(--diagram-blue-text)">e</text>
+        <rect x="72" y="0" width="36" height="42" fill="url(#len-blue)" stroke="var(--diagram-blue-stroke)"/><text x="90" y="26" text-anchor="middle" fill="var(--diagram-blue-text)">l</text>
+        <rect x="108" y="0" width="36" height="42" fill="url(#len-blue)" stroke="var(--diagram-blue-stroke)"/><text x="126" y="26" text-anchor="middle" fill="var(--diagram-blue-text)">l</text>
+        <rect x="144" y="0" width="36" height="42" fill="url(#len-blue)" stroke="var(--diagram-blue-stroke)"/><text x="162" y="26" text-anchor="middle" fill="var(--diagram-blue-text)">o</text>
+        <rect x="180" y="0" width="36" height="42" fill="url(#len-red)" stroke="var(--diagram-red-stroke)" stroke-width="2"/><text x="198" y="26" text-anchor="middle" fill="var(--diagram-red-text)">\0</text>
+        <text x="18" y="58" text-anchor="middle" font-size="9" fill="var(--diagram-muted)">0</text>
+        <text x="54" y="58" text-anchor="middle" font-size="9" fill="var(--diagram-muted)">1</text>
+        <text x="90" y="58" text-anchor="middle" font-size="9" fill="var(--diagram-muted)">2</text>
+        <text x="126" y="58" text-anchor="middle" font-size="9" fill="var(--diagram-muted)">3</text>
+        <text x="162" y="58" text-anchor="middle" font-size="9" fill="var(--diagram-muted)">4</text>
+        <text x="198" y="58" text-anchor="middle" font-size="9" fill="var(--diagram-red-text)" font-weight="700">5</text>
       </g>
 
-      <!-- arrow s → buf[0] -->
-      <path d="M 264 32 L 296 32" stroke="var(--diagram-green-stroke)" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
-      <!-- s[-1] back-access header -->
-      <path d="M 230 50 Q 180 92 100 78" stroke="var(--diagram-orange-stroke)" stroke-width="1.5" fill="none" stroke-dasharray="4 3" marker-end="url(#arr-d)"/>
-      <text x="180" y="105" font-size="10" fill="var(--diagram-orange-text)">s[-1] = flags → 反向 O(1) 取 header 类型</text>
+      <path d="M 132 144 H 308" stroke="var(--diagram-red-stroke)" stroke-width="2" fill="none" marker-end="url(#len-arr-blue)"/>
+      <text x="220" y="166" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="700">strlen 一格格扫,遇到 \0 才停</text>
 
-      <!-- annotations -->
-      <text x="540" y="32" font-size="11" fill="var(--diagram-green-text)" font-weight="bold">↑ 与 C 兼容</text>
-      <text x="540" y="48" font-size="10" fill="var(--diagram-muted)">printf("%s", s) 直接可用</text>
-      <text x="540" y="66" font-size="11" fill="var(--diagram-green-text)" font-weight="bold">↑ \0 仍然写入</text>
-      <text x="540" y="82" font-size="10" fill="var(--diagram-muted)">但边界不靠它,靠 header.len</text>
+      <rect x="70" y="184" width="260" height="34" rx="7" fill="var(--diagram-surface)" stroke="var(--diagram-red-stroke)"/>
+      <text x="200" y="206" text-anchor="middle" fill="var(--diagram-red-text)" font-size="12" font-weight="700">结论:长度 = 扫出来的 5,O(n)</text>
     </g>
 
-    <!-- ===== Bottom annotated takeaway ===== -->
-    <g transform="translate(20,308)">
-      <rect x="0" y="0" width="880" height="44" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
-      <text x="14" y="20" font-size="12" fill="var(--diagram-purple-text)" font-weight="bold">关键差异:</text>
-      <text x="100" y="20" font-size="11" fill="var(--diagram-blue-text)">C 字符串 — 指针 = 唯一身份, 长度靠扫描;  SDS — 指针 = 数据区, header 在 s 之前, s[-1] 即可拿到 flags / type → O(1) 取 len</text>
-      <text x="14" y="36" font-size="11" fill="var(--diagram-muted)">这种"<tspan fill="var(--diagram-green-text)">数据指针不变, header 隐藏在前面</tspan>"的布局是 SDS 与 C 字符串保持二进制兼容的关键设计。</text>
+    <!-- Right: SDS -->
+    <g transform="translate(490,60)">
+      <rect x="0" y="0" width="400" height="230" rx="12" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
+      <text x="20" y="28" fill="var(--diagram-green-text)" font-size="13" font-weight="700">SDS:长度写在 header 里</text>
+      <text x="20" y="50" fill="var(--diagram-muted)" font-size="11">指针仍指向数据区,但前面藏着元数据。</text>
+
+      <rect x="22" y="78" width="110" height="70" rx="8" fill="url(#len-orange)" stroke="var(--diagram-orange-stroke)" stroke-width="2"/>
+      <text x="77" y="100" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">header</text>
+      <text x="77" y="120" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">len = 5</text>
+      <text x="77" y="138" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">alloc = 5</text>
+
+      <rect x="154" y="84" width="66" height="34" rx="6" fill="var(--diagram-surface)" stroke="var(--diagram-green-stroke)"/>
+      <text x="187" y="105" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">sds s</text>
+      <path d="M 220 101 L 248 101" stroke="var(--diagram-green-stroke)" stroke-width="1.5" fill="none" marker-end="url(#len-arr-green)"/>
+
+      <g transform="translate(252,78)" font-size="13" font-weight="700">
+        <rect x="0" y="0" width="30" height="42" fill="url(#len-green)" stroke="var(--diagram-green-stroke)"/><text x="15" y="26" text-anchor="middle" fill="var(--diagram-green-text)">h</text>
+        <rect x="30" y="0" width="30" height="42" fill="url(#len-green)" stroke="var(--diagram-green-stroke)"/><text x="45" y="26" text-anchor="middle" fill="var(--diagram-green-text)">e</text>
+        <rect x="60" y="0" width="30" height="42" fill="url(#len-green)" stroke="var(--diagram-green-stroke)"/><text x="75" y="26" text-anchor="middle" fill="var(--diagram-green-text)">l</text>
+        <rect x="90" y="0" width="30" height="42" fill="url(#len-green)" stroke="var(--diagram-green-stroke)"/><text x="105" y="26" text-anchor="middle" fill="var(--diagram-green-text)">l</text>
+        <rect x="120" y="0" width="30" height="42" fill="url(#len-green)" stroke="var(--diagram-green-stroke)"/><text x="135" y="26" text-anchor="middle" fill="var(--diagram-green-text)">o</text>
+        <rect x="150" y="0" width="30" height="42" fill="var(--diagram-surface)" stroke="var(--diagram-blue-stroke)" stroke-dasharray="3,2"/><text x="165" y="26" text-anchor="middle" fill="var(--diagram-blue-text)">\0</text>
+      </g>
+
+      <path d="M 187 126 Q 136 172 78 148" stroke="var(--diagram-green-stroke)" stroke-width="2" fill="none" marker-end="url(#len-arr-green)"/>
+      <text x="200" y="166" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">sdslen 不扫数据,直接读 header.len</text>
+
+      <rect x="70" y="184" width="260" height="34" rx="7" fill="var(--diagram-surface)" stroke="var(--diagram-green-stroke)"/>
+      <text x="200" y="206" text-anchor="middle" fill="var(--diagram-green-text)" font-size="12" font-weight="700">结论:长度 = header.len,O(1)</text>
+    </g>
+
+    <g transform="translate(60,312)">
+      <rect x="0" y="0" width="800" height="36" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <text x="16" y="23" fill="var(--diagram-purple-text)" font-size="12" font-weight="700">先记住:</text>
+      <text x="86" y="23" fill="var(--diagram-blue-text)" font-size="11">C 的 \0 决定字符串在哪里结束;SDS 的 \0 主要为兼容 C API,真实边界由 header.len 决定。</text>
     </g>
   </svg>
 </div>
@@ -477,7 +460,7 @@ GET hex: ff d8 ff 00 10 4a 46</code></pre>
 <h2 id="s1-2">1.2 SDS 结构定义与字节布局</h2>
 <!-- ============================================================ -->
 
-<p>这一节用字节级视图把 SDS 的"指针指向 buf,header 在指针之前"这一关键设计拆开:从结构定义到 9 字节实例(存 <code>"hello"</code>),再到 <code>printf</code> 与 <code>s[-1]</code> 的双重身份。</p>
+<p>现在把 SDS 摊到内存里看。读图时先不要急着记 <code>flags</code> 的每一位,只抓住一个位置关系:外部拿到的 <code>sds</code> 指针指向 <code>buf[0]</code>,而 <code>len/alloc/flags</code> 藏在它前面。Redis 内部向前退几字节就能读 header,外部 C 代码仍把它当普通 <code>char *</code> 用。</p>
 
 <div class="diagram">
   <div class="diagram-title">图 1-2-1 · SDS 指针定位机制(s 指向 buf, header 在前, s[-1] 取 flags)</div>
@@ -563,10 +546,11 @@ GET hex: ff d8 ff 00 10 4a 46</code></pre>
 
     <!-- Bottom: 3-rule summary -->
     <g transform="translate(20,200)">
-      <rect x="0" y="0" width="860" height="60" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
+      <rect x="0" y="0" width="860" height="76" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
       <text x="14" y="22" fill="var(--diagram-purple-text)" font-size="12" font-weight="bold">SDS 指针三条铁律</text>
       <text x="14" y="40" font-size="11" fill="var(--diagram-blue-text)">  ① sds 指针 = char *, 永远指向数据首字节 → 与 <tspan fill="var(--diagram-green-text)">C 标准库直接兼容</tspan></text>
-      <text x="14" y="56" font-size="11" fill="var(--diagram-blue-text)">  ② header 在 s 之前(打包无填充), s[-1] = flags → <tspan fill="var(--diagram-orange-text)">O(1)</tspan> 推出类型;③ \0 仍然写入但不作为 <tspan fill="var(--diagram-red-text)">边界依据</tspan></text>
+      <text x="14" y="56" font-size="11" fill="var(--diagram-blue-text)">  ② header 在 s 之前(打包无填充), s[-1] = flags → <tspan fill="var(--diagram-orange-text)">O(1)</tspan> 推出 header 类型</text>
+      <text x="14" y="72" font-size="11" fill="var(--diagram-blue-text)">  ③ \0 仍然写入,用于兼容 C 字符串 API;真正边界由 <tspan fill="var(--diagram-red-text)">header.len</tspan> 决定</text>
     </g>
   </svg>
 </div>
@@ -1290,7 +1274,7 @@ OK
       <tr><td><code>sdshdr8</code></td><td>3 B</td><td><code>uint8_t</code></td><td>≤ 255 B</td><td>短 key/value 主力</td></tr>
       <tr><td><code>sdshdr16</code></td><td>5 B</td><td><code>uint16_t</code></td><td>≤ 64 KiB</td><td>中等 value</td></tr>
       <tr><td><code>sdshdr32</code></td><td>9 B</td><td><code>uint32_t</code></td><td>≤ 4 GiB</td><td>大 value(关注阻塞风险)</td></tr>
-      <tr><td><code>sdshdr64</code></td><td>17 B</td><td><code>uint64_t</code></td><td>&gt; 4 GiB</td><td>受 RESP 协议 512 MiB 限制</td></tr>
+      <tr><td><code>sdshdr64</code></td><td>17 B</td><td><code>uint64_t</code></td><td>&gt; 4 GiB</td><td>SDS 库可表达;Redis 命令层还受配置与可用内存限制</td></tr>
     </tbody>
   </table>
 </div>
@@ -1496,7 +1480,7 @@ embstr("hello")     -&gt; 对象层强制 sdshdr8(非 sdshdr5)</code></pre>
   </svg>
 </div>
 
-<p>源码核心(简化):</p>
+<p>源码核心(抽掉错误处理后的主干):</p>
 
 <pre><code class="language-c">sds sdsMakeRoomFor(sds s, size_t addlen) {
     size_t avail = sdsavail(s);
@@ -1524,10 +1508,14 @@ OK
 127.0.0.1:6379&gt; OBJECT ENCODING sds:grow
 "raw"</code></pre>
 
-<p><code>APPEND</code> 触发对象层从 <code>embstr</code> 重建为 <code>raw</code>(详见 §1.8)。启用 <code>enable-debug-command yes</code> 可观察 SDS 实际容量:</p>
+<p><code>APPEND</code> 触发对象层从 <code>embstr</code> 重建为 <code>raw</code>(详见 §1.8)。在本地调试实例中启用 <code>enable-debug-command yes</code> 后,可以用 <code>DEBUG SDSLEN</code> 观察 SDS 的实际空闲容量:</p>
 
 <pre><code class="language-bash">127.0.0.1:6379&gt; DEBUG SDSLEN sds:grow
 key_sds_len:8 key_sds_avail:0 val_sds_len:11 val_sds_avail:11</code></pre>
+
+<div class="warning">
+  <strong><code>DEBUG</code> 命令只用于本地或测试环境</strong>:线上实例通常不会开启 <code>enable-debug-command</code>,也不应把它作为生产巡检手段。生产环境用 <code>STRLEN</code>、<code>MEMORY USAGE</code>、<code>OBJECT ENCODING</code> 和采样扫描做判断。
+</div>
 
 <div class="key-insight">
   <code>val_sds_avail:11</code> 表明实际数据 11 字节,SDS 内部预留 11 字节空闲容量。<strong>下次追加 ≤ 11 字节无需 <code>realloc</code></strong>。这就是预分配策略的核心收益。
@@ -1706,7 +1694,7 @@ key_sds_len:8 key_sds_avail:0 val_sds_len:11 val_sds_avail:11</code></pre>
 
     <!-- ===== Frame (d): memcpy " world" ===== -->
     <g transform="translate(20,294)" font-size="11" fill="var(--diagram-blue-text)">
-      <text x="0" y="14" font-weight="bold" fill="var(--diagram-orange-text)">(d) memcpy(buf+5, " world", 6):橙色 6 B 已写入, 但 hdr.len 仍 5, buf[11] 尚未写 \0 (危险窗口)</text>
+      <text x="0" y="14" font-weight="bold" fill="var(--diagram-orange-text)">(d) memcpy(buf+5, " world", 6):橙色 6 B 已写入, 但 hdr.len 仍 5, buf[11] 尚未写 \0 (内部中间态)</text>
       <rect x="0"   y="22" width="60" height="36" fill="url(#g-blue)" stroke="var(--diagram-red-stroke)" stroke-width="2" stroke-dasharray="4 2"/>
       <text x="30"  y="40" text-anchor="middle" fill="var(--diagram-red-text)" font-weight="bold">len=5</text>
       <rect x="60"  y="22" width="60" height="36" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/>
@@ -1734,7 +1722,7 @@ key_sds_len:8 key_sds_avail:0 val_sds_len:11 val_sds_avail:11</code></pre>
 
     <!-- ===== Frame (e): commit len + \0 ===== -->
     <g transform="translate(20,378)" font-size="11" fill="var(--diagram-blue-text)">
-      <text x="0" y="14" font-weight="bold" fill="var(--diagram-green-text)">(e) 收尾: 原子地 hdr.len=11 + buf[11]='\0' → len=11, alloc=22, avail=11(下次追加 ≤11 B 免 realloc)</text>
+      <text x="0" y="14" font-weight="bold" fill="var(--diagram-green-text)">(e) 收尾: 写 hdr.len=11 + buf[11]='\0' → len=11, alloc=22, avail=11(下次追加 ≤11 B 免 realloc)</text>
       <rect x="0"   y="22" width="60" height="36" fill="url(#g-blue)" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
       <text x="30"  y="40" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="bold">len=11</text>
       <rect x="60"  y="22" width="60" height="36" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/>
@@ -1774,8 +1762,8 @@ key_sds_len:8 key_sds_avail:0 val_sds_len:11 val_sds_avail:11</code></pre>
     <li><strong>(a) 初始</strong> <code>SET sds:grow hello</code> 后:<code>len=5, alloc=5</code>,buf=<code>"hello\0"</code>,<code>avail = 0</code>(满,无空闲容量)。</li>
     <li><strong>(b) <code>sdscatlen(s, " world", 6)</code> 入口</strong>:<code>avail=0 &lt; addlen=6</code> → 触发扩容。<code>newlen=11&lt;1MiB → ×2=22</code>,newtype=sdshdr8(≤255 类型不变)。橙色边表"准备扩容"。</li>
     <li><strong>(c) <code>s_realloc</code> 完成</strong>:<code>alloc: 5 → 22</code>,buf 头 6 字节保留,<strong>新增 17 字节未初始化空闲</strong>(灰色 <code>░</code>)。len 不变。</li>
-    <li><strong>(d) <code>memcpy(buf+5, " world", 6)</code></strong>:橙色 6 字节 <code>_world</code> 已写入(覆盖 <code>\0</code>),但 <code>hdr.len 仍 5</code>,<code>buf[11]</code> 仍未写 <code>\0</code>。<strong>这是危险窗口</strong>(单线程下不可观察)。</li>
-    <li><strong>(e) 收尾</strong>:原子地 <code>hdr.len = 11</code>,<code>buf[11] = \0</code>。最终 <code>len=11, alloc=22, avail=11</code>。<strong>下次追加 ≤11 字节不再触发 realloc → O(1) 摊销</strong>。</li>
+    <li><strong>(d) <code>memcpy(buf+5, " world", 6)</code></strong>:橙色 6 字节 <code>_world</code> 已写入(覆盖 <code>\0</code>),但 <code>hdr.len 仍 5</code>,<code>buf[11]</code> 仍未写 <code>\0</code>。这是 SDS 函数内部的中间态,Redis 命令串行执行时外部观察不到。</li>
+    <li><strong>(e) 收尾</strong>:最后写 <code>hdr.len = 11</code> 和 <code>buf[11] = \0</code>。最终 <code>len=11, alloc=22, avail=11</code>。<strong>下次追加 ≤11 字节不再触发 realloc → O(1) 摊销</strong>。</li>
   </ul>
 </div>
 
@@ -2019,9 +2007,9 @@ key_sds_len:8 key_sds_avail:0 val_sds_len:11 val_sds_avail:11</code></pre>
     <!-- Outcomes -->
     <g font-size="11" fill="var(--diagram-blue-text)">
       <rect x="500" y="14" width="200" height="64" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
-      <text x="600" y="32" text-anchor="middle" fill="var(--diagram-red-text)" font-weight="bold">MEMORY USAGE 完全替换</text>
-      <text x="600" y="50" text-anchor="middle">前后 RSS 直接换算</text>
-      <text x="600" y="68" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">⚠ 这不是"惰性释放生效"!</text>
+      <text x="600" y="32" text-anchor="middle" fill="var(--diagram-red-text)" font-weight="bold">MEMORY USAGE 看新对象</text>
+      <text x="600" y="50" text-anchor="middle">不能直接等同 RSS 回收</text>
+      <text x="600" y="68" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">这不是"SDS 惰性释放"</text>
 
       <rect x="500" y="138" width="200" height="64" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
       <text x="600" y="156" text-anchor="middle" fill="var(--diagram-orange-text)" font-weight="bold">可能触发 embstr → raw</text>
@@ -2163,7 +2151,7 @@ shrink len=5 avail=0 value='hello'</code></pre>
 </div>
 
 <div class="diagram">
-  <div class="diagram-title">图 1-7-2 · sdsnewlen 显式长度调用流程(初始化 SDS 的 6 步)</div>
+  <div class="diagram-title">图 1-7-2 · 显式长度写入流程(以 Redis String 短值 / sdshdr8 为例)</div>
   <svg viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace, 'Cascadia Code', Consolas, monospace">
     <defs>
       <linearGradient id="g-blue"   x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--diagram-blue-fill-start)"/><stop offset="100%" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
@@ -2179,7 +2167,7 @@ shrink len=5 avail=0 value='hello'</code></pre>
       <rect x="20"  y="14" width="180" height="32" rx="6" fill="url(#g-purple)" stroke="var(--diagram-purple-stroke)"/>
       <text x="110" y="35" text-anchor="middle" fill="var(--diagram-purple-text)">应用层</text>
       <rect x="230" y="14" width="180" height="32" rx="6" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/>
-      <text x="320" y="35" text-anchor="middle" fill="var(--diagram-blue-text)">sdsnewlen</text>
+      <text x="320" y="35" text-anchor="middle" fill="var(--diagram-blue-text)">SDS 构造</text>
       <rect x="440" y="14" width="180" height="32" rx="6" fill="url(#g-orange)" stroke="var(--diagram-orange-stroke)"/>
       <text x="530" y="35" text-anchor="middle" fill="var(--diagram-orange-text)">内存分配器</text>
       <rect x="650" y="14" width="180" height="32" rx="6" fill="url(#g-green)" stroke="var(--diagram-green-stroke)"/>
@@ -2195,11 +2183,11 @@ shrink len=5 avail=0 value='hello'</code></pre>
 
     <g font-size="11" fill="var(--diagram-blue-text)">
       <path d="M 110 78 L 320 78" stroke="var(--diagram-blue-stroke)" marker-end="url(#arr)"/>
-      <text x="215" y="72" text-anchor="middle" fill="var(--diagram-blue-text)">① sdsnewlen(ptr, initlen=7)</text>
+      <text x="215" y="72" text-anchor="middle" fill="var(--diagram-blue-text)">① create short String(ptr, len=7)</text>
 
       <rect x="230" y="92" width="180" height="48" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
-      <text x="320" y="110" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">② type = sdsReqType(7)</text>
-      <text x="320" y="126" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">     = TYPE_8, hdrlen=3</text>
+      <text x="320" y="110" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">② 选择 sdshdr8</text>
+      <text x="320" y="126" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">     保留 len / alloc 字段</text>
 
       <path d="M 320 162 L 530 162" stroke="var(--diagram-blue-stroke)" marker-end="url(#arr)"/>
       <text x="425" y="156" text-anchor="middle">③ malloc(3 + 7 + 1)</text>
@@ -2221,12 +2209,13 @@ shrink len=5 avail=0 value='hello'</code></pre>
   </svg>
 </div>
 
-<p>源码:</p>
+<p>源码(概念化摘录;Redis 7.x 实现名为 <code>_sdsnewlen</code>,还包含溢出检查、trymalloc 分支和 allocator usable size 处理):</p>
 
 <pre><code class="language-c">sds sdsnewlen(const void *init, size_t initlen) {
     void *sh;
     sds s;
     char type = sdsReqType(initlen);
+    if (type == SDS_TYPE_5 && initlen == 0) type = SDS_TYPE_8;
     int hdrlen = sdsHdrSize(type);
 
     sh = s_malloc(hdrlen + initlen + 1);
@@ -2242,6 +2231,10 @@ shrink len=5 avail=0 value='hello'</code></pre>
     }
     return s;
 }</code></pre>
+
+<div class="warning">
+  <strong><code>sdshdr5</code> 与 Redis String 对象不要混在一起</strong>:独立 SDS 库对很短的非空字符串可能选择 <code>SDS_TYPE_5</code>;但 Redis 对象层的 <code>embstr</code> 短字符串使用 <code>sdshdr8</code>,因为对象层仍需要 <code>alloc</code> 字段和统一的后续处理路径。
+</div>
 
 <p>Python 客户端的存取一致性验证:</p>
 
@@ -2340,7 +2333,7 @@ ff d8 ff 00 10 4a 46</code></pre>
     <g transform="translate(20,358)">
       <rect x="0" y="0" width="880" height="48" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
       <text x="14" y="20" font-size="12" fill="var(--diagram-purple-text)" font-weight="bold">三档编码的内存代价</text>
-      <text x="14" y="38" font-size="11" fill="var(--diagram-blue-text)">  int = <tspan fill="var(--diagram-green-text)">0 KB</tspan>(共享或塞进 ptr); embstr = <tspan fill="var(--diagram-blue-text)">1 块连续 ≤ 64 B</tspan>; raw = <tspan fill="var(--diagram-orange-text)">2 块独立, robj 16 B + sdshdr+buf</tspan></text>
+      <text x="14" y="38" font-size="11" fill="var(--diagram-blue-text)">  int = <tspan fill="var(--diagram-green-text)">value 不另分配 SDS</tspan>(整数塞进 ptr); embstr = <tspan fill="var(--diagram-blue-text)">1 块连续 ≤ 64 B</tspan>; raw = <tspan fill="var(--diagram-orange-text)">2 块独立, robj 16 B + sdshdr+buf</tspan></text>
     </g>
   </svg>
 </div>
@@ -2441,7 +2434,7 @@ ff d8 ff 00 10 4a 46</code></pre>
 </div>
 
 <div class="diagram">
-  <div class="diagram-title">图 1-8-3 · 编码状态转移图</div>
+  <div class="diagram-title">图 1-8-3 · 编码状态转移图(SET 分流 + 修改后单向升级)</div>
   <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:920px;width:100%;margin:8px auto;height:auto;">
     <defs>
       <linearGradient id="enc-int" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-blue-fill-start)"/><stop offset="1" stop-color="var(--diagram-blue-fill-end)"/></linearGradient>
@@ -2455,7 +2448,7 @@ ff d8 ff 00 10 4a 46</code></pre>
       </marker>
     </defs>
     <rect x="0" y="0" width="920" height="460" fill="var(--diagram-panel)" rx="10"/>
-    <text x="460" y="28" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="14" font-weight="700">Redis String 编码状态机:int → embstr → raw (单向)</text>
+    <text x="460" y="28" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="14" font-weight="700">SET 时三选一;一旦走字符串修改路径,最终统一落到 raw</text>
 
     <!-- SET 入口 -->
     <g transform="translate(380, 60)">
@@ -2497,10 +2490,10 @@ ff d8 ff 00 10 4a 46</code></pre>
       <text x="80" y="62" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">两次 malloc,可变</text>
     </g>
 
-    <!-- 转换线 1: int → embstr (溢出) -->
-    <path d="M 320 200 L 380 200" stroke="var(--diagram-red-stroke)" stroke-width="1.8" marker-end="url(#enc-arr-r)" fill="none"/>
-    <text x="350" y="192" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10" font-weight="700">溢出</text>
-    <text x="350" y="218" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">INCRBY 超 long</text>
+    <!-- 转换线 1: int → raw (字符串修改时解码) -->
+    <path d="M 240 230 C 240 270 740 270 740 230" stroke="var(--diagram-red-stroke)" stroke-width="1.8" marker-end="url(#enc-arr-r)" fill="none"/>
+    <text x="490" y="258" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10" font-weight="700">APPEND/SETRANGE</text>
+    <text x="490" y="274" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">整数先解码为字符串,再变 raw</text>
 
     <!-- 转换线 2: embstr → raw (修改) -->
     <path d="M 540 200 L 660 200" stroke="var(--diagram-red-stroke)" stroke-width="1.8" marker-end="url(#enc-arr-r)" fill="none"/>
@@ -2525,7 +2518,7 @@ ff d8 ff 00 10 4a 46</code></pre>
 
       <g transform="translate(20, 40)">
         <rect x="0" y="0" width="6" height="22" fill="var(--diagram-blue-fill)"/>
-        <text x="16" y="16" fill="var(--diagram-blue-text)" font-size="11">① <tspan font-weight="700" fill="var(--diagram-blue-text)">int</tspan> → 任何非数值字符串操作必触发重建为 embstr/raw</text>
+      <text x="16" y="16" fill="var(--diagram-blue-text)" font-size="11">① <tspan font-weight="700" fill="var(--diagram-blue-text)">int</tspan> → 数值自增保持 int;字符串修改会解码并重建为 raw</text>
       </g>
       <g transform="translate(20, 70)">
         <rect x="0" y="0" width="6" height="22" fill="var(--diagram-green-fill)"/>
@@ -2678,10 +2671,10 @@ OK
 <h2 id="s1-9">1.9 内存使用诊断</h2>
 <!-- ============================================================ -->
 
-<p><code>STRLEN</code> 返回的是业务字节数;<code>MEMORY USAGE</code> 返回的是 Redis 实际占用——两者之比就是<strong>内存放大比</strong>。这一节给出 String key 内存组成的拆解,以及把"放大比"用作大 key / 元数据膨胀诊断指标的方法。</p>
+<p><code>STRLEN</code> 只回答“业务内容有多少字节”;<code>MEMORY USAGE</code> 回答“Redis 为这个 key 能归因到多少内存”。两者相除得到的<strong>内存放大比</strong>,能帮你区分两类问题:是 value 本身太大,还是 key、对象头、SDS header、分配器对齐这些元数据把内存吃掉了。</p>
 
 <div class="diagram">
-  <div class="diagram-title">图 1-9-1 · String key 的内存组成</div>
+  <div class="diagram-title">图 1-9-1 · 单个 String key 可归因的内存组成</div>
   <svg viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:920px;width:100%;margin:8px auto;height:auto;">
     <defs>
       <linearGradient id="mem-key" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-purple-fill-start)"/><stop offset="1" stop-color="var(--diagram-purple-fill-end)"/></linearGradient>
@@ -2691,7 +2684,7 @@ OK
       <linearGradient id="mem-pad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--diagram-red-fill-start)"/><stop offset="1" stop-color="var(--diagram-red-fill-end)"/></linearGradient>
     </defs>
     <rect x="0" y="0" width="920" height="460" fill="var(--diagram-panel)" rx="10"/>
-    <text x="460" y="28" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="14" font-weight="700">MEMORY USAGE 返回值的内存组成 (典型 String key)</text>
+    <text x="460" y="28" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="14" font-weight="700">MEMORY USAGE 不是 RSS,而是单 key 可归因内存估算</text>
 
     <!-- 左侧:5 层堆叠图 -->
     <g transform="translate(60, 60)">
@@ -2701,8 +2694,8 @@ OK
 
       <rect x="0" y="52" width="380" height="50" fill="url(#mem-de)"/>
       <text x="20" y="76" fill="var(--diagram-text)" font-size="12" font-weight="700">dictEntry</text>
-      <text x="20" y="92" fill="var(--diagram-blue-text)" font-size="10">next + key + val + hash</text>
-      <text x="360" y="82" text-anchor="end" fill="var(--diagram-blue-text)" font-size="11" font-family="monospace">32 B</text>
+      <text x="20" y="92" fill="var(--diagram-blue-text)" font-size="10">key + value union + next</text>
+      <text x="360" y="82" text-anchor="end" fill="var(--diagram-blue-text)" font-size="11" font-family="monospace">24 B(常按 32 B 分配)</text>
 
       <rect x="0" y="104" width="380" height="50" fill="url(#mem-obj)"/>
       <text x="20" y="128" fill="var(--diagram-text)" font-size="12" font-weight="700">redisObject</text>
@@ -2712,7 +2705,7 @@ OK
       <rect x="0" y="156" width="380" height="80" fill="url(#mem-sds)"/>
       <text x="20" y="180" fill="var(--diagram-text)" font-size="12" font-weight="700">value SDS</text>
       <text x="20" y="198" fill="var(--diagram-green-text)" font-size="10">header (3-17 B) + buf 数据 + \0</text>
-      <text x="20" y="216" fill="var(--diagram-green-text)" font-size="10">关键开销区域 → STRLEN 报告这部分</text>
+      <text x="20" y="216" fill="var(--diagram-green-text)" font-size="10">STRLEN 只报告 data,不含 header/对齐</text>
       <text x="360" y="186" text-anchor="end" fill="var(--diagram-green-text)" font-size="11" font-family="monospace">header + data + 1 B</text>
 
       <rect x="0" y="238" width="380" height="50" fill="url(#mem-pad)"/>
@@ -2736,7 +2729,7 @@ OK
       <text x="20" y="120" fill="var(--diagram-blue-text)" font-size="11">STRLEN (业务字节)</text>
       <text x="340" y="120" text-anchor="end" fill="var(--diagram-green-text)" font-size="14" font-weight="700" font-family="monospace">8 B</text>
 
-      <text x="20" y="148" fill="var(--diagram-blue-text)" font-size="11">MEMORY USAGE (实际占用)</text>
+      <text x="20" y="148" fill="var(--diagram-blue-text)" font-size="11">MEMORY USAGE (key 归因内存)</text>
       <text x="340" y="148" text-anchor="end" fill="var(--diagram-orange-text)" font-size="14" font-weight="700" font-family="monospace">80 B</text>
 
       <line x1="20" y1="164" x2="340" y2="164" stroke="var(--diagram-blue-stroke)"/>
@@ -2778,7 +2771,7 @@ OK
     <!-- Step 1: --bigkeys -->
     <rect x="240" y="20" width="180" height="44" rx="8" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/>
     <text x="330" y="42" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="bold">① redis-cli --bigkeys</text>
-    <text x="330" y="58" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">低峰扫描 TOP-N</text>
+       <text x="330" y="58" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">低峰 SCAN 巡检</text>
     <path d="M 420 42 L 460 42" stroke="var(--diagram-border)" marker-end="url(#arr)"/>
 
     <!-- Step 2: STRLEN -->
@@ -2790,7 +2783,7 @@ OK
     <!-- Step 3: MEMORY USAGE -->
     <rect x="680" y="20" width="220" height="44" rx="8" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/>
     <text x="790" y="42" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="12" font-weight="bold">③ MEMORY USAGE</text>
-    <text x="790" y="58" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">实际占用</text>
+    <text x="790" y="58" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">key 归因内存</text>
 
     <!-- Step 4: ENCODING -->
     <rect x="460" y="84" width="180" height="44" rx="8" fill="url(#g-blue)" stroke="var(--diagram-blue-stroke)"/>
@@ -2872,6 +2865,10 @@ OK
 127.0.0.1:6379&gt; OBJECT IDLETIME order:O1001
 (integer) 382</code></pre>
 
+<div class="warning">
+  <strong><code>--bigkeys</code> 和 <code>OBJECT IDLETIME</code> 都要看上下文</strong>:<code>--bigkeys</code> 是基于 <code>SCAN</code> 的巡检,用于找每种类型里的最大样本,不是精确排行榜;如果实例使用 LFU 淘汰策略,<code>OBJECT IDLETIME</code> 不适用,应改看 <code>OBJECT FREQ</code>。
+</div>
+
 <p>批量扫描放大比(Python 脚本):</p>
 
 <pre><code class="language-python">import redis
@@ -2908,7 +2905,7 @@ order:O1002 strlen=8       memory=80      ratio=10.0</code></pre>
 <h2 id="s1-10">1.10 已知陷阱与限制</h2>
 <!-- ============================================================ -->
 
-<p>SDS 的设计目标是"内存效率 + 二进制安全 + 摊销 O(1)",这些目标在生产环境里如果配合错了使用模式,会立刻反噬:超长 JSON 整块存、频繁 APPEND 大 value、URL 直接作 key、误判 embstr 永久保持……本节把 7 类典型陷阱与对应监控指标列出。</p>
+<p>SDS 本身解决的是字符串存储问题,不是替你选择数据模型。把 2 MiB JSON 当一个 String 存、把 URL 原文当 key、在大 value 上反复 <code>APPEND</code>,都会把 SDS 的优势用反。本节按“容量、编码、诊断、运行时”四类列出 7 个常见坑,重点看每个坑为什么发生、用什么指标发现、怎么换一种存法。</p>
 
 <div class="diagram">
   <div class="diagram-title">图 1-10-1 · SDS 相关陷阱分类(4 大类 · 7 个典型)</div>
@@ -3143,7 +3140,7 @@ OK
 
 <h4>取舍 4:embstr 不可变 + 单向转 raw</h4>
 
-<p>embstr 设计为不可变的核心动机是简化原子性:既然 redisObject 与 SDS 在同一内存块中,任何容量变化都需重新分配整块——直接重建为 raw 反而省去后续修改时的重复重建。该设计也使 embstr 在共享场景(如配置缓存)下天然线程安全。<strong>raw 是终态,无回退路径</strong>,这条单向边在状态机里看起来"少了一条边",实际是简化了一切关于"是否可降级"的判断。</p>
+<p>embstr 设计为不可变的核心动机是让短字符串读路径更简单:redisObject 与 SDS 在同一内存块中,一次分配、局部性好。只要发生容量变化,整块都要重新分配;既然已经要重建,直接转成更适合后续修改的 raw,比继续维持 embstr 更省判断。<strong>raw 是修改路径上的终态,无回退路径</strong>,这条单向边看起来“少了一条边”,实际是在简化所有关于“是否可降级”的判断。</p>
 
 <!-- ============================================================ -->
 <h2 id="s1-summary">1.12 本章要点</h2>
@@ -3161,7 +3158,7 @@ OK
       <tr><td>SDS 结构 = header + buf</td><td><code>sdshdr8</code>、<code>sdsnewlen()</code></td><td>终端乱码不等于数据截断</td></tr>
       <tr><td><code>STRLEN</code> 时间复杂度 O(1)</td><td><code>sdslen()</code>、<code>STRLEN</code></td><td><code>STRLEN</code> 小不代表内存小</td></tr>
       <tr><td><code>alloc</code> 字段管理可用容量</td><td><code>sdsavail()</code>、<code>sdsMakeRoomFor()</code></td><td>频繁追加大 value 引发内存放大</td></tr>
-      <tr><td>预分配:&lt; 1 MiB 翻倍,≥ 1 MiB +1 MiB</td><td><code>APPEND</code>、<code>DEBUG SDSLEN</code></td><td>空闲容量不通过 RDB/复制传播</td></tr>
+      <tr><td>预分配:&lt; 1 MiB 翻倍,≥ 1 MiB +1 MiB</td><td><code>APPEND</code>、<code>sdsavail()</code> / 本地 <code>DEBUG SDSLEN</code></td><td>空闲容量不通过 RDB/复制传播</td></tr>
       <tr><td>惰性释放仅在内部 API 路径生效</td><td><code>sdstrim()</code>、<code>sdsRemoveFreeSpace()</code></td><td>命令层 <code>SET</code> 走对象重建路径</td></tr>
       <tr><td>二进制安全基于显式 len</td><td><code>sdsnewlen(init, len)</code></td><td>终端字符渲染 ≠ Redis 截断</td></tr>
       <tr><td>embstr 不可变,修改触发升级 raw</td><td><code>OBJECT ENCODING</code></td><td>任何原地修改触发对象重建</td></tr>

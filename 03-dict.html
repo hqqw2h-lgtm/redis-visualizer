@@ -60,24 +60,17 @@
   <p>dict 必须在<strong>单线程模型</strong>下提供:<strong>O(1) 平均查找</strong>、<strong>抗碰撞攻击</strong>、<strong>支持百万级 key 的扩容而不阻塞主线程</strong>。前两项决定算法选择(开链法哈希 + SipHash-2-4),第三项决定本章的核心机制——<strong>渐进式 rehash</strong>:把一次可能耗时数百毫秒的全表迁移,拆成"每次读写顺手搬一个 bucket"的小步,保证主线程任何单次操作的延迟可控。</p>
   <p>本章按"<strong>动机 → 布局 → 7 种 CRUD 操作逐帧 → 算法对比 → 陷阱 → 源码</strong>"七层组织。<strong>§3.8 渐进式 rehash 是本章核心</strong>,展示如何把 O(n) 的搬迁分摊到每次操作。其他章节如 4-skiplist、6-listpack、8-rax 都会在自己的角色中调用 dict —— 学透 dict 等于打通了 Redis 一半的内核。</p>
   <ul class="will-learn">
-    <li>dict / dictht / dictEntry / dictType 四个结构在 64-bit 系统上的字节级布局</li>
-    <li>dictAdd 头插法、链路重连、ht_used 维护的 5 帧动画</li>
-    <li>dictFind 在 rehash 中的"先 ht[0] 后 ht[1]"双表查找语义</li>
-    <li>dictDelete 删除链头与链中节点的 prev 指针差异</li>
-    <li>dictReplace 的"先 Add 失败再 Find 更新"双路径与 valDestructor 释放时机</li>
-    <li>dictExpand 触发条件:负载因子 1 / BGSAVE 期间 force_resize_ratio=5</li>
-    <li><strong>_dictRehashStep 把 O(n) 拆成 O(1) 步</strong>的核心实现 + serverCron 主动 rehash</li>
-    <li>dictScan 反向二进制迭代如何在 rehash 期间保证最终覆盖性</li>
-    <li>开链 vs 开放寻址、哈希 vs 平衡树、SipHash vs MurmurHash 的取舍依据</li>
-    <li>典型陷阱:KEYS 全表扫描、单 Hash 百万 field、fork 期 dict 修改触发 CoW</li>
+    <li><strong>一张表怎么放:</strong><code>dict</code> 管两张哈希表,<code>dictEntry</code> 串成链,<code>dictType</code> 决定 key/value 的所有权。</li>
+    <li><strong>扩容为什么不卡:</strong>rehash 期间新旧两表共存,每次读写顺手迁几个 bucket。</li>
+    <li><strong>上线最怕什么:</strong><code>KEYS</code> 全表扫描、大 Hash、fork 期间写入和 DEBUG 误用。</li>
   </ul>
-  <p class="prereq">前置知识:第 2 章 SDS(理解 dict 内 sds key 的所有权);C 语言指针、union、柔性数组(C99 flexible array member)、位字段;基本算法常识(哈希表负载因子、链表头插法、二分查找)。读者需要熟悉 Redis 命令 <code>SET/GET/HSET/SCAN/HSCAN/UNLINK/DEBUG HTSTATS</code>。</p>
+  <p class="prereq">前置知识:第 2 章 SDS(理解 dict 内 sds key 的所有权);C 语言指针、union、柔性数组(C99 flexible array member)、位字段;基本算法常识(哈希表负载因子、链表头插法、二分查找)。命令层面熟悉 <code>SET/GET/HSET/SCAN/HSCAN/UNLINK</code>; <code>DEBUG HTSTATS</code> 只作为本地或临时诊断工具出现。</p>
 </div>
 
 <h3>本章全景图</h3>
 
 <div class="diagram">
-  <div class="diagram-title">图 3-0 · 本章导览 — 4 大模块 13 节</div>
+  <div class="diagram-title">图 3-0 · 本章导览 — 先看双表 rehash,再看 CRUD 细节</div>
   <svg viewBox="0 0 960 560" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:960px;width:100%;margin:8px auto;height:auto;">
     <rect x="0" y="0" width="960" height="560" fill="var(--diagram-panel)" rx="10"/>
 
@@ -207,7 +200,7 @@
       <tr><td>B-tree</td><td>O(log n)</td><td>O(log n)</td><td>节点分裂</td><td>—</td><td>复杂</td><td>主要用于磁盘场景,内存场景常数高</td></tr>
       <tr><td>一次性扩容哈希表</td><td>O(1)</td><td>O(n) 扩容时</td><td>O(n) 阻塞</td><td>弱</td><td>简单</td><td><strong>百万 key 扩容阻塞主线程数百 ms</strong></td></tr>
       <tr><td>开放寻址哈希表(线性探测)</td><td>O(1)</td><td>O(n) 退化</td><td>O(n) 重哈希</td><td>同上</td><td>中</td><td>删除复杂(墓碑标记);键值所有权管理难</td></tr>
-      <tr><td><strong>dict(开链 + 渐进 rehash)</strong></td><td><strong>O(1)</strong></td><td><strong>O(链长)</strong></td><td><strong>每操作 O(1)</strong></td><td><strong>强(SipHash)</strong></td><td><strong>中</strong></td><td><strong>无,本场景最优</strong></td></tr>
+      <tr><td><strong>dict(开链 + 渐进 rehash)</strong></td><td><strong>O(1)</strong></td><td><strong>O(链长)</strong></td><td><strong>每操作摊销小步迁移</strong></td><td><strong>强(SipHash)</strong></td><td><strong>中</strong></td><td><strong>适合按 key 查找;不提供有序范围</strong></td></tr>
     </tbody>
   </table>
 </div>
@@ -1169,7 +1162,7 @@ typedef struct dictType {
   </table>
 </div>
 
-<p>链长在均匀哈希(SipHash + 负载因子 ≤ 1)下期望为 <strong>1.0-1.5</strong>,极端情况下取决于哈希分布。<code>DEBUG HTSTATS &lt;dbid&gt;</code> 可输出实际链长直方图,用于线上诊断。</p>
+<p>链长在均匀哈希(SipHash + 负载因子 ≤ 1)下通常很短,但极端情况下取决于哈希分布与负载因子。<code>DEBUG HTSTATS &lt;dbid&gt;</code> 能输出链长直方图,适合本地复现或受控临时诊断;生产环境不要常态化开启 DEBUG 命令。</p>
 
 <!-- ============================================================ -->
 <h2 id="s3-5">3.5 dictDelete 删除操作</h2>
@@ -2376,7 +2369,7 @@ else
       <tr><td>B-tree</td><td>O(log n)</td><td>O(log n)</td><td>节点分裂</td><td>—</td><td>复杂</td><td>主要用于磁盘场景,内存场景常数高</td></tr>
       <tr><td>一次性扩容哈希</td><td>O(1)</td><td>O(n) 扩容时</td><td>O(n) 阻塞</td><td>弱(MurmurHash)</td><td>简单</td><td><strong>百万 key 扩容阻塞 100+ ms</strong></td></tr>
       <tr><td>开放寻址(线性探测)</td><td>O(1)</td><td>O(n) 退化</td><td>O(n) 重哈希</td><td>同上</td><td>中</td><td>删除复杂(墓碑标记);所有权管理难</td></tr>
-      <tr><td><strong>dict(开链 + 渐进 + SipHash)</strong></td><td><strong>O(1)</strong></td><td><strong>O(链长)</strong></td><td><strong>每操作 O(1)</strong></td><td><strong>强</strong></td><td><strong>中</strong></td><td><strong>无,本场景最优</strong></td></tr>
+      <tr><td><strong>dict(开链 + 渐进 + SipHash)</strong></td><td><strong>O(1)</strong></td><td><strong>O(链长)</strong></td><td><strong>每操作摊销小步迁移</strong></td><td><strong>强</strong></td><td><strong>中</strong></td><td><strong>适合 key/value 查找;不适合有序范围</strong></td></tr>
     </tbody>
   </table>
 </div>
@@ -2582,7 +2575,7 @@ else
   <table>
     <thead><tr><th>#</th><th>陷阱</th><th>症状</th><th>根因</th><th>处理</th></tr></thead>
     <tbody>
-      <tr><td>1</td><td>长链导致 O(N) 退化</td><td>单 key GET P99 突增</td><td>哈希分布不均或恶意构造碰撞</td><td>保留 SipHash-2-4;监控 <code>DEBUG HTSTATS</code> 链长</td></tr>
+      <tr><td>1</td><td>长链导致 O(N) 退化</td><td>单 key GET P99 突增</td><td>哈希分布不均或恶意构造碰撞</td><td>保留 SipHash-2-4;用慢日志和受控 <code>DEBUG HTSTATS</code> 辅助定位</td></tr>
       <tr><td>2</td><td>单 Hash 塞百万 field</td><td>HGET/HSET 抖动,rehash 内存峰值高</td><td>对象内部 dict 过大</td><td>按 field hash 分片(如 <code>hash:user:{uid}:1..N</code>)</td></tr>
       <tr><td>3</td><td>KEYS 全量扫库</td><td>主线程阻塞,P99 飙升</td><td>两张表都要遍历 + 链遍历</td><td>改 SCAN/HSCAN,限制 COUNT</td></tr>
       <tr><td>4</td><td>rehash 期间内存翻倍</td><td>INFO memory 显示 used_memory 飙升</td><td>ht[0] + ht[1] 同时驻留</td><td>maxmemory 留 30% 余量;预估 rehash 高峰内存</td></tr>
@@ -2880,8 +2873,8 @@ int dictRehash(dict *d, int n) {
 </div>
 
 <div class="real-world">
-  <strong>用例 3:DEBUG HTSTATS 帮助定位 SipHash secret 泄漏</strong><br>
-  某团队的 Redis 收到大量构造性 key(<code>aaaa...</code>、<code>aaab...</code> 长尾),怀疑遭遇 Hash-Flooding 攻击。<strong>诊断</strong>:用 <code>DEBUG HTSTATS 0</code> 看链长分布,P99 = 32(正常 &lt; 5),最长链 256;同时 SLOWLOG 显示 GET 某些 key 耗时 1 ms+(本应 &lt; 100 μs)。<strong>修复</strong>:重启 Redis(SipHash secret 在启动时随机生成,重启会换 secret 让所有"构造"失效);加 <code>tcp-keepalive 60</code> 检测异常连接;前置 WAF 限制 key 长度。
+  <strong>用例 3:用链长分布辅助定位疑似 Hash-Flooding</strong><br>
+  某团队的 Redis 收到大量构造性 key(<code>aaaa...</code>、<code>aaab...</code> 长尾),怀疑遭遇 Hash-Flooding 攻击。<strong>诊断</strong>:在受控窗口临时用 <code>DEBUG HTSTATS 0</code> 看链长分布,P99 = 32(正常通常 &lt; 5),最长链 256;同时 SLOWLOG 显示部分 GET 耗时 1 ms+。<strong>处理</strong>:限制异常 key 长度和写入速率,必要时重启实例刷新 SipHash seed,并在前置网关/WAF 侧拦截构造性流量。
 </div>
 
 <div class="real-world">

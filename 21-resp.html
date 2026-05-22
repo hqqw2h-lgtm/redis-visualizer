@@ -53,7 +53,7 @@
 
 <div class="chapter-intro">
   <p class="lead">Redis 客户端与服务端之间通过一条 TCP 连接交换字节流,字节流的语法称为 <strong>REdis Serialization Protocol(RESP)</strong>。该协议的设计目标是:<strong>首字节判型</strong>、<strong>长度前缀</strong>、<strong>二进制安全</strong>、<strong>解析路径无需回溯</strong>。</p>
-  <p>RESP2 自 Redis 1.2 起作为唯一线缆协议,定义五种基本类型;RESP3 自 Redis 6.0 起作为可选升级协议,在 RESP2 基础上扩充至十四种类型,补齐 Map、Set、Boolean、Null、Big number、Double、Verbatim string、Push 等语义。客户端通过 <code>HELLO 3</code> 命令在握手阶段切换至 RESP3。</p>
+  <p>RESP2 自 Redis 1.2 起作为唯一线缆协议,定义五种基本类型;RESP3 自 Redis 6.0 起作为可选升级协议,在 RESP2 基础上扩充至十五种首字节类型,补齐 Map、Set、Boolean、Null、Big number、Double、Verbatim string、Blob Error、Push、Attribute 等语义。客户端通过 <code>HELLO 3</code> 命令在握手阶段切换至 RESP3。</p>
   <p>实现 RESP 解析的核心约束是:TCP 是流协议,单次 <code>read()</code> 可能读到半条命令或多条命令。Redis 在 <code>client.querybuf</code> 上维护<strong>增量解析状态机</strong>,通过 <code>multibulklen</code> 与 <code>bulklen</code> 两个计数器跟踪进度,半包等待事件循环下一轮,粘包则在同一轮内顺序处理。<strong>这一机制同时是 Pipeline 的物理基础</strong>。</p>
   <ul class="will-learn">
     <li>RESP 与 HTTP/JSON/Protobuf 候选协议的对比依据(首字节判型、无 schema 协商)</li>
@@ -61,13 +61,13 @@
     <li>每种类型的字节级布局(逐字节 ASCII + CRLF 终止符)</li>
     <li><code>processInputBuffer</code> 状态机:<code>multibulklen</code>、<code>bulklen</code> 双计数器跟踪进度</li>
     <li>半包/粘包的字节级演变与"数据不足即退回事件循环"的不变量</li>
-    <li>RESP3 九种新增类型:Map <code>%</code>、Set <code>~</code>、Bool <code>#</code>、Null <code>_</code>、Big <code>(</code>、Double <code>,</code>、Verbatim <code>=</code>、Push <code>&gt;</code>、Attribute <code>|</code></li>
+    <li>RESP3 十种新增/独立类型:Map <code>%</code>、Set <code>~</code>、Bool <code>#</code>、Null <code>_</code>、Big <code>(</code>、Double <code>,</code>、Verbatim <code>=</code>、Blob Error <code>!</code>、Push <code>&gt;</code>、Attribute <code>|</code></li>
     <li>Pipeline 的本质:客户端连续写、服务端无专属路径、RTT 摊薄 N→1</li>
     <li>Cluster smart client 的按槽分组、MOVED/ASK 重定向、CROSSSLOT 限制</li>
     <li><code>client-query-buffer-limit</code>、<code>proto-max-bulk-len</code>、<code>client-output-buffer-limit</code> 三类配置</li>
     <li>10 类典型陷阱:Inline 误用、长度不匹配、批次过大、Push 错位、跨槽 MOVED 等</li>
   </ul>
-  <p class="prereq">前置知识:第 19-20 章 ae 事件循环 + I/O 多路复用(知道 <code>readQueryFromClient</code> 是事件回调);Redis 命令模型(<code>SET</code>/<code>GET</code>/<code>HGETALL</code>/<code>SUBSCRIBE</code>);Cluster 16384 个 slot 与 CRC16 路由(第 14-15 章)。</p>
+  <p class="prereq">前置知识:第 19-20 章 ae 事件循环 + I/O 多路复用(知道 <code>readQueryFromClient</code> 是事件回调);Redis 命令模型(<code>SET</code>/<code>GET</code>/<code>HGETALL</code>/<code>SUBSCRIBE</code>);Cluster 场景可先了解第 27 章的 16384 slot 与第 15 章 CRC16 路由。</p>
 </div>
 
 <!-- ============================================================ -->
@@ -143,7 +143,7 @@
         <text x="830" y="196" text-anchor="middle">Inline 命令限制</text>
         <text x="830" y="210" text-anchor="middle">大 value 缓冲膨胀</text>
         <text x="830" y="224" text-anchor="middle">RESP3 客户端兼容</text>
-        <text x="830" y="244" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">CLIENT NO-EVICT</text>
+        <text x="830" y="244" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">Push 分发与降级</text>
       </g>
 
       <rect x="120" y="290" width="700" height="60" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
@@ -1060,7 +1060,7 @@
   </svg>
 </div>
 
-<p>RESP3 在 RESP2 基础上新增九种类型,首字节集合扩展为十四个。除了 <strong>Map 与 Push 改变了客户端读循环假设</strong>外,其余新类型语义独立,客户端可以选择性支持。Redis 通过 <code>HELLO 3</code> 切换连接协议,服务端在该连接上对所有应答使用 RESP3 编码。</p>
+<p>RESP3 在 RESP2 基础上新增十种类型,首字节集合扩展为十五个。除了 <strong>Map 与 Push 改变了客户端读循环假设</strong>外,Blob Error 让错误也具备长度前缀和二进制安全语义。Redis 通过 <code>HELLO 3</code> 切换连接协议,服务端在该连接上对所有应答使用 RESP3 编码。</p>
 
 <div class="diagram">
   <div class="diagram-title">图 21-4-2 · Map 字节布局(HGETALL)</div>
@@ -1311,7 +1311,7 @@
       </g>
 
       <rect x="40" y="270" width="860" height="200" rx="8" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)" stroke-dasharray="4,3"/>
-      <text x="60" y="290" fill="var(--diagram-green-text)" font-size="11" font-weight="700">Pipeline · 1 次 RTT 摊薄 N 个命令(10×1ms = 1ms · 1000×1ms = 1ms)</text>
+      <text x="60" y="290" fill="var(--diagram-green-text)" font-size="11" font-weight="700">Pipeline · 1 次 RTT 摊薄 N 个命令(还要加 N 次命令执行时间)</text>
 
       <g font-size="10" fill="var(--diagram-blue-text)">
         <line x1="120" y1="318" x2="820" y2="318" stroke="var(--diagram-blue-stroke)" stroke-width="2" marker-end="url(#d-arr-b)"/>
@@ -1403,7 +1403,7 @@
         <text x="650" y="190" fill="var(--diagram-green-text)">脚本执行不被打断</text>
         <text x="650" y="218" fill="var(--diagram-purple-text)" font-weight="700">代价</text>
         <text x="650" y="238" fill="var(--diagram-red-text)">阻塞主线程 · 长脚本拖累全员</text>
-        <text x="650" y="266" fill="var(--diagram-muted)" font-size="9">需控制时长 ≤ 1ms</text>
+        <text x="650" y="266" fill="var(--diagram-muted)" font-size="9">需按延迟预算严格控制时长</text>
       </g>
 
       <line x1="165" y1="284" x2="165" y2="310" stroke="var(--diagram-blue-stroke)" stroke-width="1.5" marker-end="url(#d-arr-b)"/>
@@ -1426,7 +1426,7 @@
       <text x="775" y="332" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">收益</text>
       <text x="775" y="352" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">原子 + 服务端计算</text>
       <text x="775" y="368" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">条件 / 循环 / 多 key 操作</text>
-      <text x="775" y="384" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">脚本时长必须 &lt; 1ms</text>
+      <text x="775" y="384" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">脚本时长需纳入 P99 预算</text>
 
       <rect x="40" y="406" width="860" height="44" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
       <text x="60" y="424" fill="var(--diagram-green-text)" font-size="11" font-weight="700">组合用法</text>
@@ -1582,7 +1582,7 @@
       <text x="470" y="416" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">每条命令带 index,3 个并发应答数组合并</text>
 
       <rect x="40" y="438" width="860" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
-      <text x="470" y="458" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">最优情况:N 条命令 + 3 节点并发 = 1 RTT(慢节点决定) · 比 naive 跨槽 Pipeline 快 5-10×</text>
+      <text x="470" y="458" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">最优情况:按节点分组并发发送,总耗时由最慢子批次决定 · 不改变单条命令语义</text>
     </g>
   </svg>
 </div>
@@ -1758,7 +1758,7 @@
       <line x1="280" y1="380" x2="690" y2="380" stroke="var(--diagram-border)" stroke-dasharray="3,3"/>
 
       <rect x="320" y="380" width="300" height="40" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
-      <text x="470" y="400" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">server.log + INFO clients (rejected_connections / output_buffer)</text>
+      <text x="470" y="400" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">server log + CLIENT LIST / INFO clients</text>
       <text x="470" y="414" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">运维可看到具体哪个 client 因 obuf 被踢</text>
 
       <rect x="40" y="430" width="860" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
@@ -1777,9 +1777,9 @@
     <thead><tr><th>字段</th><th>含义</th><th>异常阈值</th></tr></thead>
     <tbody>
       <tr><td><code>qbuf</code></td><td>querybuf 已用字节</td><td>持续接近 <code>client-query-buffer-limit</code></td></tr>
-      <tr><td><code>qbuf-free</code></td><td>querybuf 剩余空间</td><td>接近 0 表示半包堆积</td></tr>
-      <tr><td><code>obl</code></td><td>输出 buf 已用字节</td><td>持续 16 KiB 上限</td></tr>
-      <tr><td><code>oll</code></td><td>reply 链表节点数</td><td>&gt; 100 表示 Pipeline 批次过大</td></tr>
+      <tr><td><code>qbuf-free</code></td><td>querybuf 预留空闲容量</td><td>需结合 <code>qbuf</code> 看,单独接近 0 不代表故障</td></tr>
+      <tr><td><code>obl</code></td><td>固定输出 buf 已用字节</td><td>接近 16 KiB 只说明小缓冲已满,重点看 <code>oll/omem</code></td></tr>
+      <tr><td><code>oll</code></td><td>reply 链表节点数</td><td>持续快速增长表示客户端读慢或 Pipeline 批次过大</td></tr>
       <tr><td><code>omem</code></td><td>reply 链表占用内存(字节)</td><td>接近 <code>output-buffer-limit hard</code></td></tr>
       <tr><td><code>cmd</code></td><td>最后执行的命令名</td><td>异常长命令需排查</td></tr>
       <tr><td><code>age</code></td><td>连接秒数</td><td>长连接占用 fd</td></tr>
@@ -1809,7 +1809,7 @@ obl=16384 oll=8124 omem=67108864 cmd=set</code></pre>
       <tr><td>1</td><td>Inline 当正式协议</td><td>含空格 value 解析错误</td><td>客户端一律使用 Multibulk</td></tr>
       <tr><td>2</td><td>长度前缀错误</td><td><code>Protocol error</code> 日志</td><td>客户端 RESP 编码自检</td></tr>
       <tr><td>3</td><td>Pipeline 批次过大</td><td><code>omem</code> 暴涨,连接被断</td><td>批次控制在 50-1000</td></tr>
-      <tr><td>4</td><td>大 value 拒绝</td><td><code>-ERR Bulk reply too big</code></td><td>调高 <code>proto-max-bulk-len</code> 或拆分</td></tr>
+      <tr><td>4</td><td>大 value 超过协议上限</td><td>协议错误或写入被拒</td><td>优先拆分,确需大对象再评估 <code>proto-max-bulk-len</code></td></tr>
       <tr><td>5</td><td>output-buffer 断连</td><td>客户端被剔除</td><td>调高限制 + 客户端读快</td></tr>
       <tr><td>6</td><td>Pipeline 当事务</td><td>中间状态被其他客户端观察</td><td>用 <code>MULTI/EXEC</code> 或 Lua</td></tr>
       <tr><td>7</td><td>RESP3 Push 未分发</td><td>应答与通知错位</td><td>升级客户端库或回退 RESP2</td></tr>
@@ -2055,7 +2055,7 @@ obl=16384 oll=8124 omem=67108864 cmd=set</code></pre>
       <tr><td>RESP 首字节判型,长度前缀承载二进制安全</td><td><code>processInputBuffer()</code></td><td>Inline 命令不可承载二进制</td></tr>
       <tr><td>RESP2 五种基本类型 <code>+ - : $ *</code></td><td><code>addReplyStatus/Error/Integer/Bulk/Multi</code></td><td>Null Bulk <code>$-1</code> ≠ 空 Bulk <code>$0</code></td></tr>
       <tr><td>增量解析依赖 <code>multibulklen</code> 与 <code>bulklen</code> 计数器</td><td><code>processMultibulkBuffer()</code></td><td>半包退回事件循环,不修改已解析字段</td></tr>
-      <tr><td>RESP3 新增九种类型,通过 <code>HELLO 3</code> 启用</td><td><code>helloCommand()</code> / <code>addReplyMapLen()</code></td><td>Push 必须在客户端读循环分发</td></tr>
+      <tr><td>RESP3 新增十种类型,通过 <code>HELLO 3</code> 启用</td><td><code>helloCommand()</code> / <code>addReplyMapLen()</code></td><td>Push 必须在客户端读循环分发</td></tr>
       <tr><td>Pipeline 是客户端连续写,服务端无专属路径</td><td><code>processInputBuffer</code> while 循环</td><td>不提供原子性,需配合 MULTI/Lua</td></tr>
       <tr><td><code>proto-max-bulk-len</code> 默认 512 MiB</td><td>server.c</td><td>大 value 命令需调整或拆分</td></tr>
       <tr><td><code>client-output-buffer-limit</code> 控制输出缓冲断连阈值</td><td>networking.c</td><td>Pipeline 批次过大触发</td></tr>

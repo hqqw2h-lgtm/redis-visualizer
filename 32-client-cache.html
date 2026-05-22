@@ -53,17 +53,17 @@
 <p class="subtitle">Server-Assisted Client-Side Caching · CLIENT TRACKING · Tracking vs Broadcasting · RESP3 Push · NOLOOP / OPTIN / OPTOUT · 一致性数学 · 目录式与嗅探式</p>
 
 <div class="chapter-intro">
-  <p class="lead">Redis 命令的服务端处理通常仅约 <strong>1 µs</strong>,而同 AZ 部署下网络往返(RTT)却在 <strong>100–300 µs</strong> 之间——网络成为绝对瓶颈。Redis 6.0 引入的<strong>服务端辅助客户端缓存</strong>(Server-Assisted Client-Side Caching)允许客户端把热数据副本保留在进程内,把"最近的数据源"从 Redis 实例前移到应用进程,RTT 从主路径移除;一致性的代价被压缩成"<strong>写入时的一次失效推送</strong>"。这是一种典型的<strong>目录式缓存一致性协议</strong>,与 CPU MESI、HTTP ETag、CDN purge 同属"多副本一致性"问题家族。</p>
-  <p>Redis 选择<strong>最终一致</strong>而非强一致,因为强一致需要 2PC 级别的同步,延迟成本会与缓存收益相互抵消。机制本质上是一种工程权衡:服务端维护 <code>tracking_table</code>(每 key 的客户端订阅列表),写入时通过 RESP3 Push 或 RESP2 重定向频道推送 <code>invalidate</code> 通知;客户端收到后驱逐本地副本,下次读取再从源端重新加载。本章按"问题 → Tracking → Broadcasting → RESP3 协议 → 三大修饰符 → 一致性数学 → 跨系统映射 → 多部署 → 基线 → 陷阱 → 源码"组织,目标是让你读完后能够:为某条 key 选出最优的跟踪模式、估算 <code>tracking_table</code> 内存预算、看懂 <code>INFO tracking</code> 的每一行、设计出断线/failover 安全的客户端模板。</p>
+  <p class="lead">Redis 单条简单命令在服务端通常很快,而同 AZ 网络 RTT 往往高出一到两个数量级。对稳定热 key 来说,瓶颈常常不是命令本身,而是每次都要跨网络取值。Redis 6.0 引入的<strong>服务端辅助客户端缓存</strong>(Server-Assisted Client-Side Caching)允许客户端把热数据副本保留在进程内:命中时走本地读,写入时由 Redis 推送失效通知。这是一种目录式缓存一致性协议。</p>
+  <p>Redis 客户端缓存选择<strong>最终一致</strong>:失效通知是异步到达的,客户端在收到通知前可能短暂读到旧值。若要强一致读,就不能把本地副本当权威来源,而应直接读 Redis 或把校验与写入放到服务端完成。机制本质上是一种工程权衡:服务端维护 <code>tracking_table</code>(每 key 的客户端订阅列表),写入时通过 RESP3 Push 或 RESP2 重定向频道推送 <code>invalidate</code> 通知;客户端收到后驱逐本地副本,下次读取再从源端重新加载。</p>
   <ul class="will-learn">
-    <li>为什么 Redis 7+ 把客户端缓存放在 RESP3 第一公民位置,以及背后的"目录式 vs 嗅探式"硬件级类比</li>
+    <li>为什么 RESP3 Push 让客户端缓存从"双连接技巧"变成协议内能力,以及"目录式 vs 广播式"的直观类比</li>
     <li><code>CLIENT TRACKING ON</code> 启用流程、<code>tracking_table</code> 与 <code>tracking_table_prefixes</code> 双 rax 结构</li>
     <li><code>lookupKey</code> 中读命令登记的精确触发点,以及 <code>signalModifiedKey</code> 写时失效的调用链</li>
     <li>Broadcasting 与 Tracking 的内存/网络/精度三维权衡,以及"K=100 万 / C=10 客户端"下的内存推导</li>
     <li>RESP3 的 <code>&gt;</code> Push 类型如何让单连接多路复用替代 RESP2 双连接 + Pub/Sub</li>
     <li>NOLOOP 解决自写自收、OPTIN 让稳定热 key 不被临时数据挤走、OPTOUT 排除高频抖动 key</li>
     <li>命中率 <code>h = 1 − r/W</code> 的推导与延迟加速比 <code>Speedup ≈ 1/(1−h)</code> 的边际爆炸</li>
-    <li>失效通知微秒级延迟下的脏读概率公式 <code>P(stale) ≈ d/W</code> 与强一致禁用边界</li>
+    <li>失效通知延迟下的脏读概率估算 <code>P(stale) ≈ d/W</code>,以及哪些强一致场景不该使用本地缓存</li>
     <li>Cluster / Sentinel / 主从切换下"tracking 状态丢失即本地缓存全部不可信"的工程约束</li>
     <li>断线重连模板、tracking_table 溢出的连锁反应与 10 大生产陷阱速查</li>
   </ul>
@@ -215,7 +215,7 @@
 <h2 id="s32-1">32.1 客户端缓存解决的问题</h2>
 <!-- ============================================================ -->
 
-<p>客户端缓存不是"性能锦上添花",而是<strong>一次延迟数量级的跃迁</strong>。它解决一个非常具体的工程问题:当 Redis 单条命令的服务端处理仅 ~1 µs,而网络 RTT 占总延迟 99% 时,任何"再优化命令逻辑"的努力都无效——必须把读路径整体短路。下面先看延迟分解,再看为什么"目录式失效"是 Redis 6 选择的解。</p>
+<p>客户端缓存不是泛泛的"再快一点",而是把稳定热 key 的读路径从网络请求变成本地查找。若一次 Redis 请求的大部分时间花在 RTT 上,继续优化命令内部逻辑收益有限;更有效的办法是让命中读不出进程。下面先看延迟分解,再看为什么"目录式失效"是 Redis 6 选择的解。</p>
 
 <h3>32.1.1 网络 RTT 在请求延迟中的占比</h3>
 
@@ -1060,7 +1060,7 @@ GET user:1001</code></pre>
 观察:
   命中率提升的边际收益指数增长
   从 90% 到 99% 比从 50% 到 90% 收益更大
-  关键热 key 的命中率应努力推到 99%+</code></pre>
+  命中率越高收益越大,但目标值要按业务收益和内存成本确定</code></pre>
 </div>
 
 <h3>32.6.2 定理 32-6-2:命中率与读写比</h3>
@@ -1166,7 +1166,7 @@ tracking_table 内存:
 <h2 id="s32-7">32.7 跨系统对比</h2>
 <!-- ============================================================ -->
 
-<p>客户端缓存不是 Redis 独家发明,它是一个跨越 30 年硬件与协议史的<strong>同构问题</strong>——只要存在"多副本 + 写更新",一致性协议就有同样的设计空间。看清这些同构关系,有助于把"Tracking 是目录式、Broadcasting 是嗅探式"这一组对应迁移到任何缓存系统设计中。</p>
+<p>客户端缓存不是 Redis 独家发明。只要系统里存在"多份副本 + 写入后通知",都会遇到类似问题:谁记录副本位置、写入时通知谁、通知丢了怎么办。把 Redis Tracking 与 CPU 缓存、HTTP ETag、CDN Purge 放在一起看,是为了帮助理解取舍,不是说它们语义完全相同。</p>
 
 <h3>32.7.1 多副本一致性同构表</h3>
 
@@ -1238,7 +1238,7 @@ Broadcasting 模式 ≈ 嗅探式缓存一致性 (Snoopy Protocol):
 </div>
 
 <div class="key-insight">
-  <strong>30 年硬件经验是 Redis 设计的隐含先验</strong>:Tracking 内存随订阅者数增长这一弱点,在多 socket CPU 上 30 年前就被研究透;Broadcasting 写放大这一弱点,在共享 bus 时代就有完整教科书答案。Redis 6 选择"<strong>两种都做、按场景选</strong>",而不是赌某一种,正是吸取了硬件历史的工程谦逊。
+  <strong>类比的价值在于看清取舍</strong>:Tracking 记录"谁读过什么",内存更精确但要维护目录;Broadcasting 按前缀广播,服务端状态更少但会产生虚假失效。Redis 6 两种都提供,让业务按 key 空间规模、写入频率和可接受的虚假失效来选择。
 </div>
 
 <!-- ============================================================ -->
@@ -1355,7 +1355,7 @@ Broadcasting 模式 ≈ 嗅探式缓存一致性 (Snoopy Protocol):
       <text x="40" y="430" fill="var(--diagram-blue-text)" font-size="13" font-weight="800">★ 必须清空的根因</text>
       <text x="40" y="448" fill="var(--diagram-red-text)" font-size="11">✗ 旧 Master 与新 Master 之间存在异步复制延迟,新 Master 上的 key 可能比 App 本地副本更旧或不一致</text>
       <text x="40" y="466" fill="var(--diagram-red-text)" font-size="11">✗ 新 Master 的 tracking_table 没有 App 的订阅记录 — 即使后续写入也不会推送 invalidate 给 App</text>
-      <text x="40" y="484" fill="var(--diagram-green-text)" font-size="11">✓ 客户端基础库必须把 failover 事件绑定到 localCache.clear() — 见真实事故案例</text>
+      <text x="40" y="484" fill="var(--diagram-green-text)" font-size="11">✓ 客户端基础库必须把 failover 事件绑定到 localCache.clear() — 见典型风险案例</text>
     </g>
   </svg>
 </div>
@@ -1386,14 +1386,14 @@ Broadcasting 模式 ≈ 嗅探式缓存一致性 (Snoopy Protocol):
 </div>
 
 <div class="real-world">
-  <strong>真实事故案例:</strong> 某金融交易系统启用了客户端缓存,Sentinel 触发了一次 failover,客户端基础库由于"<strong>未把 failover 事件绑定到本地缓存清空</strong>",在新 Master 上读到了 12 秒前的余额值——这条余额数据已经在旧 Master 上被 <code>SET</code> 过一次但因复制延迟未同步到新 Master。客户业务方在风控环节读到旧余额放行了一笔异常出账。事后修复:在 lettuce 的 <code>ReconnectFailedListener</code> 中显式调用 <code>localCache.clear()</code>,并把 <code>maxmemory-policy</code> 等关键余额数据从客户端缓存白名单中移除。
+  <strong>典型风险案例:</strong> 如果 Sentinel failover 后客户端没有清空本地缓存,应用可能继续使用旧 Master 时期缓存的值;而新 Master 的 <code>tracking_table</code> 又没有这条客户端订阅记录,后续写入也未必能通知到它。修复思路很直接:在客户端库的重连 / 拓扑变更回调中调用 <code>localCache.clear()</code>,并把余额、库存这类强一致 key 排除在客户端缓存白名单外。
 </div>
 
 <!-- ============================================================ -->
 <h2 id="s32-9">32.9 性能基线</h2>
 <!-- ============================================================ -->
 
-<p>没有数字的设计是<strong>口头协议</strong>。下表是在固定基准下(Redis 7.2、同 AZ、RTT ~0.2 ms、16 并发、100 字节 value)的实测,目的是给容量规划与故障排查提供"基线对比"。</p>
+<p>客户端缓存是否值得用,要靠数字判断。下表是在固定基准下(Redis 7.2、同 AZ、RTT ~0.2 ms、16 并发、100 字节 value)的示例结果,目的是给容量规划与故障排查提供"基线对比",不是通用承诺。</p>
 
 <h3>32.9.1 吞吐与延迟基线</h3>
 
@@ -1550,7 +1550,7 @@ for log_id in range(1_000_000):
 # 显式缓存稳定热 key
 r.execute_command("CLIENT", "CACHING", "YES")
 hot = r.get("config:feature-a")</code></pre>
-    <p>OPTIN + 白名单让 <code>tracking_table</code> 只保留真正高价值的 ~1k 条目,内存与服务端 CPU 都回到正常水位,稳定 key 命中率保持 99%+。</p>
+    <p>OPTIN + 白名单让 <code>tracking_table</code> 只保留真正高价值的少量条目,内存与服务端 CPU 都回到可控水位,稳定 key 的命中率也更容易维持。</p>
   </div>
 </div>
 
@@ -1818,7 +1818,7 @@ void evictTrackingTable(void) {
       <tr><td>客户端缓存是最终一致</td><td>异步推送</td><td>强一致场景禁用</td></tr>
       <tr><td><code>tracking-table-max-keys</code> 溢出导致虚假失效与命中率断崖</td><td><code>evictTrackingTable</code></td><td>容量规划保 30% 余量</td></tr>
       <tr><td>断线/failover/MOVED 必须立即清空本地缓存</td><td>客户端模板</td><td>否则脏读</td></tr>
-      <tr><td>Tracking ≈ 目录式,Broadcasting ≈ 嗅探式</td><td>MESI 类比</td><td>30 年硬件经验是先验</td></tr>
+      <tr><td>Tracking ≈ 目录式,Broadcasting ≈ 广播式</td><td>缓存一致性类比</td><td>类比用于理解取舍,不要混同语义</td></tr>
     </tbody>
   </table>
 </div>
@@ -1865,15 +1865,15 @@ demo:k1</code></pre>
 
 <h3>章末总结</h3>
 
-<p>第 32 章把视角从"<strong>Redis 单实例的执行</strong>"拉到了"<strong>Redis + 客户端进程的两层一致性系统</strong>"。客户端缓存的工程价值不在"再快一点",而在<strong>把读路径的延迟整体砍掉两个数量级</strong>;它的设计哲学是"<strong>服务端最小承诺、客户端最大自由</strong>",这与 Redis 全书的"提供原语 + 让业务组合"的哲学完全一致。</p>
+  <p>第 32 章把视角从"<strong>Redis 单实例的执行</strong>"拉到了"<strong>Redis + 客户端进程的两层一致性系统</strong>"。客户端缓存的工程价值不在"再快一点",而在让稳定热 key 的读路径绕开网络;它的设计哲学是"<strong>服务端只负责失效提示,客户端负责本地缓存策略</strong>",这与 Redis 全书的"提供原语 + 让业务组合"的哲学一致。</p>
 
 <ul>
   <li><strong>§32.1-32.2</strong> 给出问题域与 Tracking 模式的目录式协议骨架;</li>
-  <li><strong>§32.3</strong> 用 Broadcasting 给出"嗅探式"备选方案,完成两种硬件级类比;</li>
+  <li><strong>§32.3</strong> 用 Broadcasting 给出"广播式"备选方案,帮助比较服务端状态与虚假失效;</li>
   <li><strong>§32.4</strong> 把 RESP3 Push 的协议层意义讲清楚——单连接多路复用替代双连接 Pub/Sub;</li>
   <li><strong>§32.5</strong> 三个修饰符 NOLOOP/OPTIN/OPTOUT 把"通知粒度"细化到生产可调;</li>
   <li><strong>§32.6</strong> 四个公式把延迟、命中率、内存预算、脏读概率全部数学化;</li>
-  <li><strong>§32.7</strong> 把 Redis 选型放回 30 年硬件历史的同构问题里;</li>
+  <li><strong>§32.7</strong> 用跨系统类比说明目录、广播、验证三类一致性思路;</li>
   <li><strong>§32.8-32.10</strong> 落到 Cluster / Sentinel / 断线 / failover 的工程约束与陷阱速查;</li>
   <li><strong>§32.11</strong> 从源码角度证明这套协议是 9 个函数 + 2 个 rax 的工程小品。</li>
 </ul>

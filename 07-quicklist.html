@@ -60,18 +60,9 @@
   <p>quicklist(Redis 3.2 引入)用 <strong>"分而治之"</strong> 解决:外层是双向链表,每个节点内部存一个小型 listpack(默认目标 8 KB),两端节点(head/tail)保持未压缩,中间节点可选 LZF 压缩。LPUSH/RPUSH/LPOP/RPOP 在头/尾节点 O(1) 完成,节点超阈值时新建节点接入链表,<strong>不引发整列表搬迁</strong>;中间冷节点 LZF 压缩,百万元素 List 内存可降至 1/3;节点内 listpack 享受 cache locality,L1 内顺序扫描。</p>
   <p>代价是 <strong>LINDEX/LINSERT/LRANGE 在中间位置仍需 O(N/K + K) 扫描</strong>(K 是节点平均元素数,默认 ~100),不是真正的 O(1) 随机访问。Redis 7.0 起进一步把节点内编码从 ziplist 改为 listpack,即使单节点内插入也彻底告别连锁更新。</p>
   <ul class="will-learn">
-    <li>quicklist "分而治之" 思想:把大 List 切成 N/K 个 8 KB 节点的设计动机</li>
-    <li>quicklist 容器与 quicklistNode 字节布局(48 B 容器 + 48 B 节点元数据 + listpack)</li>
-    <li>fill 与 compress 两个调参的取值表与含义</li>
-    <li>LPUSH 头节点未满 5 帧:<code>_quicklistNodeAllowInsert</code> + <code>lpPrepend</code></li>
-    <li>LPUSH 头节点已满 5 帧:新建节点 + 4 个指针 + <code>quicklistCompress</code></li>
-    <li>LINSERT 节点分裂 5 帧:<code>_quicklistSplitNode</code> 拆分 listpack(本章核心)</li>
-    <li>压缩节点的访问流程:解压 → 操作 → 重压(<code>recompress</code> 标志)</li>
-    <li>LZF 压缩特性(600 MB/s 压缩、1 GB/s 解压、~70% 压缩比)</li>
-    <li>LINDEX 跨节点定位:从较近端开始 + 跳节点 + 节点内 lpSeek</li>
-    <li>典型陷阱:LIST 当数组用、compress 调高遇随机访问、fill 调过大</li>
-    <li><code>quicklistPushHead</code> 源码逐行解读 + 设计取舍 4 条</li>
-    <li>真实用例:消息队列 + 时间线 + 任务栈 + 日志缓冲 + LZF 收益对比</li>
+    <li><strong>为什么分块:</strong>外层链表保证头尾 O(1),内层 listpack 保持紧凑和 cache locality。</li>
+    <li><strong>什么时候变慢:</strong>中间位置仍要跨节点定位并在节点内扫描,不要把 LIST 当数组。</li>
+    <li><strong>怎么调参数:</strong><code>list-max-listpack-size</code> 控制节点大小,<code>list-compress-depth</code> 控制中间冷节点是否 LZF 压缩。</li>
   </ul>
   <p class="prereq">前置知识:第 1 章 SDS;第 6 章 ziplist 与 listpack(理解节点内编码);adlist 双向链表;LZF 算法基本概念;Redis 命令基础(<code>LPUSH</code> / <code>RPOP</code> / <code>LINDEX</code> / <code>LINSERT</code> / <code>OBJECT ENCODING</code>);C 语言指针操作。</p>
 </div>
@@ -79,7 +70,7 @@
 <h3>本章全景图</h3>
 
 <div class="diagram">
-  <div class="diagram-title">图 7-0 · 本章导览 — 5 大模块 13 节</div>
+  <div class="diagram-title">图 7-0 · 本章导览 — 先看外层链表与内层 listpack 的分工</div>
   <svg viewBox="0 0 960 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:960px;width:100%;margin:8px auto;height:auto;">
     <rect x="0" y="0" width="960" height="460" fill="var(--diagram-panel)" rx="10"/>
     <g transform="translate(380, 18)" filter="url(#d-shadow)"><rect width="200" height="46" rx="10" fill="url(#d-purple)"/><text x="100" y="22" text-anchor="middle" fill="var(--diagram-text)" font-size="14" font-weight="800">quicklist 快速列表</text><text x="100" y="38" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">链表 + listpack 双层</text></g>
@@ -120,7 +111,7 @@
 
     <g transform="translate(20, 364)">
       <rect width="920" height="80" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
-      <text x="20" y="22" fill="var(--diagram-green-text)" font-size="13" font-weight="800">★ 设计核心: 两层结构 + LRU 压缩</text>
+      <text x="20" y="22" fill="var(--diagram-green-text)" font-size="13" font-weight="800">★ 设计核心: 两层结构 + LZF 冷压缩</text>
       <text x="20" y="44" fill="var(--diagram-green-text)" font-size="11">外层链表 → 节点级别 O(1) 头/尾插入,跨节点 O(N/K) 跳转</text>
       <text x="20" y="60" fill="var(--diagram-green-text)" font-size="11">内层 listpack → 单节点紧凑存储,适合 cache,且无 ziplist 连锁更新</text>
       <text x="20" y="76" fill="var(--diagram-muted)" font-size="10">★ list-compress-depth 控制冷节点 LZF 压缩,头/尾保持热以确保 LPOP/RPOP O(1)</text>
@@ -170,7 +161,7 @@
       <tr><td>单一 listpack</td><td>8-18 B</td><td>O(N) memmove</td><td>O(N)</td><td>O(N) memmove</td><td>大列表 memmove 成本爆炸(MB 级)</td></tr>
       <tr><td>动态数组(vector)</td><td>8-16 B</td><td>O(N) 头插</td><td>O(1)</td><td>O(N)</td><td>LPUSH O(N) 不可用</td></tr>
       <tr><td>B-tree / Rope</td><td>16-32 B + 元数据</td><td>O(log N)</td><td>O(log N)</td><td>O(log N)</td><td>实现复杂;不符合双端队列模式</td></tr>
-      <tr><td><strong>quicklist</strong>(链表+listpack)</td><td><strong>8-24 B</strong></td><td><strong>O(1)</strong></td><td><strong>O(N/K+K)</strong></td><td><strong>O(N) 定位 pivot</strong></td><td><strong>无,本场景最优</strong></td></tr>
+      <tr><td><strong>quicklist</strong>(链表+listpack)</td><td><strong>8-24 B</strong></td><td><strong>O(1)</strong></td><td><strong>O(N/K+K)</strong></td><td><strong>O(N) 定位 pivot</strong></td><td><strong>折中最好:头尾快、内存紧凑,但中间访问仍慢</strong></td></tr>
     </tbody>
   </table>
 </div>
@@ -228,7 +219,7 @@
     <g transform="translate(40, 270)">
       <rect x="0" y="0" width="840" height="80" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
       <text x="20" y="22" fill="var(--diagram-purple-text)" font-size="12" font-weight="700">★ quicklist 的工程平衡 — 分块 + 头/尾 RAW + 中间 LZF</text>
-      <text x="20" y="44" fill="var(--diagram-blue-text)" font-size="11">• LPUSH/RPUSH/LPOP/RPOP 头/尾节点 O(1) 命中(永远 RAW,无解压开销)</text>
+      <text x="20" y="44" fill="var(--diagram-blue-text)" font-size="11">• LPUSH/RPUSH/LPOP/RPOP 头/尾节点 O(1) 命中(按 compress depth 保留 RAW,避免解压热路径)</text>
       <text x="20" y="62" fill="var(--diagram-blue-text)" font-size="11">• LRANGE 跨节点访问中间冷节点时按需解压,用完重压 → 内存 vs 延迟可调</text>
     </g>
   </svg>
@@ -1325,7 +1316,7 @@
       <tr><td>单一 listpack</td><td>8-18 B</td><td>O(N) memmove</td><td>O(N)</td><td>O(N) memmove</td><td>中</td><td>大列表 memmove 数 MB</td></tr>
       <tr><td>动态数组</td><td>8-16 B</td><td>O(N) 头插</td><td>O(1)</td><td>O(N)</td><td>简单</td><td>LPUSH O(N) 不可用</td></tr>
       <tr><td>B-tree / Rope</td><td>16-32 B</td><td>O(log N)</td><td>O(log N)</td><td>O(log N)</td><td>复杂</td><td>实现复杂;元数据多</td></tr>
-      <tr><td><strong>quicklist + listpack</strong></td><td><strong>8-24 B</strong></td><td><strong>O(1)</strong></td><td><strong>O(N/K + K)</strong></td><td><strong>O(N) 定位</strong></td><td><strong>中</strong></td><td><strong>无,本场景最优</strong></td></tr>
+      <tr><td><strong>quicklist + listpack</strong></td><td><strong>8-24 B</strong></td><td><strong>O(1)</strong></td><td><strong>O(N/K + K)</strong></td><td><strong>O(N) 定位</strong></td><td><strong>中</strong></td><td><strong>折中最好;中间随机访问仍慢</strong></td></tr>
     </tbody>
   </table>
 </div>
@@ -1351,7 +1342,7 @@
 
 <div class="key-insight">
   <strong>Redis 选择 quicklist + listpack(7.0+)替代历史方案的核心动机</strong>:<br>
-  ① <strong>分而治之根除 ziplist O(N²)</strong> — 每节点 8 KB 上限,单节点内修改的 memmove 永远在 KB 级,不会爆炸;<br>
+  ① <strong>分而治之根除 ziplist O(N²)</strong> — 每节点大小受配置限制,单节点内修改的 memmove 被压在可控范围内;<br>
   ② <strong>保持 O(1) 双端访问</strong> — 头/尾节点未压缩,LPUSH/RPUSH/LPOP/RPOP 直接命中;<br>
   ③ <strong>可选 LZF 压缩</strong> — 中间冷数据 70% 压缩比,长队列内存效率显著;<br>
   ④ <strong>listpack 替代 ziplist 节点</strong> — Redis 7.0 起节点内编码从 ziplist 改为 listpack,即使单节点内插入也不会触发连锁更新(已被节点大小限制,但 listpack 自描述更优雅);<br>
@@ -1575,7 +1566,7 @@ quicklist *quicklistPushHead(quicklist *quicklist, void *value, size_t sz) {
 
 /* ★ 关键不变量:
  *   1. 无论快/慢路径,O(1) 摊销不变
- *   2. quicklist-&gt;count 一定在最后 +1,保证 LLEN 一致性
+ *   2. quicklist-&gt;count 在返回前 +1,保证 LLEN 一致性
  *   3. likely() 提示 CPU 预测分支:绝大多数 LPUSH 走快路径
  *   4. 不会触发整列表 memmove(quicklist 相对单一 listpack 的核心收益)
  */</code></pre>
@@ -1661,7 +1652,7 @@ quicklist *quicklistPushHead(quicklist *quicklist, void *value, size_t sz) {
 
 <div class="key-insight">
   <strong>性能速记</strong>:<br>
-  ① LPUSH/RPUSH/LPOP/RPOP 永远在 1-5 μs 范围(无论 N 多大);<br>
+  ① LPUSH/RPUSH/LPOP/RPOP 通常与列表总长度 N 无关,主要受头/尾节点大小和压缩配置影响,常见为微秒级;<br>
   ② LINDEX 中间随 N 增长线性扩展(N=1M 时 ~5 ms);<br>
   ③ LZF 压缩节省 ~40% 内存,代价是中间访问 +20 μs;<br>
   ④ fill 调过大(N&gt;1024)会让单节点操作劣化为 O(N);<br>
@@ -1790,7 +1781,7 @@ redis-cli CONFIG GET list-max-listpack-size
 redis-cli CONFIG GET list-compress-depth
 # 期望: 0
 
-# 节点数验证(灰盒)
+# 节点数验证(灰盒,仅本地/测试环境)
 redis-cli DEBUG OBJECT q
 # 包含 ql_nodes:N 字段,N 是 quicklist 节点数
 
@@ -1800,6 +1791,10 @@ for i in $(seq 1 100000); do
 done
 redis-cli DEBUG OBJECT q
 # ql_nodes 应 ≈ 100000 / (8KB / avg_size) ≈ 几百 ~ 几千</code></pre>
+
+<div class="warning">
+  <strong><code>DEBUG OBJECT</code> 不适合生产常态化巡检</strong>:线上验证 quicklist 行为时优先用 <code>OBJECT ENCODING</code>、<code>LLEN</code>、慢日志和延迟监控;节点数这类灰盒信息只在本地或受控测试环境观察。
+</div>
 
 <h3>性能速查</h3>
 

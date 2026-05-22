@@ -59,24 +59,17 @@
   <p>代价是插入与删除需要 <code>memmove</code> 维护有序性,最坏 O(N)。intset 仅在以下条件全部满足时使用:<strong>所有元素都是整数 + 元素数量不超过 <code>set-max-intset-entries</code>(默认 512)</strong>。任意条件失败立即转为 hashtable,<strong>且不可逆</strong>。</p>
   <p>这一章是 Redis "<strong>编码自适应</strong>"思想最干净的样本:数据结构本身极简(只有 3 个字段、150 行 C 代码),却把"内存极致压缩 + 支持任意 64-bit 整数 + 有序范围扫描"三个矛盾目标同时解决。理解 intset 是理解后续 <code>ziplist</code>/<code>listpack</code>/<code>quicklist</code>/<code>rax</code> 等"紧凑编码"族的入门钥匙。</p>
   <ul class="will-learn">
-    <li>intset 三字段(<code>encoding</code> / <code>length</code> / <code>contents[]</code>)与 8B header 紧跟柔性数组的字节布局</li>
-    <li>三种 encoding(INT16 / INT32 / INT64)的数值范围、触发条件与字节宽度</li>
-    <li><code>intsetSearch</code> 二分查找 + 头/尾速判,顺序插入退化为 O(1)</li>
-    <li><code>intsetAdd</code> 不升级路径:<code>zrealloc</code> 扩容 + <code>memmove</code> 维序 + <code>_intsetSet</code> 写值</li>
-    <li><code>intsetUpgradeAndAdd</code> 升级路径(本章核心):<strong>从后往前重排</strong>避免覆盖,prepend 标志决定头尾</li>
-    <li><code>intsetRemove</code> 不降级的设计动机:"少做事"原则</li>
-    <li>六种候选数据结构对比:为什么只有 intset 适配"全整数小集合"</li>
-    <li>八大典型陷阱:类型污染、阈值穿越、不可逆转换、SPOP 抖动等</li>
-    <li>核心源码 <code>intset.c</code> + <code>t_set.c</code> 的调用链与位字节翻转(<code>intrev32ifbe</code>)细节</li>
-    <li>"少做事"哲学:升级一次后不再降级,转换后不回头,把判断逻辑剪到最简</li>
+    <li><strong>省内存靠什么:</strong>8B header 后面直接接连续整数数组,没有每个元素的 dictEntry/SDS 元数据。</li>
+    <li><strong>升级怎么安全:</strong>INT16/INT32/INT64 只升不降,升级时从后往前搬,避免覆盖旧值。</li>
+    <li><strong>什么时候别指望它:</strong>混入非整数或超过阈值后会转 hashtable,这条路不可逆。</li>
   </ul>
-  <p class="prereq">前置知识:第 1 章 SDS(理解 <code>sdshdr</code> 与紧凑头部);第 3 章 dict(理解 <code>dictEntry</code> 24-48B 元数据放大);C99 柔性数组成员(flexible array member);jemalloc size class 对齐(8/16/32/48/64 字节)。读者需要熟悉 <code>redis-cli</code> 与 <code>OBJECT ENCODING</code> / <code>MEMORY USAGE</code> 调试命令。</p>
+  <p class="prereq">前置知识:第 1 章 SDS(理解紧凑头部);第 3 章 dict(理解 hashtable 元数据放大);C99 柔性数组成员(flexible array member);jemalloc size class 对齐。命令层面熟悉 <code>OBJECT ENCODING</code> / <code>MEMORY USAGE</code> 的基本含义即可。</p>
 </div>
 
 <h3>本章全景图</h3>
 
 <div class="diagram">
-  <div class="diagram-title">图 5-0 · 本章导览 — 4 大模块 12 节</div>
+  <div class="diagram-title">图 5-0 · 本章导览 — 先看小整数集合为什么不用 hashtable</div>
   <svg viewBox="0 0 960 540" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:960px;width:100%;margin:8px auto;height:auto;">
     <rect x="0" y="0" width="960" height="540" fill="var(--diagram-panel)" rx="10"/>
     <g transform="translate(380, 20)" filter="url(#d-shadow)"><rect width="200" height="46" rx="10" fill="url(#d-purple)"/><text x="100" y="29" text-anchor="middle" fill="var(--diagram-text)" font-size="15" font-weight="700">intset 整数集合</text></g>
@@ -155,7 +148,7 @@
 </div>
 
 <div class="key-insight">
-  <strong>核心观察</strong>:实际生产中 <strong>全整数小集合占 Set 用例的 60-80%</strong>。如果统一使用 hashtable,这部分 Set 浪费大量内存;如果只保留 hashtable,无法在小整数场景达到内存极致。Redis 选择"双轨制"——小整数走 intset,大集合或非整数走 hashtable,由写入路径自动切换。
+  <strong>核心观察</strong>:很多 Set 其实只是小规模整数 ID 集合。如果统一使用 hashtable,这类 Set 会被元数据放大;如果只保留 intset,又扛不住大集合和字符串元素。Redis 选择"双轨制"——小整数走 intset,大集合或非整数走 hashtable,由写入路径自动切换。
 </div>
 
 <h3>5.1.2 候选方案的不足</h3>
@@ -172,7 +165,7 @@
       <tr><td>跳表</td><td>24-40 B</td><td>O(log N)</td><td>O(log N)</td><td>内存放大 + 实现复杂</td></tr>
       <tr><td>有序数组(单宽度)</td><td>4 B(int32)</td><td>O(log N)</td><td>O(N) memmove</td><td>不能存 int64 大数;固定宽度浪费小数</td></tr>
       <tr><td>位图(bitmap)</td><td>1 bit/元素</td><td>O(1)</td><td>O(1)</td><td>只适合密集小整数,稀疏场景内存爆炸</td></tr>
-      <tr><td><strong>intset(自适应宽度)</strong></td><td><strong>2-8 B</strong></td><td><strong>O(log N)</strong></td><td><strong>O(N) memmove</strong></td><td><strong>无,本场景最优</strong></td></tr>
+      <tr><td><strong>intset(自适应宽度)</strong></td><td><strong>2-8 B</strong></td><td><strong>O(log N)</strong></td><td><strong>O(N) memmove</strong></td><td><strong>适合小整数集合;大集合/字符串会转 hashtable</strong></td></tr>
     </tbody>
   </table>
 </div>
@@ -250,7 +243,7 @@
 <p>5 个 INT16 元素 + 8B header + jemalloc 对齐 = 80 字节。等价 hashtable 编码(5 个 dictEntry + dict 元数据)约 350-450 字节,内存差距 4-5 倍。</p>
 
 <div class="real-world">
-  <strong>用例提前预告</strong>:这 80 字节的 Set 如果转为 hashtable,实际占用会跳到 ~440 字节(dictEntry 24B × 5 + sds key 16B × 5 + dict 容器 96B + bucket 数组 64B + redisObject 16B × 5)。生产中常见的"权限位 Set" 或"标签 ID Set" 通常 5-50 个元素,intset 编码下只占 100 byte 量级,hashtable 下可达 KB 量级,集群级别累计差距非常显著。
+  <strong>用例提前预告</strong>:这 80 字节的 Set 如果转为 hashtable,按常见 64-bit 分配器口径估算会到 ~440 字节(dictEntry 24B × 5 + sds key 16B × 5 + dict 容器 96B + bucket 数组 64B + redisObject 16B × 5)。生产中常见的"权限位 Set" 或"标签 ID Set" 通常 5-50 个元素,intset 编码下只占 100 byte 量级,hashtable 下可达 KB 量级,集群级别累计差距非常显著。
 </div>
 
 <!-- ============================================================ -->
@@ -1404,7 +1397,7 @@ typedef struct intset {
       <tr><td>跳表</td><td>24-40 B</td><td>O(log N)</td><td>O(log N)</td><td>O(log N)</td><td>有序</td><td>内存放大;实现复杂</td></tr>
       <tr><td>有序数组(int32)</td><td>4 B</td><td>O(log N)</td><td>O(N) memmove</td><td>O(N) memmove</td><td>有序</td><td>无法存 int64;固定宽度浪费小数</td></tr>
       <tr><td>位图</td><td>1 bit/元素</td><td>O(1)</td><td>O(1)</td><td>O(1)</td><td>无</td><td>只适合密集小整数,稀疏爆炸</td></tr>
-      <tr><td><strong>intset</strong></td><td><strong>2-8 B</strong></td><td><strong>O(log N)</strong></td><td><strong>O(N) memmove</strong></td><td><strong>O(N) memmove</strong></td><td><strong>有序</strong></td><td><strong>无,本场景最优</strong></td></tr>
+      <tr><td><strong>intset</strong></td><td><strong>2-8 B</strong></td><td><strong>O(log N)</strong></td><td><strong>O(N) memmove</strong></td><td><strong>O(N) memmove</strong></td><td><strong>有序</strong></td><td><strong>适合小整数集合;不适合频繁大集合写入</strong></td></tr>
     </tbody>
   </table>
 </div>

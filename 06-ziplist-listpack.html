@@ -59,18 +59,11 @@
 <div class="chapter-intro">
   <p class="lead">Redis 的小集合(小 Hash、小 ZSet、quicklist 节点、Stream 节点)需要把元素紧凑塞进 <strong>一段连续内存</strong>:无指针、无对齐空隙、cache friendly。<code>HSET user name "Tom" age "25"</code> 用标准 dict 编码需要 ~100 B/entry(<code>dictEntry</code> 24 B + 两段 sds + 元数据);用紧凑编码只需 ~20 B/entry,<strong>省 5-10 倍内存</strong>。代价是遍历变 O(N),但小集合的 N 本身就小,L1 cache 内的连续扫描比哈希表的指针追踪更快。</p>
   <p><strong>ziplist</strong> 是 Redis 早期(2.x-6.x)的紧凑编码,布局是 <code>[header][entries...][end]</code>,每个 entry 含 <code>prevlen</code>(前一个 entry 总长度)、<code>encoding</code>、<code>payload</code>。<strong>致命缺陷</strong>:<code>prevlen</code> 字段是变长(1 B 或 5 B,以 254 为分界),前一个 entry 长度跨过 254 字节边界时,当前 entry 的 prevlen 从 1 B 膨胀为 5 B,自身总长度也增加 4 B,可能继续触发下一个 entry 的 prevlen 扩容,引发 <strong>最坏 O(N²) 的连锁更新</strong>。</p>
-  <p>Redis 7.0 引入 <strong>listpack</strong>(antirez 设计)替代 ziplist。布局改为 <code>[header][entries...][end]</code>,每个 entry 含 <code>encoding</code>、<code>payload</code>、<code>backlen</code>(<strong>当前 entry 自身的总长度</strong>,放在 entry 尾部)。反向遍历通过尾部 backlen 解码,<strong>完全不依赖邻居信息</strong>。任意 entry 长度变化只影响自身,<strong>杜绝连锁更新</strong>,最坏复杂度从 O(N²) 降到 O(N)。</p>
+  <p><strong>listpack</strong>(antirez 设计)就是为了解掉这个邻居耦合问题。它在 Redis 5.x 已经用于 Stream 等场景,Redis 7.0 开始成为 Hash/ZSet/quicklist 节点等小集合的主力紧凑编码。布局仍是 <code>[header][entries...][end]</code>,但每个 entry 变成 <code>encoding</code>、<code>payload</code>、<code>backlen</code>(<strong>当前 entry 自身的总长度</strong>,放在 entry 尾部)。反向遍历通过尾部 backlen 解码,<strong>完全不依赖邻居信息</strong>。任意 entry 长度变化只影响自身,<strong>杜绝连锁更新</strong>,最坏复杂度从 O(N²) 降到 O(N)。</p>
   <ul class="will-learn">
-    <li>紧凑编码相对 hashtable / skiplist 节省 5-10 倍内存的原因(去掉指针 + 元数据)</li>
-    <li>ziplist 三段式布局 <code>[zlbytes][zltail][zllen][entries][zlend]</code> 与 entry 结构</li>
-    <li>prevlen 变长字段在 254 边界两侧的字节差异(1 B vs 5 B)</li>
-    <li>连锁更新逐帧:N 个边界长度 entry 在头部插入 300 B 大值后的 N 次 memmove 雪崩</li>
-    <li>listpack <code>backlen</code> 自描述设计如何彻底消除邻居耦合</li>
-    <li>backlen 7-bit 变长编码 + continuation bit,反向遍历从尾部累积解码</li>
-    <li>Hash / ZSet / List / Stream 编码阈值矩阵与不可逆转换路径</li>
-    <li>典型陷阱:边界长度 entry 触发连锁、转换内存跳变 5x、value 超 64 B 触发转换</li>
-    <li><code>lpEncodeBacklen</code> 源码逐行解读,5 段 if 链对应 1/2/3/4/5 字节编码</li>
-    <li>真实用例:用户画像 Hash 节省 5x、订单状态机紧凑存储、Stream 消息节点二级打包</li>
+    <li><strong>为什么省内存:</strong>连续内存里只放 entry 编码和 payload,去掉指针和哈希表元数据。</li>
+    <li><strong>ziplist 错在哪里:</strong><code>prevlen</code> 记录前驱长度,一个 entry 变长会把变化传给后继。</li>
+    <li><strong>listpack 怎么修:</strong><code>backlen</code> 只描述自己,邻居变动不会连锁传播。</li>
   </ul>
   <p class="prereq">前置知识:第 1 章 SDS(字节布局基础);第 3 章 dict(理解 hashtable 浪费);第 5 章 intset(理解"不可逆转换"设计);Redis 命令基础(<code>HSET</code> / <code>ZADD</code> / <code>RPUSH</code> / <code>OBJECT ENCODING</code>);C 语言指针运算与变长编码思想。</p>
 </div>
@@ -78,7 +71,7 @@
 <h3>本章全景图</h3>
 
 <div class="diagram">
-  <div class="diagram-title">图 6-0 · 本章导览 — 5 大模块 14 节</div>
+  <div class="diagram-title">图 6-0 · 本章导览 — 先看 ziplist 为什么被 listpack 替代</div>
   <svg viewBox="0 0 960 600" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:960px;width:100%;margin:8px auto;height:auto;">
     <rect x="0" y="0" width="960" height="600" fill="var(--diagram-panel)" rx="10"/>
 
@@ -141,7 +134,7 @@
     <g transform="translate(20, 290)">
       <rect width="920" height="50" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-dasharray="4 3"/>
       <text x="20" y="22" fill="var(--diagram-purple-text)" font-size="13" font-weight="800">⚖ 演进主线</text>
-      <text x="160" y="22" fill="var(--diagram-blue-text)" font-size="12">ziplist (Redis 3.x 起) → 暴露 O(N²) 连锁更新 → listpack (Redis 7.0 全面替换 ziplist)</text>
+      <text x="160" y="22" fill="var(--diagram-blue-text)" font-size="12">ziplist (Redis 早期紧凑编码) → 暴露 O(N²) 连锁更新 → listpack (Redis 7.0 起成为主力紧凑编码)</text>
       <text x="20" y="40" fill="var(--diagram-muted)" font-size="11">本章用同一组数据走完两种结构,把"为什么换 listpack"讲透</text>
     </g>
 
@@ -215,7 +208,7 @@
       <tr><td>数组(每 entry 定长)</td><td>~8 B (int)</td><td>O(1)</td><td>O(N)</td><td>O(1)</td><td>不支持变长元素</td></tr>
       <tr><td>列存连续数组</td><td>5-8 B</td><td>O(N)</td><td>O(N)</td><td>O(1)</td><td>类型限制(如 intset 仅整数)</td></tr>
       <tr><td><strong>ziplist</strong></td><td><strong>8-20 B</strong></td><td><strong>O(N)</strong></td><td><strong>O(N)</strong></td><td><strong>O(N) 反向链</strong></td><td><strong>连锁更新最坏 O(N²)</strong></td></tr>
-      <tr><td><strong>listpack (7.0+)</strong></td><td><strong>8-18 B</strong></td><td><strong>O(N)</strong></td><td><strong>O(N)</strong></td><td><strong>O(N) 反向</strong></td><td><strong>无,本场景最优</strong></td></tr>
+      <tr><td><strong>listpack (7.0+)</strong></td><td><strong>8-18 B</strong></td><td><strong>O(N)</strong></td><td><strong>O(N)</strong></td><td><strong>O(N) 反向</strong></td><td><strong>适合小集合;大集合会切换编码</strong></td></tr>
     </tbody>
   </table>
 </div>
@@ -1315,7 +1308,7 @@
         3 GB → 14 GB
         多了 11 GB 内存,可能直接触发 OOM
   
-  这就是为什么 capacity planning 时一定要监控
+  这就是为什么 capacity planning 时需要重点监控
   "接近阈值的 key 数",阶跃增长太可怕</code></pre>
 </div>
 
@@ -1343,7 +1336,7 @@ OK
 "hashtable"          # ★ 仍然是 hashtable ★</code></pre>
 
 <div class="warning">
-  <strong>转换不可逆的后果</strong>:即使你只是临时往一个小 Hash 里写了一个超长 value,然后立刻删除,这个 Hash 也会永远停留在 hashtable 编码上,内存翻 4-5 倍。如果业务里有大量"短暂超阈值"的 key,要么:① 接受少量浪费;② 重建 key(<code>HGETALL</code> + 删除原 key + 重新 <code>HSET</code>);③ 在写入端就避免引入超长值。
+  <strong>转换不可逆的后果</strong>:即使你只是临时往一个小 Hash 里写了一个超长 value,然后立刻删除,这个 Hash 也会持续停留在 hashtable 编码上,除非重建 key。内存可能翻 4-5 倍。如果业务里有大量"短暂超阈值"的 key,要么:① 接受少量浪费;② 重建 key(<code>HGETALL</code> + 删除原 key + 重新 <code>HSET</code>);③ 在写入端就避免引入超长值。
 </div>
 
 <!-- ============================================================ -->
@@ -1362,7 +1355,7 @@ OK
       <tr><td>单链表 + sds 节点</td><td>~40 B</td><td>O(N)</td><td>O(1)</td><td>反向链</td><td>中</td><td>sds 包装放大</td></tr>
       <tr><td>数组(每 entry 定长)</td><td>~8 B</td><td>O(1)</td><td>O(N)</td><td>O(1)</td><td>简单</td><td>不支持变长 entry</td></tr>
       <tr><td><strong>ziplist</strong>(prevlen)</td><td><strong>8-20 B</strong></td><td><strong>O(N)</strong></td><td><strong>O(N)</strong></td><td><strong>支持</strong></td><td><strong>复杂</strong></td><td><strong>连锁更新最坏 O(N²)</strong></td></tr>
-      <tr><td><strong>listpack</strong>(backlen)</td><td><strong>8-18 B</strong></td><td><strong>O(N)</strong></td><td><strong>O(N)</strong></td><td><strong>支持</strong></td><td><strong>中</strong></td><td><strong>无,本场景最优</strong></td></tr>
+      <tr><td><strong>listpack</strong>(backlen)</td><td><strong>8-18 B</strong></td><td><strong>O(N)</strong></td><td><strong>O(N)</strong></td><td><strong>支持</strong></td><td><strong>中</strong></td><td><strong>适合小集合紧凑存储;不适合大集合随机访问</strong></td></tr>
       <tr><td>列存(分类型)</td><td>4-16 B</td><td>O(N)</td><td>O(N)</td><td>O(1)</td><td>复杂</td><td>类型限制</td></tr>
     </tbody>
   </table>

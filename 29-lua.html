@@ -54,7 +54,7 @@
 
 <div class="chapter-intro">
   <p class="lead">Redis 单条命令的原子语义足以处理大量场景,但<strong>"读-判断-写"复合操作</strong>需要多次客户端往返,既增加延迟又引入竞态风险。Lua 脚本将这类操作打包到服务端执行,在<strong>单线程模型</strong>下天然获得原子性,且可基于前一命令结果进行<strong>条件分支</strong>,这是 <code>MULTI/EXEC</code> 无法做到的。Redis 7.0 引入的 <strong>Functions</strong> 进一步将脚本提升为<strong>持久化的一等公民</strong>,随 RDB/AOF 持久化、随复制传播,解决了 EVAL 脚本缓存的临时性问题。</p>
-  <p>Lua 脚本的工程价值有三:其一,<strong>原子性</strong> — 脚本内所有 <code>redis.call</code> 在主线程顺序执行,期间无任何其他命令插入;其二,<strong>条件分支</strong> — 可基于读结果决策后续写操作,实现"先校验再写"的全有全无语义;其三,<strong>网络优化</strong> — 单次 RTT 完成原本需要多次往返的逻辑。代价同等明确:脚本在主线程执行,长脚本阻塞所有客户端,生产长度通常应限制在毫秒级。本章按"问题 → EVAL 与沙箱 → EVALSHA 与缓存 → redis.call 语义 → 原子性证明 → 复制模式 → Functions → 部署适配 → 陷阱"组织,聚焦脚本机制的工程边界与生产可观测性。</p>
+  <p>Lua 脚本的工程价值有三:其一,<strong>执行期间不被插入</strong> — 脚本内所有 <code>redis.call</code> 在主线程顺序执行;其二,<strong>条件分支</strong> — 可基于读结果决定后续写操作,把"先校验再写"放到服务端完成;其三,<strong>网络优化</strong> — 单次 RTT 完成原本需要多次往返的逻辑。也要记住:Lua 脚本出错后不会自动回滚已经执行的写命令,所以复杂脚本应先校验、再写入。代价同样明确:脚本在主线程执行,长脚本会阻塞其他客户端。</p>
   <ul class="will-learn">
     <li>限流器场景下三种实现方式(独立命令 / MULTI-EXEC / WATCH-MULTI)各自的语义缺口</li>
     <li><code>EVAL script numkeys KEYS... ARGV...</code> 命令的参数语义与 KEYS/ARGV 分离的必要性</li>
@@ -62,7 +62,7 @@
     <li><code>SCRIPT LOAD / EVALSHA</code> 与 <code>NOSCRIPT</code> 错误的客户端处理模板</li>
     <li><code>redis.call</code>(throw)与 <code>redis.pcall</code>(catch)的错误语义差异</li>
     <li>Redis ↔ Lua 类型映射的四大陷阱:nil 表达、数组下标、状态回复、大整数失精</li>
-    <li>脚本原子性的证明:为何等价 SERIALIZABLE 隔离级别</li>
+    <li>脚本执行期间不被其他命令插入的边界,以及它与回滚语义的区别</li>
     <li>脚本复制(Redis &lt; 7)与效果复制(Redis 7 默认)的差异与取舍</li>
     <li>Functions 的 Library 概念、<code>FUNCTION LOAD/DUMP/RESTORE/DELETE</code> 全套生命周期</li>
     <li>Cluster 模式下 hash tag <code>{}</code> 的强制约束与 CROSSSLOT 错误避坑</li>
@@ -302,7 +302,7 @@ return 1  -- 放行</code></pre>
 </div>
 
 <div class="key-insight">
-  <strong>Lua 是 MULTI/EXEC 的严格扩展</strong>:所有 MULTI/EXEC 能做的 Lua 都能做,Lua 还能<strong>基于中间结果决策</strong>、循环、复杂逻辑。代价是 Lua 编程门槛、调试难度、运行时开销略高。当业务出现"if 读结果 X then 写 Y"模式时,客户端 + WATCH 实现总会在高并发下退化,而 Lua 永远是稳定的单 RTT。
+  <strong>Lua 与 MULTI/EXEC 解决的问题不同</strong>:MULTI/EXEC 擅长把一组已确定的命令连续提交;Lua 擅长在服务端基于中间结果做分支、循环和校验。代价是 Lua 更难调试,并且运行在主线程上。出现"if 读结果 X then 写 Y"时,Lua 通常比客户端 + WATCH 更直接,但仍要控制脚本耗时和错误处理。
 </div>
 
 <!-- ============================================================ -->
@@ -592,7 +592,7 @@ EVALSHA (仅发送 SHA1):
 
   场景 1: failover 后新主节点
     新主节点没有原主节点的脚本缓存
-    第一次 EVALSHA 一定 NOSCRIPT
+    若客户端未预加载脚本,第一次 EVALSHA 会因缓存缺失返回 NOSCRIPT
 
   场景 2: SCRIPT FLUSH 被执行
     运维清空了所有脚本缓存
@@ -638,7 +638,7 @@ EVALSHA (仅发送 SHA1):
 应对长脚本失控:
   lua-time-limit 配置 (默认 5000 ms)
   超时后 Redis 状态变为 BUSY
-  此时仅 SCRIPT KILL 与 SHUTDOWN NOSAVE 可用
+  此时普通命令会被拒绝;只读脚本可尝试 SCRIPT KILL
   其他命令返回 BUSY</code></pre>
 </div>
 
@@ -701,7 +701,7 @@ end</code></pre>
 
   陷阱 1: nil 表示
     Redis nil → Lua false (不是 nil)
-    if value == nil 永远为 false
+    对 Redis nil 返回值,if value == nil 为 false
     正确: if not value or value == false
 
   陷阱 2: 数组下标
@@ -748,20 +748,20 @@ end</code></pre>
 </div>
 
 <div class="warning">
-  <strong>"业务计数器超 2^53 静默错位"是排查难度极高的 bug</strong>:Lua 5.1 内置的 number 类型仅 double,精度上界 2^53(≈ 9.0×10¹⁵)。订单 ID、雪花 ID、纳秒时间戳都可能超过此线。一旦 <code>tonumber()</code>,低位无声丢失,业务下游唯一现象是"<strong>偶尔重复</strong>"。规则:大整数永远以字符串形式在 Lua 中流转。
+  <strong>"业务计数器超 2^53 静默错位"是排查难度极高的 bug</strong>:Lua 5.1 内置的 number 类型仅 double,精度上界 2^53(≈ 9.0×10¹⁵)。订单 ID、雪花 ID、纳秒时间戳都可能超过此线。一旦 <code>tonumber()</code>,低位无声丢失,业务下游唯一现象是"<strong>偶尔重复</strong>"。规则:大整数在 Lua 中应保持字符串形式,不要转 number 做算术。
 </div>
 
 <!-- ============================================================ -->
 <h2 id="s29-5">29.5 原子性与确定性</h2>
 <!-- ============================================================ -->
 
-<p>Lua 脚本的原子性来自 Redis 的<strong>单线程模型</strong>:<code>evalGenericCommand</code> 调用 <code>lua_pcall</code> 时,主线程被 Lua VM 完全占据,事件循环不返回 <code>epoll_wait</code>,其他客户端命令在事件队列等待。这一性质等价于数据库领域的 SERIALIZABLE 隔离级别。沙箱的确定性约束则是为了配合<strong>脚本复制</strong>(Redis &lt; 7)的需要,Redis 7 的效果复制放宽了这一约束。</p>
+<p>Lua 脚本的执行隔离来自 Redis 的<strong>单线程模型</strong>:<code>evalGenericCommand</code> 调用 <code>lua_pcall</code> 时,主线程在执行 Lua VM,其他客户端命令只能等待。这保证脚本执行期间不被插队,但不代表"出错后回滚"。沙箱的确定性约束曾服务于<strong>脚本复制</strong>(Redis &lt; 7);Redis 7 默认效果复制后,这部分约束有所放宽。</p>
 
 <h3>29.5.1 脚本原子性的形式化证明</h3>
 
 <div class="diagram">
-  <div class="diagram-title">图 29-5-1 · 脚本原子性 = SERIALIZABLE 隔离</div>
-<pre class="ascii-art"><code>定理: Lua 脚本的原子性等价于 SERIALIZABLE 事务
+  <div class="diagram-title">图 29-5-1 · 脚本执行期间不被插队</div>
+<pre class="ascii-art"><code>结论: Lua 脚本执行期间不会与其他客户端命令交错
 
 设脚本 S 执行命令序列 C_1, C_2, ..., C_n
 对任意并发客户端 P:
@@ -777,7 +777,7 @@ end</code></pre>
 
   ⊢ 脚本执行是原子调度单元
   ⊢ 多脚本的执行形成全序关系
-  ⊢ 等价 SERIALIZABLE 隔离级别  ∎</code></pre>
+  ⊢ 可把脚本看作一个连续执行片段,但失败不会自动回滚已执行写入  ∎</code></pre>
 </div>
 
 <h3>29.5.2 沙箱的确定性约束</h3>
@@ -829,8 +829,8 @@ end</code></pre>
 
       <rect x="20" y="60" width="220" height="80" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
       <text x="130" y="86" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="13" font-weight="800">原子性</text>
-      <text x="130" y="104" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">SERIALIZABLE</text>
-      <text x="130" y="120" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">隔离级别</text>
+      <text x="130" y="104" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">无交错</text>
+      <text x="130" y="120" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">执行</text>
 
       <rect x="280" y="60" width="320" height="80" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
       <text x="440" y="86" text-anchor="middle" fill="var(--diagram-green-text)" font-size="13" font-weight="800">✓ 原子(EXEC 不被插入)</text>
@@ -878,7 +878,7 @@ end</code></pre>
   </svg>
 </div>
 
-<p>"Lua 脚本是 MULTI/EXEC 的严格扩展"在第 29.1 节已陈述,这里再补一个工程视角:<strong>MULTI/EXEC 适合"批量提交一组无依赖写"</strong>(批量删除、批量初始化),Lua 适合"一组有读写依赖的复合操作"(限流、库存扣减、分布式锁释放)。两者并非取代关系,而是 Redis 提供的两层事务原语。</p>
+<p>从工程视角看,<strong>MULTI/EXEC 适合"批量提交一组无依赖写"</strong>(批量删除、批量初始化),Lua 适合"一组有读写依赖的复合操作"(限流、库存扣减、分布式锁释放)。两者并非简单取代关系,而是 Redis 提供的两种多命令编排工具。</p>
 
 <!-- ============================================================ -->
 <h2 id="s29-6">29.6 复制模式</h2>
@@ -1004,7 +1004,7 @@ EXEC
 # Replica 接收并应用
 # 不执行 Lua,只应用三条写命令</code></pre>
 
-<p>效果复制将脚本拆解为实际写命令传播。Replica 看到的是 <code>MULTI...EXEC</code> 包装的命令序列,与主节点状态一致,但脚本本身不在 Replica 执行。这一变化的工程红利是巨大的:Replica 上不再有"脚本失败 / 脚本超时"风险,Lua 也可以放心使用 <code>math.random</code>、<code>redis.call('TIME')</code> 等过去禁用的非确定性能力。</p>
+<p>效果复制将脚本产生的实际写命令传播出去。Replica 看到的是 <code>MULTI...EXEC</code> 包装的命令序列,与主节点状态一致,但脚本本身不在 Replica 执行。这样可以避免副本重放脚本时再次遇到超时或非确定性结果;不过脚本仍要声明真实 key、控制耗时,并谨慎使用随机数、时间等非确定性输入。</p>
 
 <div class="key-insight">
   <strong>效果复制的副作用 — 复制流变大</strong>:一段执行 1000 次 <code>redis.call('INCR')</code> 的脚本,脚本复制只传 1 条 EVAL,效果复制要传 1000 条 INCR。因此对于"内部多写"型脚本,Master → Replica 的复制带宽会显著上升。生产环境应监控 <code>master_repl_offset</code> 增速,大型 batch 任务考虑切到非脚本实现。
@@ -1014,7 +1014,7 @@ EXEC
 <h2 id="s29-7">29.7 Redis 7.0 Functions</h2>
 <!-- ============================================================ -->
 
-<p>EVAL/EVALSHA 的核心痛点不在性能而在<strong>生命周期</strong>:脚本缓存仅在内存,重启 / failover / FLUSH 都会丢失,客户端必须负担 <code>NOSCRIPT</code> 重载逻辑;同时脚本散落在客户端代码,难以版本管理。Redis 7.0 引入的 <strong>Functions</strong> 把脚本提升为<strong>持久化的一等数据</strong>:<code>FUNCTION LOAD</code> 写入 RDB/AOF,随复制流自动传播,FCALL 永不返回 NOSCRIPT。这是脚本机制十年里最大的一次升级。</p>
+<p>EVAL/EVALSHA 的核心痛点不在性能而在<strong>生命周期</strong>:脚本缓存仅在内存,重启 / failover / FLUSH 都会丢失,客户端必须处理 <code>NOSCRIPT</code> 并重载;同时脚本散落在客户端代码,难以版本管理。Redis 7.0 引入的 <strong>Functions</strong> 把脚本库纳入持久化与复制:<code>FUNCTION LOAD</code> 写入 RDB/AOF,随复制流传播。<code>FCALL</code> 不依赖 EVALSHA 的脚本缓存,但函数或库不存在时仍会返回错误。</p>
 
 <h3>29.7.1 Functions 解决的核心问题</h3>
 
@@ -1205,7 +1205,7 @@ $ redis-cli FUNCTION DELETE mylib</code></pre>
       <rect x="20" y="280" width="900" height="86" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
       <text x="40" y="304" fill="var(--diagram-blue-text)" font-size="13" font-weight="800">★ Functions 生命周期与 EVAL 缓存的本质差异</text>
       <text x="40" y="324" fill="var(--diagram-green-text)" font-size="11">✓ EVAL 缓存:仅在内存(server.lua_scripts) → 重启 / FLUSH / failover 丢失 → 客户端必须双 RTT 重载</text>
-      <text x="40" y="342" fill="var(--diagram-green-text)" font-size="11">✓ Functions:持久化数据(RDB 段 + AOF 命令)→ 重启 / failover / Replica 全程保留 → FCALL 永不返回 NOSCRIPT</text>
+      <text x="40" y="342" fill="var(--diagram-green-text)" font-size="11">✓ Functions:持久化数据(RDB 段 + AOF 命令)→ 重启 / failover 后仍保留 → FCALL 不依赖 NOSCRIPT 重载</text>
       <text x="40" y="360" fill="var(--diagram-orange-text)" font-size="11">⚠ 注意:FUNCTION RESTORE 与 RDB/AOF 加载互不冲突;FUNCTION FLUSH 同时清内存 + 写 AOF</text>
     </g>
   </svg>
@@ -1232,7 +1232,7 @@ $ redis-cli FUNCTION DELETE mylib</code></pre>
   EVAL 缓存仅在内存,重启丢失
   Functions 是持久化数据,重启保留
   EVAL 需要客户端处理 NOSCRIPT
-  FCALL 永远不返回 NOSCRIPT (函数已持久化)</code></pre>
+  FCALL 不依赖脚本缓存,不会因缓存丢失返回 NOSCRIPT</code></pre>
 </div>
 
 <h3>29.7.4 EVAL vs Functions 全维度对比</h3>
@@ -1423,7 +1423,7 @@ $ redis-cli LATENCY HISTORY eval-script</code></pre>
       <tr><td>5</td><td>大整数失精</td><td>业务数据错误</td><td>Lua double 精度 2^53</td><td>大整数保留 string</td></tr>
       <tr><td>6</td><td>nil 比较错误</td><td>逻辑判断失效</td><td>Redis nil → Lua false</td><td><code>not value</code> 而非 <code>== nil</code></td></tr>
       <tr><td>7</td><td>脚本不回滚</td><td>部分写入数据不一致</td><td>不回滚特性</td><td>先校验再写</td></tr>
-      <tr><td>8</td><td>BUSY 状态</td><td>服务不可用</td><td>脚本超 lua-time-limit</td><td>SCRIPT KILL 或 SHUTDOWN NOSAVE</td></tr>
+      <tr><td>8</td><td>BUSY 状态</td><td>其他命令被阻塞</td><td>脚本超 lua-time-limit</td><td>只读脚本可 SCRIPT KILL;写脚本优先等待或按预案故障切换</td></tr>
       <tr><td>9</td><td>动态构造 key</td><td>Cluster 路由失败</td><td>绕过 KEYS 声明</td><td>所有 key 通过 KEYS 传入</td></tr>
       <tr><td>10</td><td>脚本散落客户端</td><td>难以管理</td><td>没用 Functions</td><td>迁移到 Functions</td></tr>
     </tbody>
@@ -1451,10 +1451,10 @@ BUSY 期间的行为:
     脚本一旦执行 redis.call('SET'/'INCR'/...) 就不能 kill
     原因: 部分写入不能回滚,kill 会导致数据不一致
 
-  方法 2: SHUTDOWN NOSAVE
-    强制关闭 Redis,丢弃当前脚本的未完成工作
-    重启后从 RDB/AOF 恢复
-    脚本写入的数据可能丢失或保留 (取决于持久化模式)
+  方法 2: 故障切换 / 重启预案
+    仅在确认等待不可接受时使用
+    先评估已执行写入与持久化状态
+    避免把 SHUTDOWN NOSAVE 当作常规恢复手段
 
   方法 3: 等待脚本完成
     最安全,但可能阻塞数分钟
@@ -1474,12 +1474,12 @@ BUSY 期间的行为:
   </div>
   <div>
     <strong>SCRIPT KILL 不可用</strong><br/>
-    脚本已经执行过 SET/INCR/DEL 等写命令。kill 会导致部分写入,违反原子性约定,Redis 直接拒绝 kill,只能 SHUTDOWN NOSAVE 或等待。
+    脚本已经执行过 SET/INCR/DEL 等写命令。Redis 会拒绝 SCRIPT KILL,因为无法回滚已经生效的写入。常规选择是等待脚本结束;若必须恢复服务,按预先演练过的故障切换或重启流程处理。
   </div>
 </div>
 
 <div class="warning">
-  <strong>Cluster 部署最关键的一条</strong>:务必保证 <code>lua-time-limit &lt; cluster-node-timeout</code>。否则当一段超长脚本进入 BUSY,其他节点 ping 不通该主节点,Cluster 会误判为故障并触发 failover — 而<strong>新主节点同样不能 kill 那个写过数据的脚本</strong>,业务直接两节点同时不可写。
+  <strong>Cluster 部署最关键的一条</strong>:让 <code>lua-time-limit</code> 明显小于 <code>cluster-node-timeout</code>,并监控脚本耗时。否则超长脚本可能让节点长时间无法响应 Cluster 心跳,造成误判、故障切换或更长时间的不可用窗口。
 </div>
 
 <!-- ============================================================ -->
@@ -1595,7 +1595,7 @@ int luaRedisGenericCommand(lua_State *lua, int raise_error) {
 
 <h4>取舍 4:效果复制取代脚本复制</h4>
 
-<p>效果复制 (Effects Replication) 替代脚本复制的核心动机是<strong>简化</strong>。脚本复制要求严格确定性,禁用 random/TIME 等命令;效果复制无此限制,Replica 仅应用实际写命令,不需 Lua 引擎重放。Redis 7.0 默认效果复制,允许 Lua 脚本中使用任意非确定性能力,极大降低脚本编写复杂度。</p>
+<p>效果复制 (Effects Replication) 替代脚本复制的核心动机是<strong>简化</strong>。脚本复制要求脚本在主从上产生同样结果;效果复制则让 Replica 只应用主节点产生的实际写命令,不再重放 Lua。Redis 7.0 默认效果复制后,非确定性输入的限制减少了,但这不等于可以任意编写脚本:仍要正确声明 key、避免长时间阻塞,并明确错误处理。</p>
 
 <!-- ============================================================ -->
 <h2 id="s29-summary">29.12 本章要点</h2>
@@ -1619,7 +1619,7 @@ int luaRedisGenericCommand(lua_State *lua, int raise_error) {
       <tr><td>7</td><td>脚本不回滚:部分 redis.call 已写入再抛错时,已写入数据保留,需先校验再写</td></tr>
       <tr><td>8</td><td>Redis 7.0 默认效果复制,放宽确定性约束;脚本复制模式仅旧版兼容</td></tr>
       <tr><td>9</td><td>Functions (Redis 7+) 持久化业务脚本,随 RDB/AOF 保存,随复制传播,FCALL 不返回 NOSCRIPT</td></tr>
-      <tr><td>10</td><td>生产建议:脚本耗时 &lt; 1 ms;Cluster lua-time-limit &lt; cluster-node-timeout;监控 cmdstat_eval/fcall 的 usec_per_call</td></tr>
+      <tr><td>10</td><td>生产建议:脚本尽量保持毫秒级短执行;Cluster 中 lua-time-limit 应小于 cluster-node-timeout;监控 cmdstat_eval/fcall 的 usec_per_call</td></tr>
     </tbody>
   </table>
 </div>
@@ -1682,8 +1682,8 @@ cmdstat_fcall:calls=1,usec=12,usec_per_call=12.00
   <li><strong>第 28 章</strong>(MULTI/EXEC + WATCH)处理"批量提交、不需要基于读结果决策"的场景;</li>
   <li><strong>本章 29.1</strong> 的限流案例展示了"必须基于读结果决策"的硬需求,只有 Lua 能优雅解决;</li>
   <li><strong>本章 29.2-29.5</strong> 给出了写正确 Lua 必须懂的四件事:KEYS/ARGV 分离、沙箱边界、redis.call/pcall 语义、Lua ↔ Redis 类型映射;</li>
-  <li><strong>本章 29.7</strong> 把临时 EVALSHA 升级到持久化 Functions,这是 Redis 7+ 上的<strong>默认推荐</strong>;</li>
-  <li><strong>本章 29.8-29.10</strong> 收口部署 / 性能 / 陷阱三个工程视角:Cluster 必须 hash tag,脚本耗时必须 &lt; 1 ms,<code>lua-time-limit &lt; cluster-node-timeout</code> 是 Cluster 部署的硬约束。</li>
+  <li><strong>本章 29.7</strong> 把临时 EVALSHA 升级到持久化 Functions;Redis 7+ 中,需要统一部署和版本管理的脚本更适合 Functions;</li>
+  <li><strong>本章 29.8-29.10</strong> 收口部署 / 性能 / 陷阱三个工程视角:Cluster 必须 hash tag,脚本应保持短执行,<code>lua-time-limit &lt; cluster-node-timeout</code> 是 Cluster 部署的关键约束。</li>
 </ul>
 
 <h3>下一章预告</h3>

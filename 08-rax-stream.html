@@ -55,8 +55,8 @@
 <p class="subtitle">路径压缩前缀树 · raxNode 柔性数组 · iscompr 双形态 · listpack 二级打包 · 多 rax 设计 · Consumer Group · PEL 至少一次</p>
 
 <div class="chapter-intro">
-  <p class="lead">Redis 5.0 引入 <code>Stream</code> 类型,需要按 <strong>16 字节消息 ID</strong> 提供<strong>有序范围扫描</strong> + <strong>O(1) 追加</strong> + <strong>消费组确认</strong>。普通哈希表无法范围查询;跳表可以但每个节点 80 B 元数据严重浪费;B+ 树是磁盘场景的经典,内存常数过大且不能复用 ID 前缀。</p>
-  <p>Antirez 选择从零实现 <strong>rax(Radix Tree,基数树)</strong>:一种"<strong>路径压缩</strong>的前缀树"。同前缀的 key 共享一段连续字节(压缩节点),分叉处单独建节点(普通节点)。Stream ID 高位时间戳<strong>常常重复</strong>(同毫秒的多条消息前 12 字节相同),rax 的压缩节点把这部分前缀<strong>只存一次</strong>,内存效率比跳表高 5-10 倍。</p>
+  <p class="lead">Stream 要解决的是一个很朴素的问题:消息按 ID 排序写入,还要能按范围读取、让消费组确认进度。哈希表很快,但没有顺序;跳表能排序,但每条消息都要额外节点;Redis 最后用 rax 做内存里的有序索引。</p>
+  <p>rax(Radix Tree,基数树)是一棵<strong>路径压缩的前缀树</strong>:相同前缀只存一次,分叉处再拆节点。Stream ID 是 8 字节毫秒时间 + 8 字节序号,同一毫秒内的消息至少共享前 8 字节,序号较小时还会共享更多前缀。rax 利用这个特点减少索引元数据,但不要把它理解成“固定倍数更快”的魔法常数。</p>
   <p>Stream 内部把若干相邻消息打包到一个 <code>listpack</code>(master entry + 增量字段),rax 索引 "<strong>每个 listpack 的首消息 ID</strong>"。XADD 时根据 ID 找到 listpack 节点追加;XRANGE 时按 rax 范围扫描;消费组(Consumer Group)用<strong>另一棵 rax</strong> 维护 PEL(Pending Entries List)。一个 Stream 容器内同时存在 <strong>3-N 棵 rax</strong>:主索引 / 消费组索引 / 每个组内的 PEL / 每个消费者内的 PEL。</p>
   <ul class="will-learn">
     <li>rax 的核心思想:路径压缩 = 前缀共享 + 节点合并,把 Trie 节点数从 N×K 降到 N</li>
@@ -113,7 +113,7 @@
     <g transform="translate(20, 282)">
       <rect width="920" height="56" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-dasharray="4 3"/>
       <text x="20" y="22" fill="var(--diagram-purple-text)" font-size="13" font-weight="800">⚖ 为什么 Stream 选 rax 而不是 dict?</text>
-      <text x="20" y="42" fill="var(--diagram-blue-text)" font-size="11">XADD ID 单调递增 + XRANGE 区间查询 — rax 既能 O(log) 定位首个 ID,又能顺序迭代,dict 完全无序</text>
+      <text x="20" y="42" fill="var(--diagram-blue-text)" font-size="11">XADD ID 单调递增 + XRANGE 区间查询 — rax 按 16 字节 ID 前缀定位起点,再顺序迭代;dict 完全无序</text>
     </g>
 
     <g transform="translate(20, 350)">
@@ -142,10 +142,10 @@
       <tr><td>消息追加</td><td><code>XADD stream * field value</code></td><td>严格递增 ID 追加</td><td>O(1) 摊销</td></tr>
       <tr><td>范围查询</td><td><code>XRANGE stream start end</code></td><td>按 ID 范围有序扫描</td><td>O(log N + M)</td></tr>
       <tr><td>实时订阅</td><td><code>XREAD BLOCK 5000 STREAMS s $</code></td><td>阻塞等待新消息</td><td>等待 + O(1)</td></tr>
-      <tr><td>消费组消费</td><td><code>XREADGROUP GROUP g c COUNT n</code></td><td>按组分配未消费消息</td><td>O(log N + n)</td></tr>
-      <tr><td>ACK 确认</td><td><code>XACK stream group id</code></td><td>从 PEL 删除</td><td>O(log P)</td></tr>
-      <tr><td>待确认查询</td><td><code>XPENDING stream group</code></td><td>按组查 PEL</td><td>O(log P + K)</td></tr>
-      <tr><td>消息认领</td><td><code>XAUTOCLAIM stream group c idle 0-0</code></td><td>idle 阈值后转移消费者</td><td>O(log P + count)</td></tr>
+      <tr><td>消费组消费</td><td><code>XREADGROUP GROUP g c COUNT n</code></td><td>按组分配未消费消息</td><td>O(n) + PEL 写入</td></tr>
+      <tr><td>ACK 确认</td><td><code>XACK stream group id</code></td><td>从 PEL 删除</td><td>O(1)/ID</td></tr>
+      <tr><td>待确认查询</td><td><code>XPENDING stream group</code></td><td>按组查 PEL</td><td>summary O(1),range O(count)</td></tr>
+      <tr><td>消息认领</td><td><code>XAUTOCLAIM stream group c idle 0-0</code></td><td>idle 阈值后转移消费者</td><td>与扫描候选数/COUNT 相关</td></tr>
     </tbody>
   </table>
 </div>
@@ -154,7 +154,7 @@
   <strong>三个硬约束</strong>:<br>
   ① <strong>16 字节 ID 必须严格有序</strong>:消息 ID = <code>&lt;毫秒&gt;(8B) + &lt;序号&gt;(8B)</code>,大端编码后字典序 = 时间序;<br>
   ② <strong>必须支持范围扫描</strong>:<code>XRANGE 1714000000000-0 1714000005000-0</code> 查 5 秒窗口,纯哈希直接出局;<br>
-  ③ <strong>追加必须 O(1)</strong>:写入热路径,百万 QPS 不能降速,跳表的 O(log N) 在 N=1e7 时常数已经太大。
+  ③ <strong>追加路径必须短</strong>:写入热路径不能为每条消息维护沉重节点,否则吞吐与尾延迟都会变差。
 </div>
 
 <h3>8.1.2 候选方案的不足</h3>
@@ -169,7 +169,7 @@
       <tr><td>红黑树 / AVL</td><td>O(log N + M)</td><td>32-48 B</td><td>不复用</td><td>复杂</td><td>旋转开销;前缀不复用</td></tr>
       <tr><td>B+ 树</td><td>O(log N + M)</td><td>视分支数</td><td>节点内</td><td>复杂</td><td>主要为磁盘设计,内存常数高</td></tr>
       <tr><td>标准 Trie</td><td>O(K)</td><td>每字符 1 节点</td><td>完美</td><td>简单</td><td>16K 个节点(1M 消息),空间爆炸</td></tr>
-      <tr><td><strong>rax(路径压缩)</strong></td><td><strong>O(K)</strong></td><td><strong>~40 B/节点</strong></td><td><strong>完美</strong></td><td><strong>中</strong></td><td><strong>无,本场景最优</strong></td></tr>
+      <tr><td><strong>rax(路径压缩)</strong></td><td><strong>O(K)</strong></td><td><strong>~40 B/节点</strong></td><td><strong>高</strong></td><td><strong>中</strong></td><td><strong>适合有序字节串索引;随机访问仍按 key 字节走</strong></td></tr>
     </tbody>
   </table>
 </div>
@@ -1102,7 +1102,14 @@ void scan_range(rax *t, unsigned char *start, size_t slen,
 <h2 id="s8-5">8.5 stream 整体结构</h2>
 <!-- ============================================================ -->
 
-<p>Stream 不是单纯的"rax + 消息"。一个 Stream 容器要同时回答 4 个问题:① 消息存在哪里?② 消费组都在哪?③ 每个组消费到哪了?④ 哪些消息已分配但未确认?这一节把 Stream 容器内部的 4 类对象关系画清楚。</p>
+<p>Stream 不是单纯的"rax + 消息"。一个 Stream 容器要同时回答 4 个问题:</p>
+<ul>
+  <li>消息存在哪里?</li>
+  <li>消费组都在哪?</li>
+  <li>每个组消费到哪了?</li>
+  <li>哪些消息已分配但未确认?</li>
+</ul>
+<p>这一节把 Stream 容器内部的 4 类对象关系画清楚。</p>
 
 <h3>8.5.1 stream 容器与多 rax 关系</h3>
 
@@ -1488,9 +1495,9 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields,
 
   <!-- 总结 -->
   <rect x="20" y="240" width="440" height="100" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
-  <text x="35" y="262" fill="var(--diagram-green-text)" font-size="12" font-weight="bold">★ 时间复杂度 O(log N + K)</text>
-  <text x="35" y="282" fill="var(--diagram-blue-text)" font-size="11">• N = rax 节点数 (本例 1)</text>
-  <text x="35" y="300" fill="var(--diagram-blue-text)" font-size="11">• K = ID 字节长 (16)</text>
+  <text x="35" y="262" fill="var(--diagram-green-text)" font-size="12" font-weight="bold">★ 主成本:固定 16 字节 ID 查找 + listpack 追加</text>
+  <text x="35" y="282" fill="var(--diagram-blue-text)" font-size="11">• rax 内部按 key 字节走树,不是二叉树式 logN</text>
+  <text x="35" y="300" fill="var(--diagram-blue-text)" font-size="11">• Redis 命令层把普通 XADD 视为近似 O(1),trim 另算</text>
   <text x="35" y="320" fill="var(--diagram-blue-text)" font-size="11">• lpAppend 末尾追加: O(1) (或摊销 O(1) realloc)</text>
 
   <rect x="475" y="240" width="425" height="100" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
@@ -1693,20 +1700,20 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields,
 <h3>8.7.4 Stream 消费组操作复杂度</h3>
 
 <div class="diagram">
-  <div class="diagram-title">表 8-7-1 · Stream 命令的 rax 操作复杂度</div>
+  <div class="diagram-title">表 8-7-1 · Stream 命令复杂度:命令层与 rax 内部不要混读</div>
   <table>
-    <thead><tr><th>操作</th><th>时间</th><th>涉及 rax 操作</th><th>常见 P99</th></tr></thead>
+    <thead><tr><th>操作</th><th>命令层主导项</th><th>涉及 rax 操作</th><th>延迟提醒</th></tr></thead>
     <tbody>
-      <tr><td>XADD</td><td>O(log N)</td><td>raxLast / raxInsert (尾追加)</td><td>15-30 μs</td></tr>
+      <tr><td>XADD</td><td>O(1) 追加;trim 另算</td><td>尾部 listpack 或新 rax key</td><td>受 trim 与分配影响</td></tr>
       <tr><td>XRANGE</td><td>O(log N + M)</td><td>raxSeek + 顺序遍历</td><td>50-500 μs (M=100)</td></tr>
       <tr><td>XREAD BLOCK</td><td>等待 + O(1)</td><td>rax 尾部访问</td><td>等待时间为主</td></tr>
-      <tr><td>XREADGROUP</td><td>O(log N + count)</td><td>rax + 写 group PEL</td><td>30-80 μs</td></tr>
-      <tr><td>XACK</td><td>O(log P)</td><td>rax delete in group PEL + consumer PEL</td><td>5-15 μs</td></tr>
-      <tr><td>XPENDING</td><td>O(log P + K)</td><td>rax range scan in PEL</td><td>20-100 μs</td></tr>
-      <tr><td>XAUTOCLAIM</td><td>O(log P + count)</td><td>rax scan + transfer</td><td>50-300 μs</td></tr>
+      <tr><td>XREADGROUP</td><td>O(count) + PEL 写入</td><td>读取主 rax,写 group/consumer PEL</td><td>count 与 PEL 写入为主</td></tr>
+      <tr><td>XACK</td><td>O(1)/ID</td><td>从 group PEL + consumer PEL 删除</td><td>批量 ACK 按 ID 数增长</td></tr>
+      <tr><td>XPENDING</td><td>summary O(1);range O(count)</td><td>PEL 范围扫描</td><td>扩展形式别无限 COUNT</td></tr>
+      <tr><td>XAUTOCLAIM</td><td>与扫描候选数/COUNT 相关</td><td>PEL 扫描 + 转移</td><td>COUNT 太大直接拉高延迟</td></tr>
       <tr><td>XLEN</td><td>O(1)</td><td>读 stream-&gt;length</td><td>&lt; 1 μs</td></tr>
-      <tr><td>XDEL</td><td>O(log N)</td><td>找 listpack + 标记 deleted</td><td>10-30 μs</td></tr>
-      <tr><td>XGROUP CREATE</td><td>O(log G)</td><td>raxInsert in cgroups</td><td>5-15 μs</td></tr>
+      <tr><td>XDEL</td><td>O(1)/ID</td><td>定位 listpack 后标记 deleted</td><td>不会立刻压缩所有历史洞</td></tr>
+      <tr><td>XGROUP CREATE</td><td>O(1) 级别</td><td>按 group 名写 cgroups rax</td><td>组数量多时管理成本上升</td></tr>
     </tbody>
   </table>
 </div>
@@ -1731,7 +1738,7 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields,
       <tr><td>红黑树</td><td>O(log N + M)</td><td>~48 MB</td><td>无</td><td>3 μs</td><td>旋转开销;前缀不复用</td></tr>
       <tr><td>B+ 树</td><td>O(log N + M)</td><td>视分支</td><td>节点内</td><td>5 μs</td><td>主要为磁盘设计,内存常数高</td></tr>
       <tr><td>标准 Trie</td><td>O(K)</td><td>~1.2 GB</td><td>完美</td><td>2 μs</td><td>16M 个节点(每字符 1 个),空间爆炸</td></tr>
-      <tr><td><strong>rax + listpack</strong></td><td><strong>O(K)</strong></td><td><strong>~80 MB</strong></td><td><strong>完美</strong></td><td><strong>15 μs</strong></td><td><strong>无,本场景最优</strong></td></tr>
+      <tr><td><strong>rax + listpack</strong></td><td><strong>O(K) 查找 + 批量解码</strong></td><td><strong>取决于消息大小</strong></td><td><strong>高</strong></td><td><strong>需实测</strong></td><td><strong>适合内存中的有序 ID 索引</strong></td></tr>
     </tbody>
   </table>
 </div>
@@ -1740,11 +1747,11 @@ int streamAppendItem(stream *s, robj **argv, int64_t numfields,
 
 <div class="key-insight">
   <strong>Redis 选择 rax + listpack 节点 + 多 rax 设计的 5 个理由</strong>:<br>
-  ① <strong>路径压缩适配 ID 特征</strong>:同毫秒 ID 前 12 字节相同,压缩节点存共享前缀;<br>
-  ② <strong>复杂度与 N 解耦</strong>:O(K) = O(16),百万 Stream 与万级 Stream 操作时间相同;<br>
+  ① <strong>路径压缩适配 ID 特征</strong>:同毫秒 ID 前 8 字节相同,小序号还会共享更多前缀;<br>
+  ② <strong>单次 rax 查找受 ID 字节长约束</strong>:key 固定 16 字节,但命令延迟仍会受返回数量、PEL 大小和内存分配影响;<br>
   ③ <strong>listpack 二级打包</strong>:rax 索引粒度是 "listpack 节点"(50-100 条消息),不是单条;<br>
   ④ <strong>消费组用同一棵 rax</strong>:数据结构统一,代码复用度高;<br>
-  ⑤ <strong>PEL 同样用 rax</strong>:按消息 ID 范围查未确认消息高效,XPENDING 0-+ 不阻塞。
+  ⑤ <strong>PEL 同样用 rax</strong>:按消息 ID 范围查未确认消息高效,但 XPENDING range 仍要限制 COUNT。
 </div>
 
 <!-- ============================================================ -->
@@ -2125,7 +2132,7 @@ raxNode *raxAddChild(raxNode *n, unsigned char c, raxNode **childptr,
 <h3>8.11.2 各场景 P99 实测</h3>
 
 <div class="diagram">
-  <div class="diagram-title">表 8-11-1 · rax + Stream 性能基线 (M2 Pro 单实例)</div>
+  <div class="diagram-title">表 8-11-1 · rax + Stream 性能基线示例(只说明趋势,上线前必须复测)</div>
   <table>
     <thead><tr><th>场景</th><th>消息数</th><th>消费组</th><th>PEL/组</th><th>内存</th><th>XADD P99</th><th>XRANGE P99</th><th>说明</th></tr></thead>
     <tbody>
@@ -2143,37 +2150,36 @@ raxNode *raxAddChild(raxNode *n, unsigned char c, raxNode **childptr,
 </div>
 
 <div class="key-insight">
-  <strong>教学结论 (生产可直接借用)</strong>:<br>
+  <strong>诊断结论(不能直接当 SLA)</strong>:<br>
   ① rax 索引粒度是 listpack(~50-100 条消息一个节点),<strong>不是单消息</strong>;<br>
-  ② XADD 平均 15-20 μs,P99 &lt; 30 μs;<br>
+  ② XADD 延迟主要受 trim、内存分配和持久化配置影响,不要照搬示例数值;<br>
   ③ XRANGE 顺序扫描接近 listpack 解码速度;<br>
-  ④ <strong>PEL 必须监控</strong>,&gt; 10K 通常说明 XACK 漏调;<br>
+  ④ <strong>PEL 必须监控</strong>,持续增长通常说明 XACK 漏调或消费者离线;<br>
   ⑤ <code>MAXLEN ~</code> 比精确 <code>MAXLEN</code> 性能提升 2-3 倍;<br>
-  ⑥ 消费组 &gt; 100 时考虑分库或换 Kafka。
+  ⑥ 消费组很多时先看 PEL、lag、CPU,再决定分片或换专用队列。
 </div>
 
 <h3>8.11.3 监控指标</h3>
 
 <div class="diagram">
-  <div class="diagram-title">表 8-11-2 · Stream 必监控指标 (Prometheus 风格)</div>
+  <div class="diagram-title">表 8-11-2 · Stream 可观测项(内置命令 + 应用/exporter 派生指标)</div>
   <table>
-    <thead><tr><th>指标</th><th>类型</th><th>含义</th><th>告警阈值</th></tr></thead>
+    <thead><tr><th>观测项</th><th>来源</th><th>含义</th><th>提醒</th></tr></thead>
     <tbody>
-      <tr><td><code>stream_xadd_total{stream}</code></td><td>counter</td><td>XADD 总数</td><td>—</td></tr>
-      <tr><td><code>stream_xrange_total{stream}</code></td><td>counter</td><td>XRANGE 调用数</td><td>—</td></tr>
-      <tr><td><code>stream_pel_size{stream,group}</code></td><td>gauge</td><td>待确认消息数</td><td>&gt; 10K = XACK 漏调</td></tr>
-      <tr><td><code>stream_consumer_idle_seconds{stream,group,consumer}</code></td><td>gauge</td><td>消费者空闲时间</td><td>&gt; 600 = 离线</td></tr>
-      <tr><td><code>stream_length{stream}</code></td><td>gauge</td><td>Stream 当前长度</td><td>增长不停 = 没 trim</td></tr>
-      <tr><td><code>stream_listpack_count{stream}</code></td><td>gauge</td><td>内部 listpack 节点数</td><td>—</td></tr>
-      <tr><td><code>rax_node_count{key}</code></td><td>gauge</td><td>rax 节点数</td><td>—</td></tr>
-      <tr><td><code>stream_radix_tree_keys{stream}</code></td><td>gauge</td><td>索引 key 数</td><td>接近 stream_length / 80</td></tr>
+      <tr><td><code>XINFO STREAM key</code>: <code>length</code></td><td>Redis 内置</td><td>Stream 当前消息数</td><td>持续增长要检查 trim 与消费速度</td></tr>
+      <tr><td><code>XINFO STREAM key</code>: <code>radix-tree-keys</code></td><td>Redis 内置</td><td>主 rax 中的 listpack 索引数</td><td>不是单消息数,可用于看节点膨胀</td></tr>
+      <tr><td><code>XINFO STREAM key</code>: <code>radix-tree-nodes</code></td><td>Redis 内置</td><td>主 rax 节点数</td><td>Redis 暴露的是 Stream 主索引,不是所有 PEL rax</td></tr>
+      <tr><td><code>XINFO GROUPS key</code>: <code>pending</code>/<code>lag</code></td><td>Redis 内置</td><td>组级待确认与落后量</td><td>持续增长再告警,不要只看固定阈值</td></tr>
+      <tr><td><code>XINFO CONSUMERS key group</code>: <code>idle</code>/<code>pending</code></td><td>Redis 内置</td><td>消费者空闲与待确认</td><td>idle 单位是毫秒,常需转换成秒</td></tr>
+      <tr><td><code>stream_xadd_total</code>/<code>duration</code></td><td>应用或 exporter</td><td>写入量与写入延迟</td><td>Redis 不原生按 stream 暴露这些 Prometheus 指标</td></tr>
     </tbody>
   </table>
 </div>
 
-<h3>8.11.4 PromQL 报警示例</h3>
+<h3>8.11.4 派生指标报警示例</h3>
 
-<pre><code class="language-bash"># Stream 长度持续增长 (没 trim)
+<pre><code class="language-bash"># 以下指标需要应用/exporter 从 XINFO 或业务埋点导出,不是 Redis 内置指标
+# Stream 长度持续增长 (没 trim)
 deriv(stream_length[5m]) > 100
 
 # PEL 异常 (XACK 漏调)
@@ -2200,17 +2206,17 @@ count by (stream) (stream_pel_size) > 50</code></pre>
 
 <div class="real-world">
   <strong>用例 2:CDC 数据同步</strong>(MySQL → ES)<br>
-  把 binlog 转成 Stream 事件 (<code>XADD cdc.users * op insert id 123 name alice</code>),Elasticsearch 同步 worker 用 consumer group 消费。<strong>关键设计</strong>:用 <code>XADD * op ... seq <binlog_pos></code> 加上 binlog 位置作字段(不是 ID),让重启时按 <code>XRANGE last_acked_pos +</code> 续传;PEL 长度作为同步延迟指标 (<code>XPENDING cdc.users sync_g</code>)。<strong>陷阱</strong>:早期版本用了 <code>XADD MAXLEN 100000</code>(精确),写入 P99 抖到 200 μs;改成 <code>MAXLEN ~ 100000</code> 后稳定在 30 μs。
+  把 binlog 转成 Stream 事件 (<code>XADD cdc.users * op insert id 123 name alice</code>),Elasticsearch 同步 worker 用 consumer group 消费。<strong>关键设计</strong>:用 <code>XADD * op ... seq &lt;binlog_pos&gt;</code> 加上 binlog 位置作字段(不是 ID),让重启时按 <code>XRANGE last_acked_pos +</code> 续传;PEL 长度作为同步延迟指标 (<code>XPENDING cdc.users sync_g</code>)。<strong>陷阱</strong>:早期版本用了 <code>XADD MAXLEN 100000</code>(精确),写入 P99 抖到 200 μs;改成 <code>MAXLEN ~ 100000</code> 后稳定在 30 μs。
 </div>
 
 <div class="real-world">
   <strong>用例 3:轻量任务队列</strong>(异步发邮件)<br>
-  Web 应用把"发邮件"任务塞进 Stream:<code>XADD email_queue * to user@x.com tpl welcome</code>;邮件 worker 用 consumer group 拉取并发送。<strong>设计</strong>:每 worker 用 hostname+pid 做 consumer name(<code>worker.app-1.1234</code>),处理完 XACK,失败不 ACK,等下次扫到 idle &gt; 5min 时由其他 worker 接手。<strong>规模</strong>:5 worker,日均 50 万邮件,Stream 长度稳定 ~3K,PEL 平均 &lt; 50。<strong>对比 Celery + Redis</strong>:Celery 没有 PEL 流转,worker 死掉的任务永远丢失;Stream 提供 "至少一次"。
+  Web 应用把"发邮件"任务塞进 Stream:<code>XADD email_queue * to user@x.com tpl welcome</code>;邮件 worker 用 consumer group 拉取并发送。<strong>设计</strong>:每 worker 用 hostname+pid 做 consumer name(<code>worker.app-1.1234</code>),处理完 XACK,失败不 ACK,等下次扫到 idle &gt; 5min 时由其他 worker 接手。<strong>规模</strong>:5 worker,日均 50 万邮件,Stream 长度稳定 ~3K,PEL 平均 &lt; 50。<strong>对比简单 Redis 队列</strong>:Stream 的 PEL 可以显式追踪未确认任务,提供 "至少一次" 语义;若用 Celery 等框架,仍需按其 broker/ack/visibility timeout 配置单独评估。
 </div>
 
 <div class="real-world">
   <strong>用例 4:不要这么用 — 大文件分发</strong><br>
-  反例:某团队用 <code>XADD logs * payload <100KB JSON></code> 把每条访问日志(含完整 request body)塞进 Stream。<strong>结果</strong>:listpack 节点很快被撑大(单 entry &gt; 4KB),实际每个 listpack 只能放 1-2 条消息,rax 节点数 = 消息数,内存爆炸 + XADD 因频繁 raxInsert 而降速到 200 μs。<strong>正解</strong>:大 payload 单独存 (S3 / 文件系统),Stream 只放引用 (URL + metadata)。
+  反例:某团队用 <code>XADD logs * payload &lt;100KB JSON&gt;</code> 把每条访问日志(含完整 request body)塞进 Stream。<strong>结果</strong>:listpack 节点很快被撑大(单 entry &gt; 4KB),实际每个 listpack 只能放 1-2 条消息,rax 节点数 = 消息数,内存爆炸 + XADD 因频繁 raxInsert 而降速到 200 μs。<strong>正解</strong>:大 payload 单独存 (S3 / 文件系统),Stream 只放引用 (URL + metadata)。
 </div>
 
 <!-- ============================================================ -->
@@ -2265,7 +2271,7 @@ redis-cli XPENDING s g
 # 期望: 1 pending
 
 # XACK 后 PEL 清空
-redis-cli XACK s g <id>
+redis-cli XACK s g &lt;id&gt;
 redis-cli XPENDING s g
 # 期望: 0 pending
 
@@ -2290,11 +2296,11 @@ redis-cli XAUTOCLAIM s g c2 1000 0-0 COUNT 10
   <table>
     <thead><tr><th>操作</th><th>时延 P99</th><th>说明</th></tr></thead>
     <tbody>
-      <tr><td>XADD</td><td>15-30 μs</td><td>O(log N + K),K=16</td></tr>
+      <tr><td>XADD</td><td>需本机复测</td><td>普通追加近似 O(1);trim / 分配 / AOF 会影响 P99</td></tr>
       <tr><td>XRANGE COUNT 100</td><td>50-180 μs</td><td>raxSeek + listpack 解码</td></tr>
       <tr><td>XREAD BLOCK</td><td>等待为主</td><td>无消息时挂 client</td></tr>
       <tr><td>XREADGROUP</td><td>30-80 μs</td><td>+ 写组级与消费者 PEL</td></tr>
-      <tr><td>XACK</td><td>5-15 μs</td><td>双 rax 删除</td></tr>
+      <tr><td>XACK</td><td>需本机复测</td><td>按 ID 从组级与消费者 PEL 删除</td></tr>
       <tr><td>XPENDING (全)</td><td>O(P)</td><td>慎用,P 大时秒级</td></tr>
       <tr><td>XAUTOCLAIM COUNT 50</td><td>50-300 μs</td><td>scan + 转移</td></tr>
       <tr><td>XLEN</td><td>&lt; 1 μs</td><td>读字段</td></tr>

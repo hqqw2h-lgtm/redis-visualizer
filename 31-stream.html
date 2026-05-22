@@ -62,9 +62,9 @@
 
 <div class="chapter-intro">
   <p class="lead">Redis Stream 在数据结构层面是 rax 树索引的 listpack 追加日志(详见第 8 章 rax-stream),其<strong>工程价值核心在消费者组(Consumer Group)与 PEL(Pending Entries List)机制</strong>。<code>XREADGROUP</code> + <code>XACK</code> 构成 at-least-once 投递语义:消费者从组级 <code>last_id</code> 之后读取新消息,服务端为每条投递创建 <code>streamNACK</code> 节点登记到<strong>组 PEL 与消费者 PEL 两层 rax</strong>,业务确认后通过 <code>XACK</code> 从两层 PEL 删除;崩溃消费者留下的 NACK 通过 <code>XCLAIM</code>/<code>XAUTOCLAIM</code> 转移所有权,实现死亡恢复。</p>
-  <p>Redis Stream 与 Kafka 的核心差异不在持久化(均支持),而在<strong>消费者组治理</strong>:Kafka 自动 rebalance,Redis 拒绝自动重分配并将该责任推给应用层 <code>XAUTOCLAIM</code> 巡检。该取舍换取了更简单的内部实现与零停顿延迟,代价是动态扩缩容场景需应用层补偿。Stream 不能等同于 Kafka 的小型替代品,而是<strong>单 key/单节点为核心的轻量可靠日志</strong>。</p>
+  <p>Redis Stream 与 Kafka 的核心差异不在持久化(均支持),而在<strong>消费者组治理</strong>:Kafka 会围绕 partition 做自动 rebalance,Redis 不做组内自动重分配,需要应用层用 <code>XAUTOCLAIM</code> 巡检和接管。该取舍让 Redis 内部实现更简单,也避免了自动 rebalance 带来的停顿;代价是动态扩缩容场景必须由应用补偿。Stream 不是 Kafka 的小型替代品,更适合作为围绕单个 stream key 的轻量可靠日志。</p>
   <ul class="will-learn">
-    <li>XREAD 广播 vs XREADGROUP 协作两种语义的差异,以及消费者组提供的四项能力(水平扩展、可靠投递、死亡恢复、进度追踪)</li>
+    <li>XREAD 独立游标读取 vs XREADGROUP 协作消费两种语义的差异,以及消费者组提供的四项能力(水平扩展、可靠投递、死亡恢复、进度追踪)</li>
     <li><code>stream</code> / <code>streamCG</code> / <code>streamConsumer</code> / <code>streamNACK</code> 四层结构以及双层 rax 共享指针的内存布局</li>
     <li>为何采用"组 PEL + 消费者 PEL"双层索引:每类查询都为 O(log N),以 64 字节 rax 节点换取查询时间</li>
     <li>从 <code>XADD</code> 到 <code>XACK</code> 的完整时序:NACK 创建、双层写入、释放路径</li>
@@ -72,9 +72,9 @@
     <li><code>XPENDING</code> 概要模式(O(consumers))与详细模式(O(returned + log N))的复杂度差异与典型耗时</li>
     <li><code>XCLAIM</code> NACK 转移的 6 步实现以及 <code>min-idle-time</code> / <code>FORCE</code> / <code>JUSTID</code> / <code>IDLE</code> 参数语义</li>
     <li><code>XAUTOCLAIM</code> 游标式扫描 + 孤儿 NACK 检测,以及推荐的巡检模板</li>
-    <li>定理 31.6.1:Redis Stream 不可在不引入 2PC 的前提下实现 exactly-once,业务必须用 message id 作幂等键</li>
+    <li>Redis Stream 无法单独保证端到端 exactly-once,业务必须用 message id 作幂等键</li>
     <li><code>XTRIM</code> 精确 vs 近似(<code>~</code>)策略,以及为何 trim 不清 PEL 会产生孤儿 NACK</li>
-    <li>PEL 内存的数学分析:152 字节/NACK,百万级未确认 ≈ 145 MB</li>
+    <li>PEL 内存的估算方法:每条未确认消息是百字节级开销,需结合版本与 allocator 实测</li>
     <li>Redis Stream / Kafka / RabbitMQ / AWS SQS 在并行度、重分配、有序性、持久性、单节点峰值上的对比</li>
     <li>单节点 / 主从 / Sentinel / Cluster 四种部署下的消费者组约束(hash tag、CROSSSLOT、failover 重复)</li>
     <li>主要命令 QPS / 延迟基线,PEL 规模对 <code>XREADGROUP id</code> 模式延迟的非线性影响</li>
@@ -161,11 +161,12 @@
 <h2 id="s31-0">31.0 章首速览</h2>
 
 <div class="key-insight">
-  <strong>核心结论:</strong> 消费者组是 Stream 的真正"杀手锏"——把"消息存储"与"消费状态追踪"在服务端原生合一。<strong>双层 PEL 共享指针</strong>让"组内总未确认"与"某消费者未确认"都能 O(log N) 查询;<strong>XACK 只删 PEL 不删消息体</strong>使多组共享同一日志;<strong>Redis 拒绝自动 rebalance</strong>换来零停顿,代价是 <code>XAUTOCLAIM</code> 巡检责任在应用层。投递语义最强只能达到 <strong>at-least-once</strong>,业务必须用 message id 作幂等键。
+  <strong>核心结论:</strong> 消费者组把"消息存储"与"消费状态追踪"放在服务端。<strong>双层 PEL 共享指针</strong>让"组内总未确认"与"某消费者未确认"都能 O(log N) 查询;<strong>XACK 只删 PEL 不删消息体</strong>使多组共享同一日志;Redis 不做自动 rebalance,因此 <code>XAUTOCLAIM</code> 巡检责任在应用层。投递语义是 <strong>at-least-once</strong>,业务必须用 message id 作幂等键。
 </div>
 
 <div class="real-world">
-  <strong>真实事故:</strong> 某团队部署订单消费者组,峰值 5 万 msg/s。一台消费者实例 OOM 后未重启,持有的 12 万 NACK 滞留在 PEL。一周后内存告警,排查发现 <code>XPENDING</code> 显示该消费者 idle 7 天。<strong>根因:</strong>未部署 <code>XAUTOCLAIM</code> 巡检,崩溃消费者的 NACK 永久滞留。<strong>教训:</strong>消费者组的死亡恢复责任 100% 在应用层,部署后必须配套巡检任务,<strong>同时</strong>设置 <code>delivery_count</code> 阈值与 DLQ 防止毒消息循环。
+  <strong>典型事故:</strong> 订单消费者组在高峰期有消费者 OOM 后未重启,它持有的 NACK 长时间滞留在 PEL,最终触发内存告警。排查时 <code>XPENDING</code> 显示该消费者 idle 很久。<strong>根因:</strong>没有部署 <code>XAUTOCLAIM</code> 巡检,崩溃消费者的 NACK 无人接管。<strong>教训:</strong>消费者组的死亡恢复主要在应用层完成,部署后必须配套巡检任务,同时设置 <code>delivery_count</code> 阈值与 DLQ 防止毒消息循环。
+</div>
 
 <p class="svg-title">图 31-0 · Stream 消费者组全景</p>
 <svg class="svg-diagram" viewBox="0 0 920 460" xmlns="http://www.w3.org/2000/svg">
@@ -243,9 +244,9 @@
 
 <h2 id="s31-1">31.1 消费者组解决的问题</h2>
 
-<p>Redis Stream 提供两种消费模式:<code>XREAD</code> 是<strong>广播</strong>语义,所有客户端独立读取所有消息;<code>XREADGROUP</code> 是<strong>协作</strong>语义,每条消息仅投递给组内一个消费者。<strong>消费者组是 Stream 用于"任务队列"场景的唯一正确接口</strong>。</p>
+<p>Redis Stream 提供两种消费模式:<code>XREAD</code> 让每个客户端按自己的游标读取,多个客户端可以各自读到同一批消息;<code>XREADGROUP</code> 是<strong>协作</strong>语义,每条新消息通常只投递给组内一个消费者。把 Stream 当任务队列使用时,消费者组通常是更合适的接口。</p>
 
-<p class="svg-title">图 31-1-1 · XREAD 广播 vs XREADGROUP 协作</p>
+<p class="svg-title">图 31-1-1 · XREAD 独立游标 vs XREADGROUP 协作</p>
 <svg class="svg-diagram" viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg">
   <g filter="url(#shadow)">
     <rect x="30" y="20" width="400" height="320" rx="12" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)" stroke-width="1.5"/>
@@ -871,7 +872,7 @@ def autoclaim_loop(redis_cli, group, recovery_consumer):
 
 <h2 id="s31-6">31.6 投递语义</h2>
 
-<p>消息中间件的三种投递语义在 Redis Stream 中的实现路径完全不同:<strong>at-least-once 是默认且推荐</strong>;at-most-once 易丢消息不推荐;exactly-once 在不引入 2PC 的前提下<strong>不可实现</strong>。</p>
+<p>消息中间件的三种投递语义在 Redis Stream 中的实现路径完全不同:<strong>at-least-once 是消费者组的常用目标</strong>;at-most-once 只适合可丢消息;端到端 exactly-once 需要业务处理结果与 ACK 原子提交,Redis Stream 单独无法保证。</p>
 
 <p class="svg-title">图 31-6-1 · 三种语义的实现路径</p>
 <svg class="svg-diagram" viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
@@ -892,7 +893,7 @@ def autoclaim_loop(redis_cli, group, recovery_consumer):
 
   <g filter="url(#shadow)">
     <rect x="320" y="20" width="290" height="340" rx="12" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)" stroke-width="1.5"/>
-    <text x="465" y="50" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="14" font-weight="700">At-Most-Once ✗ 不推荐</text>
+    <text x="465" y="50" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="14" font-weight="700">At-Most-Once · 仅适合可丢</text>
   </g>
   <g filter="url(#shadow)"><rect x="350" y="80" width="230" height="32" rx="6" fill="url(#g-amber)" stroke="var(--diagram-orange-stroke)"/><text x="465" y="100" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="600">1. XREADGROUP &gt;</text></g>
   <g filter="url(#shadow)"><rect x="350" y="125" width="230" height="32" rx="6" fill="url(#g-amber)" stroke="var(--diagram-orange-stroke)"/><text x="465" y="145" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="600">2. XACK (先 ACK!)</text></g>
@@ -968,7 +969,7 @@ def consume(redis_cli, db):
 
 <h2 id="s31-7">31.7 XTRIM 与内存控制</h2>
 
-<p>Stream 是只追加日志,XADD 不断推进 last_id 但不主动释放老消息。<strong>不裁剪即 OOM</strong>。XTRIM 提供 MAXLEN / MINID 两种维度,各有精确 / 近似(<code>~</code>)两档,共四种策略。</p>
+<p>Stream 是追加日志,<code>XADD</code> 不断推进 <code>last_id</code>,但不会自动按业务保留期删除老消息。长期不裁剪会持续占用内存,极端情况下可能 OOM。<code>XTRIM</code> 提供 MAXLEN / MINID 两种维度,各有精确 / 近似(<code>~</code>)两档,共四种策略。</p>
 
 <p class="svg-title">图 31-7-1 · 裁剪策略与孤儿 NACK 风险</p>
 <svg class="svg-diagram" viewBox="0 0 920 420" xmlns="http://www.w3.org/2000/svg">
@@ -996,7 +997,7 @@ streamNACK 对象:           24 字节
 group.pel rax 节点:         ~64 字节
 consumer.pel rax 节点:      ~64 字节
 ─────────────────────────────────
-总计 (不考虑 rax 共享前缀):  ~152 字节/未确认消息
+粗略总计 (不考虑 rax 共享前缀与 allocator 差异):  百字节级/未确认消息
 
 # 百万级 PEL 的内存开销
 P = 1,000,000
@@ -1021,14 +1022,14 @@ PEL 内存 ≈ 1,000,000 × 152 = 152 MB
 
 <h2 id="s31-8">31.8 跨系统对比</h2>
 
-<p>消费者组在不同消息中间件中的实现策略反映了各自架构哲学:Kafka 选择"分区 + 自动 rebalance",Redis 选择"无分区 + 应用层巡检",RabbitMQ 选择"竞争消费 + 自动重入队",SQS 选择"visibility timeout 自动重新可见"。</p>
+<p>消费者组在不同消息中间件中的实现策略反映了各自架构哲学:Kafka 选择"分区 + 自动 rebalance",Redis 围绕 stream key 和 PEL 让应用层巡检接管,RabbitMQ 选择"竞争消费 + 自动重入队",SQS 选择"visibility timeout 自动重新可见"。</p>
 
 <table class="compare">
 <thead><tr><th>维度</th><th>Redis Stream</th><th>Kafka</th><th>RabbitMQ</th><th>AWS SQS</th></tr></thead>
 <tbody>
 <tr><td>消息存储</td><td>rax + listpack(内存)</td><td>分区日志(磁盘)</td><td>队列(内存/磁盘)</td><td>分布式队列(云)</td></tr>
 <tr><td>进度追踪</td><td>PEL + last_id</td><td>offset(per partition per group)</td><td>per-message ACK</td><td>visibility timeout</td></tr>
-<tr><td>并行度单位</td><td>消费者(无分区)</td><td>分区(≤ partition)</td><td>消费者(竞争)</td><td>消费者(竞争)</td></tr>
+<tr><td>并行度单位</td><td>消费者(围绕 stream key)</td><td>分区(≤ partition)</td><td>消费者(竞争)</td><td>消费者(竞争)</td></tr>
 <tr><td>消息再分配</td><td>手动 XCLAIM</td><td>自动 rebalance</td><td>自动 NACK 重入队</td><td>超时自动重新可见</td></tr>
 <tr><td>消息有序性</td><td>全局有序</td><td>分区内有序</td><td>不保证</td><td>FIFO 队列保证</td></tr>
 <tr><td>消费者扩缩</td><td>立即生效</td><td>触发 rebalance 短停顿</td><td>立即生效</td><td>立即生效</td></tr>
@@ -1366,7 +1367,7 @@ void claimNACK(streamNACK *nack, streamConsumer *new_consumer,
 
 <p>Redis Stream 的<strong>双层 PEL 是空间换时间的精确权衡</strong>。若仅维护 <code>group.pel</code>,XPENDING 按消费者过滤需 O(group_pel_size) 遍历;若仅维护 <code>consumer.pel</code> 集合,XPENDING summary 与 NACK 总量查询需累加所有消费者。共享指针的双层 rax 让两类查询都为 O(log N),代价是每条 NACK 多一个 rax 节点(~64 字节)。该设计与数据库覆盖索引的多列检索同构,选择最优查询路径而非压缩存储。</p>
 
-<p>Redis 拒绝实现 rebalance 是与 Kafka 形成的<strong>关键架构差异</strong>。Kafka rebalance 在消费者增减时自动重新分配 partition,代价是 stop-the-world 停顿(合作 rebalance 改善但未消除)。Redis 选择"消费者各自处理 PEL,新消费者只处理新消息,崩溃消费者 PEL 由 XAUTOCLAIM 接管",代码复杂度极低,无任何停顿,但负载均衡责任推给应用层。该取舍在中小规模(&lt; 10 万 msg/s)是务实选择;大规模高吞吐场景应选择 Kafka 等专用日志系统。</p>
+<p>Redis 不实现自动 rebalance,这是与 Kafka 的关键架构差异。Kafka rebalance 会在消费者增减时重新分配 partition,可能带来暂停或抖动;Redis 选择"消费者各自处理 PEL,新消费者只处理新消息,崩溃消费者 PEL 由 XAUTOCLAIM 接管"。这样内部机制更简单,但负载均衡责任交给应用层。吞吐很高、需要长期保留或跨节点水平扩展时,应评估 Kafka 等专用日志系统。</p>
 
 <p>XACK 不删除消息体而仅删除 PEL 索引,是 Stream 与传统消息队列的<strong>核心差异</strong>。传统 MQ 的 ACK 表示"消息可从队列移除";Stream 的 XACK 仅表示"消费组对此消息的债务清算"。消息体由 XTRIM 独立控制,允许多个消费者组共享同一日志,各自有独立的 PEL 与 last_id。该设计将"日志保留"与"消费状态"解耦,但引入孤儿 NACK 风险(XTRIM 后 PEL 残留),需要 XAUTOCLAIM 第三返回值或应用层主动清理。</p>
 
@@ -1378,13 +1379,13 @@ void claimNACK(streamNACK *nack, streamConsumer *new_consumer,
   <table class="compare">
   <thead><tr><th>要点</th><th>命令 / 源码依据</th><th>易错点</th></tr></thead>
   <tbody>
-  <tr><td>消费者组提供 4 项能力:水平扩展、可靠投递、死亡恢复、进度追踪</td><td><code>XREADGROUP</code> 替代 <code>XREAD</code> 广播</td><td>把 Stream 当 Kafka 替代品</td></tr>
+  <tr><td>消费者组提供 4 项能力:水平扩展、可靠投递、死亡恢复、进度追踪</td><td><code>XREADGROUP</code> 替代多个客户端各自轮询 <code>XREAD</code></td><td>把 Stream 当 Kafka 替代品</td></tr>
   <tr><td>四层结构:streamCG/streamConsumer/streamNACK + 双层 rax 共享指针</td><td><code>t_stream.c</code> streamCreateNACK</td><td>把 PEL 当作消息存储</td></tr>
   <tr><td>双层 PEL 让组内总 pending 与某消费者 pending 都 O(log N)</td><td><code>raxFind</code> / <code>raxInsert</code></td><td>仅维护单层降低查询性能</td></tr>
   <tr><td>XACK 只删 PEL 索引,不删消息体;消息体由 XTRIM 独立控制</td><td><code>streamDelConsumerGroupPEL</code></td><td>认为 XACK 释放消息体</td></tr>
   <tr><td>XCLAIM 改 NACK.consumer + rax 转移;XAUTOCLAIM 自动化巡检</td><td><code>claimNACK</code> · <code>xautoclaimCommand</code></td><td>不部署巡检,崩溃 NACK 永久滞留</td></tr>
   <tr><td>Stream 提供 at-least-once;exactly-once 不可在 Redis 内实现</td><td>定理 31.6.1</td><td>试图用 MULTI/EXEC 模拟原子提交</td></tr>
-  <tr><td>PEL 内存 ~152 字节/条;百万级未确认 ≈ 145 MB</td><td><code>MEMORY USAGE</code> · <code>XPENDING</code></td><td>仅监控 stream 长度,忽略 PEL</td></tr>
+  <tr><td>PEL 是百字节级/条的额外开销,百万级未确认必须单独容量规划</td><td><code>MEMORY USAGE</code> · <code>XPENDING</code></td><td>仅监控 stream 长度,忽略 PEL</td></tr>
   <tr><td><code>XADD MAXLEN ~</code> 是裁剪推荐方式;<code>~</code> 性能远优于精确</td><td><code>streamTrim</code></td><td>用精确 MAXLEN 阻塞主线程</td></tr>
   <tr><td>failover 必然引入重复投递,业务幂等是唯一防线</td><td><code>WAIT</code> + <code>min-replicas-to-write</code></td><td>依赖服务端保证不重复</td></tr>
   <tr><td>Cluster 中消费者组依附 stream key,跨 stream 需 hash tag</td><td>CROSSSLOT 错误</td><td>跨 slot 组成消费者组失败</td></tr>

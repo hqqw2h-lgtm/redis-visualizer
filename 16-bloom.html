@@ -54,13 +54,13 @@
 <div class="article">
 
 <h1>第 16 章 · 概率结构 Bloom Filter / Count-Min Sketch / TopK</h1>
-<p class="subtitle">概率换内存 · 假阳无假阴 · m=-N·ln(p)/(ln 2)² · k=ln 2·m/N · Scalable 几何级数 · Cuckoo 原生删除 · CMS d×w 矩阵取 min · HeavyKeeper 衰减 · RedisBloom 模块化</p>
+<p class="subtitle">概率换内存 · 无假阴/有假阳 · m=-N·ln(p)/(ln 2)² · k=ln 2·m/N · Scalable 几何级数 · Cuckoo 原生删除 · CMS d×w 矩阵取 min · HeavyKeeper 衰减 · RedisBloom 模块化</p>
 
 <div class="chapter-intro">
-  <p class="lead">第 11 章的 HyperLogLog 估算<strong>集合的基数</strong>("有多少不同元素");本章关注另一类概率结构,回答<strong>三类不同问题</strong>:某元素是否在集合中(Bloom Filter)、某元素出现多少次(Count-Min Sketch)、集合中频次最高的 K 个元素是谁(TopK)。三者共同特点是<strong>用受控的近似换取常数级内存与查询复杂度</strong>,让 Redis 主线无法精确实现的高吞吐查询成为可能。</p>
+  <p class="lead">第 11 章的 HyperLogLog 估算<strong>集合的基数</strong>("有多少不同元素");本章关注另一类概率结构,回答<strong>三类不同问题</strong>:某元素是否在集合中(Bloom Filter)、某元素出现多少次(Count-Min Sketch)、集合中频次最高的 K 个元素是谁(TopK)。三者共同特点是<strong>用显式误差参数换取远小于精确结构的内存与稳定查询成本</strong>,让 Redis 主线无法经济实现的高吞吐查询成为可能。</p>
   <p>这些数据结构由 <code>RedisBloom</code> 模块(开源 Redis Stack 组件)提供,通过 Redis Modules API 注册 <code>BF.*</code> / <code>CF.*</code> / <code>CMS.*</code> / <code>TOPK.*</code> 命令族。本章描述算法原理、字节级位图布局、参数选择、可扩展变体,并给出 RedisBloom 核心源码片段。</p>
   <ul class="will-learn">
-    <li>Bloom Filter 三组件:位图 + 多 hash + SET/CHECK 语义,假阴无假阳有</li>
+    <li>Bloom Filter 三组件:位图 + 多 hash + SET/CHECK 语义,无假阴但有假阳</li>
     <li>假阳率公式 <code>p = (1 - e^(-kn/m))^k</code> 推导与最优 k = ln 2 · m/n</li>
     <li>1e8 元素 1% 假阳率仅需 114 MiB,相比 Set 的 4–6 GiB 节省 35–50×</li>
     <li>Scalable Bloom 几何级数累积假阳率有上界,牺牲查询性能换容量灵活</li>
@@ -76,7 +76,7 @@
 <h2 id="s16-1">16.1 概率结构与精确结构的边界</h2>
 <!-- ============================================================ -->
 
-<p>Redis 主线提供精确的 <code>Set</code> / <code>Hash</code> / <code>HSET HINCRBY</code> 等结构,在元素规模较小时表现极佳;但当数据量进入<strong>千万级 / 亿级</strong>,精确结构的内存代价变得不可接受。概率结构的核心思想是接受<strong>受控的小概率错误</strong>(假阳率 1%、估算偏差 0.1%),换取<strong>独立于元素规模的常数级内存</strong>。</p>
+<p>Redis 主线提供精确的 <code>Set</code> / <code>Hash</code> / <code>HSET HINCRBY</code> 等结构,在元素规模较小时表现极佳;但当数据量进入<strong>千万级 / 亿级</strong>,精确结构的内存代价会很高。概率结构的核心思想是接受<strong>受控的小概率错误</strong>(假阳率 1%、估算偏差 0.1%),用按容量和误差预先计算的紧凑结构替代逐元素存储。</p>
 
 <h3>16.1.1 三类概率问题</h3>
 
@@ -89,7 +89,7 @@
     <g font-family="ui-monospace,Consolas">
       <rect x="350" y="44" width="240" height="46" rx="22" fill="url(#d-purple)" filter="url(#d-shadow)"/>
       <text x="470" y="64" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">概率近似数据结构</text>
-      <text x="470" y="80" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">用受控误差换 O(1) 内存</text>
+      <text x="470" y="80" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">用受控误差换紧凑内存</text>
 
       <line x1="470" y1="90" x2="120" y2="138" stroke="var(--diagram-blue-stroke)" stroke-width="1.5"/>
       <line x1="470" y1="90" x2="350" y2="138" stroke="var(--diagram-green-stroke)" stroke-width="1.5"/>
@@ -149,7 +149,7 @@
 
       <rect x="40" y="320" width="860" height="70" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
       <text x="60" y="342" fill="var(--diagram-purple-text)" font-size="12" font-weight="800">★ 共同特征 — 都是 "用空间复杂度换准确性" 的工程权衡</text>
-      <text x="60" y="362" fill="var(--diagram-blue-text)" font-size="10">• 单次操作 O(k) 或 O(d), k/d 极小 (5~14) → 极快; 内存 O(m) 与元素数 N 无关</text>
+      <text x="60" y="362" fill="var(--diagram-blue-text)" font-size="10">• 单次操作 O(k) 或 O(d), k/d 极小 (5~14) → 极快; 内存由 capacity/error_rate 决定</text>
       <text x="60" y="380" fill="var(--diagram-blue-text)" font-size="10">• 适用边界: N ≥ 10⁶ 时收益显著 (1%-10% 精确结构内存); 小数据集仍用 SADD/HSET</text>
     </g>
   </svg>
@@ -252,7 +252,7 @@
       <text x="510" y="288" fill="var(--diagram-blue-text)" font-size="11">  ∀i ∈ {1..k}: bit[pᵢ] == 1 ?</text>
       <rect x="510" y="304" width="380" height="50" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
       <text x="700" y="322" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10" font-weight="800">"全 1 → 可能存在" (假阳率 p ≈ 1%)</text>
-      <text x="700" y="340" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">"任一 0 → 一定不存在" (假阴率 = 0)</text>
+      <text x="700" y="340" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">"任一 0 → 可判定不存在" (标准 Bloom 无假阴)</text>
 
       <rect x="40" y="386" width="860" height="26" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
       <text x="470" y="404" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="800">★ 三个组件: 位图 m bits + k 个独立 hash + SET/CHECK 语义 = Bloom Filter 全部</text>
@@ -661,7 +661,11 @@ p_fp* ≈ 0.6185^9.585 ≈ 0.0098 ≈ 1% ✓</pre>
   </table>
 </div>
 
-<p>10⁸ 元素 1% 假阳率仅需 <strong>114 MiB</strong>,相比 <code>SADD</code> 的 4–6 GiB 节省 <strong>35–50×</strong>;若把假阳率收紧到 0.1%,内存仅扩大到 172 MiB(增加 50%),仍远小于精确 Set。</p>
+<p>10⁸ 元素 1% 假阳率的理论位图约 <strong>114 MiB</strong>,相比存储同等短字符串的 <code>SADD</code> 常见 GiB 级内存节省明显;若把假阳率收紧到 0.1%,理论位图约 172 MiB(增加 50%),仍远小于精确 Set。</p>
+
+<div class="key-insight">
+  <strong>内存口径要分清</strong>:上表是 Bloom 位图与模块元数据的结构占用,不是业务逻辑数据大小;Redis <code>MEMORY USAGE</code> 还会包含模块对象、jemalloc size class 取整等开销;操作系统 RSS 还会包含内存碎片、页缓存与 CoW 等进程级因素。
+</div>
 
 <!-- ============================================================ -->
 <h2 id="s16-5">16.5 参数选择 m/k 的工程实践</h2>
@@ -892,6 +896,8 @@ p_n = p × 0.5^(n+1)</pre>
     <li><strong>EXISTS 查询代价</strong>:<code>O(layers × k_avg)</code> 而非 <code>O(k)</code>, 最坏情况扫所有 n+1 层</li>
     <li>缓解:层数通常 &lt; 10(每层容量翻倍, 2<sup>10</sup> = 1024 倍初始容量)</li>
   </ul>
+</div>
+
 </div>
 
 <h3>16.6.3 Scalable vs Fixed 对比</h3>
@@ -1250,7 +1256,7 @@ p_n = p × 0.5^(n+1)</pre>
       <text x="14" y="34" fill="var(--diagram-green-text)" font-weight="bold">关键洞察 · "总是高估, 从不低估"</text>
       <text x="14" y="58">  • 每行 <tspan fill="var(--diagram-orange-text)">单独可能因 hash 碰撞被高估</tspan></text>
       <text x="14" y="78">  • 取所有行的 <tspan fill="var(--diagram-green-text)">min</tspan> → 至少有一行未被碰撞干扰的概率高</text>
-      <text x="14" y="98">  • <tspan fill="var(--diagram-green-text)" font-weight="bold">min 是对真实 freq 的上界估计, 绝不会低于真实值</tspan></text>
+      <text x="14" y="98">  • <tspan fill="var(--diagram-green-text)" font-weight="bold">min 是对真实 freq 的上界估计,在计数器未溢出前不会低于真实值</tspan></text>
       <text x="14" y="118">  • 这种 "总是高估, 从不低估" 性质是 CMS 的核心契约</text>
       <text x="14" y="138">  • 对比 Bloom Filter:CMS 用 d 个 hash 独立采样, 取 min 而非 AND</text>
     </g>
@@ -1442,7 +1448,7 @@ OK
  5) count
  6) (integer) 350</code></pre>
 
-<p>CMS 估算只会过高(由 hash 碰撞导致),不会过低。"取 min over rows" 的设计原因是<strong>最小候选最不可能被碰撞干扰</strong>——若某行命中"未被任何其他元素占用"的列,该行就是真实值;否则也至少不超过其他被碰撞污染的行。</p>
+<p>CMS 估算在计数器未溢出且只增不减的前提下只会过高(由 hash 碰撞导致),不会过低。"取 min over rows" 的设计原因是<strong>最小候选最不可能被碰撞干扰</strong>——若某行命中"未被任何其他元素占用"的列,该行就是真实值;否则也至少不超过其他被碰撞污染的行。</p>
 
 <!-- ============================================================ -->
 <h2 id="s16-10">16.10 TopK:HeavyKeeper 算法</h2>
@@ -1922,9 +1928,9 @@ OK
         <text x="100" y="244" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">→ 仅做预过滤</text>
 
         <rect x="170" y="190" width="120" height="68" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
-        <text x="230" y="210" text-anchor="middle" fill="var(--diagram-red-text)" font-weight="800">② 黑名单 Bloom</text>
-        <text x="230" y="226" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">误伤合法用户</text>
-        <text x="230" y="244" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">→ Set / CF</text>
+        <text x="230" y="210" text-anchor="middle" fill="var(--diagram-red-text)" font-weight="800">② 安全名单 Bloom</text>
+        <text x="230" y="226" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">假阳会误放行</text>
+        <text x="230" y="244" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">→ 精确二次确认</text>
 
         <rect x="300" y="190" width="120" height="68" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
         <text x="360" y="210" text-anchor="middle" fill="var(--diagram-orange-text)" font-weight="800">③ N ≫ capacity</text>
@@ -1968,7 +1974,7 @@ OK
     <thead><tr><th>#</th><th>陷阱</th><th>典型症状</th><th>根因</th><th>修复</th></tr></thead>
     <tbody>
       <tr><td>1</td><td>Bloom 判存做强语义决策</td><td>1% 假阳导致少量错误转账 / 错误授权</td><td>Bloom 假阳本质</td><td>仅做"可能存在"快速过滤,精确判断仍查 DB</td></tr>
-      <tr><td>2</td><td>Bloom 黑名单做安全控制</td><td>攻击者可绕过(非 Bloom 元素被误判通过)</td><td>Bloom 假阴无,假阳有,黑名单方向相反</td><td>Bloom 用于"是否在白名单"才安全;黑名单用 Set 或 CF</td></tr>
+      <tr><td>2</td><td>Bloom 直接做安全名单</td><td>假阳可能误放行,或黑名单场景误伤正常用户</td><td>Bloom 只有"可能存在/肯定不存在"语义</td><td>只做预过滤;授权、黑白名单最终判断必须查 Set/DB 等精确来源</td></tr>
       <tr><td>3</td><td>N 远超 capacity</td><td>假阳率从 1% 升到 50%+</td><td>位图填充率超过 50% 后假阳率指数恶化</td><td>BF.RESERVE 时容量预留 1.5×;启用 SCALING</td></tr>
       <tr><td>4</td><td>NONSCALING 满后写失败</td><td>BF.ADD 返回 (error) 'is full'</td><td>选了 NONSCALING 又达到 capacity</td><td>移除 NONSCALING 或扩容重建</td></tr>
       <tr><td>5</td><td>CMS.MERGE 失败</td><td>"ERR width should be the same"</td><td>合并要求 d/w 完全一致</td><td>提前规范化所有 CMS 配置</td></tr>
@@ -1980,7 +1986,7 @@ OK
 </div>
 
 <div class="warning">
-  <strong>语义方向陷阱</strong>:Bloom 适合"是否在<strong>白名单</strong>"(假阳率 = 误放过攻击者?不,假阳率 = 多少非白名单元素被误判为白名单),<strong>不适合</strong>"是否在<strong>黑名单</strong>"(假阳率 = 多少非黑名单元素被误封,误伤合法用户)。在安全控制场景必须明确"假阳的代价是误放还是误封",再决定是否能用 Bloom。
+  <strong>语义方向陷阱</strong>:Bloom 只能回答"肯定不存在 / 可能存在"。用于白名单时,假阳可能把非白名单对象误判为白名单;用于黑名单时,假阳可能误封正常对象。安全控制不能只靠 Bloom,必须在 Bloom 之后查 Set、数据库或策略服务做精确确认。
 </div>
 
 <!-- ============================================================ -->
@@ -2194,7 +2200,7 @@ size_t CMS_IncrBy(CMSketch *cms, const char *item, size_t itemlen,
   <table>
     <thead><tr><th>要点</th><th>源码 / 命令依据</th><th>易错点</th></tr></thead>
     <tbody>
-      <tr><td>Bloom 假阴无,假阳可能</td><td><code>bloom_check</code> 全 bit 命中才返回存在</td><td>安全场景必须查 DB 二次确认</td></tr>
+      <tr><td>Bloom 无假阴、有假阳</td><td><code>bloom_check</code> 全 bit 命中才返回存在</td><td>安全场景必须查 DB 二次确认</td></tr>
       <tr><td>m / k 公式 m = -N×ln(p)/(ln 2)²</td><td><code>bloom_init</code> 公式</td><td>k 不在 m/n × ln 2 时假阳率上升</td></tr>
       <tr><td>Scalable Bloom 总假阳率有上界</td><td>几何级数 r=0.5</td><td>NONSCALING 满后写失败</td></tr>
       <tr><td>Cuckoo Filter 支持删除</td><td><code>CF.DEL</code></td><td>内存比 Bloom 多 ~25%</td></tr>

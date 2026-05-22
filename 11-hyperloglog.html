@@ -52,10 +52,10 @@
 <div class="article">
 
 <h1>第 11 章 · HyperLogLog 基数估算</h1>
-<p class="subtitle">12 KiB 固定内存 · 0.81% 标准误差 · 零-run 启发式 · 调和平均 · 稀疏 / 稠密双存储 · LinearCounting 修正 · 可分布式合并不累加误差</p>
+<p class="subtitle">稀疏小内存 · 稠密约 12 KiB · 0.81% 标准误差 · 零-run 启发式 · 调和平均 · LinearCounting 修正 · 可分布式合并不累加误差</p>
 
 <div class="chapter-intro">
-  <p class="lead">精确统计 N 个元素的<strong>去重基数</strong>(distinct count)需要 O(N) 量级的内存:<code>SET</code> 要把每个元素本体存起来才能判断"出现过没"。<strong>HyperLogLog</strong>(以下简称 HLL)用<strong>固定 12 KiB</strong>对任意大小的数据集给出基数估算,标准误差稳定在 <strong>0.81%</strong>。算法核心来自 Flajolet 等人 2007 年的论文 <em>HyperLogLog: the analysis of a near-optimal cardinality estimation algorithm</em>,Redis 在 <code>PFADD</code>/<code>PFCOUNT</code>/<code>PFMERGE</code> 三条命令中将其工程化。</p>
+  <p class="lead">精确统计 N 个元素的<strong>去重基数</strong>(distinct count)需要 O(N) 量级的内存:<code>SET</code> 要把每个元素本体存起来才能判断"出现过没"。<strong>HyperLogLog</strong>(以下简称 HLL)不保存元素本体,而是保存一组寄存器来估算基数:低基数时用稀疏编码省内存,转稠密后约 12 KiB,大基数标准误差约 <strong>0.81%</strong>。算法核心来自 Flajolet 等人 2007 年的论文 <em>HyperLogLog: the analysis of a near-optimal cardinality estimation algorithm</em>,Redis 在 <code>PFADD</code>/<code>PFCOUNT</code>/<code>PFMERGE</code> 三条命令中将其工程化。</p>
   <p>HLL 的"魔法"看起来违反直觉:用 12 KiB 估出 1 亿 UV,误差只有 ±81 万。秘密是 <strong>"hash 函数把元素映射到均匀 bit 串 → 观察前导零最大值 → 用最大值反推 N"</strong>。零-run 启发式给出粗估,分桶 + 调和平均把方差压下来,LinearCounting 修正小基数区,稀疏编码把低基数下的 12 KiB 内存压到几百字节。本章按这条逻辑链一节一节展开,每个公式都给出可在 Redis 源码 <code>src/hyperloglog.c</code> 中对应的代码片段。</p>
   <p>HLL 不是万能锤子。它<strong>不能反查元素是否存在</strong>(无 <code>PFEXISTS</code>),<strong>不能枚举元素</strong>(无 <code>PFRANGE</code>),<strong>不能删除单个元素</strong>(无 <code>PFDEL</code>),<strong>不能精确计数</strong>。需要任何一项请用 <code>SET</code> / <code>BITMAP</code> / <code>Bloom Filter</code>。HLL 的甜点场景是 <strong>"只问 N 是多少,不问 N 由谁组成"</strong>:网站日活 UV、广告独立曝光数、独立访问 IP 数、唯一搜索词数 ── 这些场景下,12 KiB vs Set 的 4-6 GiB 是<strong>百万倍</strong>的内存差距。</p>
   <ul class="will-learn">
@@ -1338,8 +1338,8 @@ double hllCount(struct hllhdr *hdr, int *invalid) {
         <g transform="translate(20, 40)" filter="url(#d-shadow)"><rect width="240" height="36" rx="6" fill="url(#d-green)"/><text x="120" y="16" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">PFADD key elem</text><text x="120" y="30" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">添加元素</text></g>
         <g transform="translate(20, 84)" filter="url(#d-shadow)"><rect width="240" height="36" rx="6" fill="url(#d-green)"/><text x="120" y="16" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">PFCOUNT key</text><text x="120" y="30" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">估算基数 ±0.81%</text></g>
         <g transform="translate(20, 128)" filter="url(#d-shadow)"><rect width="240" height="36" rx="6" fill="url(#d-green)"/><text x="120" y="16" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="700">PFMERGE dst src...</text><text x="120" y="30" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">合并多个 HLL</text></g>
-        <text x="140" y="200" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">★ 永远 12 KiB · 永远 ±0.81%</text>
-        <text x="140" y="220" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">★ 100% 适合 UV / DAU 类</text>
+        <text x="140" y="200" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">★ 稠密约 12 KiB · 标准误差约 0.81%</text>
+        <text x="140" y="220" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">★ 适合 UV / DAU 等可容忍估算误差的场景</text>
       </g>
 
       <g transform="translate(330, 50)">
@@ -1412,13 +1412,13 @@ double hllCount(struct hllhdr *hdr, int *invalid) {
       <g transform="translate(0, 102)"><rect x="60" y="-10" width="540" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)" stroke-dasharray="3 3"/><text x="330" y="6" text-anchor="middle" fill="var(--diagram-blue-text)" font-weight="700">实时写入阶段</text></g>
 
       <g transform="translate(0, 138)"><path d="M 92 0 L 466 0" stroke="var(--diagram-blue-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-b)"/><text x="280" y="-4" text-anchor="middle" fill="var(--diagram-blue-text)">1. PFADD uv:2026-05-06 user_001</text></g>
-      <g transform="translate(0, 162)"><path d="M 466 0 L 92 0" stroke="var(--diagram-green-stroke)" stroke-width="1.4" stroke-dasharray="3 3" fill="none" marker-end="url(#d-arr-g)"/><text x="280" y="-4" text-anchor="middle" fill="var(--diagram-muted)">2. → 1 (新增)</text></g>
+      <g transform="translate(0, 162)"><path d="M 466 0 L 92 0" stroke="var(--diagram-green-stroke)" stroke-width="1.4" stroke-dasharray="3 3" fill="none" marker-end="url(#d-arr-g)"/><text x="280" y="-4" text-anchor="middle" fill="var(--diagram-muted)">2. → 1 (寄存器被更新)</text></g>
 
       <g transform="translate(0, 192)"><path d="M 92 0 L 466 0" stroke="var(--diagram-blue-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-b)"/><text x="280" y="-4" text-anchor="middle" fill="var(--diagram-blue-text)">3. PFADD uv:2026-05-06 user_002</text></g>
-      <g transform="translate(0, 216)"><path d="M 466 0 L 92 0" stroke="var(--diagram-green-stroke)" stroke-width="1.4" stroke-dasharray="3 3" fill="none" marker-end="url(#d-arr-g)"/><text x="280" y="-4" text-anchor="middle" fill="var(--diagram-muted)">4. → 1 (新增)</text></g>
+      <g transform="translate(0, 216)"><path d="M 466 0 L 92 0" stroke="var(--diagram-green-stroke)" stroke-width="1.4" stroke-dasharray="3 3" fill="none" marker-end="url(#d-arr-g)"/><text x="280" y="-4" text-anchor="middle" fill="var(--diagram-muted)">4. → 1 (寄存器被更新)</text></g>
 
       <g transform="translate(0, 246)"><path d="M 92 0 L 466 0" stroke="var(--diagram-blue-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr-b)"/><text x="280" y="-4" text-anchor="middle" fill="var(--diagram-blue-text)">5. PFADD uv:2026-05-06 user_001 (重复)</text></g>
-      <g transform="translate(0, 270)"><path d="M 466 0 L 92 0" stroke="var(--diagram-orange-stroke)" stroke-width="1.4" stroke-dasharray="3 3" fill="none" marker-end="url(#d-arr)"/><text x="280" y="-4" text-anchor="middle" fill="var(--diagram-orange-text)">6. → 0 (已存在,桶位 ρ 不更新)</text></g>
+      <g transform="translate(0, 270)"><path d="M 466 0 L 92 0" stroke="var(--diagram-orange-stroke)" stroke-width="1.4" stroke-dasharray="3 3" fill="none" marker-end="url(#d-arr)"/><text x="280" y="-4" text-anchor="middle" fill="var(--diagram-orange-text)">6. → 0 (状态未改变,不等于“元素一定已存在”)</text></g>
 
       <g transform="translate(0, 304)"><rect x="60" y="-10" width="540" height="22" rx="4" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)" stroke-dasharray="3 3"/><text x="330" y="6" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="700">实时查询阶段</text></g>
 
@@ -1477,32 +1477,32 @@ double hllCount(struct hllhdr *hdr, int *invalid) {
       <tr><td>empty</td><td>0</td><td>sparse</td><td>32</td><td>3</td><td>5</td><td>0</td><td>空 HLL 仅头部</td></tr>
       <tr><td>small_sparse</td><td>100</td><td>sparse</td><td>180</td><td>8</td><td>12</td><td>&lt; 0.1</td><td>稀疏阶段</td></tr>
       <tr><td>medium_sparse</td><td>1k</td><td>sparse</td><td>1800</td><td>12</td><td>18</td><td>0.4</td><td>接近稀疏阈值</td></tr>
-      <tr><td>large_sparse</td><td>3k</td><td>sparse</td><td>3000</td><td>15</td><td>22</td><td>0.6</td><td>稀疏阈值附近</td></tr>
-      <tr><td>auto_to_dense</td><td>3001</td><td>dense</td><td>12296</td><td>18</td><td>28</td><td>0.7</td><td>转稠密</td></tr>
-      <tr><td>small_dense</td><td>10k</td><td>dense</td><td>12296</td><td>18</td><td>42</td><td>0.8</td><td>稠密</td></tr>
-      <tr><td>medium_dense</td><td>1m</td><td>dense</td><td>12296</td><td>18</td><td>42</td><td>0.81</td><td>典型生产</td></tr>
-      <tr><td>huge_dense</td><td>100m</td><td>dense</td><td>12296</td><td>18</td><td>42</td><td>0.81</td><td>误差稳定</td></tr>
-      <tr><td>pfmerge_2</td><td>2 streams</td><td>dense</td><td>12296</td><td>—</td><td>82</td><td>0.81</td><td>合并 2 个</td></tr>
-      <tr><td>pfmerge_10</td><td>10 streams</td><td>dense</td><td>12296</td><td>—</td><td>420</td><td>0.81</td><td>合并 10 个</td></tr>
-      <tr><td>pfmerge_100</td><td>100 streams</td><td>dense</td><td>12296</td><td>—</td><td>4200</td><td>0.81</td><td>合并慢</td></tr>
+      <tr><td>sparse_near_limit</td><td>取决于分布</td><td>sparse</td><td>&lt;=3000</td><td>15</td><td>22</td><td>0.6</td><td>稀疏字节阈值附近</td></tr>
+      <tr><td>auto_to_dense</td><td>触发阈值后</td><td>dense</td><td>12304</td><td>18</td><td>28</td><td>0.7</td><td>超过 sparse 字节阈值或寄存器值过大</td></tr>
+      <tr><td>small_dense</td><td>10k</td><td>dense</td><td>12304</td><td>18</td><td>42</td><td>0.8</td><td>稠密</td></tr>
+      <tr><td>medium_dense</td><td>1m</td><td>dense</td><td>12304</td><td>18</td><td>42</td><td>0.81</td><td>典型生产</td></tr>
+      <tr><td>huge_dense</td><td>100m</td><td>dense</td><td>12304</td><td>18</td><td>42</td><td>0.81</td><td>误差稳定</td></tr>
+      <tr><td>pfmerge_2</td><td>2 streams</td><td>dense</td><td>12304</td><td>—</td><td>82</td><td>0.81</td><td>合并 2 个</td></tr>
+      <tr><td>pfmerge_10</td><td>10 streams</td><td>dense</td><td>12304</td><td>—</td><td>420</td><td>0.81</td><td>合并 10 个</td></tr>
+      <tr><td>pfmerge_100</td><td>100 streams</td><td>dense</td><td>12304</td><td>—</td><td>4200</td><td>0.81</td><td>合并慢</td></tr>
     </tbody>
   </table>
 </div>
 
 <div class="key-insight">
-  <strong>教学结论(生产可直接借用)</strong>:<br>
-  ① 稀疏 &lt; 3000 distinct,内存几百字节,极轻量;<br>
-  ② &gt; 3000 distinct 自动转稠密,固定 12 KiB;<br>
-  ③ 误差 0.81% 不论 distinct N 多少都成立;<br>
-  ④ PFCOUNT 单 key &lt; 50 µs;<br>
-  ⑤ PFMERGE 多 key 时间随 key 数线性(每 key ~40 µs);<br>
-  ⑥ 合并 100 个 HLL 需 4 ms,高频合并要谨慎。
+  <strong>诊断结论(上线前按本机复测)</strong>:<br>
+  ① 稀疏/稠密切换看 sparse 编码长度(默认 3000B)和寄存器值,不是看 distinct 是否刚好 3000;<br>
+  ② 转稠密后字符串长度固定 12304B;<br>
+  ③ 大基数标准误差约 0.81%,小基数会走 LinearCounting 修正,但仍是估算;<br>
+  ④ PFCOUNT 单 key 可利用 cached_cardinality,但写入后首次读取可能重算;<br>
+  ⑤ PFMERGE / 多 key PFCOUNT 时间随 key 数线性增长;<br>
+  ⑥ 高频合并要分级预聚合,不要在请求热路径合并大量 HLL。
 </div>
 
 <h3>11.10.4 监控指标</h3>
 
 <div class="diagram">
-  <div class="diagram-title">表 11-10-3 · HLL 必监控指标(Prometheus 风格)</div>
+  <div class="diagram-title">表 11-10-3 · HLL 可观测项(业务/exporter 派生,非 Redis 内置逐 key 指标)</div>
   <table>
     <thead><tr><th>指标</th><th>类型</th><th>含义</th><th>告警阈值</th></tr></thead>
     <tbody>
@@ -1511,23 +1511,23 @@ double hllCount(struct hllhdr *hdr, int *invalid) {
       <tr><td><code>hll_pfmerge_total{key}</code></td><td>counter</td><td>PFMERGE 调用数</td><td>&gt; 1000/min = 频繁合并</td></tr>
       <tr><td><code>hll_encoding{key}</code></td><td>gauge</td><td>sparse=0 / dense=1</td><td>—</td></tr>
       <tr><td><code>hll_estimated_cardinality{key}</code></td><td>gauge</td><td>当前估计基数</td><td>—</td></tr>
-      <tr><td><code>hll_memory_bytes{key}</code></td><td>gauge</td><td>实际占用字节</td><td>sparse 渐进上升 / dense 固定</td></tr>
+      <tr><td><code>hll_memory_bytes{key}</code></td><td>gauge</td><td>Redis 口径估算字节</td><td>sparse 渐进上升 / dense 固定</td></tr>
     </tbody>
   </table>
 </div>
 
-<h3>11.10.5 PromQL 报警示例</h3>
+<h3>11.10.5 派生指标报警示例</h3>
 
 <pre><code class="language-bash"># 频繁 PFMERGE
 rate(hll_pfmerge_total[5m]) > 100
 
-# 误差敏感场景告警(估计 < 1000 时仍然 ±0.81% 是 ±8 误差)
+# 误差敏感场景:小集合若要精确计数,不要用 HLL
 hll_estimated_cardinality < 1000 and rate(hll_pfcount_total[5m]) > 100
 
 # 稀疏到稠密临界(内存翻 7 倍)
 hll_memory_bytes > 3000 and hll_encoding == 0
 
-# PFCOUNT 缓存命中率太低(意味着 PFADD 写入太频繁)
+# 写多读少:PFADD 频繁会让 cached_cardinality 变脏,PFCOUNT 更容易重算
 rate(hll_pfcount_total[5m]) > 0
   and (rate(hll_pfadd_total[5m]) / rate(hll_pfcount_total[5m])) > 100
 </code></pre>
@@ -1684,7 +1684,7 @@ int hllDenseAdd(uint8_t *registers, long index, uint8_t count) {
       <rect width="500" height="64" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
       <text x="20" y="22" fill="var(--diagram-purple-text)" font-size="13" font-weight="800">★ Redis HLL = 稀疏 + 稠密双存储</text>
       <text x="20" y="42" fill="var(--diagram-purple-text)" font-size="11">小基数 (≤3000 不同) 走稀疏 ~几百 B</text>
-      <text x="20" y="58" fill="var(--diagram-purple-text)" font-size="11">大基数 → 自动转稠密 12 KiB · 永远不退回</text>
+      <text x="20" y="58" fill="var(--diagram-purple-text)" font-size="11">大基数 → 自动转稠密 12 KiB · 不自动退回稀疏</text>
     </g>
     <path d="M 800 350 L 670 400" stroke="var(--diagram-purple-stroke)" stroke-width="1.4" fill="none" marker-end="url(#d-arr)"/>
 

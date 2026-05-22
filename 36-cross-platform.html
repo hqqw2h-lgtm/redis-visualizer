@@ -57,18 +57,10 @@
   <p class="lead">Redis 源码可在 Linux、FreeBSD、macOS、WSL2、Docker 容器内编译运行,但<strong>"可编译"与"适合作为生产基线"是两个不同问题</strong>。后者由事件循环后端、<code>fork()</code> 行为、文件描述符上限、文件系统 fsync 语义、服务管理器模型共同决定。任一项不匹配,QPS 压测数字均不具备外推价值。</p>
   <p>Redis 通过 <code>src/ae.c</code> 在编译期选择事件循环后端(<code>epoll</code> / <code>kqueue</code> / <code>evport</code> / <code>select</code>),<strong>热路径不引入运行时多态</strong>。该决定与 Linux 的 <code>epoll</code> + <code>fork()</code> + jemalloc + sysctl 组合共同构成生产首选路径。跨平台部署需独立评估每条系统调用的语义差异。</p>
   <ul class="will-learn">
-    <li>"运行时指纹"采集方法:用 <code>INFO server</code> + <code>CONFIG GET dir</code> + <code>df -T</code> + <code>/proc/&lt;pid&gt;/limits</code> 而非平台名称定生产基线</li>
-    <li><code>ae.c</code> 编译期后端选择机制:<code>HAVE_EPOLL</code> / <code>HAVE_KQUEUE</code> / <code>HAVE_EVPORT</code> 三个宏的优先级</li>
-    <li>四种后端能力对比:<code>epoll</code> / <code>kqueue</code> / <code>evport</code> / <code>select</code> 的 fd 扩展性与触发模式</li>
-    <li>Linux 生产基线检查清单:内核版本、jemalloc、THP、overcommit、fd 上限、数据盘、systemd</li>
-    <li>macOS 不可作为生产的四条证据:fd 默认 256、无 overcommit、fork 不稳定、kqueue ≠ epoll</li>
-    <li>FreeBSD 作为非 Linux 生产平台的可行路径:<code>kqueue</code> + jemalloc + jail</li>
-    <li>Windows 三条路径:WSL2 / Docker Desktop / Memurai 商业兼容,以及为何停维 Win32 端口不应使用</li>
-    <li>虚拟化文件系统的 fsync 延迟对比:9p / fuse.osxfs / virtiofs / VM 内 ext4 差距可达 100 倍</li>
-    <li>跨平台压测最低字段表与"数字可外推"判定规则</li>
-    <li>容器化 Redis 的 cgroup memory.max 与 maxmemory 关系,以及为何需要 1.5 倍裕量防 fork OOM-kill</li>
-    <li>Kubernetes StatefulSet 部署模式与 Sentinel quorum 的配合</li>
-    <li>四个被拒绝的跨平台方案:libevent 抽象层、IOCP 后端、运维适配器、线程池隐藏 fd</li>
+    <li>怎样采集"运行时指纹",避免只凭 Linux/macOS/Windows 名称判断性能</li>
+    <li><code>ae.c</code> 如何在编译期选择 epoll/kqueue/evport/select,以及这个选择影响什么</li>
+    <li>为什么开发环境、CI 环境和生产环境的 fsync/fork 数字不能随意外推</li>
+    <li>容器与 Kubernetes 中 Redis 需要额外验证哪些 cgroup、卷和优雅终止边界</li>
   </ul>
   <p class="prereq">前置知识:第 19 章 ae 事件循环(理解 <code>aeApi*</code> 函数族);第 20 章 I/O 多路复用(epoll/kqueue/select 模型差异);第 22 章 jemalloc(理解非 Linux 平台的分配器);第 17 章 RDB(fork + CoW 的平台依赖);第 18 章 AOF(fsync 延迟敏感性);第 35 章 Linux 调优(overcommit / THP / nofile);Docker 与 Kubernetes 基础。</p>
 </div>
@@ -132,7 +124,7 @@
       <text x="740" y="314" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="12" font-weight="800">§36.10-11 容器/源码</text>
       <text x="740" y="330" text-anchor="middle" fill="var(--diagram-muted)" font-size="10">K8s + 平台抽象边界</text>
 
-      <text x="20" y="364" fill="var(--diagram-green-text)" font-size="11">★ 唯一被充分验证的生产基线:Linux 6+ + epoll + jemalloc + sysctl 调优(见第 35 章)</text>
+      <text x="20" y="364" fill="var(--diagram-green-text)" font-size="11">★ 最常见且验证最充分的生产基线:Linux + epoll + jemalloc + 明确 sysctl/资源配置(见第 35 章)</text>
     </g>
   </svg>
 </div>
@@ -142,11 +134,11 @@
 <!-- ============================================================ -->
 
 <div class="key-insight">
-  <strong>核心结论:</strong> Redis 跨平台不是"一份源码,多平台运行"的均质问题,<strong>而是"编译期后端选择 + 平台语义差异"的合成问题</strong>。Linux + <code>epoll</code> + jemalloc + sysctl 是唯一被充分验证的生产基线;FreeBSD 是可选生产路径;macOS 仅适合开发;Windows 必须经 WSL2/Docker/商业兼容产品。任何跨平台压测必须记录后端、文件系统、虚拟化层,否则数字无效。
+  <strong>核心结论:</strong> Redis 跨平台不是"一份源码,多平台运行"的均质问题,<strong>而是"编译期后端选择 + 平台语义差异"的合成问题</strong>。Linux + <code>epoll</code> + jemalloc + 明确调优是最常见的生产基线;FreeBSD 可作为具备运维体系团队的生产路径;macOS/WSL2/Docker Desktop 更适合开发与 CI。任何跨平台压测必须记录后端、文件系统、虚拟化层,否则数字不可外推。
 </div>
 
 <div class="real-world">
-  <strong>真实事故:</strong> 某团队在 macOS 上做了 100K QPS 的 SET 压测,据此评估"3 台 c5.xlarge 足够支撑生产"。上线后第二天 BGSAVE 触发 OOM-kill,RDB 永久失败。<strong>根因:</strong>macOS Mach 内核的 fork 行为与 Linux <code>vm.overcommit_memory=1</code> 差异显著,峰值内存外推错误。教训:跨平台数字必须标注"源平台 → 目标平台"是否可外推。
+  <strong>案例化场景:</strong> 团队在 macOS 上做了 100K QPS 的 SET 压测,据此评估"3 台 c5.xlarge 足够支撑生产"。上线后 BGSAVE 触发 OOM-kill,RDB 持续失败。<strong>根因:</strong>macOS Mach 内核的 fork 行为与 Linux <code>vm.overcommit_memory=1</code> 差异显著,峰值内存外推错误。教训:跨平台数字必须标注"源平台 → 目标平台"是否可外推。
 </div>
 
 <!-- ============================================================ -->
@@ -213,7 +205,7 @@
       <text x="840" y="256" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">macOS/WSL2/Docker</text>
 
       <text x="20" y="296" fill="var(--diagram-muted)" font-size="11">★ "平台正确" 必须由 5 条命令的输出共同证明,不能由 uname / hostname 推断</text>
-      <text x="20" y="312" fill="var(--diagram-red-text)" font-size="11">★ macOS 压测数字外推到生产 = 真实事故来源(参见章首速览)</text>
+      <text x="20" y="312" fill="var(--diagram-red-text)" font-size="11">★ macOS 压测数字外推到生产 = 高风险容量误判(参见章首速览)</text>
     </g>
   </svg>
 </div>
@@ -508,7 +500,7 @@ static char *aeApiName(void);
 <h2 id="s36-3">36.3 Linux 生产首选</h2>
 <!-- ============================================================ -->
 
-<p>Linux + <code>epoll</code> + jemalloc + sysctl 是 Redis <strong>唯一被充分验证的生产基线</strong>。该组合在事件循环、内存分配、fork 行为、磁盘同步、进程隔离五个维度都有可调旋钮与丰富的运维经验沉淀。</p>
+<p>Linux + <code>epoll</code> + jemalloc + 明确 sysctl/资源配置是 Redis <strong>最常见且验证最充分的生产基线</strong>。该组合在事件循环、内存分配、fork 行为、磁盘同步、进程隔离五个维度都有可调旋钮与丰富的运维经验沉淀;FreeBSD 等路径也可以成立,前提是团队具备对应运维体系并完成等价验证。</p>
 
 <h3>36.3.1 Linux 生产路径完整堆栈</h3>
 
@@ -822,7 +814,7 @@ mem_allocator:jemalloc-5.3.0</code></pre>
       <rect x="20" y="280" width="160" height="60" rx="8" fill="url(#d-green)" filter="url(#d-shadow)"/>
       <text x="100" y="304" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">★ WSL2 + Ubuntu</text>
       <text x="100" y="320" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">Linux epoll</text>
-      <text x="100" y="334" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">完全兼容</text>
+      <text x="100" y="334" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">语义接近</text>
 
       <rect x="200" y="280" width="160" height="60" rx="8" fill="url(#d-blue)" filter="url(#d-shadow)"/>
       <text x="280" y="304" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">Docker Desktop</text>
@@ -850,8 +842,8 @@ mem_allocator:jemalloc-5.3.0</code></pre>
 <table class="compare">
 <thead><tr><th>路径</th><th>适用场景</th><th>性能损失</th><th>兼容性</th></tr></thead>
 <tbody>
-<tr><td>WSL2</td><td>Windows 开发</td><td>接近 Linux</td><td>完全兼容</td></tr>
-<tr><td>Docker Desktop</td><td>CI / 一次性环境</td><td>bind mount 慢</td><td>完全兼容</td></tr>
+<tr><td>WSL2</td><td>Windows 开发</td><td>接近 Linux</td><td>接近 Linux,需避开 <code>/mnt/*</code> 数据目录</td></tr>
+<tr><td>Docker Desktop</td><td>CI / 一次性环境</td><td>bind mount 慢</td><td>容器语义接近,fsync 需单独验证</td></tr>
 <tr><td>Memurai 等兼容产品</td><td>强制 Windows 生产</td><td>与 Redis 接近</td><td>命令兼容,版本可能滞后</td></tr>
 <tr><td><strong>MSOpenTech Win32 端口</strong></td><td><strong>不应使用</strong></td><td>—</td><td>停留在 Redis 3.x</td></tr>
 </tbody>
@@ -927,7 +919,7 @@ docker exec redis-dev redis-cli INFO server | grep multiplexing_api
       <text x="20" y="40" fill="var(--diagram-blue-text)" font-size="13" font-weight="800">★ fsync 延迟差距可达 100 倍</text>
       <text x="20" y="60" fill="var(--diagram-muted)" font-size="11">★ Redis AOF 是高频 fsync 工作负载,数据目录置于宿主机共享路径会显著降低性能</text>
       <text x="20" y="320" fill="var(--diagram-green-text)" font-size="11">★ 修复:WSL2 用 ext4 路径(如 /var/lib/redis),Docker 用 named volume(默认走 VM 内 ext4)</text>
-      <text x="20" y="340" fill="var(--diagram-red-text)" font-size="11">★ 在 CI 启动时校验 fs_type,9p / fuse.osxfs / virtiofs 直接 FAIL,避免无效压测数据</text>
+      <text x="20" y="340" fill="var(--diagram-red-text)" font-size="11">★ CI 应校验 fs_type:共享文件系统可跑功能测试,但不得纳入生产 fsync 基线</text>
     </g>
   </svg>
 </div>
@@ -940,7 +932,7 @@ docker exec redis-dev redis-cli INFO server | grep multiplexing_api
 <tr><td>WSL2 ext4</td><td>ext4(VM 原生)</td><td>&lt; 1 ms</td><td>开发可接受</td></tr>
 <tr><td>WSL2 <code>/mnt/c</code></td><td>9p(共享 NTFS)</td><td>5-50 ms</td><td><strong>不可用</strong></td></tr>
 <tr><td>Docker bind mount(macOS)</td><td>fuse.osxfs</td><td>10-100 ms</td><td><strong>不可用</strong></td></tr>
-<tr><td>Docker virtiofs(macOS)</td><td>virtiofs</td><td>1-5 ms</td><td>部分可用</td></tr>
+<tr><td>Docker virtiofs(macOS)</td><td>virtiofs</td><td>1-5 ms</td><td>开发/功能测试可用,生产 fsync 基线需另测</td></tr>
 <tr><td>Docker named volume</td><td>ext4(VM 原生)</td><td>&lt; 1 ms</td><td>开发可接受</td></tr>
 </tbody>
 </table>
@@ -996,7 +988,7 @@ Filesystem     Type  1K-blocks     Used Available Use% Mounted on
 
       <rect x="700" y="140" width="220" height="50" rx="10" fill="url(#d-red)" filter="url(#d-shadow)"/>
       <text x="810" y="162" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">⚠ FAIL · 中止</text>
-      <text x="810" y="180" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">9p / fuse / virtiofs / bind</text>
+      <text x="810" y="180" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">9p / fuse / bind / 未标注 virtiofs</text>
 
       <text x="20" y="40" fill="var(--diagram-blue-text)" font-size="13" font-weight="800">★ CI 启动前文件系统校验门禁</text>
       <text x="20" y="60" fill="var(--diagram-muted)" font-size="11">★ 见 ci/check-redis-fs.sh 一键校验脚本</text>
@@ -1011,9 +1003,12 @@ set -euo pipefail
 dir="$(redis-cli --raw CONFIG GET dir | tail -n 1)"
 fs_type="$(df -T "$dir" | awk 'NR==2 {print $2}')"
 case "$dir:$fs_type" in
-    /mnt/*:*|*:9p|*:fuse.osxfs|*:virtiofs)
+    /mnt/*:*|*:9p|*:fuse.osxfs)
         echo "FAIL redis dir=$dir fs=$fs_type is not a production-like data path"
         exit 1
+        ;;
+    *:virtiofs)
+        echo "WARN redis dir=$dir fs=$fs_type: OK for functional CI, exclude from fsync baseline"
         ;;
     *)
         echo "PASS redis dir=$dir fs=$fs_type"
@@ -1382,7 +1377,7 @@ spec:
         - "allkeys-lru"
       resources:
         limits:
-          memory: 8Gi   # ≥ maxmemory × 1.5 (fork OOM 防护)
+          memory: 8Gi   # 示例:按 maxmemory、写脏率、缓冲与 backlog 估算
           cpu: "4"
         requests:
           memory: 6Gi
@@ -1447,13 +1442,13 @@ spec:
       <text x="760" y="280" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11">通过 volume 挂载到持久化存储</text>
       <text x="760" y="294" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">named volume / PVC</text>
 
-      <text x="20" y="20" fill="var(--diagram-red-text)" font-size="12" font-weight="800">★ 容器内 fork OOM 规则:cgroup memory.max 应 ≥ Redis maxmemory × 1.5(防 CoW + buffer)</text>
+      <text x="20" y="20" fill="var(--diagram-red-text)" font-size="12" font-weight="800">★ 容器内 fork OOM 规则:memory.max 需覆盖 maxmemory + CoW + buffer + backlog,1.5× 只是起点</text>
     </g>
   </svg>
 </div>
 
 <div class="key-insight">
-  <strong>容器内 fork OOM 规则:</strong> cgroup v2 的 <code>memory.max</code> 同时限制父进程与子进程总内存。Redis fork 期间若<code>父进程 used + 子进程 CoW &gt; cgroup 上限</code>,子进程被 OOM-killer 杀死,RDB 失败。<strong>生产应:cgroup <code>memory.max</code> ≥ Redis <code>maxmemory</code> × 1.5。</strong>
+  <strong>容器内 fork OOM 规则:</strong> cgroup v2 的 <code>memory.max</code> 同时限制父进程与子进程总内存。Redis fork 期间若<code>父进程 used + 子进程 CoW &gt; cgroup 上限</code>,子进程会被 OOM-killer 杀死,RDB 失败。生产应按 maxmemory、写脏率、客户端缓冲、复制 backlog 与碎片率建模; <code>maxmemory × 1.5</code> 只能作为初始估算,不能替代压测。
 </div>
 
 <h3>36.10.4 容器化 Redis 的常见错误配置</h3>
@@ -1461,10 +1456,10 @@ spec:
 <table class="compare">
 <thead><tr><th>错误</th><th>表现</th><th>修正</th></tr></thead>
 <tbody>
-<tr><td>cgroup memory.max = maxmemory</td><td>RDB 频繁失败</td><td>memory.max ≥ maxmemory × 1.5</td></tr>
+<tr><td>cgroup memory.max = maxmemory</td><td>RDB 频繁失败</td><td>按容量模型给 CoW/buffer/backlog 留余量</td></tr>
 <tr><td>使用 host 网络又 publish 端口</td><td>端口冲突</td><td>二选一</td></tr>
 <tr><td>数据 bind mount 到 macOS 主机</td><td>fsync 慢 1000 倍</td><td>使用命名 volume</td></tr>
-<tr><td>terminationGracePeriodSeconds = 30</td><td>BGSAVE 中断</td><td>≥ 60s 或更大</td></tr>
+<tr><td>terminationGracePeriodSeconds 固定写 30</td><td>大数据集关闭或保存可能被中断</td><td>按数据集、持久化策略和实测关闭耗时设置</td></tr>
 <tr><td>共享 NFS 作为持久化卷</td><td>AOF 写入延迟高</td><td>用本地 SSD 或专用块存储</td></tr>
 <tr><td>不设 CPU limit</td><td>邻居 Pod 抢占导致延迟</td><td>requests = limits 或保证类</td></tr>
 <tr><td><code>restart: always</code> 无健康检查</td><td>启动失败循环</td><td>livenessProbe + 限制重启次数</td></tr>
@@ -1762,7 +1757,7 @@ master_link_status:up</code></pre>
   <tr><td>Docker 用 named volume</td><td><code>docker run -v name:/data</code></td><td>bind mount 走 fuse / virtiofs 慢</td></tr>
   <tr><td>跨平台压测必须记录后端</td><td>benchmark 报告字段</td><td>缺字段无法复现</td></tr>
   <tr><td>集群禁止混合平台</td><td>各节点 <code>INFO server</code></td><td>监控 / fork / 时钟差异</td></tr>
-  <tr><td>容器 cgroup ≥ maxmemory × 1.5</td><td>K8s resources.limits.memory</td><td>等于 maxmemory 会触发 fork OOM-kill</td></tr>
+  <tr><td>容器 cgroup 按容量模型留余量</td><td>K8s resources.limits.memory</td><td>等于 maxmemory 会触发 fork OOM-kill</td></tr>
   <tr><td><code>select</code> 不可作为高并发生产</td><td>FD_SETSIZE 限制</td><td>静态库默认 1024</td></tr>
   </tbody>
   </table>

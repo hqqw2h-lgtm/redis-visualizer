@@ -69,7 +69,7 @@
     <li>Hash / Set / ZSet 在 7.x 用 <code>listpack</code> 替代 <code>ziplist</code>;每次写入检查 entries + 长度</li>
     <li>升级单向不可逆的动机:避免阈值附近反复 O(N) 转换</li>
     <li>9 个核心阈值参数 + 内存差距(1 万 Hash entry:250 KiB 紧凑 vs 1.6 MiB hashtable)</li>
-    <li>陷阱:intset 混入字符串、AOF reload 批量升级、误期 hashtable 自动降级</li>
+    <li>陷阱:intset 混入字符串、AOF reload 批量升级、误以为 hashtable 会自动降级</li>
   </ul>
   <p class="prereq">前置知识:第 1 章 SDS 字符串结构(理解 <code>sdshdr8</code> 与 jemalloc size class);第 3 章 dict(<code>dictEntry</code> 24 B 与渐进 rehash);第 6 章 ziplist/listpack(连续 entry 序列布局);第 9 章 redisObject(16 B 总开销与 4 bit type/encoding 字段)。读者需要熟悉 <code>redis-cli</code> 与 <code>OBJECT</code> 调试命令。</p>
 </div>
@@ -461,7 +461,7 @@ raw 编码 (两次 malloc · 2 块独立内存):
   100 万个 key 值都是 0  → value 端共占 1 个 robj 的 16 B</code></pre>
 </div>
 
-<p>命令层验证(<code>maxmemory-policy = noeviction</code> 时):</p>
+<p>命令层验证(仅本地测试实例;<code>maxmemory-policy = noeviction</code> 时):</p>
 
 <pre><code class="language-bash">127.0.0.1:6379&gt; CONFIG SET maxmemory 0
 OK
@@ -1250,12 +1250,12 @@ skiplist+dict 双结构(切换后):
     <g transform="translate(20, 330)">
       <rect width="900" height="180" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
       <text x="20" y="22" fill="var(--diagram-green-text)" font-size="13" font-weight="800">★ 单向规则汇总 (升级路径,不存在降级)</text>
-      <text x="20" y="46" fill="var(--diagram-green-text)" font-size="11" font-family="ui-monospace,Consolas">String: int → embstr → raw  (APPEND/SETRANGE 永远到 raw,不会回 embstr)</text>
+      <text x="20" y="46" fill="var(--diagram-green-text)" font-size="11" font-family="ui-monospace,Consolas">String: int → embstr → raw  (APPEND/SETRANGE 会转 raw,不会自动回 embstr)</text>
       <text x="20" y="64" fill="var(--diagram-green-text)" font-size="11" font-family="ui-monospace,Consolas">Hash:    listpack → hashtable    (HDEL 删元素到 ≤128,encoding 仍 ht)</text>
       <text x="20" y="82" fill="var(--diagram-green-text)" font-size="11" font-family="ui-monospace,Consolas">Set:     intset → listpack → hashtable    (SREM 元素到阈值内,encoding 仍 ht)</text>
       <text x="20" y="100" fill="var(--diagram-green-text)" font-size="11" font-family="ui-monospace,Consolas">ZSet:    listpack → skiplist+dict   (ZREM 删元素到 ≤128,encoding 仍 sk+dict)</text>
       <text x="20" y="118" fill="var(--diagram-green-text)" font-size="11" font-family="ui-monospace,Consolas">List:    quicklist (无切换,只有节点分裂)</text>
-      <text x="20" y="138" fill="var(--diagram-green-text)" font-size="11" font-family="ui-monospace,Consolas">Stream:  stream (rax + listpack 一种,永远不变)</text>
+      <text x="20" y="138" fill="var(--diagram-green-text)" font-size="11" font-family="ui-monospace,Consolas">Stream:  stream (rax + listpack 一种专用编码)</text>
       <text x="20" y="160" fill="var(--diagram-muted)" font-size="11">★ 设计动机: 阈值附近反复转换会引起 O(N) 抖动 — 单向降本增稳</text>
     </g>
 
@@ -1324,7 +1324,7 @@ Step 3: 元素数检查(每次写入后)
   </table>
 </div>
 
-<p>参数可通过 <code>CONFIG SET</code> 实时调整,但<strong>仅对新写入</strong>触发的编码判定生效。已有 key 的编码不会因参数调整而重新评估。</p>
+<p>参数可通过 <code>CONFIG SET</code> 实时调整,但<strong>仅对新写入</strong>触发的编码判定生效。已有 key 的编码不会因参数调整而重新评估。生产环境还要用配置文件、参数组或编排系统持久化变更,不要只依赖一次临时 <code>CONFIG SET</code>。</p>
 
 <h3>10.10.1 阈值调整的取舍</h3>
 
@@ -1344,8 +1344,8 @@ Step 3: 元素数检查(每次写入后)
   1. 用 OBJECT ENCODING 与 MEMORY USAGE 抽样观察当前分布
   2. 评估 P99 延迟与 used_memory 的容忍度
   3. 在测试环境压测目标阈值下的 HGET/SADD 延迟
-  4. 实施前禁用 LFU 共享池,避免共享对象语义干扰
-  5. CONFIG SET 仅对新 key 生效,旧 key 需 DEL 重建</code></pre>
+  4. 确认变更如何持久化,并准备回滚参数
+  5. CONFIG SET 仅对新 key 生效,旧 key 需 DEL 重建或迁移重写</code></pre>
 </div>
 
 <!-- ============================================================ -->
@@ -1638,8 +1638,8 @@ hashtable 物理布局(指针散布):
       <tr><td><code>OBJECT IDLETIME key</code></td><td>空闲时间(秒)</td><td>淘汰策略调试</td></tr>
       <tr><td><code>OBJECT FREQ key</code></td><td>LFU 访问频率</td><td>LFU 模式调试</td></tr>
       <tr><td><code>OBJECT HELP</code></td><td>帮助信息</td><td>—</td></tr>
-      <tr><td><code>MEMORY USAGE key</code></td><td>实际占用字节(含 robj + 底层结构)</td><td>容量预算</td></tr>
-      <tr><td><code>DEBUG OBJECT key</code></td><td>详细信息(serializedlength、encoding 等)</td><td>RDB/AOF 调试</td></tr>
+      <tr><td><code>MEMORY USAGE key</code></td><td>Redis 估算的 key 级内存(含 robj + 底层结构)</td><td>容量预算</td></tr>
+      <tr><td><code>DEBUG OBJECT key</code></td><td>详细信息(serializedlength、encoding 等)</td><td>仅本地调试;生产通常禁用</td></tr>
     </tbody>
   </table>
 </div>
@@ -1758,7 +1758,7 @@ Step 3: 找 outlier
 # 后果:
 # 1. 单 hash 占 1.6 MiB(hashtable)
 # 2. 任何 HGETALL 阻塞主线程 ~12 ms
-# 3. 任何 HSCAN 也要先遍历整个 dict
+# 3. 全量 HSCAN 仍要分批扫完整个 dict,只是把阻塞拆小
 # 4. 该 key 是大 key, 集群迁移卡住
 # 5. AOF rewrite 时该 hash 整体序列化 → 内存翻倍
 
@@ -1766,8 +1766,8 @@ Step 3: 找 outlier
 "hashtable"
 127.0.0.1:6379&gt; MEMORY USAGE company:emp
 (integer) 1638400
-127.0.0.1:6379&gt; DEBUG OBJECT company:emp
-... serializedlength:204800 ...   # AOF 一行 200 KB
+127.0.0.1:6379&gt; HLEN company:emp
+(integer) 9999                    # 大 key 应拆分,不要用 DEBUG OBJECT 巡检
 </code></pre>
   </div>
   <div class="compare-good">
@@ -1942,8 +1942,8 @@ OK
     <tbody>
       <tr><td>1</td><td>intset 混入字符串</td><td>整 key 编码切换,内存放大 5–10×</td><td>编码属于整个 key,任何元素类型不一致触发全局升级</td><td>应用层类型校验,token 与整数 ID 分 key</td><td><code>OBJECT ENCODING</code></td></tr>
       <tr><td>2</td><td>大 value 写入小 Hash</td><td>单次 HSET 后 listpack 升级 hashtable</td><td>任一 field/value 长度 &gt; 阈值</td><td>大文本拆 String 单独存,Hash 仅放索引</td><td><code>MEMORY USAGE</code></td></tr>
-      <tr><td>3</td><td>误期 hashtable 自动降级</td><td>删除元素后内存不下降</td><td>集合类编码无降级路径</td><td>DEL key 重建,或迁移到新 key 后 RENAME</td><td><code>OBJECT ENCODING</code> 抽样</td></tr>
-      <tr><td>4</td><td>误期 raw 回退 embstr</td><td><code>SET</code> 短值后仍是 raw</td><td><code>SET</code> 创建新对象,但 <code>APPEND</code> 后再 <code>SET</code> 是覆盖</td><td>显式 DEL 后再 SET</td><td><code>OBJECT ENCODING</code> 抽样</td></tr>
+      <tr><td>3</td><td>误以为 hashtable 自动降级</td><td>删除元素后内存不下降</td><td>集合类编码无降级路径</td><td>DEL key 重建,或迁移到新 key 后 RENAME</td><td><code>OBJECT ENCODING</code> 抽样</td></tr>
+      <tr><td>4</td><td>误以为 raw 会自动回退 embstr</td><td><code>APPEND</code>/<code>SETRANGE</code> 修改后仍是 raw</td><td>EMBSTR 只读,原地修改会转 RAW;只有重建对象才重新编码</td><td>需要紧凑编码时用 <code>SET</code> 重建短值</td><td><code>OBJECT ENCODING</code> 抽样</td></tr>
       <tr><td>5</td><td>阈值调高未压测</td><td>内存下降但 P99 上升</td><td>listpack 线性扫描 O(N),N 越大延迟越高</td><td>测试环境压测后再上线;按业务峰值 N 选择</td><td><code>latency-monitor</code> + slowlog</td></tr>
       <tr><td>6</td><td>已有 key 不受新阈值影响</td><td>调整阈值后部分 key 编码不变</td><td><code>CONFIG SET</code> 仅影响新写入路径</td><td>DEL 重建,或业务侧主动覆盖</td><td><code>OBJECT ENCODING</code> 全量扫描</td></tr>
       <tr><td>7</td><td>AOF reload 批量转换</td><td>启动慢/重启时段集中 latency spike</td><td>AOF 重放按命令逐条恢复,触发同样的升级判定 N 次</td><td>RDB 优先恢复,或 AOF 重写后再启动</td><td>启动日志 <code>Loading data</code> 时长</td></tr>
@@ -2166,7 +2166,7 @@ listpack</code></pre>
 
 <h3>下一章预告</h3>
 
-<p>本章建立的"对象类型 + 底层编码"双层结构在下一章的 <strong>HyperLogLog</strong> 中体现为:HyperLogLog 共用 String 类型,但底层不是 embstr/raw 而是<strong>稠密 / 稀疏两种内部表示</strong>(由 String 的 SDS 装载固定 16 384 个 6 位计数桶)。下一章讨论 HyperLogLog 的核心算法:基于伯努利试验的最大前导零位估计、调和平均消除离群点、稀疏 → 稠密的自动切换、以及为何 1.5% 标准误差对应固定 12 KiB 内存——独立于基数规模。读完下一章你会理解为什么 <code>PFADD key element</code> 可以用一个 String 类型同时承载"普通字符串"和"统计结构"两种语义。</p>
+<p>本章建立的"对象类型 + 底层编码"双层结构在下一章的 <strong>HyperLogLog</strong> 中体现为:HyperLogLog 对外仍是 String 类型,但值内容按 HLL 的稀疏 / 稠密格式解释;稠密格式装载 16 384 个 6 位寄存器,稀疏格式则用变长游程压缩。下一章讨论最大前导零位估计、调和平均、稀疏 → 稠密的自动切换,以及为什么大基数标准误差约 0.81%,稠密后内存约 12 KiB。读完下一章你会理解为什么 <code>PFADD key element</code> 可以用一个 String 类型承载统计结构语义。</p>
 
 </div>
 

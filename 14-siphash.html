@@ -128,7 +128,7 @@
       <text x="20" y="80" fill="var(--diagram-purple-text)" font-size="11">• Redis 启动时随机生成密钥 (dictSetHashFunctionSeed),进程内全局统一,跨重启不一致</text>
       <text x="20" y="106" fill="var(--diagram-purple-text)" font-size="12" font-weight="800">★ 工程边界</text>
       <text x="20" y="126" fill="var(--diagram-purple-text)" font-size="11">cluster slot = CRC16(key) % 16384 — 仍用 CRC16,因为 slot 必须可预测才能让客户端正确路由</text>
-      <text x="20" y="142" fill="var(--diagram-muted)" font-size="10">★ 这种"内部安全 + 外部可预测"的双层设计是 Redis 在 5.0 后的稳定方案</text>
+      <text x="20" y="142" fill="var(--diagram-muted)" font-size="10">★ 这种"内部安全 + 外部可预测"的双层设计是 Redis 4.0 之后的稳定方案</text>
     </g>
   </svg>
 </div>
@@ -201,7 +201,7 @@
         <g transform="translate(20, 230)">
           <rect width="400" height="76" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)" stroke-dasharray="3 3"/>
           <text x="200" y="22" text-anchor="middle" fill="var(--diagram-green-text)" font-size="12" font-weight="800">★ 性能特性</text>
-          <text x="14" y="40" fill="var(--diagram-green-text)" font-size="11">平均链长 ≈ 1.5 (生日悖论上界)</text>
+          <text x="14" y="40" fill="var(--diagram-green-text)" font-size="11">平均链长受装载因子控制</text>
           <text x="14" y="56" fill="var(--diagram-green-text)" font-size="11">dictFind ≈ O(1)</text>
           <text x="14" y="70" fill="var(--diagram-muted)" font-size="9">★ 任何 hash 在随机输入下都 OK</text>
         </g>
@@ -313,7 +313,7 @@
       <tr><td>攻击者构造同桶键代价</td><td>多项式时间(穷举)</td><td>等同破解 128 位密钥</td></tr>
       <tr><td>单次哈希延迟</td><td>极低</td><td>略高(短输入仍 ns 级)</td></tr>
       <tr><td>是否需要 seed 同步</td><td>否</td><td>否(每实例独立)</td></tr>
-      <tr><td>最坏链长上界</td><td>由攻击者控制</td><td>由生日悖论决定,期望 O(log N)</td></tr>
+      <tr><td>最坏链长上界</td><td>由攻击者控制</td><td>接近随机分布,随装载因子缓慢增长</td></tr>
       <tr><td>防御场景</td><td>不抗 HashDoS</td><td>抗 HashDoS</td></tr>
     </tbody>
   </table>
@@ -815,7 +815,7 @@ uint64_t siphash24(const uint8_t *in, size_t len, const uint8_t key[16]) {
 </div>
 
 <div class="key-insight">
-  <strong>byte7 永远是 <code>len mod 256</code>。</strong>所以 <code>"ab"</code>、<code>"ab\0"</code>、<code>"ab\0\0"</code> 的尾块完全不同 — <code>0x0200000000006261</code> / <code>0x0300000000006261</code> / <code>0x0400000000006261</code>,补零混淆被彻底消除。
+  <strong>byte7 始终写入 <code>len mod 256</code>。</strong>所以 <code>"ab"</code>、<code>"ab\0"</code>、<code>"ab\0\0"</code> 的尾块完全不同 — <code>0x0200000000006261</code> / <code>0x0300000000006261</code> / <code>0x0400000000006261</code>,补零混淆被彻底消除。
 </div>
 
 <pre><code class="language-c">uint64_t pack_tail(const uint8_t *tail, size_t len) {
@@ -1205,7 +1205,7 @@ uint64_t dictGenCaseHashFunction(const unsigned char *buf, size_t len) {
 
     <g transform="translate(20, 220)">
       <rect width="900" height="50" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
-      <text x="20" y="20" fill="var(--diagram-green-text)" font-size="12" font-weight="800">★ 4.0 是关键拐点 — 用 ~2-3× 单次哈希延迟换 HashDoS 防御 (短输入仍 ns 级, 不影响 P99)</text>
+      <text x="20" y="20" fill="var(--diagram-green-text)" font-size="12" font-weight="800">★ 4.0 是关键拐点 — 用 ~2-3× 单次哈希延迟换 HashDoS 防御 (短输入仍 ns 级,通常不主导 P99)</text>
       <text x="20" y="40" fill="var(--diagram-muted)" font-size="10">★ 这是 Salvatore 在 2017 年的关键安全升级 — 随机 seed + 带密钥 PRF 设计</text>
     </g>
   </svg>
@@ -1382,9 +1382,9 @@ uint64_t dictGenCaseHashFunction(const unsigned char *buf, size_t len) {
   <table>
     <thead><tr><th>运维场景</th><th>seed 行为</th><th>工程含义</th><th>注意事项</th></tr></thead>
     <tbody>
-      <tr><td>进程重启</td><td>重新生成</td><td>桶布局完全不同</td><td>DEBUG HTSTATS 重启前后不可对比</td></tr>
+      <tr><td>进程重启</td><td>重新生成</td><td>桶布局完全不同</td><td>内部链长统计重启前后不可直接对比</td></tr>
       <tr><td>主从切换</td><td>新主沿用本机 seed</td><td>dict 桶布局不变</td><td>不会因切换重建桶</td></tr>
-      <tr><td>主从复制</td><td>各自独立</td><td>主从桶布局不同</td><td>HTSTATS 主从不一致是正常</td></tr>
+      <tr><td>主从复制</td><td>各自独立</td><td>主从桶布局不同</td><td>内部链长分布不一致是正常</td></tr>
       <tr><td>集群扩容</td><td>新节点独立生成</td><td>新节点桶布局独立</td><td>slot 迁移走 ASKING,与 seed 无关</td></tr>
       <tr><td>RDB 重载</td><td>按本机 seed 重新哈希</td><td>桶位置由当前 seed 决定</td><td>RDB 不存桶布局,只存键值</td></tr>
       <tr><td>AOF 重放</td><td>同上</td><td>同上</td><td>AOF 不存桶布局</td></tr>
@@ -1505,13 +1505,13 @@ uint64_t dictGenCaseHashFunction(const unsigned char *buf, size_t len) {
       <text x="540" y="194" text-anchor="middle" fill="var(--diagram-muted)" font-size="9" font-weight="800">否</text>
       <rect x="400" y="230" width="200" height="48" rx="8" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
       <text x="500" y="250" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="800">Lua / big key / hot key</text>
-      <text x="500" y="266" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">SLOWLOG GET / OBJECT FREQ</text>
+      <text x="500" y="266" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">SLOWLOG / 热点 key 观测</text>
 
       <path d="M780,170 L860,200 L860,230" stroke="var(--diagram-red-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
       <text x="830" y="194" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9" font-weight="800">是</text>
       <rect x="700" y="230" width="200" height="48" rx="8" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
-      <text x="800" y="250" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="800">DEBUG HTSTATS</text>
-      <text x="800" y="266" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">查 max / avg chain length</text>
+      <text x="800" y="250" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="800">受控链长采样</text>
+      <text x="800" y="266" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">仅隔离/维护窗口使用</text>
 
       <path d="M800,278 L800,304" stroke="var(--diagram-red-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
 
@@ -1535,8 +1535,8 @@ uint64_t dictGenCaseHashFunction(const unsigned char *buf, size_t len) {
       <rect x="780" y="455" width="160" height="74" rx="8" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)" stroke-width="2"/>
       <text x="860" y="475" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="800">★ 应急处置</text>
       <text x="860" y="491" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">① ACL 限流</text>
-      <text x="860" y="505" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">② FLUSHDB 隔离</text>
-      <text x="860" y="521" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">③ 升级 4.0+ 或 7.x</text>
+      <text x="860" y="505" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">② 阻断来源/迁移流量</text>
+      <text x="860" y="521" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">③ 升级到受支持版本</text>
 
       <rect x="40" y="455" width="700" height="120" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
       <text x="60" y="478" fill="var(--diagram-purple-text)" font-size="12" font-weight="800">★ HashDoS 与普通慢查询的关键区别</text>
@@ -1548,10 +1548,11 @@ uint64_t dictGenCaseHashFunction(const unsigned char *buf, size_t len) {
   </svg>
 </div>
 
-<pre><code class="language-bash">127.0.0.1:6379&gt; DEBUG HTSTATS 0
-[Dictionary HT]
+<p>下面是<strong>隔离测试实例</strong>上的链长统计示例,用于理解字段含义。不要把 Redis <code>DEBUG</code> 类内部命令当作生产常规巡检手段。</p>
+
+<pre><code class="language-text">[Dictionary HT]
 Hash table 0 stats (main hash table):
- table size: 1048576
+  table size: 1048576
  number of elements: 1000000
  different slots: 644120
  max chain length: 9
@@ -1571,7 +1572,7 @@ Hash table 0 stats (main hash table):
   10+: 16247 (1.55%)</code></pre>
 
 <div class="diagram">
-  <div class="diagram-title">表 14-10-2 · DEBUG HTSTATS 关键字段解读</div>
+  <div class="diagram-title">表 14-10-2 · 链长统计关键字段解读(隔离样例)</div>
   <table>
     <thead><tr><th>字段</th><th>含义</th><th>健康判断</th></tr></thead>
     <tbody>
@@ -1587,7 +1588,7 @@ Hash table 0 stats (main hash table):
 </div>
 
 <div class="warning">
-  <strong>HashDoS 信号:</strong> <code>max chain length</code> <strong>突然显著超过同负载历史值</strong>是 HashDoS 的可疑信号。生产环境中,Redis 7+ 默认禁用 <code>DEBUG</code> 命令,需要通过受控调试通道查看。
+  <strong>HashDoS 信号:</strong> <code>max chain length</code> <strong>突然显著超过同负载历史值</strong>只是可疑信号,不能单独定性。生产排查应先看慢日志、热点 key、容量与版本;链长采样只适合隔离实例或维护窗口。
 </div>
 
 <h3>14.10.1 反例 → 修复对照(误用 SipHash 为 MAC)</h3>
@@ -1601,7 +1602,7 @@ send_header("X-Signature", hex64(sig));
 
 /* 问题:
  * 1. 64 位 tag 对认证场景过短
- *    (2^32 次伪造尝试可成功)
+ *    安全裕度低于常见 128-bit 认证标签
  * 2. SipHash 不是设计用来抵抗
  *    MAC 伪造攻击
  * 3. Redis 中的 SipHash 用法

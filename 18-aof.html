@@ -74,7 +74,7 @@
 
 <div class="chapter-intro">
   <p class="lead">RDB 通过周期性快照获取 keyspace 一致副本,但<strong>两次快照之间的写入仅存在于内存</strong>。AOF (Append Only File) 采用补偿性方案:<strong>每条成功执行的写命令以 RESP 协议格式追加到日志文件</strong>,重启时通过回放日志重建 keyspace。</p>
-  <p>AOF 的关键约束有三:其一,<strong>主线程命令执行路径上的额外开销必须小于 5%</strong>;其二,<strong>fsync 策略必须可配置</strong>,以适配不同业务的丢失容忍度;其三,<strong>日志体积必须可控</strong>,避免无限膨胀消耗磁盘。Redis 通过分层管道(执行 → aof_buf → write → fsync)、三种 fsync 策略(<code>always / everysec / no</code>)、子进程重写(BGREWRITEAOF)三项机制同时满足三类约束。</p>
+  <p>AOF 的关键约束有三:其一,<strong>主线程命令执行路径上的额外开销要足够低</strong>;其二,<strong>fsync 策略必须可配置</strong>,以适配不同业务的丢失容忍度;其三,<strong>日志体积必须可控</strong>,避免无限膨胀消耗磁盘。Redis 通过分层管道(执行 → aof_buf → write → fsync)、三种 fsync 策略(<code>always / everysec / no</code>)、子进程重写(BGREWRITEAOF)三项机制同时满足三类约束。</p>
   <p>Redis 7.0 进一步将单文件 AOF 拆为 <strong>BASE + INCR + MANIFEST</strong> 的多部分结构 (Multi-Part AOF),原子切换从单文件 rename 改为清单更新,简化重写期间的状态管理。</p>
   <ul class="will-learn">
     <li>RDB 与 AOF 在丢失窗口、恢复速度、文件体积三个维度的取舍</li>
@@ -86,11 +86,11 @@
     <li>BGREWRITEAOF 子进程遍历 keyspace 生成最小等价命令的工作原理</li>
     <li>Redis 7 Multi-Part AOF 通过 manifest 原子切换的实现机制</li>
     <li>混合持久化(<code>aof-use-rdb-preamble yes</code>)将 10M keys 恢复时间从 25 秒降至 5 秒</li>
-    <li>Master 关闭 AOF 必须配合 Sentinel/Cluster 自动 failover 的原因</li>
+    <li>主节点不开 AOF 时,必须明确由副本、RDB 或上游日志承担恢复窗口的原因</li>
     <li>重写期间 CoW 复制 + aof_rewrite_buf 内存峰值的估算公式</li>
     <li>七类典型陷阱及其根因、症状、修复路径与监控指标</li>
   </ul>
-  <p class="prereq">前置知识:第 17 章 RDB 持久化(理解 fork + CoW 机制与 BGSAVE 调度);第 19 章 ae 事件循环预读(理解 <code>beforeSleep</code> 钩子);第 21 章 RESP 协议(理解 AOF 文本编码的 <code>*N\r\n$N\r\n...</code> 格式);Linux 内核知识(page cache、<code>fsync()</code>、<code>dirty_expire_centisecs</code>、<code>rename()</code> 原子性)。读者最好亲手跑过 <code>cat appendonly.aof</code> 查看过文件内容。</p>
+  <p class="prereq">前置知识:第 17 章 RDB 持久化(理解 fork + CoW 机制与 BGSAVE 调度);第 19 章 ae 事件循环预读(理解 <code>beforeSleep</code> 钩子);第 21 章 RESP 协议(理解 AOF 文本编码的 <code>*N\r\n$N\r\n...</code> 格式);Linux 内核知识(page cache、<code>fsync()</code>、<code>dirty_expire_centisecs</code>、<code>rename()</code> 原子性)。若要查看 AOF 内容,请在测试实例或备份文件上操作。</p>
 </div>
 
 <h3>本章全景图</h3>
@@ -155,7 +155,7 @@
         <text x="400" y="190" text-anchor="middle" fill="var(--diagram-orange-text)" font-weight="700">fork + CoW</text>
         <text x="400" y="206" text-anchor="middle" fill="var(--diagram-muted)">子进程遍历内存</text>
         <text x="400" y="222" text-anchor="middle" fill="var(--diagram-muted)">BASE + INCR + manifest</text>
-        <text x="400" y="240" text-anchor="middle" fill="var(--diagram-muted)">原子 rename 切换</text>
+        <text x="400" y="240" text-anchor="middle" fill="var(--diagram-muted)">manifest 原子切换</text>
 
         <line x1="540" y1="149" x2="540" y2="172" stroke="var(--diagram-purple-stroke)" stroke-width="1"/>
         <rect x="450" y="172" width="180" height="78" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
@@ -200,7 +200,7 @@
 <p>本章按"<strong>持久化语义边界 → 写入管道 → 重写机制 → 文件结构 → 部署适配 → 观测与陷阱</strong>"六层组织。前两节定义 AOF 的命令日志语义与刷盘策略,中间两节解析重写如何控制日志体积,后两节聚焦生产观测信号与边界条件。</p>
 
 <div class="key-insight">
-  <strong>核心定位:</strong> AOF 是 RDB 的<strong>补偿机制</strong>,不是替代。RDB 解决"快速恢复 + 紧凑存储",AOF 解决"细粒度数据安全 + 1 秒以内的丢失窗口"。Redis 5.0+ 默认开启的<strong>混合持久化</strong>正是把两者捏在一起:BASE 用 RDB 格式,INCR 用 AOF 格式,一份文件兼顾两边的优点。
+  <strong>核心定位:</strong> AOF 是 RDB 的<strong>补偿机制</strong>,不是替代。RDB 解决"快速恢复 + 紧凑存储",AOF 解决"细粒度数据安全 + 约 1 秒级的丢失窗口"。当开启 AOF 时,Redis 5.0+ 默认使用的<strong>混合持久化</strong>把两者捏在一起:BASE 用 RDB 格式,INCR 用 AOF 格式,一份文件兼顾两边的优点。
 </div>
 
 <!-- ============================================================ -->
@@ -1030,7 +1030,7 @@ $2\r\n30\r\n
       <text x="470" y="282" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="800">⑤ rename(manifest.tmp, manifest)</text>
 
       <rect x="160" y="305" width="620" height="36" rx="6" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
-      <text x="470" y="322" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10" font-weight="800">★ rename 是 POSIX 原子操作 — 崩溃时新旧 manifest 二选一,绝不会读到中间状态</text>
+      <text x="470" y="322" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10" font-weight="800">★ 同一文件系统内 rename 原子 — 崩溃后看到旧或新 manifest,不会读到半个文件名</text>
       <text x="470" y="335" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">同一文件系统内由内核 vfs_rename 保证</text>
 
       <path d="M165,360 L460,360" stroke="var(--diagram-orange-stroke)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#d-arr)"/>
@@ -1155,7 +1155,7 @@ $2\r\n30\r\n
   </div>
 </div>
 
-<p>混合持久化由 <code>aof-use-rdb-preamble yes</code> 启用(Redis 5.0+ 默认开启)。重写时子进程生成 RDB 格式的 BASE 文件而非 RESP,加载速度从"逐条解析回放"降为"二进制反序列化",<strong>10M keys 规模下恢复时间从约 25 秒降至约 5 秒</strong>。</p>
+<p>混合持久化由 <code>aof-use-rdb-preamble yes</code> 启用(开启 AOF 时 Redis 5.0+ 默认使用)。重写时子进程生成 RDB 格式的 BASE 文件而非 RESP,加载速度从"逐条解析回放"降为"二进制反序列化",<strong>10M keys 规模下恢复时间从约 25 秒降至约 5 秒</strong>。</p>
 
 <h3>18.6.2 三种持久化形式的对比矩阵</h3>
 
@@ -1194,17 +1194,17 @@ $2\r\n30\r\n
     </thead>
     <tbody>
       <tr><td>单节点</td><td>必须开启</td><td>N/A</td><td>BGREWRITEAOF 期间 CoW + rewrite_buf 内存压力</td></tr>
-      <tr><td>主从复制</td><td>可关闭</td><td>建议开启</td><td>Master 关闭 AOF 时必须配合 Sentinel/Cluster,避免空 Master 重启污染 Replica</td></tr>
+      <tr><td>主从复制</td><td>可关闭但需评估</td><td>建议开启</td><td>主节点不开 AOF 时,必须有 RDB/副本提升/上游日志兜底,并隔离故障旧主</td></tr>
       <tr><td>Sentinel</td><td>全部开启</td><td>全部开启</td><td>failover 后新 Master 继续使用本地 AOF</td></tr>
       <tr><td>Cluster</td><td>每节点独立</td><td>每节点独立</td><td>节点间不传播 AOF,Slot 迁移命令记录到本地 AOF</td></tr>
     </tbody>
   </table>
 </div>
 
-<h3>18.7.2 Master 关闭 AOF 的风险</h3>
+<h3>18.7.2 主节点不开持久化的风险</h3>
 
 <div class="diagram">
-  <div class="diagram-title">图 18-7-2 · 空 Master 重启污染 Replica — 生产事故场景</div>
+  <div class="diagram-title">图 18-7-2 · 空主节点重启污染副本 — 事故场景</div>
   <svg viewBox="0 0 940 460" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
     <rect width="940" height="460" fill="var(--diagram-panel)" rx="10"/>
     <g font-family="ui-monospace,Consolas">
@@ -1244,20 +1244,20 @@ $2\r\n30\r\n
       <text x="140" y="330" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">runid 改变!</text>
 
       <path d="M155,360 L455,360" stroke="var(--diagram-red-stroke)" stroke-width="2" marker-end="url(#d-arr-r)"/>
-      <text x="305" y="354" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10" font-weight="700">⑥ PSYNC ?(新 runid → 强制全量同步)</text>
+      <text x="305" y="354" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10" font-weight="700">⑥ Replica 重连旧主(新 runid → 全量同步)</text>
 
-      <path d="M455,388 L155,388" stroke="var(--diagram-green-stroke)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#d-arr-g)"/>
-      <text x="305" y="382" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">⑦ Replica 给 Master 自己的 RDB(全量同步反向)</text>
+      <path d="M155,388 L455,388" stroke="var(--diagram-red-stroke)" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#d-arr-r)"/>
+      <text x="305" y="382" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">⑦ 旧主生成空 RDB 作为全量同步载体</text>
 
       <rect x="280" y="406" width="380" height="44" rx="6" fill="url(#d-red)" filter="url(#d-shadow)"/>
-      <text x="470" y="426" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">⑧ Master 把"空 RDB"反推给 Replica</text>
-      <text x="470" y="442" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">★ Replica 本地 AOF 被空数据覆盖 — 数据全丢</text>
+      <text x="470" y="426" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">⑧ 旧主把"空 RDB"发给 Replica</text>
+      <text x="470" y="442" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">★ Replica 内存被空快照覆盖,本地 AOF 也会被后续重写污染</text>
     </g>
   </svg>
 </div>
 
 <div class="warning">
-  <strong>严重事故场景:</strong> Master 关闭 AOF 且无 Sentinel 自动 failover 时,崩溃重启会以空 keyspace 启动,Replica 的全量同步会用空数据覆盖自身。生产环境 Master 关闭 AOF 必须满足两项前提:其一,<strong>Sentinel/Cluster 检测到 Master 失联立即提升 Replica</strong>;其二,<strong>旧 Master 重启后以 Replica 身份加入</strong>,从新 Master 同步数据。
+  <strong>严重事故场景:</strong> 主节点没有任何本地持久化时,崩溃重启会以空 keyspace 启动;如果副本仍把它当主节点重新同步,空快照会覆盖副本内存,后续 AOF 重写还会把空状态固化到磁盘。生产环境若主节点不开 AOF,必须确保有 RDB/副本提升/上游日志兜底,并在旧主恢复前先隔离或降级为副本。
 </div>
 
 <h3>18.7.3 Cluster 中 AOF 与 Slot 迁移</h3>
@@ -1491,7 +1491,7 @@ $2\r\n30\r\n
         <text x="290" y="268" fill="var(--diagram-muted)" font-size="9">+ rewrite_buf 双倍</text>
 
         <rect x="500" y="148" width="200" height="40" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
-        <text x="510" y="166" fill="var(--diagram-blue-text)">C1. 空 Master 重启</text>
+        <text x="510" y="166" fill="var(--diagram-blue-text)">C1. 空主节点重启</text>
         <text x="510" y="180" fill="var(--diagram-muted)" font-size="9">污染 Replica AOF</text>
 
         <rect x="500" y="192" width="200" height="40" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
@@ -1509,7 +1509,7 @@ $2\r\n30\r\n
 
       <rect x="40" y="296" width="880" height="34" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
       <text x="480" y="314" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="800">关键防御</text>
-      <text x="480" y="328" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">auto-aof-rewrite-percentage 调优 + 监控 aof_delayed_fsync + Master 必开 AOF + manifest 一并备份 + check-aof 前先 cp</text>
+      <text x="480" y="328" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">rewrite 阈值调优 + 监控 delayed_fsync + 明确恢复策略 + 备份 manifest + check-aof 前先备份</text>
 
       <rect x="40" y="338" width="880" height="34" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
       <text x="480" y="356" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="800">监控信号</text>
@@ -1531,7 +1531,7 @@ $2\r\n30\r\n
       <tr><td>2</td><td>always 吞吐崩塌</td><td>OPS 从 10 万降至 8 千</td><td>fsync 同步阻塞主线程</td><td>改为 everysec</td><td>OPS / fsync 延迟</td></tr>
       <tr><td>3</td><td>everysec 阻塞</td><td>P99 偶发尖刺</td><td>bio fsync 延迟 &gt; 2 秒,主线程等待</td><td>AOF 独立磁盘,排查 I/O 竞争</td><td><code>aof_delayed_fsync</code> 增量</td></tr>
       <tr><td>4</td><td>重写 CoW 放大</td><td>内存峰值翻倍,触发 OOM</td><td>写流量高 × 重写持续时间</td><td>业务低峰手动重写,上调 <code>auto-aof-rewrite-min-size</code></td><td><code>latest_fork_usec</code> / 内存峰值</td></tr>
-      <tr><td>5</td><td>Master 无持久化重启</td><td>重启后 keyspace 空,Replica 也清空</td><td>Master 全量同步空 RDB 给 Replica</td><td>Master 必须持久化或配 Sentinel 提升 Replica</td><td><code>aof_enabled</code> 配置审计</td></tr>
+      <tr><td>5</td><td>Master 无持久化重启</td><td>重启后 keyspace 空,Replica 也可能被空数据覆盖</td><td>主节点以空数据集重新加入并触发全量同步</td><td>主节点开启持久化,或故障后先隔离旧主并由健康副本接管</td><td><code>aof_enabled</code> / RDB 配置审计</td></tr>
       <tr><td>6</td><td>AOF 损坏</td><td>启动报"Bad file format"</td><td>断电导致末尾命令半写入</td><td>备份后 <code>redis-check-aof --fix manifest</code></td><td>启动日志监控</td></tr>
       <tr><td>7</td><td>备份遗漏 manifest</td><td>恢复时无法识别 BASE/INCR</td><td>仅 cp 单个 .aof 文件</td><td>备份整个 appendonlydir</td><td>备份脚本审计</td></tr>
     </tbody>
@@ -1755,7 +1755,7 @@ void flushAppendOnlyFile(int force) {
 
 <p>AOF 选择"<strong>后写日志</strong>"是为了保持命令日志的语义清洁:仅记录已生效的修改,避免恢复路径处理无效命令。代价是 apply-log 之间的窗口需要错误状态保护(<code>aof_last_write_status</code>),write 失败时 Redis 拒绝所有写命令直至 AOF 恢复。</p>
 
-<p><code>appendfsync everysec</code> 是默认策略的根本原因是<strong>吞吐与丢失窗口的非线性关系</strong>:从 always 到 everysec,丢失窗口从"已 fsync 命令通常不丢"放宽到"约 1 秒",但吞吐量从 8,000 ops/s 提升至 105,000 ops/s,提升约 13 倍。该非线性来源于 fsync 是每命令同步操作时的放大效应。</p>
+<p><code>appendfsync everysec</code> 是默认策略的根本原因是<strong>吞吐与丢失窗口的非线性关系</strong>:从 always 到 everysec,丢失窗口从"已 fsync 命令通常不丢"放宽到"约 1 秒",但吞吐量常可提升一个数量级。具体 ops/s 取决于磁盘、内核和 value 大小,不要把示例基准当成通用容量承诺。</p>
 
 <p>Redis 7 Multi-Part AOF 的设计动机是<strong>简化重写期间的状态管理</strong>。Redis 6 单文件方案需要重写期间双写到旧 AOF 与 rewrite_buf,切换瞬间将 rewrite_buf 拼接进新文件并 rename;该流程在主线程引入了"拼接 + rename"的不可中断段,且 aof_rewrite_buf 在写流量大时可达数百 MB。Multi-Part 方案将 BASE 与 INCR 物理分离,父进程始终只写 INCR,子进程仅写 BASE,切换从 rename 简化为更新 manifest,主线程影响显著降低。</p>
 
@@ -1771,21 +1771,22 @@ void flushAppendOnlyFile(int force) {
     <tbody>
       <tr><td>1</td><td>AOF 是<strong>后写日志</strong>:仅记录成功执行的命令,与传统 WAL(预写日志)方向相反</td></tr>
       <tr><td>2</td><td>三阶段管道:命令执行 → <code>aof_buf</code> 追加 → <code>write</code> 至 page cache → <code>fsync</code> 落盘</td></tr>
-      <tr><td>3</td><td><code>appendfsync</code> 三策略:<code>always</code>(每命令 fsync,吞吐 ~8k)、<code>everysec</code>(后台每秒,~100k,<strong>默认推荐</strong>)、<code>no</code>(交内核,丢失 30 秒)</td></tr>
+      <tr><td>3</td><td><code>appendfsync</code> 三策略:<code>always</code>(每命令 fsync,吞吐最低)、<code>everysec</code>(后台每秒,<strong>默认推荐</strong>)、<code>no</code>(交内核,丢失窗口由 OS 刷盘策略决定)</td></tr>
       <tr><td>4</td><td><code>aof_delayed_fsync</code> 是 <code>everysec</code> 退化为主线程阻塞的<strong>早期信号</strong>,单位时间增量 &gt; 0 立即告警</td></tr>
       <tr><td>5</td><td>BGREWRITEAOF 通过 <strong>fork + 子进程遍历 keyspace</strong> 生成最小等价命令,父进程继续接受新写并独立追加到 INCR</td></tr>
       <tr><td>6</td><td>Redis 7 Multi-Part AOF 将单文件拆为 <strong>BASE + INCR + manifest</strong>,切换从 rename 简化为 manifest 更新</td></tr>
       <tr><td>7</td><td>混合持久化(<code>aof-use-rdb-preamble yes</code>)通过 RDB 二进制 BASE 加 RESP 增量 INCR,恢复速度从 <strong>25 秒降至 5 秒</strong>(10M keys)</td></tr>
-      <tr><td>8</td><td>Master 关闭 AOF 必须配合 Sentinel/Cluster 自动 failover,否则空 Master 重启会通过全量同步污染 Replica</td></tr>
+      <tr><td>8</td><td>主节点不开 AOF 时,必须明确 RDB、Replica 或上游事件流谁负责恢复;旧主故障重启前要先隔离,避免空数据集重新同步给副本</td></tr>
       <tr><td>9</td><td>备份单位是<strong>整个 appendonlydir 目录</strong>,仅备份单个 .aof 文件会遗漏 manifest 导致无法恢复</td></tr>
       <tr><td>10</td><td>重写期间 <strong>CoW 复制 + aof_rewrite_buf</strong> 可使内存峰值翻倍,生产环境建议业务低峰手动触发或上调 <code>auto-aof-rewrite-min-size</code></td></tr>
     </tbody>
   </table>
 </div>
 
-<h3>最小回归测试</h3>
+<h3>最小回归测试(仅测试实例)</h3>
 
-<pre><code class="language-bash"># 1. 启用 AOF + 混合持久化
+<pre><code class="language-bash"># 仅在本地/测试实例执行: 会修改持久化配置并重启 Redis
+# 1. 启用 AOF + 混合持久化
 redis-cli CONFIG SET appendonly yes
 redis-cli CONFIG SET appendfsync everysec
 redis-cli CONFIG SET aof-use-rdb-preamble yes
@@ -1812,7 +1813,7 @@ redis-cli DBSIZE   # 期望: 10000</code></pre>
 
 <p>第 17 章 RDB + 第 18 章 AOF 共同构成 Redis 的持久化层:</p>
 <ul>
-  <li><strong>RDB</strong>:周期性二进制快照,恢复快、文件小,但丢失窗口大(5-15 分钟);</li>
+  <li><strong>RDB</strong>:周期性二进制快照,恢复快、文件小,但丢失窗口取决于 <code>save</code> 规则与最近一次成功快照;</li>
   <li><strong>AOF</strong>:命令日志,丢失窗口小(1 秒)、可读,但恢复慢、文件大;</li>
   <li><strong>混合持久化</strong>:RDB 做 BASE + AOF 做 INCR,集两者优点。</li>
 </ul>
@@ -1824,8 +1825,6 @@ redis-cli DBSIZE   # 期望: 10000</code></pre>
 </div>
 
 <p class="footer">&copy; 2026 图解 Redis &middot; 第 18 章 &middot; AOF 持久化</p>
-
-</div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/c.min.js"></script>

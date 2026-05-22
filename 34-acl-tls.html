@@ -74,11 +74,11 @@
     <li>TLS 配置十二项:port 禁用、tls-port、证书、CA、auth-clients、protocols、ciphersuites、replication、cluster</li>
     <li><code>tls-auth-clients no/optional/yes</code> 三档对 mTLS 演进的影响</li>
     <li>TLS 1.2(2 RTT)与 TLS 1.3(1 RTT)握手轮次差异及对短连接的影响</li>
-    <li>会话恢复与 0-RTT Early Data 的重放风险</li>
+    <li>会话恢复的收益,以及前置 TLS 终止器启用 0-RTT Early Data 时的重放风险</li>
     <li>典型环境下 TLS 1.3 + AES-GCM 与 ChaCha20-Poly1305 在 x86 / ARM 的吞吐对比</li>
     <li>主从复制、Cluster Gossip、Sentinel 三种模式的 ACL + TLS 集成要点</li>
     <li>Redis ACL 与 PostgreSQL/MongoDB/Linux DAC/AWS IAM 在主体、客体、继承、审计上的对比</li>
-    <li>七大典型陷阱:default 残留、仅 requirepass、未 SAVE、证书过期、0-RTT 重放、Cluster TLS 混合、ACL 不同步</li>
+    <li>七大典型陷阱:default 残留、仅 requirepass、未 SAVE、证书过期、Early Data 重放、Cluster TLS 混合、ACL 不同步</li>
     <li>源码入口:<code>src/acl.c</code> 的 <code>ACLCheckAllPerm()</code> + <code>aclSelector</code> 内存布局,<code>src/tls.c</code> 的 <code>connection</code> 抽象层</li>
   </ul>
   <p class="prereq">前置知识:第 21 章 RESP 协议(理解 AUTH 在协议帧中的位置);第 25-27 章 Replication/Sentinel/Cluster(理解多部署模式拓扑);OpenSSL 基础(证书链 / CA / mTLS);glob 模式;TCP 抓包工具(tcpdump / wireshark)。</p>
@@ -128,7 +128,7 @@
 </div>
 
 <div class="real-world">
-  <strong>真实事故:</strong> 某团队从 5.x 升 6.x 后,启用了 <code>requirepass</code> 但忘记<code>ACL SETUSER default off</code>。<strong>结果:</strong>旧客户端用旧密码 <code>AUTH passwd</code> 继续获得超级权限,渗透测试时单密码泄露 → 全集群 <code>FLUSHALL</code>。<strong>教训:</strong>升级到 ACL 模式后,<strong>第一步必须禁用 default</strong>,然后为每个应用创建独立用户。
+  <strong>典型事故:</strong> 从 5.x 升到 6.x 后,如果只保留 <code>requirepass</code> 思路而不拆分 ACL 用户,旧客户端仍可能用共享密码获得过大权限。<strong>教训:</strong>先创建并验证专用用户和管理员用户,再禁用或收紧 <code>default</code> 用户,避免把自己锁在实例外。
 </div>
 
 <h2 id="s34-1">34.1 Pre-ACL 与 ACL 模型对比</h2>
@@ -282,7 +282,7 @@ OK
 5) "smembers"</code></pre>
 
 <div class="key-insight">
-  <code>resetkeys resetcommands</code> 先清空继承权限,<strong>再以白名单方式追加</strong>,避免规则叠加产生隐式权限。生产规则应总以 reset 开头,显式列出所需命令。
+  <code>resetkeys resetcommands</code> 先清空当前用户上已累积的 key/command 规则,<strong>再以白名单方式追加</strong>,避免规则叠加产生隐式权限。生产规则应总以 reset 开头,显式列出所需命令。
 </div>
 
 <h2 id="s34-3">34.3 权限校验决策链</h2>
@@ -385,7 +385,7 @@ if (ACLCheckAllPerm(c, &amp;acl_errpos) != ACL_OK) {
 </tbody>
 </table>
 
-<p>P 为模式条数,len 为模式与 key 长度。<strong>生产规则应保持 P ≤ 10、模式简短可审计</strong>。</p>
+<p>P 为模式条数,len 为模式与 key 长度。生产规则应尽量减少模式数量,保持前缀清晰、可审计;具体上限要结合命令 QPS 与压测结果确定。</p>
 
 <pre><code class="language-bash">127.0.0.1:6379&gt; AUTH cache-reader readOnlyP@ss
 OK
@@ -410,7 +410,7 @@ OK
 <thead><tr><th>命令</th><th>作用</th><th>典型用例</th></tr></thead>
 <tbody>
 <tr><td><code>ACL SETUSER</code></td><td>创建或修改用户</td><td>部署期写入应用账号</td></tr>
-<tr><td><code>ACL GETUSER</code></td><td>查看用户规则</td><td>审计单用户权限</tr>
+<tr><td><code>ACL GETUSER</code></td><td>查看用户规则</td><td>审计单用户权限</td></tr>
 <tr><td><code>ACL DELUSER</code></td><td>删除用户</td><td>离线时清理</td></tr>
 <tr><td><code>ACL LIST</code></td><td>列出全部用户规则</td><td>配置审查</td></tr>
 <tr><td><code>ACL WHOAMI</code></td><td>当前连接用户名</td><td>调试客户端连接</td></tr>
@@ -625,14 +625,14 @@ OK</code></pre>
 <tr><td>握手轮次</td><td>2 RTT</td><td><strong>1 RTT</strong></td></tr>
 <tr><td>密钥交换</td><td>RSA / DHE / ECDHE</td><td>ECDHE / DHE 强制前向保密</td></tr>
 <tr><td>密码套件</td><td>含 RC4、CBC 等弱算法</td><td>仅 AEAD(AES-GCM、ChaCha20-Poly1305)</td></tr>
-<tr><td>0-RTT(Early Data)</td><td>不支持</td><td><strong>可选,有重放风险</strong></td></tr>
+<tr><td>0-RTT(Early Data)</td><td>不支持</td><td>协议支持,Redis 部署通常不应依赖</td></tr>
 <tr><td>会话恢复</td><td>Session ID / Ticket</td><td>PSK 模式</td></tr>
 <tr><td>弃用算法</td><td>SHA-1、MD5 等</td><td>强制移除</td></tr>
 </tbody>
 </table>
 
 <div class="warning">
-  <strong>0-RTT Early Data 由攻击者重放时</strong>,服务端无法区分原始请求与重放请求。Redis 的 <code>INCR</code>、<code>DEL</code> 等写命令在 Early Data 中执行<strong>可能造成数据不一致</strong>。生产配置应禁用 0-RTT 或仅限只读命令。
+  <strong>0-RTT Early Data 由攻击者重放时</strong>,服务端无法区分原始请求与重放请求。Redis 自身不需要依赖 0-RTT;如果前置 TLS 终止器或代理启用了 Early Data,不要让 <code>INCR</code>、<code>DEL</code> 等非幂等写命令通过这条路径。
 </div>
 
 <h2 id="s34-8">34.8 TLS 性能开销</h2>
@@ -733,7 +733,7 @@ OK</code></pre>
   <text x="440" y="282" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="12">7. FULLRESYNC / CONTINUE + 加密复制流</text>
 </svg>
 
-<p><code>masteruser</code> 指向主节点 ACL 中具有 <code>+psync +replconf</code> 权限的专用用户。<code>masterauth</code> 提供该用户的密码。</p>
+<p><code>masteruser</code> 指向主节点 ACL 中供副本使用的专用用户,至少要允许复制握手相关命令(如 <code>+psync</code>、<code>+replconf</code>、<code>+ping</code>)。<code>masterauth</code> 提供该用户的密码。</p>
 
 <p class="svg-title">图 34-9-2 · Cluster 节点间的 TLS 总线</p>
 <svg class="svg-diagram" viewBox="0 0 920 280" xmlns="http://www.w3.org/2000/svg">
@@ -804,7 +804,7 @@ OK</code></pre>
   <g filter="url(#shadow)"><rect x="40"  y="225" width="170" height="36" rx="6" fill="url(#g-slate)" stroke="var(--diagram-red-stroke)"/><text x="125" y="247" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">2. 仅设 requirepass</text></g>
   <g filter="url(#shadow)"><rect x="250" y="180" width="170" height="36" rx="6" fill="url(#g-slate)" stroke="var(--diagram-orange-stroke)"/><text x="335" y="202" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">3. 运行时改未 SAVE</text></g>
   <g filter="url(#shadow)"><rect x="460" y="180" width="170" height="36" rx="6" fill="url(#g-slate)" stroke="var(--diagram-orange-stroke)"/><text x="545" y="202" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">4. 证书过期未监控</text></g>
-  <g filter="url(#shadow)"><rect x="460" y="225" width="170" height="36" rx="6" fill="url(#g-slate)" stroke="var(--diagram-orange-stroke)"/><text x="545" y="247" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">5. 0-RTT 重放</text></g>
+  <g filter="url(#shadow)"><rect x="460" y="225" width="170" height="36" rx="6" fill="url(#g-slate)" stroke="var(--diagram-orange-stroke)"/><text x="545" y="247" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11">5. Early Data 重放</text></g>
   <g filter="url(#shadow)"><rect x="670" y="180" width="180" height="36" rx="6" fill="url(#g-slate)" stroke="var(--diagram-blue-stroke)"/><text x="760" y="202" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">6. Cluster TLS 混合</text></g>
   <g filter="url(#shadow)"><rect x="670" y="225" width="180" height="36" rx="6" fill="url(#g-slate)" stroke="var(--diagram-blue-stroke)"/><text x="760" y="247" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11">7. ACL 跨节点不同步</text></g>
   <path d="M420,60 L125,100" stroke="var(--diagram-border)" stroke-width="1.3" fill="none" marker-end="url(#arr)"/>
@@ -822,7 +822,7 @@ OK</code></pre>
 <tr><td>2</td><td>仅设 requirepass</td><td>全部应用共享单密码</td><td>创建独立 ACL 用户</td></tr>
 <tr><td>3</td><td>运行时修改未保存</td><td>重启后规则消失</td><td>修改后立刻 <code>ACL SAVE</code></td></tr>
 <tr><td>4</td><td>证书过期</td><td>集群节点重启后无法连接</td><td>自动续期 + cron <code>checkend</code> 监控</td></tr>
-<tr><td>5</td><td>0-RTT 重放</td><td>写命令多次执行</td><td>禁用 0-RTT 或仅限只读</td></tr>
+<tr><td>5</td><td>Early Data 重放</td><td>写命令多次执行</td><td>在 TLS 终止层禁用 0-RTT,或只允许幂等只读请求</td></tr>
 <tr><td>6</td><td>Cluster TLS 混合</td><td>Gossip 失败、集群分裂</td><td>全节点统一启用</td></tr>
 <tr><td>7</td><td>ACL 跨节点不同步</td><td>部分节点拒绝</td><td>aclfile 集中分发</td></tr>
 </tbody>
@@ -927,7 +927,7 @@ struct user {
   <tr><td>ACL 提供多用户、命令、key、channel 四级权限</td><td><code>ACL SETUSER</code>、<code>ACLCheckAllPerm</code></td><td>default 用户残留全权限</td></tr>
   <tr><td>命令位图实现 O(1) 权限检查</td><td><code>aclSelector.allowed_commands</code></td><td>key/channel 仍为 O(P × len)</td></tr>
   <tr><td><code>ACL SAVE</code> 持久化运行时修改</td><td><code>aclfile</code></td><td>仅 SETUSER 不重启会丢失</td></tr>
-  <tr><td><code>ACL LOG</code> 记录全部拒绝事件</td><td><code>addACLLogEntry()</code></td><td>default 用户的命令不会被审计</td></tr>
+  <tr><td><code>ACL LOG</code> 记录 ACL 拒绝事件</td><td><code>addACLLogEntry()</code></td><td>已授权命令不会进 ACL LOG;default 残留会掩盖越权风险</td></tr>
   <tr><td>TLS 1.3 握手为 1 RTT</td><td><code>tls-protocols TLSv1.3</code></td><td>TLS 1.2 的 2 RTT 在短连接放大</td></tr>
   <tr><td><code>tls-auth-clients yes</code> 启用 mTLS</td><td><code>connTLSAccept()</code></td><td>optional 模式下未提供证书的客户端仍连接</td></tr>
   <tr><td><code>tls-replication</code> / <code>tls-cluster</code> 独立开关</td><td><code>replication.c</code>、<code>cluster.c</code></td><td>主从或集群链路可能仍走明文</td></tr>
@@ -939,21 +939,22 @@ struct user {
 
   <h3>最小回归测试</h3>
 
-<pre><code class="language-bash">redis-cli ACL SETUSER default off
+<pre><code class="language-bash"># 先创建专用应用用户与管理员用户,确认可登录后再关闭 default
 redis-cli ACL SETUSER app on '&gt;p@ss' resetkeys resetcommands +get +set ~app:* '&amp;*'
-redis-cli ACL SAVE
-redis-cli AUTH app p@ss
-redis-cli SET app:1 v        # OK
-redis-cli SET other:1 v      # NOPERM
-redis-cli ACL LOG 1
+redis-cli ACL SETUSER admin on '&gt;adminP@ss' allcommands allkeys allchannels
+redis-cli --user app -a p@ss SET app:1 v        # OK
+redis-cli --user app -a p@ss SET other:1 v      # NOPERM
+redis-cli --user admin -a adminP@ss ACL SETUSER default off
+redis-cli --user admin -a adminP@ss ACL SAVE
+redis-cli --user admin -a adminP@ss ACL LOG 1
 
 # 期望输出
 OK
 OK
 OK
-OK
-OK
 (error) NOPERM this user has no permissions to access one of the keys used as arguments
+OK
+OK
 1) 1) "reason"
    2) "key"
    3) "username"

@@ -55,17 +55,17 @@
   <p class="lead">Redis 是单线程命令处理模型,所有命令在主线程顺序执行。该模型的核心约束是<strong>命令路径上的任何同步操作都直接转化为客户端延迟</strong>。删除一个 500 万元素的 hashtable 需要遍历释放每个 entry,主线程被占用 1-2 秒,期间所有客户端命令被阻塞。该现象在 Redis 4.0 之前是单线程模型的固有限制。</p>
   <p>Redis 4.0 引入两项异步化机制以解决该限制。其一,<strong>Lazy Free</strong> 将大对象的内存释放从主线程卸载到 bio 后台线程,主线程仅承担索引摘除的 O(1) 开销;其二,<strong>Active Defrag</strong> 在事件循环空隙渐进式整理 jemalloc 碎片,以"主线程时间片切片"形式控制对命令延迟的影响。两者共同将"释放即阻塞"与"长时间运行碎片累积"这两类工程问题从单线程模型中剥离。</p>
   <ul class="will-learn">
-    <li>DEL 大 key 阻塞主线程的实测延迟(1M 元素 hashtable ~ 480 ms)与 Sentinel 误判 failover 的连锁反应</li>
+    <li>DEL 大 key 阻塞主线程的示例延迟(1M 元素 hashtable 可达数百 ms)与 Sentinel 误判 failover 的风险链路</li>
     <li>bio 三线程架构(<code>BIO_CLOSE_FILE</code> / <code>BIO_AOF_FSYNC</code> / <code>BIO_LAZY_FREE</code>)的任务提交与消费</li>
-    <li>UNLINK 的两阶段:主线程 <code>dictUnlink</code>(O(1))+ bio 线程 <code>decrRefCount</code></li>
+    <li>UNLINK 的两阶段:主线程 <code>dictUnlink</code>(逻辑删除)+ 按 effort 决定后台或内联 <code>decrRefCount</code></li>
     <li><code>lazyfreeGetFreeEffort</code> 估算逻辑与 <code>LAZYFREE_THRESHOLD = 64</code> 阈值的工程依据</li>
-    <li>5 个 <code>lazyfree-lazy-*</code> 配置项默认 <code>no</code>,升级 4.0+ 后必须显式开启</li>
-    <li>DEL vs UNLINK 语义差异:DEL 默认同步,UNLINK 始终走 <code>dbAsyncDelete</code></li>
+    <li><code>lazyfree-lazy-*</code> 与 <code>replica-lazy-flush</code> 默认多为 <code>no</code>,升级后需按场景显式开启</li>
+    <li>DEL vs UNLINK 语义差异:DEL 默认同步,UNLINK 先逻辑删除,大对象释放才卸载到后台</li>
     <li>jemalloc size class 与 slab 空洞:碎片产生的根本原因</li>
-    <li><code>mem_fragmentation_ratio</code> 解读:&gt; 1.5 触发,&lt; 1.0 警告 swap</li>
+    <li><code>mem_fragmentation_ratio</code> 解读:把它作为入口指标,再结合 allocator 与 RSS 字段定位原因</li>
     <li>Active Defrag 主线程时间片切片(cycle-min/max)与 jemalloc <code>defrag_hint</code></li>
-    <li>主从复制陷阱:复制流传播 DEL 不是 UNLINK,Replica 必须独立配置 lazyfree</li>
-    <li>MIGRATE 仍同步释放,Cluster 大 key Slot 迁移的工程考量</li>
+    <li>复制与本地释放配置的关系:显式命令、过期/淘汰/覆盖路径需分别分析</li>
+    <li>MIGRATE/Cluster Slot 迁移大 key 仍可能阻塞的工程考量</li>
   </ul>
   <p class="prereq">前置知识:第 22 章 jemalloc(arena/bin/slab/tcache);第 23 章 eviction(<code>performEvictions</code> 释放路径);Redis 数据结构(quicklist/skiplist/hashtable/listpack)的内部布局。</p>
 </div>
@@ -194,7 +194,7 @@
       <text x="40" y="534" fill="var(--diagram-green-text)" font-size="10" font-weight="700">Lazy Free</text>
       <text x="120" y="534" fill="var(--diagram-blue-text)" font-size="10">→ 解决"单次大对象释放阻塞主线程"(短延迟尖峰)</text>
       <text x="40" y="554" fill="var(--diagram-orange-text)" font-size="10" font-weight="700">Active Defrag</text>
-      <text x="140" y="554" fill="var(--diagram-blue-text)" font-size="10">→ 解决"长期 RSS 浮高 / mem_fragmentation_ratio &gt; 1.5"(累积碎片)</text>
+      <text x="140" y="554" fill="var(--diagram-blue-text)" font-size="10">→ 解决部分"长期 RSS 浮高 / allocator 碎片"(活对象碎片)</text>
     </g>
   </svg>
 </div>
@@ -275,7 +275,7 @@
 </div>
 
 <div class="diagram">
-  <div class="diagram-title">表 24-1-1 · DEL 大 key 实测延迟(Redis 7.2)</div>
+  <div class="diagram-title">表 24-1-1 · DEL 大 key 示例延迟(Redis 7.2,依硬件/编码而变)</div>
   <table>
     <thead><tr><th>对象类型</th><th>元素数</th><th>遍历释放成本</th></tr></thead>
     <tbody>
@@ -291,7 +291,7 @@
 </div>
 
 <div class="warning">
-  <strong>Sentinel 误判连锁:</strong>DEL 大 key 触发的延迟尖峰可能被监控系统误判为节点故障,触发不必要的 failover。<strong>新 master 缓存未预热,缓存命中率骤降,流量穿透至下游数据库,引发级联故障</strong>。该模式在生产环境中已多次观测到,是引入 UNLINK 的直接动因。
+  <strong>Sentinel 误判连锁:</strong>DEL 大 key 触发的延迟尖峰可能被过短的监控/Sentinel 超时配置放大为故障判断,带来不必要的 failover。新 master 缓存预热不足时,还可能出现命中率下降与下游压力上升。这里表达的是风险链路,不是说一次大 key 删除必然触发故障转移。
 </div>
 
 <div class="diagram">
@@ -490,19 +490,20 @@ void *bioProcessBackgroundJobs(void *arg) {
 <div class="diagram">
   <div class="diagram-title">表 24-3-1 · lazyfree 配置项</div>
   <table>
-    <thead><tr><th>配置项</th><th>默认值</th><th>触发场景</th><th>推荐生产值</th></tr></thead>
+    <thead><tr><th>配置项</th><th>默认值</th><th>触发场景</th><th>常见取值/评估建议</th></tr></thead>
     <tbody>
       <tr><td><code>lazyfree-lazy-eviction</code></td><td>no</td><td>maxmemory 淘汰</td><td><strong>yes</strong></td></tr>
       <tr><td><code>lazyfree-lazy-expire</code></td><td>no</td><td>TTL 过期删除</td><td><strong>yes</strong></td></tr>
       <tr><td><code>lazyfree-lazy-server-del</code></td><td>no</td><td>RENAME/SET 覆盖旧值</td><td><strong>yes</strong></td></tr>
       <tr><td><code>lazyfree-lazy-user-del</code></td><td>no</td><td>显式 DEL 命令</td><td>按需</td></tr>
+      <tr><td><code>lazyfree-lazy-user-flush</code></td><td>no</td><td>显式 FLUSHDB/FLUSHALL</td><td>按需或直接使用 ASYNC</td></tr>
       <tr><td><code>replica-lazy-flush</code></td><td>no</td><td>Replica 全量同步前 FLUSHALL</td><td><strong>yes</strong></td></tr>
     </tbody>
   </table>
 </div>
 
 <div class="warning">
-  四个 <code>lazyfree-*</code> 配置覆盖四类内部释放路径,加上 <code>replica-lazy-flush</code> 处理全量同步场景。<strong>所有配置默认 <code>no</code></strong>,意味着升级到 Redis 4.0+ 后若不显式配置,大部分隐式释放仍走同步路径。
+  多个 <code>lazyfree-*</code> 配置覆盖用户删除、用户 flush 与内部释放路径,加上 <code>replica-lazy-flush</code> 处理全量同步场景。<strong>默认多为 <code>no</code></strong>,意味着升级到 Redis 4.0+ 后若不显式配置,不少隐式释放仍走同步路径。
 </div>
 
 <div class="diagram">
@@ -516,7 +517,7 @@ void *bioProcessBackgroundJobs(void *arg) {
 
       <rect x="560" y="14" width="320" height="40" rx="8" fill="url(#d-green)" filter="url(#d-shadow)"/>
       <text x="720" y="36" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">UNLINK key</text>
-      <text x="720" y="50" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">语义固定:始终异步</text>
+      <text x="720" y="50" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">语义固定:先逻辑删除</text>
 
       <line x1="220" y1="54" x2="220" y2="74" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
       <line x1="720" y1="54" x2="720" y2="74" stroke="var(--diagram-green-stroke)" stroke-width="1.5" marker-end="url(#d-arr-g)"/>
@@ -533,8 +534,8 @@ void *bioProcessBackgroundJobs(void *arg) {
 
       <rect x="580" y="74" width="280" height="62" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
       <text x="720" y="100" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">无配置开关</text>
-      <text x="720" y="118" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">UNLINK 永远异步</text>
-      <text x="720" y="132" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">应用层强语义保证</text>
+      <text x="720" y="118" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="10">先逻辑删除,大对象异步</text>
+      <text x="720" y="132" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">小对象可能内联释放</text>
 
       <rect x="20"  y="180" width="180" height="60" rx="8" fill="url(#d-red)" filter="url(#d-shadow)"/>
       <text x="110" y="202" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">dbSyncDelete</text>
@@ -578,7 +579,7 @@ void *bioProcessBackgroundJobs(void *arg) {
 </div>
 
 <div class="key-insight">
-  <strong>工程建议:</strong>应用代码统一使用 <code>UNLINK</code>,语义清晰。保留 <code>lazyfree-lazy-user-del = no</code>,DEL 语义不变。<strong>其他四个 lazyfree-lazy-* 全部开 yes</strong>,覆盖隐式释放。
+  <strong>工程建议:</strong>应用删除大 key 优先使用 <code>UNLINK</code>,语义清晰。保留 <code>lazyfree-lazy-user-del = no</code>,DEL 语义不变。淘汰、过期、覆盖、Replica flush 等隐式释放路径按业务延迟要求开启;显式 FLUSH 优先使用 <code>ASYNC</code> 或评估 <code>lazyfree-lazy-user-flush</code>。
 </div>
 
 <div class="diagram">
@@ -671,7 +672,7 @@ void *bioProcessBackgroundJobs(void *arg) {
       <text x="705" y="360" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">异步 emptyDb</text>
       <text x="705" y="376" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">受 replica-lazy-flush 控制</text>
 
-      <text x="510" y="406" fill="var(--diagram-red-text)" font-size="10" font-weight="700">⚠ 此场景不开 lazy 几乎必然超时</text>
+      <text x="510" y="406" fill="var(--diagram-red-text)" font-size="10" font-weight="700">⚠ 大实例不开 lazy 容易阻塞复制线程</text>
       <text x="510" y="422" fill="var(--diagram-muted)" font-size="9">大实例同步释放可能阻塞分钟级</text>
     </g>
   </svg>
@@ -740,7 +741,7 @@ void *bioProcessBackgroundJobs(void *arg) {
       <text x="565" y="344" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9" font-weight="700">3a. 异步 — 入 BIO_LAZY_FREE</text>
 
       <line x1="280" y1="380" x2="100" y2="380" stroke="var(--diagram-green-stroke)" stroke-width="1.5" marker-end="url(#d-arr-g)"/>
-      <text x="190" y="374" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10" font-weight="700">+1 OK(微秒级 ✓)</text>
+      <text x="190" y="374" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10" font-weight="700">+1 OK(大对象主线程短路径)</text>
 
       <line x1="640" y1="412" x2="830" y2="412" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
       <text x="735" y="406" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">decrRefCount(val)</text>
@@ -753,7 +754,7 @@ void *bioProcessBackgroundJobs(void *arg) {
 
       <text x="20" y="468" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">3b. 同步路径(小对象):</text>
       <line x1="280" y1="492" x2="830" y2="492" stroke="var(--diagram-purple-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
-      <text x="555" y="486" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">直接 decrRefCount → 主线程释放(免线程切换)</text>
+      <text x="555" y="486" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="9">小对象直接 decrRefCount → 主线程释放(免线程切换)</text>
       <line x1="280" y1="512" x2="100" y2="512" stroke="var(--diagram-purple-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
       <text x="190" y="506" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">+1</text>
     </g>
@@ -809,7 +810,7 @@ size_t lazyfreeGetFreeEffort(robj *key, robj *obj, int dbid) {
 </div>
 
 <div class="real-world">
-  <strong>线程安全的根源:</strong>主线程与 bio 线程的并发安全通过<strong>"先脱离引用,再异步释放"</strong>的两阶段设计保证。任何时刻,某个 robj 要么在 keyspace 中可被命令访问,要么已脱离 keyspace 待 bio 释放,<strong>不存在共享状态</strong>。该设计避免了通用读写锁、RCU 宽限期等复杂并发原语。
+  <strong>并发安全的根源:</strong>主线程与 bio 线程的安全边界来自<strong>"先脱离引用,再异步释放"</strong>的两阶段设计。对命令路径而言,某个 robj 要么仍在 keyspace 中可被访问,要么已脱离 keyspace 待 bio 释放,<strong>不会再被普通命令共享访问</strong>。该设计避免了在 keyspace 读写路径引入通用读写锁、RCU 宽限期等复杂并发原语。
 </div>
 
 <!-- ============================================================ -->
@@ -906,9 +907,9 @@ size_t lazyfreeGetFreeEffort(robj *key, robj *obj, int dbid) {
   <table>
     <thead><tr><th>比值</th><th>状态</th><th>动作</th></tr></thead>
     <tbody>
-      <tr><td><strong>&gt; 1.5</strong></td><td>碎片严重</td><td><strong>开启 Active Defrag</strong></td></tr>
+      <tr><td><strong>&gt; 1.5</strong></td><td>RSS 明显高于 used_memory</td><td><strong>结合 allocator_* 判断碎片、dirty page 或 CoW</strong></td></tr>
       <tr><td>1.0-1.5</td><td>正常碎片</td><td>监控,无需处理</td></tr>
-      <tr><td>&lt; 1.0</td><td>used_memory 大于 RSS</td><td>可能 swap,排查 OS</td></tr>
+      <tr><td>&lt; 1.0</td><td>used_memory 大于 RSS</td><td>先核对采样时点与平台指标,再排查 swap/统计口径</td></tr>
       <tr><td>≈ 1.0</td><td>刚启动或刚 Defrag 完成</td><td>正常</td></tr>
     </tbody>
   </table>
@@ -1259,9 +1260,9 @@ void *activeDefragAlloc(void *ptr) {
     <thead><tr><th>部署模式</th><th>Lazy Free 行为</th><th>Active Defrag 行为</th><th>关键约束</th></tr></thead>
     <tbody>
       <tr><td>单节点</td><td>标准 bio 异步</td><td>主线程时间片</td><td>配置全开</td></tr>
-      <tr><td>主从复制</td><td>从节点本地按各自 lazyfree-* 释放</td><td>各节点独立</td><td>主从配置应一致</td></tr>
+      <tr><td>主从复制</td><td>显式命令随复制流传播;内部删除按本地配置释放</td><td>各节点独立</td><td>主从配置应一致</td></tr>
       <tr><td>Sentinel</td><td>failover 后新主继承</td><td>failover 后状态重置</td><td>所有节点配置一致</td></tr>
-      <tr><td>Cluster</td><td>每分片独立</td><td>每分片独立</td><td>MIGRATE 仍同步</td></tr>
+      <tr><td>Cluster</td><td>每分片独立</td><td>每分片独立</td><td>迁移大 key 仍可能阻塞</td></tr>
     </tbody>
   </table>
 </div>
@@ -1289,14 +1290,14 @@ void *activeDefragAlloc(void *ptr) {
       <text x="480" y="106" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="700">dbAsyncDelete(本地异步)</text>
 
       <line x1="480" y1="138" x2="800" y2="138" stroke="var(--diagram-orange-stroke)" stroke-width="2" marker-end="url(#d-arr)"/>
-      <text x="640" y="132" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="800">复制流:DEL bigkey</text>
-      <text x="640" y="154" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">⚠ 不是 UNLINK,只是 DEL</text>
+      <text x="640" y="132" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="800">复制流:原命令/删除语义</text>
+      <text x="640" y="154" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">显式 UNLINK 与内部删除需区分</text>
 
       <line x1="480" y1="174" x2="140" y2="174" stroke="var(--diagram-green-stroke)" stroke-width="1.5" marker-end="url(#d-arr-g)"/>
       <text x="310" y="168" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">+1(微秒级)</text>
 
       <rect x="700" y="190" width="200" height="34" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
-      <text x="800" y="212" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">收到的是 DEL,不是 UNLINK</text>
+      <text x="800" y="212" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">若收到 DEL,看本地配置</text>
 
       <line x1="800" y1="224" x2="800" y2="244" stroke="var(--diagram-border)" stroke-width="1.5" marker-end="url(#d-arr)"/>
 
@@ -1319,23 +1320,24 @@ void *activeDefragAlloc(void *ptr) {
       <text x="860" y="370" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">异步释放</text>
       <text x="860" y="384" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">读流量正常</text>
 
-      <text x="20" y="420" fill="var(--diagram-red-text)" font-size="11" font-weight="700">⚠ 主从陷阱:Master 升级 lazyfree 后延迟稳定,Replica 仍出现尖刺</text>
-      <text x="20" y="436" fill="var(--diagram-muted)" font-size="9">→ 复制流传播 DEL 不传 UNLINK,Replica 是否异步取决于本地 lazyfree-lazy-user-del 配置;主从必须统一</text>
+      <text x="20" y="420" fill="var(--diagram-red-text)" font-size="11" font-weight="700">⚠ 主从陷阱:Master 本地释放稳定,Replica 仍可能因本地配置出现尖刺</text>
+      <text x="20" y="436" fill="var(--diagram-muted)" font-size="9">→ 显式命令与内部删除路径不同;DEL/过期/淘汰在 Replica 上是否异步取决于本地 lazyfree 配置</text>
     </g>
   </svg>
 </div>
 
 <div class="warning">
-  <strong>主从陷阱:</strong>Master 升级 Lazy Free 后延迟稳定,但 Replica 仍出现大 key 删除导致的延迟尖刺。根因:<strong>复制流传播的是 DEL,不是 UNLINK</strong>。Replica 收到 DEL 后是否异步释放,取决于 Replica 自身的 <code>lazyfree-lazy-user-del</code> 配置。<strong>主从配置必须统一</strong>。
+  <strong>主从陷阱:</strong>Master 本地开启 Lazy Free 后延迟稳定,Replica 仍可能出现大 key 删除尖刺。原因不是"所有删除都会自动变成异步",而是显式 <code>UNLINK</code>、显式 <code>DEL</code>、过期/淘汰/覆盖等路径的传播与本地释放配置不同。Replica 的异步释放能力取决于收到的命令以及自身 <code>lazyfree-*</code> 配置。<strong>主从配置必须统一</strong>。
 </div>
 
 <pre><code class="language-bash">redis-cli --cluster call $ENTRY CONFIG SET lazyfree-lazy-eviction yes
 redis-cli --cluster call $ENTRY CONFIG SET lazyfree-lazy-expire yes
 redis-cli --cluster call $ENTRY CONFIG SET lazyfree-lazy-server-del yes
+redis-cli --cluster call $ENTRY CONFIG SET lazyfree-lazy-user-flush yes
 redis-cli --cluster call $ENTRY CONFIG SET replica-lazy-flush yes</code></pre>
 
 <div class="real-world">
-  <strong>MIGRATE 例外:</strong>Cluster 中 <code>MIGRATE</code> 命令的源端 <code>dbSyncDelete</code> <strong>始终同步释放</strong>,不受 <code>lazyfree-lazy-server-del</code> 影响。Slot 迁移大 key 仍可能阻塞主线程。<br/><br/>
+  <strong>MIGRATE 例外:</strong>Cluster 中 <code>MIGRATE</code> 的源端删除/迁移路径不应被简单等同为普通 <code>UNLINK</code>。不同 Redis 版本细节需以源码和压测确认;工程上应假设 Slot 迁移大 key 仍可能阻塞主线程。<br/><br/>
   工程考虑:Cluster 重新分片选择业务低峰,避免迁移 1 GB+ 的单 key,极大对象建议通过应用层迁移(业务双写后切流)。
 </div>
 
@@ -1348,9 +1350,9 @@ redis-cli --cluster call $ENTRY CONFIG SET replica-lazy-flush yes</code></pre>
   <table>
     <thead><tr><th>#</th><th>陷阱</th><th>症状</th><th>修复</th></tr></thead>
     <tbody>
-      <tr><td>1</td><td>升级 4.0+ 后仍卡顿</td><td>大 key 删除阻塞主线程</td><td><code>CONFIG SET lazyfree-lazy-eviction yes</code> 等四项</td></tr>
+      <tr><td>1</td><td>升级 4.0+ 后仍卡顿</td><td>大 key 删除阻塞主线程</td><td>按释放路径开启对应 <code>lazyfree-*</code> 配置</td></tr>
       <tr><td>2</td><td>UNLINK 后内存不降</td><td>RSS 持续高</td><td>分批 UNLINK,等待 bio 消费</td></tr>
-      <tr><td>3</td><td>RSS 高但 used 不高</td><td>碎片率 &gt; 1.5</td><td>开启 Active Defrag</td></tr>
+      <tr><td>3</td><td>RSS 高但 used 不高</td><td>碎片率持续偏高</td><td>结合 allocator 指标选择 Defrag/PURGE/重启窗口</td></tr>
       <tr><td>4</td><td>Defrag 后 P99 升高</td><td>整理期间命令延迟尖刺</td><td>cycle-max 降至 25 或更低</td></tr>
       <tr><td>5</td><td>Replica 延迟尖刺</td><td>主稳定从节点抖动</td><td>主从 lazyfree 配置统一</td></tr>
       <tr><td>6</td><td>DEL 仍卡顿</td><td>改了配置仍慢</td><td>改用 UNLINK 或开 user-del</td></tr>
@@ -1361,10 +1363,10 @@ redis-cli --cluster call $ENTRY CONFIG SET replica-lazy-flush yes</code></pre>
 </div>
 
 <pre><code class="language-bash"># Lazy Free 队列状态
-redis-cli INFO stats | grep -E 'lazyfree_pending_objects|expired_keys|evicted_keys'
+redis-cli INFO memory | grep -E 'lazyfree_pending_objects|allocator_'
 
 # Defrag 状态
-redis-cli INFO stats | grep -E 'active_defrag_running|active_defrag_hits|active_defrag_misses'
+redis-cli INFO memory | grep -E 'active_defrag_running|active_defrag_hits|active_defrag_misses'
 
 # 内存状态
 redis-cli INFO memory | grep -E 'used_memory_human|used_memory_rss_human|mem_fragmentation_ratio|allocator_'
@@ -1384,7 +1386,7 @@ redis-cli MEMORY USAGE bigkey</code></pre>
     <thead><tr><th>命令</th><th>用途</th><th>异常解读</th></tr></thead>
     <tbody>
       <tr><td><code>lazyfree_pending_objects</code></td><td>bio 队列深度</td><td>持续增长 → 删除速率超过 bio 处理</td></tr>
-      <tr><td><code>mem_fragmentation_ratio</code></td><td>碎片率</td><td>&gt; 1.5 → 开启 Defrag</td></tr>
+      <tr><td><code>mem_fragmentation_ratio</code></td><td>碎片入口指标</td><td>持续偏高 → 结合 allocator 指标判断是否需要 Defrag/PURGE</td></tr>
       <tr><td><code>active_defrag_running</code></td><td>Defrag 状态</td><td>持续 1 → Defrag 跟不上碎片</td></tr>
       <tr><td><code>active_defrag_hits</code></td><td>整理对象计数</td><td>增长缓慢 → 检查 cycle-max</td></tr>
       <tr><td><code>LATENCY HISTORY</code></td><td>命令延迟历史</td><td>大 spike → 排查同步释放路径</td></tr>
@@ -1552,13 +1554,13 @@ void lazyfreeFreeObject(void *args[]) {
     <thead><tr><th>#</th><th>要点</th></tr></thead>
     <tbody>
       <tr><td>1</td><td>DEL 大 key 同步释放阻塞主线程,千万级元素可达秒级,可能触发 Sentinel 误判 failover</td></tr>
-      <tr><td>2</td><td>UNLINK 在主线程仅执行 dictUnlink (O(1)),实际释放卸载到 bio_thread[2] 异步执行</td></tr>
+      <tr><td>2</td><td>UNLINK 先逻辑删除 key;释放成本足够大且对象可安全后台释放时,才交给 bio_thread[2] 异步执行</td></tr>
       <tr><td>3</td><td>bio 三线程独立队列处理 close fd / AOF fsync / 异步释放,与主线程无锁竞争</td></tr>
       <tr><td>4</td><td>LAZYFREE_THRESHOLD = 64 是 t_bio / t_free 经验取舍,小对象同步快,大对象异步快</td></tr>
-      <tr><td>5</td><td>lazyfree-lazy-* 四项配置覆盖淘汰、过期、覆盖、Replica flush 四类隐式释放,默认全 no 必须显式开启</td></tr>
-      <tr><td>6</td><td>DEL 默认仍同步,Redis 6.2+ 通过 lazyfree-lazy-user-del 可改为异步,业务推荐使用 UNLINK 显式表达</td></tr>
-      <tr><td>7</td><td>主从复制传播的是 DEL 不是 UNLINK,Replica 是否异步释放取决于自身 lazyfree 配置,主从必须一致</td></tr>
-      <tr><td>8</td><td>mem_fragmentation_ratio = RSS / used_memory &gt; 1.5 表示碎片严重,需启用 Active Defrag</td></tr>
+      <tr><td>5</td><td>lazyfree-lazy-* 与 replica-lazy-flush 覆盖用户删除/flush、淘汰、过期、覆盖、Replica flush 等路径,需按场景显式开启</td></tr>
+      <tr><td>6</td><td>DEL 默认仍同步,Redis 6.2+ 通过 lazyfree-lazy-user-del 可改为异步;UNLINK 先逻辑删除,大对象释放才后台化</td></tr>
+      <tr><td>7</td><td>复制场景要区分显式 UNLINK、显式 DEL 与内部删除路径;Replica 异步释放取决于收到的命令和自身配置</td></tr>
+      <tr><td>8</td><td>mem_fragmentation_ratio = RSS / used_memory 只是入口指标,需结合 allocator 指标判断碎片、dirty page 或 RSS 未归还</td></tr>
       <tr><td>9</td><td>Active Defrag 在主线程事件循环时间片内渐进搬迁,cycle-min/cycle-max 控制 CPU 占用比</td></tr>
       <tr><td>10</td><td>Defrag 不能用独立线程因指针更新需串行化;Lazy Free 不消灭释放成本,仅卸载至 bio,内存释放总耗时不变</td></tr>
     </tbody>

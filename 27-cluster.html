@@ -56,21 +56,21 @@
 
 <div class="chapter-intro">
   <p class="lead">单节点 Redis 的容量与吞吐受限于单机硬件:内存上限取决于物理 RAM,写吞吐上限取决于单核 CPU。<strong>主从复制与 Sentinel</strong> 提供高可用,但不解决水平扩展问题:所有节点存储相同数据,内存与写吞吐上限不变。<strong>Redis Cluster</strong> 通过 16384 个 hash slot 将 keyspace 分散到多个 master 节点,每个节点独立处理一部分 slot 的读写,实现存储与吞吐的水平扩展。</p>
-  <p>Cluster 的核心设计选择有四:其一,<strong>固定 16384 个 slot</strong> 替代一致性 hash,bitmap 仅 2 KB 可塞入 Gossip 包;其二,<strong>Gossip 协议</strong>替代中心化协调器,无单点故障且消息复杂度 O(N);其三,<strong>PFAIL → FAIL 多数派投票</strong>替代外部 Sentinel,故障检测内置;其四,<strong>ASK + MIGRATE</strong> 实现在线 reshard,扩缩容期间服务不中断。这些选择共同形成"足够强大且足够简洁"的分布式方案,代价是多 key 命令、Lua 脚本、事务必须确保所有 key 在同一 slot。</p>
+  <p>Cluster 的核心设计选择有四:其一,<strong>固定 16384 个 slot</strong> 替代一致性 hash,bitmap 仅 2 KB 可塞入 Gossip 包;其二,<strong>Gossip 协议</strong>替代中心化协调器,无单点故障且消息复杂度 O(N);其三,<strong>PFAIL → FAIL 多数派投票</strong>替代外部 Sentinel,故障检测内置;其四,<strong>ASK + MIGRATE</strong> 支持在线 reshard,客户端按重定向处理迁移中 slot。这些选择共同形成"足够强大且足够简洁"的分布式方案,代价是多 key 命令、Lua 脚本、事务必须确保所有 key 在同一 slot。</p>
   <p>本章按"<strong>分片 → Gossip → 故障检测 → 重定向 → 在线迁移 → 部署适配</strong>"组织,聚焦 Cluster 的工程语义边界与生产可观测性。读完后,你应能解释 MOVED 与 ASK 的差异、cluster-node-timeout 的取舍、为何不能把 Cluster 节点同时交给 Sentinel 监控。</p>
   <ul class="will-learn">
     <li>16384 slot 与 CRC16 路由:<code>slot = CRC16(key) &amp; 0x3FFF</code>,bitmap 大小如何决定集群规模</li>
     <li>hash tag <code>{tag}</code> 强制相关 key 落同 slot,粒度过粗导致热点、过细失去意义</li>
-    <li>Gossip 协议 PING/PONG 周期性传播,O(log N) 收敛,1000 节点约 14 秒达成共识</li>
+    <li>Gossip 协议 PING/PONG 周期性传播;O(log N) 与 1000 节点约 14 秒是理想传播模型,不是生产 SLO</li>
     <li>PFAIL 单点判定 vs FAIL 多数派(<code>⌊N/2⌋+1</code>)确认,网络分区下的安全性证明</li>
     <li>MOVED(永久迁移,更新缓存)vs ASK(临时跳转,需先发 ASKING)的语义差异</li>
     <li>SETSLOT MIGRATING/IMPORTING + MIGRATE 三步骤完成在线 reshard</li>
-    <li>MIGRATE 单 key 原子性(DUMP+RESTORE+DEL),大 key 阻塞主线程的工程后果</li>
+    <li>MIGRATE 正常路径(DUMP+RESTORE+DEL)、超时校验边界与大 key 阻塞主线程的工程后果</li>
     <li>Failover 流程:PFAIL → FAIL → 投票 → replica 提升,configEpoch 递增防脑裂</li>
     <li>cluster-node-timeout 的取舍:5-10 秒平衡故障检测速度与误判风险</li>
     <li>10 大陷阱:CROSSSLOT、hash tag 过粗、cluster-require-full-coverage、failover 过慢、大 key 迁移、Cluster 与 Sentinel 共用</li>
   </ul>
-  <p class="prereq">前置知识:第 24 章主从复制(replica 提升机制);第 26 章 Sentinel(对比 Cluster 的内置 failover);CRC16 算法基础;TCP/网络分区基础概念。读者需要熟悉 redis-cli <code>--cluster</code> 命令族。</p>
+  <p class="prereq">前置知识:第 25 章主从复制(replica 提升机制);第 26 章 Sentinel(对比 Cluster 的内置 failover);CRC16 算法基础;TCP/网络分区基础概念。读者需要熟悉 redis-cli <code>--cluster</code> 命令族。</p>
 </div>
 
 <h3>章首速览</h3>
@@ -93,7 +93,7 @@
       <line x1="350" y1="70" x2="350" y2="98" stroke="var(--diagram-blue-stroke)" marker-end="url(#d-arr-b)"/>
 
       <polygon points="350,98 530,140 350,182 170,140" fill="url(#d-purple)" filter="url(#d-shadow)"/>
-      <text x="350" y="138" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">CRC16(key) % 16384</text>
+      <text x="350" y="138" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">CRC16(key) &amp; 0x3FFF</text>
       <text x="350" y="154" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">slot 路由</text>
 
       <line x1="225" y1="155" x2="80" y2="220" stroke="var(--diagram-green-stroke)" marker-end="url(#d-arr-g)"/>
@@ -262,7 +262,7 @@
 
       <rect x="20" y="100" width="280" height="50" rx="8" fill="url(#d-red)"/>
       <text x="160" y="122" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">P2 · 单核写吞吐上限</text>
-      <text x="160" y="140" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">Redis 单线程,写 ≤ 100K QPS</text>
+      <text x="160" y="140" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">Redis 主路径单线程,写吞吐受单核约束</text>
 
       <line x1="300" y1="125" x2="380" y2="125" stroke="var(--diagram-green-stroke)" stroke-width="2" marker-end="url(#d-arr-g)"/>
 
@@ -519,7 +519,7 @@ typedef struct {
       <tr>
         <td><code>gossip section</code></td>
         <td>~104 B × count</td>
-        <td>其他节点摘要(node ID/IP/port/flags/ping&amp;pong 时间戳)· 每次 PING 随机选 ~1/10 节点摘要, 指数传播 → <strong>O(log N) 收敛</strong></td>
+        <td>其他节点摘要(node ID/IP/port/flags/ping&amp;pong 时间戳)· 每次 PING 携带部分节点摘要;理想模型近似指数传播,真实收敛取决于超时、丢包和实现采样</td>
       </tr>
       <tr>
         <td><code>flags</code></td>
@@ -615,7 +615,7 @@ void clusterCron(void) {
 
       <rect x="620" y="100" width="200" height="80" rx="10" fill="url(#d-red)" filter="url(#d-shadow)"/>
       <text x="720" y="128" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">FAIL</text>
-      <text x="720" y="148" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">客观下线(全网共识)</text>
+      <text x="720" y="148" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">客观下线(多数确认)</text>
       <text x="720" y="166" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">广播 FAIL 触发 failover</text>
 
       <line x1="820" y1="140" x2="860" y2="140" stroke="var(--diagram-purple-stroke)" stroke-width="1.5" marker-end="url(#d-arr)"/>
@@ -623,8 +623,8 @@ void clusterCron(void) {
       <circle cx="880" cy="140" r="8" fill="var(--diagram-purple-fill)"/>
       <text x="845" y="170" fill="var(--diagram-purple-text)" font-size="9" font-weight="800">replica 提升</text>
 
-      <text x="40" y="232" fill="var(--diagram-muted)" font-size="11">★ 两阶段判定:PFAIL 单方面判断不触发 failover · FAIL 必须多数派 master 共识 → 防误报 + 防脑裂</text>
-      <text x="40" y="252" fill="var(--diagram-muted)" font-size="11">★ Cluster 与 Sentinel 的对比:Sentinel SDOWN/ODOWN 来自外部独立进程 · Cluster PFAIL/FAIL 来自数据节点本身(内嵌共识)</text>
+      <text x="40" y="232" fill="var(--diagram-muted)" font-size="11">★ 两阶段判定:PFAIL 单方面判断不触发 failover · FAIL 需要多数 master 确认 → 降低误报</text>
+      <text x="40" y="252" fill="var(--diagram-muted)" font-size="11">★ Cluster 与 Sentinel 的对比:Sentinel SDOWN/ODOWN 来自外部独立进程 · Cluster PFAIL/FAIL 来自数据节点本身</text>
     </g>
   </svg>
 </div>
@@ -645,7 +645,7 @@ void clusterCron(void) {
       <li><strong>触发</strong>:半数以上 master 在 <code>2 × cluster-node-timeout</code> 内都报同一节点 PFAIL</li>
       <li><strong>作用</strong>:广播 FAIL 给全网, 触发 replica 提升</li>
       <li><strong>含义</strong>:"集群多数派认定该节点故障"</li>
-      <li><strong>特点</strong>:多数派共识, <span style="color:var(--green)">触发 failover</span></li>
+      <li><strong>特点</strong>:多数派确认, <span style="color:var(--green)">触发 failover</span></li>
     </ul>
   </div>
 </div>
@@ -723,7 +723,7 @@ void clusterCron(void) {
       <text x="430" y="186" fill="var(--diagram-purple-text)" font-size="10" font-weight="700">③ Gossip 累计 PFAIL 报告</text>
 
       <rect x="20" y="216" width="900" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
-      <text x="470" y="232" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">Note: 多数派达成 PFAIL 共识</text>
+      <text x="470" y="232" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="11" font-weight="700">Note: 收集到多数 master 的 PFAIL 报告</text>
 
       <rect x="270" y="246" width="180" height="32" rx="6" fill="url(#d-red)"/>
       <text x="360" y="266" text-anchor="middle" fill="var(--diagram-text)" font-size="11" font-weight="800">④ 升级为 FAIL</text>
@@ -770,7 +770,7 @@ void clusterCron(void) {
       <tr><td>Replica 投票延时</td><td>0.5 – 5 s</td><td>随机退避防同时发起</td></tr>
       <tr><td>投票完成</td><td>~0.5 s</td><td>新 master 接管 slot</td></tr>
       <tr><td><strong>默认总计</strong></td><td><strong style="color:var(--orange)">17 – 22 s</strong></td><td>默认 15s timeout</td></tr>
-      <tr style="background:rgba(63,185,80,0.06)"><td><strong>生产推荐</strong>(<code>cluster-node-timeout 5000</code>)</td><td><strong style="color:var(--green)">6 – 10 s</strong></td><td>平衡灵敏度与误判风险</td></tr>
+      <tr style="background:rgba(63,185,80,0.06)"><td><strong>示例配置</strong>(<code>cluster-node-timeout 5000</code>)</td><td><strong style="color:var(--green)">6 – 10 s</strong></td><td>需按网络抖动与误判成本评估</td></tr>
     </tbody>
   </table>
 </div>
@@ -959,7 +959,7 @@ OK</code></pre>
    3) 1) "192.168.1.101"
    ...</code></pre>
 
-<p>CLUSTER SLOTS 返回的是 <strong>master + replicas 的完整拓扑</strong>。Smart Client 用此构建本地映射,后续命令路由完全本地决策,无需查询任何节点。生产推荐配合服务端 PUBSUB topology change 通知,主动推送拓扑变化。</p>
+<p>CLUSTER SLOTS 返回的是 <strong>master + replicas 的完整拓扑</strong>。Smart Client 用此构建本地映射,后续命令路由完全本地决策,无需每次查询节点。生产客户端通常在 MOVED/ASK、连接异常或定时任务触发拓扑刷新。</p>
 
 <!-- ============================================================ -->
 <h2 id="s27-6">27.6 ASK 重定向</h2>
@@ -1061,7 +1061,7 @@ OK</code></pre>
 <div class="compare-grid">
   <div class="compare-bad">
     <h4 style="color:var(--red);">✗ 错误方式 1:阻塞至 reshard 完成</h4>
-    <p style="color:var(--text);font-size:13px;">服务中断, 违背"零停机"目标</p>
+    <p style="color:var(--text);font-size:13px;">服务受影响, 违背"在线迁移"目标</p>
   </div>
   <div class="compare-bad">
     <h4 style="color:var(--red);">✗ 错误方式 2:A 处理所有, B 缓冲</h4>
@@ -1116,7 +1116,7 @@ clusterNode *getNodeByQuery(client *c, ...) {
 <h2 id="s27-7">27.7 Slot 迁移机制</h2>
 <!-- ============================================================ -->
 
-<p>Slot 迁移由 5 条命令编排完成:源节点先标记 MIGRATING,目标节点先标记 IMPORTING,然后用 GETKEYSINSLOT 拿 key 列表,MIGRATE 把 key 一批批从源原子搬到目标,最后 SETSLOT NODE 通知集群更新归属。这一节看每条命令的作用,以及 MIGRATE 单 key 的原子性边界。</p>
+<p>Slot 迁移由 5 条命令编排完成:源节点先标记 MIGRATING,目标节点先标记 IMPORTING,然后用 GETKEYSINSLOT 拿 key 列表,MIGRATE 按 key/批次搬迁(正常返回时目标已创建且源端删除),最后 SETSLOT NODE 通知集群更新归属。这一节看每条命令的作用,以及超时/网络错误下的确认与重试边界。</p>
 
 <h3>27.7.1 迁移涉及的命令</h3>
 
@@ -1128,7 +1128,7 @@ clusterNode *getNodeByQuery(client *c, ...) {
       <tr><td><code>CLUSTER SETSLOT &lt;slot&gt; MIGRATING &lt;target-id&gt;</code></td><td>源节点</td><td>slot 标记为"正在迁出"</td></tr>
       <tr><td><code>CLUSTER SETSLOT &lt;slot&gt; IMPORTING &lt;source-id&gt;</code></td><td>目标节点</td><td>slot 标记为"正在导入"</td></tr>
       <tr><td><code>CLUSTER GETKEYSINSLOT &lt;slot&gt; &lt;count&gt;</code></td><td>源节点</td><td>列出该 slot 的 keys</td></tr>
-      <tr><td><code>MIGRATE &lt;host&gt; &lt;port&gt; "" 0 5000 KEYS k1 k2 ...</code></td><td>源节点</td><td>原子搬迁 keys</td></tr>
+      <tr><td><code>MIGRATE &lt;host&gt; &lt;port&gt; "" 0 5000 KEYS k1 k2 ...</code></td><td>源节点</td><td>逐 key 搬迁;批次不等于分布式事务</td></tr>
       <tr><td><code>CLUSTER SETSLOT &lt;slot&gt; NODE &lt;target-id&gt;</code></td><td>所有节点</td><td>迁移完成,更新 slot 归属</td></tr>
     </tbody>
   </table>
@@ -1171,24 +1171,24 @@ clusterNode *getNodeByQuery(client *c, ...) {
       <text x="470" y="282" text-anchor="middle" fill="var(--diagram-green-text)" font-size="11" font-weight="700">→ Caller: +OK(原子三步成功)</text>
 
       <rect x="20" y="296" width="900" height="22" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
-      <text x="470" y="312" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="700">★ 失败分支:任意步骤失败 → 不执行后续 → A 保留 k1,B 不持有(两端一致)</text>
+      <text x="470" y="312" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="700">★ 失败分支:超时/网络错误可能需要扫描两端确认,不要当分布式事务</text>
 
       <rect x="40" y="328" width="860" height="120" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
       <text x="60" y="350" fill="var(--diagram-blue-text)" font-size="13" font-weight="800">★ 单 key 原子性保证</text>
-      <text x="60" y="372" fill="var(--diagram-green-text)" font-size="11">✓ 要么两端都更新成功(B 有 + A 删除)</text>
-      <text x="60" y="390" fill="var(--diagram-green-text)" font-size="11">✓ 要么两端都未变化(B 无 + A 保留)</text>
-      <text x="60" y="408" fill="var(--diagram-red-text)" font-size="11">✗ 不存在"B 有 + A 也有"或"B 无 + A 删了"</text>
+      <text x="60" y="372" fill="var(--diagram-green-text)" font-size="11">✓ +OK 正常路径:目标写入成功后源端删除</text>
+      <text x="60" y="390" fill="var(--diagram-green-text)" font-size="11">✓ 明确失败且未 RESTORE:源端保留 key</text>
+      <text x="60" y="408" fill="var(--diagram-red-text)" font-size="11">⚠ IOERR/超时后可能两端状态不确定,需要幂等重试/校验</text>
       <text x="60" y="430" fill="var(--diagram-orange-text)" font-size="11">⚠ 多 key 一次 MIGRATE:每 key 独立保证原子性,但批次不保证;部分成功部分失败可能存在</text>
     </g>
   </svg>
 </div>
 
 <div class="key-insight">
-  <strong>MIGRATE 原子性保证</strong> · 对单个 key:
+  <strong>MIGRATE 的边界</strong> · 对单个 key 的正常路径:
   <ul style="margin:8px 0 0 18px;color:var(--text);">
-    <li>要么两端都更新成功(B 有 + A 删除)</li>
-    <li>要么两端都未变化(B 无 + A 保留)</li>
-    <li>不存在"B 有 + A 也有"或"B 无 + A 删了"</li>
+    <li><code>+OK</code> 表示目标写入成功且源端删除完成</li>
+    <li>明确失败且未发送/未恢复时源端保留 key</li>
+    <li>网络超时或 <code>IOERR</code> 后不能仅凭客户端结果判断两端状态,需要扫描校验</li>
   </ul>
 </div>
 
@@ -1205,8 +1205,8 @@ clusterNode *getNodeByQuery(client *c, ...) {
     <h4 style="color:var(--orange);">⚠ 注意:MIGRATE 不是分布式事务</h4>
     <ul style="color:var(--text);font-size:13px;line-height:1.7;margin:8px 0 0 18px;">
       <li>多 key 一次 MIGRATE 时, 部分成功部分失败<strong>可能存在</strong></li>
-      <li>每 key 独立保证原子性, 但批次不保证</li>
-      <li>失败需要应用层重试或扫描清理</li>
+      <li>每 key 的正常迁移路径有顺序保证, 但批次不保证</li>
+      <li>失败、超时需要应用层幂等重试或扫描清理</li>
     </ul>
   </div>
 </div>
@@ -1244,7 +1244,7 @@ redis-cli --latency-history -h $TARGET</pre>
 <h2 id="s27-8">27.8 在线 Resharding</h2>
 <!-- ============================================================ -->
 
-<p>Cluster 的"零停机扩容"由三层机制共同保证:未迁移 slot 正常服务、已迁移 slot 通过 MOVED 路由、迁移中 slot 通过 ASK 临时跳转。<code>redis-cli --cluster reshard</code> 把上一节那 5 条命令编排成一个全自动的迁移流程。</p>
+<p>Cluster 的在线扩容由三层机制共同支撑:未迁移 slot 正常服务、已迁移 slot 通过 MOVED 路由、迁移中 slot 通过 ASK 临时跳转。<code>redis-cli --cluster reshard</code> 把上一节那 5 条命令编排成一个自动迁移流程;实际影响取决于 key 大小、批次与客户端重试实现。</p>
 
 <h3>27.8.1 添加新节点的完整流程</h3>
 
@@ -1300,7 +1300,7 @@ redis-cli --latency-history -h $TARGET</pre>
       <text x="780" y="304" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">⑦ CLUSTER SLOTS 验证</text>
       <text x="780" y="318" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">最终拓扑确认 ✓</text>
 
-      <text x="20" y="358" fill="var(--diagram-muted)" font-size="10">★ 整个 reshard 期间,客户端无感知 — 未迁移 slot 正常 + 已迁移 MOVED + 迁移中 ASK 三态共同保证零停机</text>
+      <text x="20" y="358" fill="var(--diagram-muted)" font-size="10">★ reshard 期间,Smart Client 通过 MOVED/ASK 跟随迁移;大 key/超时仍需监控与重试</text>
     </g>
   </svg>
 </div>
@@ -1383,19 +1383,19 @@ $ redis-cli --cluster reshard 192.168.1.100:7000 \
 </div>
 
 <div class="key-insight">
-  reshard 期间的"零停机"由三层机制共同保证:<strong>未迁移 slot 正常服务、已迁移 slot 通过 MOVED 路由、迁移中 slot 通过 ASK 临时跳转</strong>。客户端感知到的最大开销是 reshard 期间偶尔的额外跳转(毫秒级延迟)。Smart Client 在稳态下绝大多数请求一次命中。
+  reshard 期间的在线服务由三层机制共同支撑:<strong>未迁移 slot 正常服务、已迁移 slot 通过 MOVED 路由、迁移中 slot 通过 ASK 临时跳转</strong>。客户端通常感知为偶尔的额外跳转;大 key、超时或客户端未正确处理 ASK/MOVED 时仍可能出现抖动。Smart Client 在稳态下绝大多数请求一次命中。
 </div>
 
 <!-- ============================================================ -->
 <h2 id="s27-9">27.9 数学分析:Gossip 收敛速度</h2>
 <!-- ============================================================ -->
 
-<p>Gossip 是经典的"流行病传播"模型 — 已知节点每轮再感染一个未知节点,感染数指数增长直到全集群覆盖。这一节给出 Push-Based Gossip 的递推式与连续时间近似,得出 <strong>O(log N)</strong> 收敛的结论,并计算 1000 节点集群的实际收敛时间。</p>
+<p>Gossip 常用"流行病传播"模型帮助理解 — 已知节点每轮再感染若干未知节点,感染数近似指数增长直到覆盖大部分集群。本节的 <strong>O(log N)</strong> 与 1000 节点约 14 秒是理想化推导,用于建立量级直觉;生产收敛还受 <code>cluster-node-timeout</code>、丢包、节点负载与实现采样策略影响。</p>
 
 <h3>27.9.1 Push-Based Gossip 的收敛</h3>
 
 <div class="diagram">
-  <div class="diagram-title">图 27-9-1 · Gossip 收敛公式推导</div>
+  <div class="diagram-title">图 27-9-1 · Gossip 收敛公式推导(理想模型)</div>
 <pre><code class="language-text">设 N 个节点,初始 1 个节点持有信息 (sender)
 每轮每个已知节点随机选一个其他节点发送
 
@@ -1422,12 +1422,12 @@ $ redis-cli --cluster reshard 192.168.1.100:7000 \
 <div class="diagram">
   <div class="diagram-title">表 27-9-1 · 不同集群规模的收敛时间</div>
   <table>
-    <thead><tr><th>集群规模 N</th><th>理论轮数 ⌈2 ln N⌉</th><th>心跳周期</th><th>预计收敛时间</th></tr></thead>
+    <thead><tr><th>集群规模 N</th><th>理论轮数 ⌈2 ln N⌉</th><th>假设心跳周期</th><th>模型估算时间</th></tr></thead>
     <tbody>
       <tr><td>6 节点</td><td>4 轮</td><td>1 秒/轮</td><td>~4 秒</td></tr>
       <tr><td>50 节点</td><td>8 轮</td><td>1 秒/轮</td><td>~8 秒</td></tr>
       <tr><td>200 节点</td><td>11 轮</td><td>1 秒/轮</td><td>~11 秒</td></tr>
-      <tr><td>1000 节点</td><td>14 轮</td><td>1 秒/轮</td><td>~14 秒</td></tr>
+      <tr><td>1000 节点</td><td>14 轮</td><td>1 秒/轮</td><td>~14 秒(非 SLO)</td></tr>
     </tbody>
   </table>
 </div>
@@ -1437,16 +1437,16 @@ $ redis-cli --cluster reshard 192.168.1.100:7000 \
 <pre><code class="language-text">对数增长的工程意义:
 
   集群规模从 6 扩到 1000 (167 倍增长)
-  收敛时间从 4 秒到 14 秒 (3.5 倍增长)
+  理想模型下收敛时间从 4 秒到 14 秒 (3.5 倍增长)
 
   log N 增长意味着:
     扩大集群对收敛速度的影响极小
     Gossip 协议天然支持大规模集群
-    生产环境 ~1000 节点上限主要受 Gossip 带宽 (O(N²))
+    生产环境 ~1000 节点上限主要受 Gossip 带宽、运维复杂度与故障域影响
     而非收敛速度限制
 
 对比中心化协调:
-  中心化 (Sentinel 单点):
+  中心化协调器(单点模型):
     所有信息流经协调器
     协调器带宽 = O(N²)
     协调器宕机 = 系统不可用
@@ -1485,7 +1485,7 @@ $ redis-cli --cluster reshard 192.168.1.100:7000 \
 <h3>27.10.2 Cluster 与 Sentinel 不可共用</h3>
 
 <div class="warning">
-  <strong>千万不要把 Cluster 节点交给 Sentinel 监控</strong>:Cluster 通过 PFAIL/FAIL 自行处理 failover,Sentinel 通过 SDOWN/ODOWN 处理 failover。两者同时触发会导致状态不一致 — Cluster 提升新 master 后,Sentinel 也尝试提升,configEpoch 与 Sentinel epoch 冲突,集群进入不可恢复状态。<br><br>
+  <strong>不要把同一组 Cluster 数据节点再交给 Sentinel 自动故障转移</strong>:Cluster 通过 PFAIL/FAIL 自行处理 failover,Sentinel 通过 SDOWN/ODOWN 处理 failover。两套自动 failover 权威同时操作同一批节点,会导致角色与 slot 归属状态互相覆盖,恢复成本很高。<br><br>
   正确选择:<strong>需要分片 + 高可用 → Cluster(内置 failover);仅需高可用,无分片需求 → 主从 + Sentinel。不要混用。</strong>
 </div>
 
@@ -1494,6 +1494,7 @@ $ redis-cli --cluster reshard 192.168.1.100:7000 \
 <!-- ============================================================ -->
 
 <h3>27.11.1 性能基线</h3>
+<p>以下数字是示例压测量级,受硬件、网络、pipeline、value 大小与客户端实现影响很大;用于理解趋势,不要直接作为生产 SLO。</p>
 
 <div class="metric-row">
   <div class="metric">
@@ -1509,15 +1510,15 @@ $ redis-cli --cluster reshard 192.168.1.100:7000 \
     <div class="label">1000 节点 Gossip 带宽</div>
   </div>
   <div class="metric">
-    <div class="value">15-30 μs</div>
-    <div class="label">P99 (cache hit)</div>
+    <div class="value">~0.9 ms</div>
+    <div class="label">示例 P99 (cache hit)</div>
   </div>
 </div>
 
 <h3>27.11.2 Cluster 吞吐扩展效率</h3>
 
 <div class="diagram">
-  <div class="diagram-title">表 27-11-1 · 节点数 vs 吞吐线性度 (100B value, pipeline=1, 50 并发)</div>
+  <div class="diagram-title">表 27-11-1 · 示例:节点数 vs 吞吐线性度 (100B value, pipeline=1, 50 并发)</div>
   <table>
     <thead><tr><th>master 数</th><th>实测 SET ops/s</th><th>理想线性</th><th>扩展效率</th></tr></thead>
     <tbody>
@@ -1578,7 +1579,7 @@ $ redis-cli --cluster reshard 192.168.1.100:7000 \
       <tr><td>3</td><td>cluster-require-full-coverage</td><td>单 master 故障导致全集群拒绝写入</td><td>默认 yes</td><td>缓存型业务设 no</td></tr>
       <tr><td>4</td><td>failover 过慢</td><td>故障后服务中断 15+ 秒</td><td>cluster-node-timeout 默认 15s</td><td>调至 5000-10000</td></tr>
       <tr><td>5</td><td>大 key 迁移阻塞</td><td>reshard 期间 P99 飙升秒级</td><td>MIGRATE 同步执行 DUMP/RESTORE</td><td>业务层迁移大 key</td></tr>
-      <tr><td>6</td><td>集群超过 1000 节点</td><td>Gossip 带宽 GB/s 级</td><td>O(N²) 通信复杂度</td><td>拆分多个 Cluster</td></tr>
+      <tr><td>6</td><td>集群规模过大</td><td>Gossip 带宽和运维复杂度显著上升</td><td>集群总通信随节点数快速增长</td><td>拆分多个 Cluster</td></tr>
       <tr><td>7</td><td>Lua 脚本跨 slot</td><td>NOSCRIPT 或 CROSSSLOT</td><td>脚本访问的 key 不同 slot</td><td>用 hash tag 统一</td></tr>
       <tr><td>8</td><td>Cluster 与 Sentinel 共用</td><td>failover 状态混乱</td><td>两套机制冲突</td><td>二选一,不混用</td></tr>
       <tr><td>9</td><td>客户端不缓存 slot</td><td>每次请求两跳</td><td>收到 MOVED 仅重试</td><td>使用 Smart Client</td></tr>
@@ -1799,16 +1800,16 @@ void markNodeAsFailingIfNeeded(clusterNode *node) {
     <tbody>
       <tr><td>1</td><td>16384 hash slot 分片,<code>slot = CRC16(key) &amp; 0x3FFF</code></td><td>bitmap 2 KB 适配 Gossip 包大小</td></tr>
       <tr><td>2</td><td>hash tag <code>{tag}</code> 强制相关 key 落同 slot</td><td>粒度过粗导致热点,过细失去意义</td></tr>
-      <tr><td>3</td><td>Gossip 协议 PING/PONG 周期性传播,O(log N) 收敛</td><td>1000 节点集群约 14 秒达成共识</td></tr>
+      <tr><td>3</td><td>Gossip 协议 PING/PONG 周期性传播;理想模型近似 O(log N)</td><td>1000 节点约 14 秒只是模型估算,不是生产 SLO</td></tr>
       <tr><td>4</td><td>PFAIL 单节点判定,FAIL 多数派 (<code>⌊N/2⌋+1</code>) 确认</td><td>网络分区时少数派无法误触 failover</td></tr>
       <tr><td>5</td><td>MOVED 永久 slot 归属,客户端更新本地缓存</td><td><code>MOVED &lt;slot&gt; &lt;ip&gt;:&lt;port&gt;</code></td></tr>
       <tr><td>6</td><td>ASK 迁移期临时跳转,不更新缓存,需先发 ASKING</td><td>避免源/目标间死循环</td></tr>
-      <tr><td>7</td><td>MIGRATE 单 key 原子 (DUMP+RESTORE+DEL)</td><td>大 key 迁移同步阻塞主线程</td></tr>
-      <tr><td>8</td><td>reshard 通过 SETSLOT MIGRATING/IMPORTING + 批量 MIGRATE</td><td>服务零中断,ASK 跳转</td></tr>
-      <tr><td>9</td><td>Cluster 与 Sentinel 不能混用</td><td>两套故障检测机制冲突</td></tr>
+      <tr><td>7</td><td>MIGRATE 正常路径为 DUMP+RESTORE+DEL;超时后需校验两端</td><td>大 key 迁移同步阻塞主线程</td></tr>
+      <tr><td>8</td><td>reshard 通过 SETSLOT MIGRATING/IMPORTING + 批量 MIGRATE</td><td>在线迁移依赖 ASK/MOVED 与客户端重试</td></tr>
+      <tr><td>9</td><td>同一组 Cluster 节点不要再交给 Sentinel 自动 failover</td><td>两套故障转移权威会互相覆盖状态</td></tr>
       <tr><td>10</td><td>多 key 命令、Lua 脚本、MULTI/EXEC 要求所有 key 同 slot</td><td>否则 CROSSSLOT 错误</td></tr>
-      <tr><td>11</td><td>cluster-node-timeout 5-10s,cluster-require-full-coverage no</td><td>缓存场景生产推荐</td></tr>
-      <tr><td>12</td><td>Smart Client 缓存 slot 映射,~1000 节点上限拆多 Cluster</td><td>带宽 O(N²) 是规模瓶颈</td></tr>
+      <tr><td>11</td><td>cluster-node-timeout 5-10s,cluster-require-full-coverage no</td><td>缓存场景的常见起点,需按业务校准</td></tr>
+      <tr><td>12</td><td>Smart Client 缓存 slot 映射,超大规模应拆多 Cluster</td><td>Gossip 带宽、故障域与运维复杂度是规模瓶颈</td></tr>
     </tbody>
   </table>
 </div>
@@ -1858,9 +1859,9 @@ redis-cli CLUSTER COUNT-FAILURE-REPORTS &lt;node-id&gt;</code></pre>
       <tr><td>SET / GET (MOVED 重定向)</td><td>2.0 ms</td><td>多一跳网络 RTT</td></tr>
       <tr><td>MGET 同 hash tag</td><td>1-2 ms</td><td>单节点完成</td></tr>
       <tr><td>Failover 总耗时 (默认 15s)</td><td>17-22 秒</td><td>不可服务窗口</td></tr>
-      <tr><td>Failover (timeout 5000)</td><td>6-10 秒</td><td>生产推荐配置</td></tr>
-      <tr><td>1000 节点 Gossip 收敛</td><td>~14 秒</td><td>O(log N)</td></tr>
-      <tr><td>1000 节点 Gossip 带宽</td><td>~30 MB/s</td><td>O(N²) 集群总量</td></tr>
+      <tr><td>Failover (timeout 5000)</td><td>6-10 秒</td><td>示例配置,需按误判率校准</td></tr>
+      <tr><td>1000 节点 Gossip 收敛</td><td>~14 秒</td><td>理想模型估算,非 SLO</td></tr>
+      <tr><td>1000 节点 Gossip 带宽</td><td>~30 MB/s</td><td>示例估算,实际看包大小/频率</td></tr>
       <tr><td>6 master 吞吐扩展效率</td><td>91%</td><td>~680K SET ops/s</td></tr>
     </tbody>
   </table>

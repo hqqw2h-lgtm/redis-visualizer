@@ -53,7 +53,7 @@
 <p class="subtitle">八种 maxmemory-policy · 采样 + 16 槽淘汰池 · 24-bit LRU 时钟 · Morris 概率计数器 · LFU 衰减 · volatile-ttl 预测性淘汰 · Cluster 一致性</p>
 
 <div class="chapter-intro">
-  <p class="lead">Redis 是内存数据库,内存容量是<strong>硬约束</strong>。当数据量增长至 <code>maxmemory</code> 上限时,必须在"写入新 key"与"淘汰旧 key"之间作出选择。Redis 的淘汰机制由三部分组成:<strong>八种策略</strong>覆盖"范围 × 算法"二维取舍空间,<strong>随机采样 + 淘汰池</strong>实现 O(1) 时间复杂度的近似 LRU/LFU,<strong>redisObject 内嵌 24-bit lru 字段</strong>使元数据开销近零。</p>
+  <p class="lead">Redis 是内存数据库,内存容量是<strong>硬约束</strong>。当 Redis 通过分配器申请的内存接近 <code>maxmemory</code> 时,写命令必须在"淘汰旧 key"与"返回 OOM"之间作出选择。注意:<code>maxmemory</code> 约束的是 Redis 统计内存,不是 OS RSS、网络缓冲、复制缓冲或持久化 fork 峰值。Redis 的淘汰机制由三部分组成:<strong>八种策略</strong>覆盖"范围 × 算法"二维取舍空间,<strong>随机采样 + 淘汰池</strong>实现 O(1) 时间复杂度的近似 LRU/LFU,<strong>redisObject 内嵌 24-bit lru 字段</strong>使元数据开销近零。</p>
   <p>精确 LRU 需要全局双向链表,每节点至少 16 字节指针开销,千万级 key 下额外内存约 152 MB,且每次访问都需链表移动维护。精确 LFU 需要全局优先队列,空间 O(N) + 维护 O(log N)。Redis 的近似方案以"命中率损失约 3-5%"换取"元数据开销近零 + 维护 O(1)",该取舍在缓存场景下显著优于精确算法。本章按"必要性 → 八种策略 → 采样机制 → LRU/LFU 算法 → 部署适配 → 陷阱"组织,聚焦淘汰决策的工程权衡与生产可观测性。</p>
   <ul class="will-learn">
     <li><code>processCommand</code> 写命令前置淘汰检查的执行时机与延迟影响</li>
@@ -70,7 +70,7 @@
     <li>命中率基线、samples 调优、核心 INFO/OBJECT 监控指标</li>
     <li>八类典型陷阱及其根因、症状、修复路径与监控指标</li>
   </ul>
-  <p class="prereq">前置知识:第 4 章 redisObject 与 encoding(理解 <code>type:4 / encoding:4 / lru:24 / refcount:32 / ptr</code> 五字段布局);第 22 章 jemalloc(理解 <code>used_memory</code> / <code>RSS</code> / <code>mem_fragmentation_ratio</code> 三层关系);第 24 章预读 lazyfree(理解 <code>lazyfree-lazy-eviction yes</code> 的 bio 异步释放);Linux 内存基础(物理内存、cgroup、OOM Killer)。读者最好亲手跑过 <code>redis-cli CONFIG SET maxmemory 10mb</code> 后写入大量数据并观察 <code>INFO stats</code> 中的 <code>evicted_keys</code> 变化。</p>
+  <p class="prereq">前置知识:第 9 章 redisObject(理解 <code>type:4 / encoding:4 / lru:24 / refcount:32 / ptr</code> 五字段布局);第 10 章 encoding(理解对象编码与释放成本);第 22 章 jemalloc(理解 <code>used_memory</code> / <code>RSS</code> / <code>mem_fragmentation_ratio</code> 三层关系);第 24 章预读 lazyfree(理解 <code>lazyfree-lazy-eviction yes</code> 的 bio 异步释放);Linux 内存基础(物理内存、cgroup、OOM Killer)。读者最好亲手跑过 <code>redis-cli CONFIG SET maxmemory 10mb</code> 后写入大量数据并观察 <code>INFO stats</code> 中的 <code>evicted_keys</code> 变化。</p>
 </div>
 
 <h3>本章全景图</h3>
@@ -111,7 +111,7 @@
         <text x="120" y="196" text-anchor="middle">同步阻塞淘汰</text>
         <text x="120" y="214" text-anchor="middle">直接进 P99 延迟</text>
         <text x="120" y="232" text-anchor="middle">maxmemory ≠ 物理内存</text>
-        <text x="120" y="258" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">必须留 30-40% 给 fork</text>
+        <text x="120" y="258" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">按 fork/缓冲/RSS 峰值预留</text>
         <text x="120" y="272" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">CoW + 输出缓冲 + 碎片</text>
 
         <rect x="270" y="160" width="200" height="120" rx="4" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
@@ -370,9 +370,9 @@ int processCommand(client *c) {
           ├── COW (RDB/AOF rewrite) 取决于写流量
           └── 内存碎片             mem_fragmentation_ratio
 
-经验配置:
-  maxmemory 设为系统物理内存的 60-70%
-  其余 30-40% 留给:
+示例经验(不是固定比例):
+  maxmemory 可先按物理内存的 60-70% 估算
+  其余空间留给:
     fork() COW 内存峰值
     输出缓冲、复制缓冲
     内存碎片(jemalloc)
@@ -381,7 +381,7 @@ int processCommand(client *c) {
   maxmemory 20 GB
   保留 12 GB 容纳 RDB/AOF 重写期间的 COW</code></pre>
 
-<p><code>maxmemory</code> 仅控制 keyspace 数据 + 数据结构开销,<strong>不包括 fork COW、输出缓冲、复制 backlog、内部数据结构</strong>。生产配置必须为这些"非 keyspace 内存"预留充足余量,否则 <code>BGREWRITEAOF</code> / <code>BGSAVE</code> 期间会触发 OOM Killer。</p>
+<p><code>maxmemory</code> 控制的是 Redis 统计内存口径,<strong>不是 OS RSS 或 cgroup 上限</strong>;fork COW、输出缓冲、复制 backlog、allocator dirty page 与内核开销仍需额外预留。生产配置应基于本实例写入峰值、持久化窗口与碎片指标校准,否则 <code>BGREWRITEAOF</code> / <code>BGSAVE</code> 期间可能触发 OOM Killer。</p>
 
 <div class="real-world">
   <strong>真实事故案例:</strong> 某电商大促前夜,运维将 <code>maxmemory</code> 设为系统物理内存的 90%(28.8 GB / 32 GB),意图最大化缓存容量。大促开始后写流量激增,触发 <code>BGREWRITEAOF</code>,fork 子进程时 COW 在 5 分钟内增长 6 GB,系统总内存使用达到 35 GB,kernel OOM Killer 选择 Redis 主进程(RSS 最大)杀掉,服务中断 12 分钟。事后将 <code>maxmemory</code> 调回 20 GB(62.5%),并增加 <code>repl-backlog-size</code> 监控。
@@ -441,7 +441,7 @@ int processCommand(client *c) {
 
       <rect x="40"  y="196" width="320" height="46" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
       <text x="200" y="216" text-anchor="middle" fill="var(--diagram-green-text)" font-size="12" font-weight="800">allkeys-* 候选集</text>
-      <text x="200" y="232" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">永远非空(只要 keyspace 有 key)</text>
+      <text x="200" y="232" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="9">只要 keyspace 有 key 就有候选</text>
 
       <rect x="580" y="196" width="320" height="46" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
       <text x="740" y="216" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="12" font-weight="800">volatile-* 候选集</text>
@@ -456,7 +456,7 @@ int processCommand(client *c) {
       <text x="600" y="296" fill="var(--diagram-red-text)" font-size="10">"配 volatile-lru 但全部 key 无 TTL"</text>
 
       <rect x="40" y="324" width="860" height="44" rx="8" fill="url(#d-orange)" filter="url(#d-shadow)"/>
-      <text x="470" y="343" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">实战检查:DEBUG OBJECT &lt;key&gt; 看 ttl;统计 INFO keyspace 中 expires 比例</text>
+      <text x="470" y="343" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">实战检查:TTL/PTTL &lt;key&gt; 看过期时间;统计 INFO keyspace 中 expires 比例</text>
       <text x="470" y="360" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">expires=0 时改用 allkeys-* 或确保 SET 都带 EX 才用 volatile-*</text>
     </g>
   </svg>
@@ -916,7 +916,7 @@ unsigned long long estimateObjectIdleTime(robj *o) {
   </svg>
 </div>
 
-<p>精确 LRU 维护全局有序链表,需要每次访问时调整链表结构,且每个 key 增加两个指针(64-bit 系统 16 字节)。Redis 近似 LRU 仅在访问时更新一个 24-bit 字段,淘汰时采样 10 个 key 选择 idle 最大者。后者牺牲了一定的精度(单次淘汰可能选不到全局最差候选),但通过淘汰池跨轮次累积,最终命中率与精确 LRU 接近。</p>
+<p>精确 LRU 维护全局有序链表,需要每次访问时调整链表结构,且每个 key 增加两个指针(64-bit 系统 16 字节)。Redis 近似 LRU 仅在访问时更新一个 24-bit 字段,淘汰时采样 10 个 key 选择 idle 最大者。后者牺牲部分精度(单次淘汰可能选不到全局最差候选),但通过淘汰池跨轮次累积,最终命中率与精确 LRU 接近。</p>
 
 <!-- ============================================================ -->
 <h2 id="s23-5">23.5 近似 LFU:Morris 计数器</h2>
@@ -1059,7 +1059,7 @@ $ redis-cli OBJECT FREQ user:cold:1
 <h2 id="s23-6">23.6 volatile-ttl:预测性淘汰</h2>
 <!-- ============================================================ -->
 
-<h3>23.6.1 volatile-ttl 的 idle 计算</h3>
+<h3>23.6.1 volatile-ttl 的评分计算</h3>
 
 <pre><code class="language-c">/* src/evict.c: evictionPoolPopulate 中 */
 if (server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL) {
@@ -1067,18 +1067,18 @@ if (server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL) {
     /* dictGetVal(de) 是 expire 字典的 value, 即过期时间戳(毫秒) */
 }</code></pre>
 
-<pre class="ascii-art"><code>idle 值计算逻辑:
+<pre class="ascii-art"><code>淘汰池 score 计算逻辑(变量名仍叫 idle):
 
   expire_time   key 的过期时间戳 (毫秒)
-  idle = ULLONG_MAX - expire_time
+  score = ULLONG_MAX - expire_time
 
-  过期越早 → expire_time 越小 → idle 越大 → 越优先淘汰
+  过期越早 → expire_time 越小 → score 越大 → 越优先淘汰
 
 示例:
   key A: 1 分钟后过期, expire_time = now + 60_000
   key B: 1 小时后过期, expire_time = now + 3_600_000
   
-  A 的 idle &gt; B 的 idle
+  A 的 score &gt; B 的 score
   A 更可能被采样选为淘汰候选
 
 设计依据:
@@ -1149,7 +1149,7 @@ if (server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL) {
       <line x1="20"  y1="295" x2="920" y2="295" stroke="var(--diagram-border)"/>
       <text x="40" y="316" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">三机制独立而互补:</text>
       <text x="40" y="336" fill="var(--diagram-blue-text)" font-size="10">①+② 处理"已过期" · ③ 处理"即将过期",在内存压力下提前释放价值最低的 key</text>
-      <text x="40" y="354" fill="var(--diagram-muted)" font-size="9">↑ 三者都仅作用于 db-&gt;expires;无 TTL 的 key 永远不被它们处理</text>
+      <text x="40" y="354" fill="var(--diagram-muted)" font-size="9">↑ 三者都仅作用于 db-&gt;expires;无 TTL 的 key 不会被这些策略处理</text>
     </g>
   </svg>
 </div>
@@ -1190,7 +1190,7 @@ if (server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL) {
       <tr><td>单节点</td><td>主节点同步淘汰</td><td>无</td><td>lazyfree 减少阻塞</td></tr>
       <tr><td>主从复制</td><td>仅主节点</td><td>主 → 从复制 DEL</td><td><code>replica-ignore-maxmemory yes</code></td></tr>
       <tr><td>Sentinel</td><td>仅当前主节点</td><td>同主从</td><td>failover 后新主继承策略</td></tr>
-      <tr><td>Cluster</td><td>每个 master 独立</td><td>各自传播给本 shard 的 replica</td><td>各 master maxmemory 必须一致</td></tr>
+      <tr><td>Cluster</td><td>每个 master 独立</td><td>各自传播给本 shard 的 replica</td><td>各 master maxmemory 应与容量/slot 规划一致</td></tr>
     </tbody>
   </table>
 </div>
@@ -1298,7 +1298,8 @@ if (server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL) {
 
 <h3>23.8.1 命中率基线 (Zipfian α=1.0)</h3>
 
-<pre class="ascii-art"><code>基准: 100,000 keys, maxmemory 容纳 50,000 keys (50%)
+<pre class="ascii-art"><code>示例基准(仅说明趋势,不要当作通用生产指标):
+基准: 100,000 keys, maxmemory 容纳 50,000 keys (50%)
 负载: 1,000,000 GET 请求, Zipfian α=1.0
 maxmemory-samples: 10
 
@@ -1335,7 +1336,7 @@ maxmemory-samples: 10
 观察:
   samples = 10 已达精确 LRU 命中率的 97.2%
   从 10 提升到 50 仅获得 2% 命中率,但 CPU 显著增加
-  生产推荐保持默认值 10</code></pre>
+  通常先保持默认值 10,再按 CPU 与命中率曲线调优</code></pre>
 
 <h3>23.8.3 核心观测指标</h3>
 
@@ -1346,9 +1347,9 @@ maxmemory-samples: 10
       <tr><th>指标</th><th>来源</th><th>含义</th><th>异常阈值</th></tr>
     </thead>
     <tbody>
-      <tr><td><code>used_memory</code></td><td>INFO memory</td><td>当前 keyspace 内存占用</td><td>接近 maxmemory 告警</td></tr>
+      <tr><td><code>used_memory</code></td><td>INFO memory</td><td>Redis 申请字节,含对象/元数据开销</td><td>接近 maxmemory 时写命令会触发淘汰/拒绝</td></tr>
       <tr><td><code>maxmemory</code></td><td>INFO memory</td><td>配置上限</td><td>—</td></tr>
-      <tr><td><code>mem_fragmentation_ratio</code></td><td>INFO memory</td><td>RSS / used_memory</td><td>&gt; 1.5 调查碎片</td></tr>
+      <tr><td><code>mem_fragmentation_ratio</code></td><td>INFO memory</td><td>RSS / used_memory</td><td>持续偏高时结合 allocator 指标调查</td></tr>
       <tr><td><code>evicted_keys</code></td><td>INFO stats</td><td>累计淘汰 key 数</td><td>单位时间增量监控</td></tr>
       <tr><td><code>keyspace_hits</code></td><td>INFO stats</td><td>累计命中数</td><td>与 misses 计算命中率</td></tr>
       <tr><td><code>keyspace_misses</code></td><td>INFO stats</td><td>累计未命中数</td><td>—</td></tr>
@@ -1374,14 +1375,14 @@ maxmemory-samples: 10
 - record: redis:memory_pressure
   expr: redis_memory_used_bytes / redis_config_maxmemory
 
-# 告警: 持续高淘汰
+# 告警示例: 持续高淘汰(阈值需按业务 QPS 调整)
 - alert: RedisHighEviction
   expr: rate(redis_evicted_keys_total[5m]) &gt; 1000
   for: 10m
   annotations:
     summary: "Redis 持续淘汰 > 1000 keys/s (instance={{ $labels.instance }})"
 
-# 告警: 命中率跌破阈值
+# 告警示例: 命中率跌破阈值(阈值需按业务基线调整)
 - alert: RedisLowHitRatio
   expr: redis:hit_ratio &lt; 0.85
   for: 15m
@@ -1473,7 +1474,7 @@ maxmemory-samples: 10
       <text x="200" y="430" fill="var(--diagram-blue-text)" font-size="10">→ 检查 lazyfree-lazy-eviction 是否 yes,有无大 key</text>
 
       <text x="40" y="448" fill="var(--diagram-purple-text)" font-size="10">主进程被 OOM Killed</text>
-      <text x="200" y="448" fill="var(--diagram-blue-text)" font-size="10">→ maxmemory ≥ 80% 物理内存 + fork 期间 CoW</text>
+      <text x="200" y="448" fill="var(--diagram-blue-text)" font-size="10">→ maxmemory 只管 Redis 统计内存,还要预留 RSS/缓冲/fork CoW</text>
     </g>
   </svg>
 </div>
@@ -1492,7 +1493,7 @@ maxmemory-samples: 10
       <tr><td>3</td><td>数据库实例配 allkeys-*</td><td>主数据被静默淘汰</td><td>角色识别错误</td><td>改回 noeviction</td><td>业务对账</td></tr>
       <tr><td>4</td><td>maxmemory-samples=1</td><td>命中率暴跌</td><td>误改配置</td><td>改回 10</td><td>命中率监控</td></tr>
       <tr><td>5</td><td>大 key 淘汰阻塞</td><td>写延迟 P99 尖刺</td><td>lazyfree 未开</td><td><code>CONFIG SET lazyfree-lazy-eviction yes</code></td><td>latest_fork / latency</td></tr>
-      <tr><td>6</td><td>maxmemory 过高</td><td>fork 时 OOM Kill</td><td>maxmemory ≥ 物理内存 80%</td><td>调低至 60-70%</td><td>mem_fragmentation_ratio</td></tr>
+      <tr><td>6</td><td>maxmemory 过高</td><td>fork 时 OOM Kill</td><td>把 maxmemory 当 RSS 上限</td><td>预留碎片、缓冲与 fork CoW 峰值</td><td>RSS / allocator 指标 / latest_fork_usec</td></tr>
       <tr><td>7</td><td>Cluster 配置不一致</td><td>部分 shard 频繁淘汰</td><td>各 master 独立配</td><td>统一通过 cluster call</td><td>各 shard evicted_keys</td></tr>
       <tr><td>8</td><td>Replica 内存超主</td><td>Replica OOM</td><td>replica-ignore-maxmemory 默认 yes</td><td>cgroup 限制 + 监控</td><td>Replica used_memory</td></tr>
     </tbody>
@@ -1754,13 +1755,13 @@ void evictionPoolPopulate(int dbid, dict *sampledict, dict *keydict,
       <tr><td>1</td><td>淘汰由 <code>processCommand</code> 在写命令前置检查触发,<strong>同步执行</strong>直至内存压回 maxmemory 或候选集耗尽</td></tr>
       <tr><td>2</td><td>八种策略按"<strong>范围 (allkeys/volatile) × 算法 (lru/lfu/random/ttl/none)</strong>"二维组合,noeviction 是默认</td></tr>
       <tr><td>3</td><td><code>volatile-*</code> 候选集为 <code>db-&gt;expires</code>,所有 key 无 TTL 时<strong>退化为 noeviction</strong>,生产最常见配置错误</td></tr>
-      <tr><td>4</td><td>数据库角色实例必须配 <code>noeviction</code>,缓存角色实例推荐 <code>allkeys-lfu</code>(Zipfian)或 <code>allkeys-lru</code>(均匀)</td></tr>
+      <tr><td>4</td><td>数据库角色通常使用 <code>noeviction</code>;缓存角色按访问分布选择 <code>allkeys-lfu</code>(Zipfian)或 <code>allkeys-lru</code>(均匀)</td></tr>
       <tr><td>5</td><td>采样 + 16 槽淘汰池实现 <strong>O(1) 元数据 + O(s) 淘汰</strong>开销,跨轮次累积使命中率逼近精确算法</td></tr>
       <tr><td>6</td><td><code>redisObject</code> 的 24-bit <code>lru</code> 字段在 LRU 模式存时间戳,LFU 模式分裂为 <strong>16-bit ldt + 8-bit logc</strong></td></tr>
       <tr><td>7</td><td>LRU 时钟 24 bits <strong>秒级精度,回绕周期 194 天</strong>,实际场景无影响;LFU 分钟级 ldt 回绕周期 45 天</td></tr>
       <tr><td>8</td><td>LFU 用 <strong>Morris 概率递增</strong>使 8-bit logc 表达 6 个数量级访问频率,衰减由 <code>lfu-decay-time</code> 控制</td></tr>
       <tr><td>9</td><td><code>volatile-ttl</code> 是<strong>预测性淘汰</strong>,优先删除即将过期的 key,与过期删除机制独立</td></tr>
-      <tr><td>10</td><td>生产配置:<code>lazyfree-lazy-eviction yes</code>(避免大 key 阻塞)、<code>maxmemory-samples 10</code>(命中率甜蜜点)、Cluster 各 master maxmemory 一致</td></tr>
+      <tr><td>10</td><td>常见配置起点:<code>lazyfree-lazy-eviction yes</code> 降低大 key 释放阻塞,<code>maxmemory-samples</code> 按命中率/CPU 权衡,Cluster 各 master 容量与 slot 规划一致</td></tr>
     </tbody>
   </table>
 </div>
@@ -1802,8 +1803,6 @@ redis-cli OBJECT FREQ hot:1   # 期望: 高 logc 值,如 ~40-50</code></pre>
 </div>
 
 <p class="footer">&copy; 2026 图解 Redis &middot; 第 23 章 &middot; 淘汰策略</p>
-
-</div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/c.min.js"></script>

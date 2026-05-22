@@ -75,7 +75,7 @@
 <p class="subtitle">双向索引 · glob 匹配 · fire-and-forget · Cluster Bus 网络放大 · Sharded 路由 · 慢消费者治理</p>
 
 <div class="chapter-intro">
-  <p class="lead">Redis 的发布订阅由 <strong>两个 dict 加一个 list</strong> 实现完整的 channel/pattern 订阅模型,语义是 <em>fire-and-forget</em>:消息不持久化、不堆积、无 ACK,投递语义是 <strong>at-most-once</strong>。这种设计在单节点上提供低于毫秒的投递延迟,代价是任何环节(订阅者离线、缓冲溢出、消费者 crash)都可能丢消息。</p>
+  <p class="lead">Redis 的发布订阅由普通 channel 字典、分片 channel 字典和 pattern 列表共同实现,语义是 <em>fire-and-forget</em>:消息不持久化、不堆积、无 ACK,投递语义是 <strong>at-most-once</strong>。这种设计追求低延迟,代价是任何环节(订阅者离线、缓冲溢出、消费者 crash)都可能丢消息。</p>
   <p>在 Cluster 模式下,普通 <code>PUBLISH</code> 通过 Cluster Bus 广播到所有节点,产生 <strong>O(N) 网络放大</strong>;Redis 7.0 引入 <strong>Sharded Pub/Sub</strong>(<code>SPUBLISH</code>/<code>SSUBSCRIBE</code>),把 channel 当成 key 计算 slot,消息仅在归属节点投递,网络放大降至 O(1)。Pub/Sub 与 Stream 共同覆盖 Redis 的消息光谱:Pub/Sub 选择极致延迟与简单性,Stream 提供 backlog/ACK/offset/consumer group,牺牲部分延迟换取可靠投递。</p>
   <ul class="will-learn">
     <li>服务端 <code>pubsub_channels</code> dict + <code>pubsub_patterns</code> list + 客户端镜像的双向索引设计,以及为何这样选</li>
@@ -85,7 +85,7 @@
     <li>Cluster 模式下 PUBLISH 的 O(N-1) Bus 放大公式,N=12 / N=100 的带宽估算</li>
     <li>Sharded Pub/Sub 的 slot 路由、MOVED 重定向、slot 迁移期的订阅中断处理</li>
     <li>Redis Pub/Sub vs MQTT / RabbitMQ / Kafka / PG NOTIFY / NATS Core 的六维对比矩阵</li>
-    <li>主从复制中 PUBLISH 不经复制流的设计原因,以及"客户端必须连主"的工程结论</li>
+    <li>主从复制中 PUBLISH 不经复制流的设计原因,以及发布端/订阅端必须统一连接策略的工程结论</li>
     <li>慢消费者的 <code>client-output-buffer-limit pubsub 32mb 8mb 60</code> 治理 + <code>CLIENT LIST</code> 观测路径</li>
     <li>大 fan-out 场景 P99 延迟从 0.5ms → 60ms 的退化曲线 + 分层架构(Redis → Kafka → 终端)的取舍</li>
     <li>客户端自动重订阅模板:指数退避 + socket_keepalive + health_check 三件套</li>
@@ -446,7 +446,7 @@ struct client {
 </table>
 
 <div class="key-insight">
-  <p><strong>设计同构。</strong>双向索引 = 数据库的二级索引:用一定空间换查询时间。Redis 在所有"反向需精确定位"的地方都用了这个模式(Cluster slot ↔ key 的反查、过期 key 的反查、复制 ID 的反查)。</p>
+  <p><strong>设计同构。</strong>双向索引 = 数据库的二级索引:用空间换查询时间。Redis 在许多"反向需精确定位"的地方都采用类似模式,例如 Cluster slot ↔ key 的反查、过期 key 的反查等。</p>
 </div>
 
 <h2 id="s30-3">30.3 SUBSCRIBE 与 PUBLISH 实现</h2>
@@ -862,7 +862,7 @@ void clusterPropagatePublish(robj *channel, robj *message) {
     <li>小集群 N = 12: <code>R_bus = 110,000 msg/s</code>, <code>BW_bus ≈ 22 MB/s</code></li>
     <li>大集群 N = 100: <code>R_bus = 990,000 msg/s</code>, <code>BW_bus ≈ 198 MB/s</code></li>
   </ul>
-  <p>Bus 带宽是 Redis 集群协议的"血管",承担 gossip、PFAIL/FAIL、SLOTUPDATE、manual failover。PUBLISH 抢占 Bus → 心跳排队 → PFAIL 误判 → 误判 failover → 业务可用性下降。</p>
+  <p>Bus 带宽承载 gossip、PFAIL/FAIL、SLOTUPDATE、manual failover 等集群控制流量。高频 PUBLISH 会挤占这些控制消息的网络与处理预算,在大集群里可能放大故障检测延迟或误判风险。</p>
 </div>
 
 <h2 id="s30-7">30.7 Sharded Pub/Sub(Redis 7.0)</h2>
@@ -1089,7 +1089,7 @@ void spublishCommand(client *c) {
 
 <h2 id="s30-10">30.10 性能与基线</h2>
 
-<p>单节点 fan-out 是 Pub/Sub 的核心成本曲线:订阅者越多,P99 延迟下降越快。</p>
+<p>单节点 fan-out 是 Pub/Sub 的核心成本曲线:订阅者越多,每次 PUBLISH 要写入的输出缓冲越多,P99 延迟通常上升越快。</p>
 
 <p class="svg-title">图 30-10-1 · 单节点 fan-out 退化曲线 — 1 → 10,000 订阅者</p>
 <svg class="svg-diagram" viewBox="0 0 920 380" xmlns="http://www.w3.org/2000/svg">
@@ -1134,9 +1134,9 @@ void spublishCommand(client *c) {
 <div class="key-insight">
   <p><strong>fan-out 取舍</strong>:</p>
   <ul>
-    <li><strong>小 fan-out</strong> (&lt; 100): Pub/Sub 几乎免费</li>
+    <li><strong>小 fan-out</strong> (&lt; 100): Pub/Sub 成本通常很低</li>
     <li><strong>中 fan-out</strong> (100-1000): 注意 P99 延迟,准备分流</li>
-    <li><strong>大 fan-out</strong> (&gt; 1000): 必须分层架构 → Redis → Kafka → 终端</li>
+    <li><strong>大 fan-out</strong> (&gt; 1000): 评估分片、分层推送或外部消息系统,不要只依赖单个 Redis 节点</li>
   </ul>
   <p>PUBLISH 总成本 = 序列化 + S × 输出缓冲写入;S × T_buffer_write 在 S=10000 时占主导,主线程被复制操作打满,其他命令延迟也会上升。</p>
 </div>
@@ -1149,7 +1149,7 @@ void spublishCommand(client *c) {
 </tbody>
 </table>
 
-<p>吞吐差异 2.6×,带宽节省 ~99%。节点越多差距越大:N=30 时 PUBLISH 接近不可用,N=100 时必然瘫痪。</p>
+<p>这个基准里吞吐差异约 2.6×,Bus 带宽节省接近 99%。节点越多,普通 PUBLISH 的 O(N) 放大越明显;到几十个节点时必须用真实负载压测,优先考虑 Sharded Pub/Sub 或外部消息系统。</p>
 
 <h3>30.10.x · 观测指标</h3>
 
@@ -1342,13 +1342,13 @@ void clusterPropagatePublish(robj *channel, robj *message) {
 
 <h3>设计取舍</h3>
 
-<p>Redis Pub/Sub 选择"双向索引"是空间换时间的经典权衡。若仅 server 端持有 channel → clients 映射,客户端断连时清理需遍历所有 channel,O(全 channel × 平均订阅者)。增加 client 端镜像后,断连清理为 O(此客户端的订阅数),代价是每个订阅消耗双倍指针。该模式与关系数据库的二级索引设计同构:用一定空间换查询时间。</p>
+<p>Redis Pub/Sub 选择"双向索引"是空间换时间的经典权衡。若仅 server 端持有 channel → clients 映射,客户端断连时清理需遍历所有 channel,O(全 channel × 平均订阅者)。增加 client 端镜像后,断连清理为 O(此客户端的订阅数),代价是每个订阅消耗双倍指针。该模式与关系数据库的二级索引设计同构:用额外空间换查询时间。</p>
 
 <p><code>pubsub_patterns</code> 选择 list 而非 dict 的根本原因是 pattern 与 channel 的不可逆关系。dict 加速的前提是有可哈希的 key 直接定位到 value;但 pattern 是表达式,channel 是具体字符串,两者不能互相反推。每次 PUBLISH 必须对每个 pattern 调用 stringmatchlen 判定,无法跳过。trie 或 NFA 可优化前缀共享场景,但代码复杂度显著增加,对生产环境通常 &lt; 100 个 pattern 的规模收益不大,Redis 选择保留最简洁的 list 实现。</p>
 
-<p>PUBLISH 不经过主从复制流是 Pub/Sub 即时性的必然结果。复制流是异步的,从节点接收时间晚于主节点,若从节点重放 PUBLISH 会导致重复投递;若仅从节点重放,主节点订阅者无消息。Redis 选择"PUBLISH 仅在执行节点处理",主从订阅者独立,代价是从节点订阅者无法完整看到全局消息流,需应用层规定连接到主节点。</p>
+<p>PUBLISH 不经过主从复制流,而是在执行该命令的节点上立即投递给本地订阅者。主从订阅状态彼此独立:如果业务只在主节点发布,连接到副本的订阅者不会自动收到同一条消息。应用层需要明确规定发布端和订阅端连接到哪些节点;需要可重放、可确认的投递语义时应改用 Stream 或专用消息系统。</p>
 
-<p>Redis 7.0 引入 Sharded Pub/Sub 是对 Cluster 模式 PUBLISH 不可扩展性的根本回应。原生 PUBLISH 通过 Cluster Bus 广播保证全局可达,但 O(N) 网络放大在大集群下不可接受。Sharded Pub/Sub 将 channel 提升为 key,通过 hash slot 路由,牺牲全局可达性换取 O(1) 网络成本。该设计与 Redis Cluster 的核心 key 分片模式一致,使消息系统与数据系统共用同一拓扑模型。代价是 pattern 订阅在 Sharded 模式下不存在(<code>SPSUBSCRIBE</code> 不实现),因为 pattern 的全局语义与 slot 隔离原则冲突。</p>
+<p>Redis 7.0 引入 Sharded Pub/Sub,是为了解决 Cluster 普通 PUBLISH 的 O(N) 广播成本。Sharded Pub/Sub 将 channel 当作 key 计算 slot,只在归属 shard 内投递,用跨 slot 广播能力换取 O(1) 级别的集群网络成本。代价是 Sharded 模式不提供 pattern 订阅(<code>SPSUBSCRIBE</code> 不存在),因为 pattern 的全局匹配语义与 slot 隔离原则冲突。</p>
 
 <h2 id="s30-summary">30.13 本章要点</h2>
 
@@ -1361,7 +1361,7 @@ void clusterPropagatePublish(robj *channel, robj *message) {
 <li>Cluster 普通 PUBLISH 通过 Cluster Bus 广播到所有节点,产生 <strong>O(N) 网络放大</strong></li>
 <li>Redis 7.0 <strong>Sharded Pub/Sub</strong>(<code>SPUBLISH</code>/<code>SSUBSCRIBE</code>)将 channel 视作 key,按 slot 路由消除 Bus 放大</li>
 <li>Sharded Pub/Sub <strong>不支持 pattern</strong>,客户端需处理 MOVED 重定向,slot 迁移触发订阅中断</li>
-<li>PUBLISH 不经主从复制流传播,主从订阅者状态独立;实践中应规定客户端连主节点</li>
+<li>PUBLISH 不经主从复制流传播,主从订阅者状态独立;实践中应统一发布端与订阅端的连接策略</li>
 <li>慢消费者通过 <code>client-output-buffer-limit pubsub 32mb 8mb 60</code> 控制</li>
 <li>需要可靠投递时应使用 Stream;Sentinel 自身用 <code>__sentinel__:hello</code> 通过 Pub/Sub 做服务发现</li>
 </ol>

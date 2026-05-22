@@ -55,19 +55,12 @@
 <p class="subtitle">概率多层链表 · span 排名累加 · backward 反向遍历 · dict + skiplist 双结构 · O(log N) 范围 + rank</p>
 
 <div class="chapter-intro">
-  <p class="lead">ZSet(Sorted Set)需要在同一个数据结构上同时提供四种访问能力:<strong><code>ZSCORE</code> 按 member 查 score(O(1) 期望)</strong>、<strong><code>ZRANGEBYSCORE</code> 按 score 范围扫描(O(log N + M))</strong>、<strong><code>ZRANK</code> 计算排名(O(log N))</strong>、<strong><code>ZREVRANGE</code> 反向遍历</strong>。dict 解决不了范围扫描;平衡树(红黑树/AVL)能解决但插删需要旋转,源码复杂且不易在单线程中精确计算 <code>span</code>(排名累加);B 树主要为磁盘 I/O 设计,内存场景常数大。</p>
+  <p class="lead">ZSet(Sorted Set)要同时回答四类问题:<strong><code>ZSCORE</code> 按 member 查 score</strong>、<strong><code>ZRANGEBYSCORE</code> 按 score 找一段</strong>、<strong><code>ZRANK</code> 算排名</strong>、<strong><code>ZREVRANGE</code> 反向遍历</strong>。单独的 dict 只能快速按 member 查,不能有序扫描;平衡树也能做范围和排名,但要维护旋转与子树大小,实现复杂、常数成本更高;B 树更偏磁盘/页式访问。Redis 最终选了更容易写成小而稳定 C 代码的 skiplist。</p>
   <p>skiplist(跳表)用 <strong>多层概率性链表</strong> 替代树旋转:每个节点以概率 P=0.25 升一层,期望高度 O(log N)。Redis 在标准跳表基础上增加 <code>span</code>(排名累加值)与 <code>backward</code>(反向指针)两个工程化扩展,使 <code>ZRANK</code>/<code>ZREVRANGE</code> 也能在 O(log N) 完成。ZSet 编码超过阈值后,采用 <strong>dict + skiplist 双结构</strong>:dict 保证 <code>ZSCORE</code> O(1),skiplist 保证范围与排名 O(log N)。</p>
   <ul class="will-learn">
-    <li>跳表为何在 Redis 中胜出红黑树/AVL/B 树/有序数组</li>
-    <li><code>zskiplistNode</code> 与 <code>zskiplist</code> 字节级布局,以及柔性数组 <code>level[]</code> 的可变长度</li>
-    <li><code>zslRandomLevel</code> 几何分布与 P=0.25 的工程取舍</li>
-    <li><strong>核心</strong>:<code>zslInsert</code> 7 帧逐帧动画 + span 修正的代数关系</li>
-    <li><code>zslDelete</code> 的 5 帧链路重连与 level 收缩</li>
-    <li><code>zslFirstInRange</code> 多层下降的 O(log N) 起点定位</li>
-    <li><code>zslGetRank</code> 沿 search path 累加 span,把 rank 从 O(N) 降到 O(log N)</li>
-    <li><code>ZRANGEBYSCORE</code> 完整命令链路:命令层 → 范围结构 → skiplist 起点 → 顺序遍历</li>
-    <li>9 种典型陷阱:雪花 ID 做 score、ZRANGEBYSCORE 全量阻塞、ZRANK 误以为 O(1) 等</li>
-    <li>dict 与 skiplist 共享 sds 指针把内存代价从 2x 降到 ~1.4x 的优化</li>
+    <li><strong>为什么是双结构:</strong>dict 管 member → score,skiplist 管 score 排序和范围扫描。</li>
+    <li><strong>跳表怎么跑快:</strong>多层 forward 指针负责跳跃,<code>span</code> 负责排名累加,<code>backward</code> 负责反向遍历。</li>
+    <li><strong>生产怎么踩坑:</strong>score 是 double,雪花 ID 这类超过 2<sup>53</sup> 的整数不能原样塞进去。</li>
   </ul>
   <p class="prereq">前置知识:第 3 章 dict(理解 ZSet 的双结构中 dict 的角色);链表与有序结构基础;C 柔性数组(C99 flexible array member)与位字段;基本概率知识(几何分布、期望)。命令层面熟悉 <code>ZADD</code> / <code>ZSCORE</code> / <code>ZRANK</code> / <code>ZRANGE</code> / <code>ZRANGEBYSCORE</code>。</p>
 </div>
@@ -75,7 +68,7 @@
 <h3>本章全景图</h3>
 
 <div class="diagram">
-  <div class="diagram-title">图 4-0 · 本章导览 — 4 大模块 12 节</div>
+  <div class="diagram-title">图 4-0 · 本章导览 — 先分清 dict 查找与 skiplist 排序</div>
   <svg viewBox="0 0 960 540" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:960px;width:100%;margin:8px auto;height:auto;">
     <rect x="0" y="0" width="960" height="540" fill="var(--diagram-panel)" rx="10"/>
 
@@ -699,7 +692,7 @@ typedef struct zset {
     </tbody>
   </table>
 </div>
-<div class="key-insight">结论:期望最高层约 8 (log₄(10 000) ≈ 6.6)。<strong>实测最高层很少超过 12</strong> — 这是为什么 header 预留 32 层是"几乎永远用不完"的工程裕量。</div>
+<div class="key-insight">结论:期望最高层约 8 (log₄(10 000) ≈ 6.6)。<strong>实测最高层很少超过 12</strong> — header 预留 32 层提供的是足够宽的工程裕量,正常规模下很难用满。</div>
 
 <div class="diagram">
   <div class="diagram-title">表 4-3-1 · 不同 P 值的内存与搜索代价对比</div>
@@ -1734,7 +1727,7 @@ OK
 
 <div class="real-world">
   <strong>真实案例 — 排行榜雪花 ID 灾难</strong><br>
-  某社交 App 把"发帖时间"写成雪花 ID 后直接做 ZSet score(<code>ZADD feed:user 1714000000123456789 post_xxx</code>),上线两周后发现"同毫秒发布的不同帖子在 ZRANGE 中互相覆盖、ZRANK 偶发返回错误索引"。排查发现:<code>1714000000123456789 ≈ 2<sup>60.6</sup></code>,远超 double 的 2<sup>53</sup> 整数精度,低位 8 bit 全部丢失。修复:<code>score = floor(snowflake_id / 1024)</code>(主键放 member,score 仅用于排序),配合 <code>OBJECT ENCODING</code> 监控编码切换。
+  某社交 App 把雪花 ID 直接做 ZSet score(<code>ZADD feed:user 1714000000123456789 post_xxx</code>),上线后发现同毫秒附近的帖子排序不符合业务预期。排查发现:<code>1714000000123456789 ≈ 2<sup>60.6</sup></code>,远超 double 可精确表示整数的 2<sup>53</sup> 边界,低位信息被舍入。注意:member 不同仍会保留多条记录,真正的问题是 score 精度损失让排序粒度变粗。修复:<code>score = floor(snowflake_id / 1024)</code> 或使用毫秒时间戳作为 score,完整雪花 ID 放 member 或 value。
 </div>
 
 <!-- ============================================================ -->
@@ -1986,8 +1979,6 @@ redis-cli OBJECT ENCODING lb
 <h3>下一章预告</h3>
 
 <p>skiplist 解决"同时按 score 与 member 双索引"的有序集合需求。Redis Set 类型在元素全为整数且数量较少时,使用更紧凑的 <code><strong>intset</strong></code> 编码——一段连续内存按升序存储 int16/int32/int64,O(log N) 二分查找,无指针开销。下一章 <strong><code>05-intset.html</code></strong> 讨论 intset 的设计:三种 encoding 的字节布局、升级时的全量数据转换、为什么不支持降级,以及"全整数 + 阈值内"切到 intset 的判定路径。</p>
-
-</div>
 
 </div>
 

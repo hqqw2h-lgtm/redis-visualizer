@@ -60,14 +60,9 @@
   <p>C 标准库不提供链表实现,引入 GLib 或 std::list 会增加外部依赖与 ABI 风险。<code>adlist</code> 是 Redis 自实现的通用双端链表,以 <strong>50 行核心代码 + 三个回调函数(<code>dup</code> / <code>free</code> / <code>match</code>)</strong> 实现"泛型 + 所有权可控"。Redis 3.2 之前用户 <code>LIST</code> 数据结构曾以 adlist 为底层,3.2 之后改为 quicklist。<strong>当前 adlist 仅用于 Redis 内部对象集合管理</strong>。</p>
   <p>理解 adlist 的关键是看清三个层次:容器 <code>list</code>(48 字节,持有 head/tail/len + 三回调)、节点 <code>listNode</code>(24 字节,prev/next/value)、迭代器 <code>listIter</code>(16 字节,预存后继节点)。这三个结构的协同设计让 adlist 同时具备"O(1) 头尾插删、O(1) 已知节点删除、O(n) 顺序扫描、遍历中安全删除当前节点"四个核心能力。</p>
   <ul class="will-learn">
-    <li>adlist 在 Redis 内部 5 类集合(clients / slowlog / monitors / ready_keys / pubsub patterns)中的角色与"为什么不是用户 LIST 的底层"</li>
-    <li><code>list</code> / <code>listNode</code> / <code>listIter</code> 三结构的字节级布局(48 / 24 / 16 字节)与三个回调函数的所有权语义</li>
-    <li>头插 / 尾插 / 中间插入 / 删除 / 查询 / 复制 6 类 CRUD 操作的逐帧字节级动画(每个操作 5 帧)</li>
-    <li><code>listIter</code> 的"预存后继"设计:为什么遍历中可以安全删除当前节点,但不能删后继</li>
-    <li>三回调(<code>dup</code>/<code>free</code>/<code>match</code>)如何实现"泛型 + 所有权可控",忘了设回调的常见泄漏陷阱</li>
-    <li>与 C 数组 / 单链表 / <code>std::list</code> / <code>glib GList</code> / <code>boost intrusive_list</code> 的五维矩阵对比</li>
-    <li>关键源码:<code>listDelNode</code> / <code>listNext</code> 内联拆解与 7 个常见陷阱</li>
-    <li>"adlist + dict"组合(如 <code>server.pubsub_channels</code>):用 dict 解决 O(n) 查找,用 adlist 维护订阅顺序</li>
+    <li><strong>它现在用在哪里:</strong>adlist 是 Redis 内部链表库,不是 Redis 3.2+ 用户 <code>LIST</code> 的底层。</li>
+    <li><strong>它为什么够用:</strong><code>list</code> 管头尾和回调,<code>listNode</code> 管前后指针,<code>listIter</code> 负责遍历时安全删除当前节点。</li>
+    <li><strong>它不能解决什么:</strong>按值查找和按下标访问仍是 O(n),需要和 dict 等结构组合使用。</li>
   </ul>
   <p class="prereq">前置知识:C 指针操作与结构体内存布局;<code>malloc</code> / <code>free</code> 的所有权语义;函数指针的回调模式;<code>void *</code> 泛型在 C 中的常用做法。建议先读完第 1 章 SDS,熟悉 Redis 的 <code>zmalloc</code> / <code>zfree</code> 内存分配封装。</p>
 </div>
@@ -75,7 +70,7 @@
 <h3>本章全景图</h3>
 
 <div class="diagram">
-  <div class="diagram-title">图 2-0 · 本章导览 — 4 大模块 13 节</div>
+  <div class="diagram-title">图 2-0 · 本章导览 — 先分清内部链表与用户 LIST</div>
   <svg viewBox="0 0 920 620" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:920px;width:100%;margin:8px auto;height:auto;">
     <rect x="0" y="0" width="920" height="620" fill="var(--diagram-panel)" rx="10"/>
 
@@ -329,7 +324,7 @@
 "quicklist"</code></pre>
 
 <div class="warning">
-  <strong>常见误解</strong>:阅读 adlist 源码时,容易把它当作 Redis 用户 <code>LIST</code> 数据结构(<code>LPUSH</code> / <code>RPUSH</code>)的底层。事实上 <strong>Redis 3.2+ 用户 LIST 已改用 quicklist</strong>(quicklist 节点内嵌 listpack,详见第 7 章)。当前 adlist 仅用于"Redis 内部通用链表库",而非用户数据类型。<code>OBJECT ENCODING mylist</code> 永远返回 <code>quicklist</code>,验证这一事实。
+  <strong>常见误解</strong>:阅读 adlist 源码时,容易把它当作 Redis 用户 <code>LIST</code> 数据结构(<code>LPUSH</code> / <code>RPUSH</code>)的底层。事实上 <strong>Redis 3.2+ 用户 LIST 已改用 quicklist</strong>(quicklist 节点内嵌 listpack,详见第 7 章)。当前 adlist 仅用于"Redis 内部通用链表库",而非用户数据类型。对现代 Redis 中真实存在的 list key,<code>OBJECT ENCODING mylist</code> 会返回 <code>quicklist</code>,可以用来验证这一事实。
 </div>
 
 <p>读取 adlist 源码应将其理解为"Redis 内部通用链表库",而非用户 <code>LIST</code> 数据结构的底层。<code>LIST</code> 改用 quicklist 的原因(海量小元素的内存放大)详见第 7 章。</p>
@@ -531,7 +526,7 @@
       <text x="20" y="42" fill="var(--diagram-red-text)" font-size="11">zmalloc 头部 ~16 B + jemalloc size class round-up = <tspan font-weight="700">实际 32 B / 节点</tspan></text>
 
       <rect x="580" y="0" width="140" height="60" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
-      <text x="650" y="24" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="13" font-weight="700">实际占用</text>
+      <text x="650" y="24" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="13" font-weight="700">分配器口径</text>
       <text x="650" y="46" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="16" font-weight="700">32 B</text>
     </g>
   </svg>
@@ -608,11 +603,11 @@
       </g>
     </g>
 
-    <!-- 底部 实际占用 -->
+    <!-- 底部分配器口径估算 -->
     <g transform="translate(60, 310)">
       <rect x="0" y="0" width="800" height="50" rx="10" fill="url(#lst-len)" fill-opacity="0.2" stroke="var(--diagram-orange-stroke)"/>
-      <text x="20" y="20" fill="var(--diagram-orange-text)" font-size="12" font-weight="700">💾 总占用</text>
-      <text x="20" y="38" fill="var(--diagram-orange-text)" font-size="11">理论 48 B (6 × 8 B) · 含 zmalloc/jemalloc 元数据后 → <tspan font-weight="700">实际 64 B</tspan> (jemalloc size class round-up)</text>
+      <text x="20" y="20" fill="var(--diagram-orange-text)" font-size="12" font-weight="700">💾 估算占用</text>
+      <text x="20" y="38" fill="var(--diagram-orange-text)" font-size="11">理论 48 B (6 × 8 B) · 含 zmalloc/jemalloc 元数据后约为 <tspan font-weight="700">64 B</tspan> (取决于 size class)</text>
     </g>
   </svg>
 </div>
@@ -2511,9 +2506,7 @@ while ((ln = listNext(&amp;li)) != NULL) {
       <text x="20" y="22" fill="var(--diagram-orange-text)" font-size="12" font-weight="700">⚠️ 浅拷贝陷阱 (dup=NULL)</text>
       <text x="20" y="42" fill="var(--diagram-orange-text)" font-size="11">A'.value == A.value (指针共享)。若后续 listRelease(src) 触发 free(A.value),dst 会读到悬挂指针 → 见 §2.11。</text>
     </g>
-  </svg>
-</div>
-
+</svg>
 </div>
 
 <h4>读图要点</h4>
@@ -2557,7 +2550,7 @@ while ((ln = listNext(&amp;li)) != NULL) {
       <tr><td>C++ <code>std::list</code></td><td>O(1)</td><td>O(1)</td><td>≥ 24 B</td><td>中</td><td>中</td><td><strong>否</strong></td><td>引入 C++ ABI 与运行时;Redis 是纯 C</td></tr>
       <tr><td><code>glib GList</code></td><td>O(1)</td><td>O(1)</td><td>24 B</td><td>中</td><td>中</td><td>是</td><td>外部依赖;无 free 回调,生命周期裸写</td></tr>
       <tr><td>Boost <code>intrusive_list</code></td><td>O(1)</td><td>O(1)</td><td>16 B</td><td>优</td><td>复杂</td><td><strong>否</strong></td><td>C++ 模板;不适合 C 项目</td></tr>
-      <tr><td><strong>adlist</strong></td><td><strong>O(1)</strong></td><td><strong>O(1)</strong></td><td><strong>24 B</strong></td><td><strong>中</strong></td><td><strong>极简</strong></td><td><strong>是</strong></td><td><strong>无,本场景最优</strong></td></tr>
+      <tr><td><strong>adlist</strong></td><td><strong>O(1)</strong></td><td><strong>O(1)</strong></td><td><strong>24 B</strong></td><td><strong>中</strong></td><td><strong>极简</strong></td><td><strong>是</strong></td><td><strong>适合内部顺序集合;不适合按值快速查找</strong></td></tr>
     </tbody>
   </table>
 </div>
@@ -3144,7 +3137,7 @@ listRelease 触发 sdsfree("c1") 与 sdsfree("c3"),无内存泄漏</code></pre>
 
 <h3>下一章预告</h3>
 
-<p>adlist 解决"<strong>已知节点的 O(1) 插删 + 顺序遍历</strong>"。当 Redis 需要"<strong>按 key 查找 value 的 O(1) 路径</strong>"时(键空间、Hash 类型、内部索引),adlist 的 O(n) 查找不再适用。下一章 <strong><code>03-dict.html</code></strong> 讨论 dict 的设计:<strong>开链法哈希表、渐进式 rehash、ht[0] / ht[1] 双表机制</strong>如何把"扩容期间的阻塞"分摊到每次操作中各承担 1 步,以及 <strong>SipHash-2-4</strong> 防碰撞攻击的位置。读完后你会理解为什么"<code>HSET</code> 命令在 1 GB 大 hash 上仍能 P99 &lt; 50 μs",以及 <code>server.pubsub_channels</code> 这种"<strong>dict + adlist 组合</strong>"双结构的协同工作机制。</p>
+<p>adlist 解决"<strong>已知节点的 O(1) 插删 + 顺序遍历</strong>"。当 Redis 需要"<strong>按 key 查找 value 的 O(1) 路径</strong>"时(键空间、Hash 类型、内部索引),adlist 的 O(n) 查找不再适用。下一章 <strong><code>03-dict.html</code></strong> 讨论 dict 的设计:<strong>开链法哈希表、渐进式 rehash、ht[0] / ht[1] 双表机制</strong>如何把"扩容期间的阻塞"分摊到每次操作中各承担 1 步,以及 <strong>SipHash-2-4</strong> 防碰撞攻击的位置。读完后你会理解为什么大 Hash 的单次 <code>HSET</code> 通常仍走 O(1) 路径,也会看到 <code>server.pubsub_channels</code> 这种"<strong>dict + adlist 组合</strong>"双结构的协同工作机制。</p>
 
 </div>
 

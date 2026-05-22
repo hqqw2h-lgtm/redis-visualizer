@@ -46,7 +46,7 @@
   <a href="#s19-11">19.11 源码切入点</a>
   <a href="#s19-12">19.12 取舍</a>
   <a href="#s19-13">19.13 生产陷阱</a>
-  <a href="#s19-14">19.14 主线程调试技巧</a>
+  <a href="#s19-14">19.14 主线程观测方法</a>
   <a href="#s19-summary">19.15 30 秒复盘</a>
 </aside>
 
@@ -69,9 +69,9 @@
     <li>Redis 6 I/O 线程的<strong>边界</strong>:并行 read/write,但 <code>call()</code> 仍串行</li>
     <li>epoll / kqueue / select 三后端的复杂度、fd 上限、触发模式对比</li>
     <li>SLOWLOG / LATENCY / INFO commandstats 的归因方法</li>
-    <li>perf 火焰图、strace 频率、<code>LATENCY DOCTOR</code> 自动诊断的实战流程</li>
+    <li>perf 火焰图、strace 频率、<code>LATENCY DOCTOR</code> 自动诊断的受控观测流程</li>
   </ul>
-  <p class="prereq">前置知识:第 1 章 Redis 整体架构;第 17 章 持久化(理解 AOF fsync / RDB fork 与主线程的关系);Linux 多路复用(epoll/select)与 fd 概念;基本 syscall 语义(read/write/epoll_wait/fsync)。</p>
+  <p class="prereq">前置知识:第 1 章 Redis 整体架构;第 17 章 RDB 持久化与第 18 章 AOF 持久化(理解 fork / fsync 与主线程的关系);Linux 多路复用(epoll/select)与 fd 概念;基本 syscall 语义(read/write/epoll_wait/fsync)。</p>
 </div>
 
 <h3>章首速览</h3>
@@ -568,7 +568,8 @@ redis-cli CONFIG SET hz 10</code></pre>
 <div class="compare-grid">
   <div class="compare-bad">
     <h4>反例:KEYS 一次卡 183 ms</h4>
-<pre><code class="language-bash">redis-cli CONFIG SET slowlog-log-slower-than 10000
+<pre><code class="language-bash"># 仅用于测试环境复现反例,不要在生产执行 KEYS 全库扫描
+redis-cli CONFIG SET slowlog-log-slower-than 10000
 redis-cli KEYS 'user:*'
 redis-cli SLOWLOG GET 1</code></pre>
 <pre><code class="language-text">1) 1) (integer) 42
@@ -626,7 +627,7 @@ order:O1005</code></pre>
       <tr><td><code>LRANGE 0 -1</code></td><td>O(N)</td><td>LRANGE 分页 / Stream</td><td>LRANGE 0 99 单次 &lt; 1 ms</td></tr>
       <tr><td><code>SORT bigset BY ...</code></td><td>O(N + N log N)</td><td>客户端排序 / SortedSet</td><td>极慢,禁用</td></tr>
       <tr><td><code>EVAL</code> 长 Lua</td><td>整段脚本占用主线程</td><td>拆短脚本 / Function (7.0+)</td><td>单次 ≤ 1 ms</td></tr>
-      <tr><td><code>DEBUG SLEEP n</code></td><td>直接阻塞 n 秒</td><td>仅测试</td><td>—</td></tr>
+      <tr><td><code>DEBUG</code> 类内部命令</td><td>可能直接阻塞或暴露内部状态</td><td>生产用 ACL 禁止,测试环境才允许</td><td>不进入生产路径</td></tr>
       <tr><td><code>DEL bigkey</code></td><td>O(M) 释放对象</td><td>UNLINK + lazyfree</td><td>DEL 释放 1 GB ≈ 250 ms</td></tr>
     </tbody>
   </table>
@@ -1137,7 +1138,7 @@ src/bio.c           后台线程主体</code></pre>
       <tr><td>5</td><td>误解 I/O 线程</td><td>开线程后慢命令仍慢</td><td>call() 仍串行</td><td>SLOWLOG / LATENCY 先定位真瓶颈</td></tr>
       <tr><td>6</td><td>maxclients 调高未升 ulimit</td><td>accept 返回 EMFILE</td><td>进程级 fd 上限未匹配</td><td>ulimit -n N + setsize 同步上调</td></tr>
       <tr><td>7</td><td>长 Lua 脚本</td><td>全实例阻塞数秒</td><td>EVAL 在主线程同步执行</td><td>拆短脚本 / 用 Function</td></tr>
-      <tr><td>8</td><td>DEBUG SLEEP / LASTSAVE</td><td>调试命令意外打入生产</td><td>命令本身阻塞主线程</td><td>ACL 限制 DEBUG 命令权限</td></tr>
+      <tr><td>8</td><td>内部 DEBUG 命令误入生产</td><td>实例被人为阻塞或泄露内部状态</td><td>调试命令不属于业务路径</td><td>ACL 禁止 DEBUG,演练只在测试实例</td></tr>
       <tr><td>9</td><td>慢消费者 omem 持续涨</td><td>客户端被 buffer-limit 断开</td><td>客户端读不下 reply</td><td>排查客户端 / 启用流控</td></tr>
       <tr><td>10</td><td>RDB / AOF 子进程 fork 慢</td><td>主线程 fork 期间完全阻塞</td><td>THP / 大内存实例</td><td>关 transparent_hugepage, 降单实例内存</td></tr>
     </tbody>
@@ -1145,8 +1146,12 @@ src/bio.c           后台线程主体</code></pre>
 </div>
 
 <!-- ============================================================ -->
-<h2 id="s19-14">19.14 主线程调试技巧</h2>
+<h2 id="s19-14">19.14 主线程观测方法</h2>
 <!-- ============================================================ -->
+
+<div class="warning">
+  <strong>观测边界</strong>:<code>perf</code>、<code>strace</code> 会给线上进程带来额外开销,只适合短时间、受控窗口使用;常规生产巡检优先看 <code>INFO</code>、<code>SLOWLOG</code>、<code>LATENCY</code> 与客户端输出缓冲。
+</div>
 
 <h3>19.14.1 perf 抓取火焰图</h3>
 
@@ -1294,33 +1299,32 @@ INFO commandstats   (看 usec_per_call)
    ↓ (找出累积耗时大的命令)
 最后才考虑: I/O 线程 / 内核网络参数 / 硬件升级</code></pre>
 
-<h3>最小回归测试</h3>
+<h3>最小生产自检清单(只读优先)</h3>
 
 <pre><code class="language-bash"># 1. 检查 multiplexing 后端
 redis-cli INFO server | grep multiplexing_api
-# 期望 Linux: epoll; macOS: kqueue
+# 期望 Linux: epoll; macOS/BSD: kqueue; select 只应作为兜底
 
-# 2. 验证 hz 与 cron 频率
+# 2. 查看 hz 与 dynamic-hz
 redis-cli CONFIG GET hz
 redis-cli CONFIG GET dynamic-hz
-# 期望: hz=10, dynamic-hz=yes
+# 常见基线: hz=10, dynamic-hz=yes
 
-# 3. 慢命令检测
-redis-cli CONFIG SET slowlog-log-slower-than 10000
-redis-cli DEBUG SLEEP 0.05
-redis-cli SLOWLOG GET 1
-# 期望: 看到 50000 µs 的 DEBUG SLEEP 记录
+# 3. 慢命令与命令耗时画像
+redis-cli SLOWLOG GET 10
+redis-cli INFO commandstats | head -20
 
-# 4. LATENCY 归因
-redis-cli CONFIG SET latency-monitor-threshold 100
-redis-cli DEBUG SLEEP 0.2
+# 4. 延迟事件归因(需已配置 latency-monitor-threshold)
 redis-cli LATENCY LATEST
-# 期望: 看到 fast-command / event-loop 200 ms 事件
+redis-cli LATENCY DOCTOR
 
-# 5. lazyfree 大 key 删除
-redis-cli RPUSH bigl $(seq 1 1000000)
-redis-cli UNLINK bigl
-# 期望: 主线程对外延迟 < 1 ms (用 redis-cli --latency 旁路验证)</code></pre>
+# 5. 输出缓冲与慢消费者
+redis-cli INFO clients
+redis-cli CLIENT LIST | head -5
+
+# 6. lazyfree 配置检查(不在生产造大 key)
+redis-cli CONFIG GET lazyfree-lazy-user-del
+redis-cli CONFIG GET lazyfree-lazy-eviction</code></pre>
 
 <h3>下一章预告</h3>
 

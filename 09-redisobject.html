@@ -67,7 +67,7 @@
     <li><code>createObject</code> / <code>tryObjectEncoding</code> / <code>decrRefCount</code> 的逐帧调用链</li>
     <li>命令前的 <code>checkType</code> WRONGTYPE 防护与 encoding 分派路径</li>
     <li>对象多态的 4 种候选方案对比:每类 struct / C++ 虚表 / union+tag / redisObject</li>
-    <li>陷阱:APPEND 引发 EMBSTR→RAW、maxmemory 关闭共享池、LFU counter 上限 255</li>
+    <li>陷阱:APPEND 引发 EMBSTR→RAW、LRU/LFU 淘汰策略下共享整数池受限、LFU counter 上限 255</li>
   </ul>
   <p class="prereq">前置知识:第 1 章 SDS(理解 EMBSTR 与 RAW 的存储差异);第 3 章 dict(<code>db.dict</code> 是 robj 的容器);第 5–7 章 listpack / quicklist(理解多种 encoding 共用同一类型);第 8 章 rax / Stream(理解 OBJ_STREAM 编码)。读者需要熟悉位字段(C bit-field)与指针类型转换。</p>
 </div>
@@ -224,7 +224,7 @@
   </svg>
 </div>
 
-<p>命令处理函数(如 <code>lpushCommand</code>)拿到的永远是 <code>robj *</code>,看不到 listpack / quicklist 的差异。<strong>差异只在两个分派点出现</strong>:第一是 <code>checkType</code> 看 type 字段,确保命令与对象类型匹配;第二是命令实现内部根据 encoding 字段调用对应模块。客户端 / 协议层 / 字典层全程只跟 <code>robj *</code> 打交道。</p>
+<p>命令处理函数(如 <code>lpushCommand</code>)通常以 <code>robj *</code> 为入口,不会把 listpack / quicklist 细节暴露给客户端。<strong>差异主要在两个分派点出现</strong>:第一是 <code>checkType</code> 看 type 字段,确保命令与对象类型匹配;第二是命令实现内部根据 encoding 字段调用对应模块。客户端 / 协议层 / 字典层全程只跟 <code>robj *</code> 打交道。</p>
 
 <!-- ============================================================ -->
 <h2 id="s9-2">9.2 redisObject 字节布局</h2>
@@ -710,16 +710,16 @@ typedef struct redisObject {
   </g>
   <text x="35" y="335" fill="var(--diagram-muted)" font-size="11">→ 共享池范围有限, 仅 0-9999 受益</text>
 
-  <!-- 失效场景 2: maxmemory -->
-  <text x="480" y="232" fill="var(--diagram-red-text)" font-size="14" font-weight="bold">失效场景 2: maxmemory &gt; 0 (LRU/LFU 元数据)</text>
+  <!-- 失效场景 2: eviction metadata -->
+  <text x="480" y="232" fill="var(--diagram-red-text)" font-size="14" font-weight="bold">失效场景 2: maxmemory + LRU/LFU 策略</text>
   <rect x="480" y="244" width="420" height="115" rx="8" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
   <g font-size="11" font-family="ui-monospace, monospace">
     <text x="495" y="266" fill="var(--diagram-blue-text)">CONFIG SET maxmemory 100mb</text>
-    <text x="495" y="285" fill="var(--diagram-blue-text)">SET d 100</text>
-    <text x="495" y="302" fill="var(--diagram-blue-text)">OBJECT REFCOUNT d</text>
-    <text x="495" y="319" fill="var(--diagram-red-text)">(integer) 1  ← 不再共享</text>
+    <text x="495" y="284" fill="var(--diagram-blue-text)">CONFIG SET maxmemory-policy allkeys-lru</text>
+    <text x="495" y="302" fill="var(--diagram-blue-text)">SET d 100 / OBJECT REFCOUNT d</text>
+    <text x="495" y="320" fill="var(--diagram-red-text)">(integer) 1  ← 不再共享</text>
   </g>
-  <text x="495" y="350" fill="var(--diagram-muted)" font-size="11">→ 每个 key 需独立 LRU/LFU 元数据, 共享池禁用</text>
+  <text x="495" y="350" fill="var(--diagram-muted)" font-size="11">→ 每个 key 需独立淘汰元数据,不能共用同一个 robj</text>
 </svg>
 </div>
 
@@ -732,7 +732,7 @@ typedef struct redisObject {
     <tbody>
       <tr><td>内存</td><td>共享对象省 robj 头 + SDS</td><td>启动时预分配 10000 × 16 B = 160 KB</td></tr>
       <tr><td>性能</td><td>省去新对象的分配</td><td>共享池范围有限(0–9999)</td></tr>
-      <tr><td>适用场景</td><td>计数器、状态码、ID 区间 0–9999</td><td>maxmemory &gt; 0 时失效</td></tr>
+      <tr><td>适用场景</td><td>计数器、状态码、ID 区间 0–9999</td><td>maxmemory 配 LRU/LFU 时失效</td></tr>
       <tr><td>调试干扰</td><td>refcount 显示 INT_MAX 不能反映客户端引用</td><td>不能用 OBJECT REFCOUNT 推断流量</td></tr>
     </tbody>
   </table>
@@ -986,7 +986,8 @@ void decrRefCount(robj *o) {
 
 <h3>9.5.5 命令观测</h3>
 
-<pre><code class="language-bash">127.0.0.1:6379> CONFIG SET maxmemory-policy allkeys-lru
+<pre><code class="language-bash"># 只在本地测试实例演示。生产不要为了观察一个 key 临时切换 LRU/LFU 策略。
+127.0.0.1:6379> CONFIG SET maxmemory-policy allkeys-lru
 OK
 127.0.0.1:6379> SET hot1 "v"
 OK
@@ -1002,9 +1003,8 @@ OK
 127.0.0.1:6379> OBJECT FREQ hot2
 (integer) 5     # LFU counter 当前值
 
-# 切换 policy 之后,旧的 lru 字段语义会被重新解释
-# 切换 LRU→LFU 时刚开始所有 key 的 freq 都很低 (lru 字段被当 LFU 解读)
-# 这是切换 policy 的小代价</code></pre>
+# 切换 policy 后,旧 key 的 24 bit 字段会按新策略重新解释。
+# 如果需要从 LRU 迁到 LFU,应灰度/重建热度,不要在生产高峰直接切。</code></pre>
 
 <!-- ============================================================ -->
 <h2 id="s9-6">9.6 createObject 与 decrRefCount 逐帧</h2>
@@ -1644,7 +1644,7 @@ OK
 # - 跟流量大小无关</code></pre>
   </div>
   <div class="compare-good">
-    <h4>正确:用 INFO + MONITOR 看流量</h4>
+    <h4>正确:用 INFO、应用指标和慢日志看流量</h4>
 <pre><code class="language-bash"># 看连接数
 127.0.0.1:6379> INFO clients
 # connected_clients: 156
@@ -1659,10 +1659,15 @@ OK
 127.0.0.1:6379> INFO keyspace
 # db0:keys=10000,expires=0,avg_ttl=0
 
-# 看指定 key 的访问 (LFU 模式下)
-127.0.0.1:6379> CONFIG SET maxmemory-policy allkeys-lfu
+# 看命令分布
+127.0.0.1:6379> INFO commandstats
+# cmdstat_get:calls=...
+
+# 看指定 key 的访问热度:只有实例已经使用 LFU 策略时才有意义
 127.0.0.1:6379> OBJECT FREQ counter
-(integer) 5     # 真实访问热度</code></pre>
+(integer) 5
+
+# 不建议在生产用 MONITOR 做流量统计:它会输出每条命令,开销和泄露风险都很高。</code></pre>
   </div>
 </div>
 
@@ -1685,7 +1690,11 @@ OK
 4) "a"</code></pre>
 
 <div class="warning">
-  <strong>WRONGTYPE 是不可恢复错误</strong>:Redis 不会自动把 String 当 List。一个 key 一旦创建为某 type,只能 DEL 后重建为另一 type。生产环境如果出现 WRONGTYPE,通常说明业务代码有 bug — 同一 key 名被用作不同类型。建议:① key 命名规范要包含 type 后缀(<code>orders:list:123</code> vs <code>orders:hash:123</code>);② 客户端 SDK 在写入前先 TYPE 检查或用事务保护。
+  <strong>WRONGTYPE 是不可恢复错误</strong>:Redis 不会自动把 String 当 List。一个 key 一旦创建为某 type,只能 DEL 后重建为另一 type。生产环境如果出现 WRONGTYPE,通常说明同一 key 名被不同代码路径当成了不同类型。
+  <ul>
+    <li>key 命名里带上类型或用途,例如 <code>orders:list:123</code> 与 <code>orders:hash:123</code> 分开。</li>
+    <li>写入前在业务层约束类型;必要时用事务或 Lua 把检查和写入放在一起。</li>
+  </ul>
 </div>
 
 <!-- ============================================================ -->
@@ -1881,12 +1890,12 @@ robj *tryObjectEncoding(robj *o) {
 </div>
 
 <div class="key-insight">
-  <strong>设计教学结论(可直接套用)</strong>:<br>
-  ① 整数 0–9999 的 1M key 几乎"零成本"(只有 dictEntry 开销);<br>
+  <strong>设计结论(容量估算需按实例复测)</strong>:<br>
+  ① 整数 0–9999 在可共享时能省掉大量值对象分配,但 key/dictEntry 仍有成本;<br>
   ② 短字符串 ≤ 44 B 走 EMBSTR,内存接近 jemalloc 64 B class 满载;<br>
   ③ 一旦超过 44 B 就跳到 RAW,2 次 malloc + jemalloc 80 B 起步,内存放大 ~25%;<br>
   ④ <code>OBJECT ENCODING key</code> 是诊断"内存放大"的第一手段;<br>
-  ⑤ <strong>maxmemory &gt; 0 关闭共享池</strong> — 内存敏感场景需要权衡。
+  ⑤ <strong>maxmemory 配 LRU/LFU 会限制共享整数池</strong> — 因为每个 key 需要独立淘汰元数据。
 </div>
 
 <h3>9.11.3 OBJECT 命令族</h3>
@@ -1901,7 +1910,7 @@ robj *tryObjectEncoding(robj *o) {
       <tr><td><code>OBJECT IDLETIME key</code></td><td>秒</td><td>距今闲置时间</td><td>LRU 模式有效</td></tr>
       <tr><td><code>OBJECT FREQ key</code></td><td>0–255</td><td>LFU 频率计数</td><td>LFU 模式有效</td></tr>
       <tr><td><code>OBJECT HELP</code></td><td>帮助文本</td><td>—</td><td>—</td></tr>
-      <tr><td><code>DEBUG OBJECT key</code></td><td>详细信息</td><td>调试用</td><td>含 ql_nodes / serializedlength 等</td></tr>
+      <tr><td><code>DEBUG OBJECT key</code></td><td>详细信息</td><td>本地调试</td><td>生产通常禁用,不要作为巡检命令</td></tr>
     </tbody>
   </table>
 </div>
@@ -1909,7 +1918,7 @@ robj *tryObjectEncoding(robj *o) {
 <h3>9.11.4 监控指标</h3>
 
 <div class="diagram">
-  <div class="diagram-title">表 9-11-3 · 必监控指标(Prometheus 风格)</div>
+  <div class="diagram-title">表 9-11-3 · 对象层可观测项(内置 INFO + 抽样导出)</div>
   <table>
     <thead><tr><th>指标</th><th>类型</th><th>含义</th><th>告警阈值</th></tr></thead>
     <tbody>
@@ -1920,12 +1929,12 @@ robj *tryObjectEncoding(robj *o) {
       <tr><td><code>redis_evicted_keys_total</code></td><td>counter</td><td>淘汰 key 数(maxmemory 触发)</td><td>突增 = 容量不足</td></tr>
       <tr><td><code>redis_keyspace_hits_total</code></td><td>counter</td><td>命中数</td><td>命中率 &lt; 90% 异常</td></tr>
       <tr><td><code>redis_keyspace_misses_total</code></td><td>counter</td><td>未命中数</td><td>—</td></tr>
-      <tr><td><code>redis_object_encoding{key}</code></td><td>gauge (label)</td><td>关键 key 编码</td><td>编码膨胀告警</td></tr>
+      <tr><td><code>redis_object_encoding{key}</code></td><td>抽样导出(label)</td><td>关键 key 编码</td><td>Redis 不原生逐 key 导出,需巡检脚本生成</td></tr>
     </tbody>
   </table>
 </div>
 
-<h3>9.11.5 PromQL 报警示例</h3>
+<h3>9.11.5 派生指标报警示例</h3>
 
 <pre><code class="language-bash"># 内存使用接近上限
 redis_memory_used_bytes / redis_memory_max_bytes > 0.8
@@ -1941,7 +1950,7 @@ sum(rate(redis_keyspace_hits_total[5m])) /
 # 淘汰速率突增 (容量不足)
 rate(redis_evicted_keys_total[5m]) > 100
 
-# 关键 key 编码膨胀 (Hash 从 listpack 升 hashtable)
+# 关键 key 编码膨胀(需由巡检脚本导出 OBJECT ENCODING 抽样结果)
 redis_object_encoding{key="orders:*", encoding="hashtable"} == 1</code></pre>
 
 <!-- ============================================================ -->
@@ -1950,12 +1959,12 @@ redis_object_encoding{key="orders:*", encoding="hashtable"} == 1</code></pre>
 
 <div class="real-world">
   <strong>用例 1:HTTP 状态码计数器(共享整数池)</strong>(亿级 PV 网关)<br>
-  某 CDN 网关用 Redis 计数 HTTP 200 / 404 / 500 等状态码:<code>SET status:200 12345678</code> / <code>INCR status:200</code>。<strong>关键点</strong>:大多数请求是 200,占 90%+;404 / 500 占比稳定;计数器值常常落在 0–9999 区间(按分钟粒度统计)。<strong>实际收益</strong>:每个状态码 1M key(按 minute 拆分),总占用预期 1M × 80 B = 80 MB,但因为整数 0–9999 被共享池命中,实际只占 1M × 40 B(dictEntry + key SDS) = 40 MB,<strong>省一半</strong>。<strong>注意</strong>:运维曾经把 maxmemory 设成 8GB,共享池失效,内存反而涨到 95 MB — 后来根据实际数据量调到 24GB 后保持 maxmemory=0 才恢复。
+  某 CDN 网关用 Redis 计数 HTTP 200 / 404 / 500 等状态码:<code>SET status:200 12345678</code> / <code>INCR status:200</code>。<strong>关键点</strong>:大多数请求是 200,占 90%+;404 / 500 占比稳定;计数器值常常落在 0–9999 区间(按分钟粒度统计)。<strong>估算收益</strong>:命中共享整数池时,每个 value 不再单独分配 robj,百万级小整数 key 能节省可观对象头开销。<strong>注意</strong>:一旦启用需要独立 LRU/LFU 元数据的 maxmemory 策略,共享池会受限,容量评估必须重新测 <code>MEMORY USAGE</code> 与 <code>used_memory</code>。
 </div>
 
 <div class="real-world">
   <strong>用例 2:大字符串 token 缓存(EMBSTR vs RAW 边界)</strong>(SaaS API 网关)<br>
-  网关把 JWT token 缓存进 Redis 做去重 / 黑名单:<code>SET token:abc123 "<JWT>"</code>。<strong>初始版本</strong>:JWT 平均 60 字节(带 header + payload + sig),全走 RAW 编码,1M token 占 ~ 96 MB。<strong>优化版本</strong>:改用 token hash(MD5 16 字节作 value)而不是完整 JWT,<code>OBJECT ENCODING</code> 返回 <code>embstr</code>,内存降到 ~ 40 MB(<strong>节省 58%</strong>)。<strong>权衡</strong>:用 hash 而不是完整 JWT 牺牲了"日志可追溯"(看到 hash 不知道是哪个 token),但在去重场景下 hash 已经够用。
+  网关把 JWT token 缓存进 Redis 做去重 / 黑名单:<code>SET token:abc123 "&lt;JWT&gt;"</code>。<strong>初始版本</strong>:JWT 平均 60 字节(带 header + payload + sig),全走 RAW 编码,1M token 占 ~ 96 MB。<strong>优化版本</strong>:改用 token hash(MD5 16 字节作 value)而不是完整 JWT,<code>OBJECT ENCODING</code> 返回 <code>embstr</code>,内存降到 ~ 40 MB(<strong>节省 58%</strong>)。<strong>权衡</strong>:用 hash 而不是完整 JWT 牺牲了"日志可追溯"(看到 hash 不知道是哪个 token),但在去重场景下 hash 已经够用。
 </div>
 
 <div class="real-world">
@@ -1965,7 +1974,7 @@ redis_object_encoding{key="orders:*", encoding="hashtable"} == 1</code></pre>
 
 <div class="real-world">
   <strong>用例 4:不要这么用 — 把 List 当大队列</strong>(失败案例复盘)<br>
-  反例:某团队用 List 做异步任务队列(<code>RPUSH tasks "<json>"</code>),JSON 平均 200 字节。<strong>初期</strong>:几千任务,List 是 quicklist + listpack,内存正常。<strong>暴涨</strong>:某天积压 100 万任务,quicklist 节点剧增到几千个,每节点 listpack ~ 4KB,总内存 4 GB。<strong>问题进一步恶化</strong>:消费端处理失败,任务一直没消费完,quicklist 内存只增不减(因为 LISTPACK→QUICKLIST 不可逆,即使消费完也保持 quicklist)。<strong>正解</strong>:改用 Stream + 消费组(第 8 章),Stream 自带 MAXLEN 控长 + PEL 流转,消费失败的消息自动重投。Stream + 100 万消息 ≈ 80 MB(50 倍内存节省)。
+  反例:某团队用 List 做异步任务队列(<code>RPUSH tasks "&lt;json&gt;"</code>),JSON 平均 200 字节。<strong>初期</strong>:几千任务,List 是 quicklist + listpack 节点,内存正常。<strong>暴涨</strong>:某天积压 100 万任务,quicklist 节点剧增,这个 key 变成大 key。<strong>问题进一步恶化</strong>:List 没有消费组、ACK 和待确认转移语义,消费端失败后只能靠业务自己补偿。<strong>正解</strong>:改用 Stream + 消费组(第 8 章),Stream 自带 MAXLEN 控长 + PEL 流转,消费失败的消息可以被认领重投。
 </div>
 
 <!-- ============================================================ -->
@@ -1984,7 +1993,7 @@ redis_object_encoding{key="orders:*", encoding="hashtable"} == 1</code></pre>
       <tr><td>redisObject 16 字节包含 type / encoding / lru / refcount / ptr</td><td><code>server.h struct redisObject</code></td><td>位域紧凑</td></tr>
       <tr><td>type 是用户可见类型(STRING / LIST 等)</td><td><code>OBJ_STRING / ...</code> 7 种</td><td>4 bit 限制 16 种</td></tr>
       <tr><td>encoding 是底层编码,同 type 可有多种 encoding</td><td><code>OBJ_ENCODING_*</code> 11 种</td><td>编码可在运行期切换</td></tr>
-      <tr><td>共享整数池(0–9999)</td><td><code>shared.integers[10000]</code></td><td><code>maxmemory &gt; 0</code> 时失效</td></tr>
+      <tr><td>共享整数池(0–9999)</td><td><code>shared.integers[10000]</code></td><td>maxmemory 配 LRU/LFU 时失效</td></tr>
       <tr><td>INT 编码:ptr 直接存 long</td><td><code>tryObjectEncoding</code></td><td>无额外分配</td></tr>
       <tr><td>EMBSTR:robj + SDS 同块分配</td><td><code>createEmbeddedStringObject</code></td><td>修改后变 RAW</td></tr>
       <tr><td>RAW:robj 与 SDS 独立分配</td><td><code>createRawStringObject</code></td><td>长字符串 / 修改频繁</td></tr>
@@ -2001,7 +2010,7 @@ redis_object_encoding{key="orders:*", encoding="hashtable"} == 1</code></pre>
 
 <pre><code class="language-bash">redis-cli FLUSHDB
 
-# 测试共享整数池
+# 测试共享整数池(默认 maxmemory=0 或非 LRU/LFU 淘汰策略)
 redis-cli SET k1 100
 redis-cli OBJECT ENCODING k1     # int
 redis-cli OBJECT REFCOUNT k1     # 2147483647 (共享)
@@ -2033,13 +2042,9 @@ redis-cli DEL k1
 redis-cli LPUSH k1 a b c
 redis-cli OBJECT ENCODING k1     # listpack
 
-# 测试 LRU/LFU
-redis-cli CONFIG SET maxmemory-policy allkeys-lru
-redis-cli OBJECT IDLETIME k1     # 整数 (秒)
-
-redis-cli CONFIG SET maxmemory-policy allkeys-lfu
-redis-cli GET k1
-redis-cli OBJECT FREQ k1         # 整数 (counter)
+# LRU/LFU 观测只在对应策略的测试实例运行;生产不要为观察单 key 临时切策略
+redis-cli OBJECT IDLETIME k1     # LRU 策略下返回秒;LFU 策略下会报错
+# redis-cli OBJECT FREQ k1       # LFU 策略下返回 counter;非 LFU 策略下会报错
 
 redis-cli FLUSHDB</code></pre>
 

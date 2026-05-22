@@ -57,18 +57,10 @@
   <p class="lead">Redis 内存逼近上限、命中率下降、复制断链、慢命令阻塞、Pub/Sub 慢消费者、AOF 写失败等问题<strong>在事故前均可被指标捕捉</strong>。监控不是"看见",而是"<strong>指标触发告警 → 告警指向命令 → 命令定位根因 → 根因绑定动作</strong>"的完整证据链。任一环缺失,Grafana 仅是截图工具。</p>
   <p>Redis 提供五类内建自省入口:<code>INFO</code>(全局计数器)、<code>SLOWLOG</code>(慢命令环形缓冲)、<code>LATENCY</code>(延迟事件采样)、<code>MEMORY</code>(分配器与 key 内存)、<code>CLIENT LIST</code>(客户端状态)。<strong>redis_exporter 将这些数据转换为 Prometheus 时序指标</strong>,Grafana 可视化,Alertmanager 触达运维。</p>
   <ul class="will-learn">
-    <li>"内存 / 延迟 / 连接 / 复制 / 持久化"五维度监控矩阵与对应处理动作</li>
-    <li><code>INFO</code> 九大 section 树与高频采集字段清单</li>
-    <li>命中率为何必须用<strong>窗口差分</strong>而非累计值,及对应 PromQL 表达</li>
-    <li>内存排查决策树:容量 → 碎片 → swap → CoW 的逐层定位</li>
-    <li><code>--bigkeys</code> / <code>MEMORY USAGE SAMPLES 0</code> / <code>--memkeys</code> / Redis-rdb-tools 四种大 key 排查工具对比</li>
-    <li><code>SLOWLOG</code> 与 <code>LATENCY</code> 的数据流分工:命令慢 vs 阶段慢(fork / aof / expire / eviction)</li>
-    <li><code>CLIENT LIST</code> 的 <code>omem / qbuf / age / idle / flags</code> 字段含义与异常阈值</li>
-    <li>复制 offset 落后超 backlog 触发全量重同步的边界条件</li>
-    <li>redis_exporter 抓取链与 <code>redis_up</code> / <code>redis_exporter_last_scrape_error</code> 自身可观测性</li>
-    <li>核心告警规则模板(RedisMemoryHigh / RedisHitRateDrop / RedisDown 等)与 Runbook 三字段</li>
-    <li>故障决策树:从症状到首查指标的映射</li>
-    <li>七类典型监控陷阱及其替代方案(MONITOR / 高频 CLIENT LIST / 累计命中率等)</li>
+    <li>怎样把内存、延迟、连接、复制和持久化指标连成可执行证据链</li>
+    <li>为什么命中率、错误率、慢日志都要看窗口变化,不能只看累计值</li>
+    <li>哪些 Redis 自省命令适合高频采集,哪些只能在告警后低频定位</li>
+    <li>告警如何写成 runbook,让值班人员知道查什么、阈值是什么、下一步做什么</li>
   </ul>
   <p class="prereq">前置知识:第 17 章 RDB(理解 <code>rdb_last_bgsave_status</code> 含义);第 18 章 AOF(理解 <code>aof_delayed_fsync</code>);第 22 章 jemalloc(理解 <code>mem_fragmentation_ratio</code>);第 23 章淘汰策略(理解 <code>maxmemory-policy</code>);第 25 章 Replication(理解 <code>repl_backlog_size</code> 与全量重同步);Prometheus + Grafana 基础。</p>
 </div>
@@ -766,7 +758,7 @@ $ redis-cli SLOWLOG GET 3
    6) "order-api"</code></pre>
 
 <div class="real-world">
-  <strong>真实定位:</strong> 上面输出立即告诉你:<code>KEYS rate:checkout:*</code> 占了 35.2 毫秒主线程,客户端 IP 10.12.4.9 / 服务名 order-api。<strong>修复路径</strong>:替换为 <code>SCAN</code> 游标 + 客户端聚合,或者改用 Redis 7.4 的 <code>--scan</code>。不要在生产实例上跑 <code>KEYS</code>,这是 Redis 文档第一条警告。
+  <strong>真实定位:</strong> 上面输出立即告诉你:<code>KEYS rate:checkout:*</code> 占了 35.2 毫秒主线程,客户端 IP 10.12.4.9 / 服务名 order-api。<strong>修复路径</strong>:替换为 <code>SCAN</code> 游标 + 客户端聚合,或使用 <code>redis-cli --scan</code> 这类基于 SCAN 的工具。不要在生产实例上跑 <code>KEYS</code>,这是 Redis 文档反复强调的风险点。
 </div>
 
 <!-- ============================================================ -->
@@ -807,7 +799,7 @@ $ redis-cli SLOWLOG GET 3
       <tr><th>异常</th><th>关键字段</th><th>阈值</th><th>处理</th></tr>
     </thead>
     <tbody>
-      <tr><td>慢消费者</td><td><code>omem</code></td><td>&gt; 32 MiB</td><td><code>CLIENT KILL ID</code></td></tr>
+      <tr><td>慢消费者</td><td><code>omem</code></td><td>&gt; 32 MiB</td><td>定位 owner,必要时 <code>CLIENT KILL ID</code></td></tr>
       <tr><td>僵尸连接</td><td><code>idle</code> + <code>age</code></td><td>双 &gt; 3600</td><td>启用 <code>tcp-keepalive</code></td></tr>
       <tr><td>大请求缓冲</td><td><code>qbuf</code></td><td>&gt; 1 MiB</td><td>客户端单批次过大</td></tr>
       <tr><td>阻塞订阅</td><td><code>sub</code> + <code>omem</code></td><td>sub &gt; 0 + omem 大</td><td>限制 pubsub buffer</td></tr>
@@ -826,7 +818,7 @@ sub=128 psub=0 qbuf=0 qbuf-free=20474 obl=8192 oll=120 omem=67108864 cmd=subscri
 <h3>38.5.3 慢消费者处置流程</h3>
 
 <div class="diagram">
-  <div class="diagram-title">图 38-5-3 · CLIENT KILL 决策树</div>
+  <div class="diagram-title">图 38-5-3 · 慢消费者处置决策树</div>
   <svg viewBox="0 0 940 420" xmlns="http://www.w3.org/2000/svg" style="display:block;max-width:940px;width:100%;margin:8px auto;height:auto;">
     <rect width="940" height="420" fill="var(--diagram-panel)" rx="10"/>
     <g font-family="ui-sans-serif">
@@ -852,7 +844,7 @@ sub=128 psub=0 qbuf=0 qbuf-free=20474 obl=8192 oll=120 omem=67108864 cmd=subscri
       <text x="700" y="206" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">否</text>
 
       <rect x="60" y="240" width="280" height="60" rx="10" fill="url(#d-red)" filter="url(#d-shadow)"/>
-      <text x="200" y="264" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">CLIENT KILL ID xxx</text>
+      <text x="200" y="264" text-anchor="middle" fill="var(--diagram-text)" font-size="13" font-weight="800">确认 owner 后 KILL</text>
       <text x="200" y="282" text-anchor="middle" fill="var(--diagram-red-text)" font-size="10">立即释放 omem</text>
       <text x="200" y="296" text-anchor="middle" fill="var(--diagram-red-text)" font-size="9">客户端会感知 RST/连接断</text>
 
@@ -878,7 +870,7 @@ sub=128 psub=0 qbuf=0 qbuf-free=20474 obl=8192 oll=120 omem=67108864 cmd=subscri
   </svg>
 </div>
 
-<pre><code class="language-bash"># 处理慢消费者
+<pre><code class="language-bash"># 应急处理慢消费者:先确认 owner / SLA / 重连能力
 $ redis-cli CLIENT KILL ID 57
 (integer) 1
 $ redis-cli CONFIG SET timeout 300
@@ -975,7 +967,7 @@ OK</code></pre>
     <tbody>
       <tr><td><code>master_link_status</code></td><td><code>down</code> 持续 &gt; 60 秒</td><td>分页告警</td></tr>
       <tr><td>复制 offset 落后</td><td>&gt; 10 MiB 持续 5 分钟</td><td>普通告警</td></tr>
-      <tr><td>复制 offset 落后</td><td>&gt; 100 MiB</td><td>分页告警</td></tr>
+      <tr><td>复制 offset 落后</td><td>接近或超过 <code>repl_backlog_size</code></td><td>分页告警</td></tr>
       <tr><td><code>master_last_io_seconds_ago</code></td><td>&gt; 30 秒</td><td>普通告警</td></tr>
       <tr><td><code>connected_slaves</code></td><td>减少</td><td>普通告警</td></tr>
     </tbody>
@@ -993,7 +985,7 @@ $ echo "$((master_offset - slave_offset)) bytes behind"
 7340032 bytes behind</code></pre>
 
 <div class="warning">
-  <strong>backlog 不足触发全量重同步:</strong> 7 MiB 落后在 backlog(默认 1 MiB)外,该从节点处于 <code>WAIT_BGSAVE_END</code> 或全量重同步状态。<strong>生产 backlog 应至少为 100-256 MiB 以容忍短暂网络抖动</strong>。
+  <strong>backlog 不足触发全量重同步:</strong> 7 MiB 落后在 backlog(默认 1 MiB)外,该从节点处于 <code>WAIT_BGSAVE_END</code> 或全量重同步状态。生产 backlog 应按写入速率 × 可容忍断线窗口估算,再用复制演练验证。
 </div>
 
 <h3>38.6.3 持久化失败的根因分类</h3>
@@ -1104,7 +1096,7 @@ $ echo "$((master_offset - slave_offset)) bytes behind"
       <text x="320" y="92" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="700">1) GET /metrics  (HTTP scrape, 默认 15s 间隔)</text>
 
       <line x1="470" y1="140" x2="770" y2="140" stroke="var(--diagram-blue-stroke)" stroke-width="2" marker-end="url(#d-arr-b)"/>
-      <text x="620" y="132" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">2) INFO all (或选择 section)</text>
+      <text x="620" y="132" text-anchor="middle" fill="var(--diagram-blue-text)" font-size="11" font-weight="700">2) INFO section(避免无脑 INFO all)</text>
 
       <line x1="770" y1="180" x2="470" y2="180" stroke="var(--diagram-red-stroke)" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#d-arr-r)"/>
       <text x="620" y="172" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11" font-weight="700">3) bulk string — 计数器快照</text>
@@ -1470,7 +1462,7 @@ redis_exporter_last_scrape_error{err="NOAUTH Authentication required."} 1</code>
 
       <rect x="270" y="220" width="200" height="50" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
       <text x="370" y="240" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="11" font-weight="800">5. 碎片率 &lt; 1 误判</text>
-      <text x="370" y="256" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">实际是 swap</text>
+      <text x="370" y="256" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">可能是 swap</text>
       <text x="370" y="266" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">查 smaps_rollup</text>
 
       <rect x="500" y="160" width="200" height="50" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
@@ -1502,7 +1494,7 @@ redis_exporter_last_scrape_error{err="NOAUTH Authentication required."} 1</code>
       <tr><td>2</td><td>高频 <code>CLIENT LIST</code></td><td>连接多时 O(N) 阻塞</td><td>告警后按 <code>TYPE</code> / <code>ID</code> 查询</td></tr>
       <tr><td>3</td><td><code>MEMORY USAGE key SAMPLES 0</code> 扫大容器</td><td>精确但 O(N) 制造延迟</td><td>先 <code>--bigkeys</code>,低峰精查</td></tr>
       <tr><td>4</td><td>命中率看累计值</td><td>历史高命中掩盖近期下降</td><td>PromQL <code>rate(...[5m])</code></td></tr>
-      <tr><td>5</td><td>碎片率 &lt; 1 误判</td><td>实为 swap</td><td><code>/proc/&lt;pid&gt;/smaps_rollup Swap</code></td></tr>
+      <tr><td>5</td><td>碎片率 &lt; 1 误判</td><td>可能是 swap 或容器/平台记账差异</td><td><code>/proc/&lt;pid&gt;/smaps_rollup Swap</code> + cgroup 指标</td></tr>
       <tr><td>6</td><td>告警无 runbook</td><td>值班仅截图转发</td><td>每告警写"查什么、阈值、动作"</td></tr>
       <tr><td>7</td><td>只监控主节点</td><td>从节点断链 / AOF 失败 / 只读延迟漏报</td><td>每节点都有 exporter + 告警</td></tr>
     </tbody>
@@ -1510,7 +1502,7 @@ redis_exporter_last_scrape_error{err="NOAUTH Authentication required."} 1</code>
 </div>
 
 <div class="warning">
-  <strong>MONITOR 是核武器:</strong> 在生产实例上跑 <code>MONITOR</code> 会把每条命令格式化后转发给 MONITOR 客户端,主线程 CPU 占用立刻翻倍,QPS 直接腰斩。Redis 默认<strong>不限制 MONITOR 权限</strong>,生产环境应该通过 ACL <code>~* -monitor</code> 或者 <code>rename-command MONITOR ""</code> 完全禁用。
+  <strong>MONITOR 是核武器:</strong> 在生产实例上跑 <code>MONITOR</code> 会把每条命令格式化后转发给 MONITOR 客户端,主线程 CPU 与网络开销会显著上升,还可能泄露敏感参数。<code>MONITOR</code> 权限取决于 Redis 版本、ACL 与实际配置;生产环境应默认禁用或严格限权,只在受控诊断窗口使用。
 </div>
 
 <!-- ============================================================ -->
@@ -1640,12 +1632,12 @@ redis_exporter_last_scrape_error{err="NOAUTH Authentication required."} 1</code>
       <tr><td><code>SLOWLOG</code> 与 <code>LATENCY</code> 分工不同</td><td><code>slowlog-log-slower-than</code>、<code>latency-monitor-threshold</code></td><td>二者必须组合使用</td></tr>
       <tr><td><code>CLIENT LIST</code> 是 O(N) 手术刀</td><td>不可高频采集</td><td>告警后按 ID 查询</td></tr>
       <tr><td>命中率必须用窗口差分</td><td><code>rate(...[5m])</code></td><td>累计值掩盖最近变化</td></tr>
-      <tr><td>碎片率 &lt; 1 通常是 swap</td><td><code>/proc/&lt;pid&gt;/smaps_rollup</code></td><td>误判为低碎片</td></tr>
-      <tr><td>复制落后超过 backlog 触发全量重同步</td><td><code>repl_backlog_size</code></td><td>backlog 默认 1 MiB,生产应 ≥ 100 MiB</td></tr>
+      <tr><td>碎片率 &lt; 1 需二次确认</td><td><code>/proc/&lt;pid&gt;/smaps_rollup</code> + cgroup 指标</td><td>误判为低碎片</td></tr>
+      <tr><td>复制落后超过 backlog 触发全量重同步</td><td><code>repl_backlog_size</code></td><td>按写入速率 × 断线窗口估算</td></tr>
       <tr><td>持久化失败影响恢复点目标</td><td><code>rdb_last_bgsave_status</code></td><td>任何 err 必告警</td></tr>
       <tr><td>每条告警必含 runbook</td><td>三字段:查什么、阈值、动作</td><td>截图转发不解决问题</td></tr>
       <tr><td>每节点独立 exporter</td><td>主从均需</td><td>仅监控主漏报从问题</td></tr>
-      <tr><td><code>MONITOR</code> 严禁在生产实例使用</td><td>rename-command / ACL 屏蔽</td><td>QPS 减半 + 敏感数据泄露</td></tr>
+      <tr><td><code>MONITOR</code> 生产默认禁用或受控限权</td><td>ACL 限权 / rename-command</td><td>主线程开销大 + 敏感数据泄露</td></tr>
     </tbody>
   </table>
 </div>
@@ -1670,8 +1662,6 @@ redis-cli SLOWLOG GET 5</code></pre>
 </div>
 
 <p class="footer">&copy; 2026 图解 Redis &middot; 第 38 章 &middot; 监控与故障排查</p>
-
-</div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/c.min.js"></script>

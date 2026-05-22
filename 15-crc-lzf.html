@@ -54,25 +54,25 @@
 <p class="subtitle">CRC16-CCITT · CRC64-Jones · 8 位表驱动 · LZ77 家族 · LZF 三种 token · hash 链查重复 · quicklist 中间节点压缩 · RDB 字符串压缩</p>
 
 <div class="chapter-intro">
-  <p class="lead">第 14 章描述了 dict 内部查找用的 <strong>SipHash</strong>(keyed 哈希,抗碰撞攻击,但不可跨实例);Redis 还使用两类<strong>不需 keyed</strong> 的哈希:<strong>CRC16</strong> 用于 Cluster slot 路由,<strong>CRC64</strong> 用于 RDB 文件完整性校验。两者都是基于<strong>多项式除法</strong>的循环冗余码,实现上通过 <strong>8 位查表</strong>加速到 ~5 ns/byte。</p>
-  <p>Redis 同时使用 <strong>LZF 压缩</strong>节省内存:<code>list-compress-depth</code> 控制 quicklist 中间节点压缩,<code>rdbcompression yes</code> 控制 RDB 文件中长字符串(≥ 21 字节)压缩。LZF 是 LZ77 家族成员,实现极简(单 .c 文件 ~200 行)、无依赖、无内存分配,与 Redis "代码简洁优先" 的设计哲学高度匹配。</p>
+  <p class="lead">第 14 章描述了 dict 内部查找用的 <strong>SipHash</strong>(keyed 哈希,抗碰撞攻击,但不可跨实例);Redis 还使用两类<strong>不需 keyed</strong> 的哈希:<strong>CRC16</strong> 用于 Cluster slot 路由,<strong>CRC64</strong> 用于 RDB 文件完整性校验。两者都是基于<strong>多项式除法</strong>的循环冗余码,实现上通过 <strong>8 位查表</strong>达到纳秒级/byte 的吞吐。</p>
+  <p>Redis 还在两个不同语义层使用 <strong>LZF 压缩</strong>:<code>list-compress-depth</code> 压缩 quicklist 中间节点,节省运行时 Redis 内存;<code>rdbcompression yes</code> 压缩 RDB 文件中的长字符串(≥ 21 字节),节省持久化文件体积与传输成本。前者影响 <code>used_memory</code>,后者影响磁盘文件,两者不要混为一谈。</p>
   <p>本章描述 <strong>CRC16-CCITT 与 CRC64-Jones 的查表实现</strong>、<strong>LZ77 家族的 LZF 字节级编码格式</strong>(三种 token 紧凑编码),以及压缩在 <strong>quicklist / RDB</strong> 中的应用边界与陷阱。读完本章可以判断:为什么 hash tag <code>{user:1001}</code> 能强制路由同 slot;为什么短字符串不压缩(21 字节阈值);为什么 <code>list-compress-depth = 0</code> 默认不启用压缩。</p>
   <ul class="will-learn">
     <li>CRC 的代数本质:GF(2) 多项式除法,余数即校验码</li>
-    <li>CRC 检错能力:k 位 CRC 漏检概率 = 1 / 2<sup>k</sup>(CRC64 ≈ 5.4e-20)</li>
-    <li>CRC16-CCITT 的 256 项 16-bit 表驱动,5 ns/byte</li>
+    <li>CRC 检错能力:对随机错误,k 位 CRC 的漏检概率近似 1 / 2<sup>k</sup>(CRC64 ≈ 5.4e-20)</li>
+    <li>CRC16-CCITT 的 256 项 16-bit 表驱动,吞吐与 CPU/编译选项相关</li>
     <li>CRC64-Jones 的反射(LSB-first)实现与 CRC16 的非反射(MSB-first)对比</li>
     <li>hash tag <code>{user:1001}:profile</code> 与 CLUSTER KEYSLOT 的交互流程</li>
     <li>RDB 文件 8 字节 CRC64 末尾布局与 <code>rdbchecksum</code> 配置</li>
     <li>LZ77 滑动窗口 + (距离, 长度) 编码原理</li>
     <li>LZF 三种 token:LITERAL / 短 BACKREF / 长 BACKREF 的字节级紧凑编码</li>
     <li>LZF 编码器的 hash 链查重复(HLOG=16,htab 64K)</li>
-    <li>LZF 解压时 BACKREF 的<strong>逐字节复制</strong>(memmove,不能 memcpy)</li>
+    <li>LZF 解压时 BACKREF 的<strong>逐字节复制</strong>(重叠回看不能整段 memcpy/memmove)</li>
     <li>quicklist <code>list-compress-depth</code> 的取舍:头尾不压缩 + 中间 LZF</li>
     <li>RDB 字符串压缩的 21 字节阈值与 0xC3 type marker</li>
-    <li>典型陷阱:CRC 不抗主动篡改、高熵数据反而膨胀、忘开 rdbchecksum</li>
+    <li>典型陷阱:CRC 不抗主动篡改、高熵数据压缩收益低、关闭 rdbchecksum</li>
   </ul>
-  <p class="prereq">前置知识:第 7 章 quicklist(理解中间节点压缩位置);第 12 章 RDB 持久化(理解 RDB 文件结构);第 14 章 SipHash(对比 keyed vs 非 keyed 哈希)。读者需要熟悉位运算、查表加速思想、滑动窗口算法基本概念。</p>
+  <p class="prereq">前置知识:第 7 章 quicklist(理解中间节点压缩位置);第 17 章 RDB 持久化(理解 RDB 文件结构);第 14 章 SipHash(对比 keyed vs 非 keyed 哈希)。读者需要熟悉位运算、查表加速思想、滑动窗口算法基本概念。</p>
 </div>
 
 <h3>本章全景图</h3>
@@ -117,7 +117,7 @@
         <rect x="40" y="254" width="220" height="28" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
         <text x="50" y="272">§15.3 CRC64-Jones (RDB)</text>
         <rect x="40" y="286" width="220" height="28" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
-        <text x="50" y="304">§15.4 8 位表驱动加速 (5 ns/byte)</text>
+        <text x="50" y="304">§15.4 8 位表驱动加速</text>
 
         <rect x="280" y="190" width="220" height="28" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
         <text x="290" y="208">§15.5 LZ77 滑动窗口 + (距离,长度)</text>
@@ -126,7 +126,7 @@
         <rect x="280" y="254" width="220" height="28" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
         <text x="290" y="272">§15.7 HLOG=16, htab 64K hash 链</text>
         <rect x="280" y="286" width="220" height="28" rx="6" fill="var(--diagram-green-fill)" stroke="var(--diagram-green-stroke)"/>
-        <text x="290" y="304">§15.8 BACKREF memmove 逐字节复制</text>
+        <text x="290" y="304">§15.8 BACKREF 逐字节复制</text>
 
         <rect x="520" y="190" width="180" height="28" rx="6" fill="var(--diagram-orange-fill)" stroke="var(--diagram-orange-stroke)"/>
         <text x="530" y="208" fill="var(--diagram-orange-text)">§15.9 quicklist 头尾不压缩</text>
@@ -143,8 +143,8 @@
 
       <rect x="40" y="350" width="880" height="110" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)" stroke-width="2"/>
       <text x="60" y="372" fill="var(--diagram-purple-text)" font-size="12" font-weight="800">★ 核心对照 — 三种哈希在 Redis 内的分工</text>
-      <text x="60" y="392" fill="var(--diagram-blue-text)" font-size="10">• <tspan fill="var(--diagram-blue-text)" font-weight="800">CRC16</tspan>: 16384 个 cluster slot 路由,无密钥, 跨节点必须一致 (CRC16-CCITT,XMODEM 变体,~5 ns/byte)</text>
-      <text x="60" y="410" fill="var(--diagram-blue-text)" font-size="10">• <tspan fill="var(--diagram-green-text)" font-weight="800">CRC64</tspan>: RDB 文件完整性校验,无密钥, 末尾 8 字节 (CRC64-Jones,reflected,~5 ns/byte)</text>
+      <text x="60" y="392" fill="var(--diagram-blue-text)" font-size="10">• <tspan fill="var(--diagram-blue-text)" font-weight="800">CRC16</tspan>: 16384 个 cluster slot 路由,无密钥,跨节点必须一致 (CRC16-CCITT/XMODEM)</text>
+      <text x="60" y="410" fill="var(--diagram-blue-text)" font-size="10">• <tspan fill="var(--diagram-green-text)" font-weight="800">CRC64</tspan>: RDB 文件完整性校验,无密钥,末尾 8 字节 (CRC64-Jones,reflected)</text>
       <text x="60" y="428" fill="var(--diagram-blue-text)" font-size="10">• <tspan fill="var(--diagram-purple-text)" font-weight="800">SipHash</tspan>: dict 内部桶定位,带密钥, 进程私有 (Ch.14,抗 HashDoS)</text>
       <text x="60" y="448" fill="var(--diagram-orange-text)" font-size="10" font-weight="800">★ 三者各司其职 — keyed vs 非 keyed,跨实例 vs 进程内,认证 vs 校验,完全不可互换</text>
     </g>
@@ -155,7 +155,7 @@
 <h2 id="s15-1">15.1 CRC 多项式除法基础</h2>
 <!-- ============================================================ -->
 
-<p>CRC(Cyclic Redundancy Check,循环冗余校验)的核心思想是把消息字节串当作 <strong>GF(2) 上的多项式系数</strong>,再用一个固定的"生成多项式"做长除法,余数就是校验码。GF(2) 是只有 0 和 1 两个元素的有限域,加减都退化成 XOR,所以硬件实现极快。这一节先讲清楚代数本质,再分析为什么 k 位 CRC 漏检概率刚好是 1 / 2<sup>k</sup>。</p>
+<p>CRC(Cyclic Redundancy Check,循环冗余校验)的核心思想是把消息字节串当作 <strong>GF(2) 上的多项式系数</strong>,再用一个固定的"生成多项式"做长除法,余数就是校验码。GF(2) 是只有 0 和 1 两个元素的有限域,加减都退化成 XOR,所以硬件实现极快。这一节先讲清楚代数本质,再说明为什么对随机错误,k 位 CRC 的漏检概率可近似看作 1 / 2<sup>k</sup>。</p>
 
 <h3>15.1.1 CRC 的代数本质</h3>
 
@@ -206,7 +206,7 @@
 </svg>
 
 <div class="key-insight">
-  <strong>GF(2) 的工程意义</strong>:加减乘除都可以用纯 XOR + 移位实现 — 一个时钟周期内硬件就能完成 1 bit 的 CRC 推进。软件上把 8 bit 一次预先打表,就得到 5 ns/byte 的实战吞吐。
+  <strong>GF(2) 的工程意义</strong>:加减乘除都可以用纯 XOR + 移位实现。软件上把 8 bit 一次预先打表,就能把 CRC 推进变成少量移位、异或和查表,吞吐通常不再是 Redis 热路径瓶颈。
 </div>
 
 <h3>15.1.2 CRC 检错能力的几何理解</h3>
@@ -268,7 +268,7 @@
       <tr><td>名称</td><td>XMODEM 风格</td><td>Jones 多项式</td></tr>
       <tr><td>Redis 用途</td><td>Cluster slot 路由</td><td>RDB 文件完整性校验</td></tr>
       <tr><td>表大小</td><td>256 × 2 B = <strong>512 B</strong></td><td>256 × 8 B = <strong>2 KB</strong></td></tr>
-      <tr><td>典型吞吐(2.5 GHz)</td><td>~5 ns/byte</td><td>~5 ns/byte</td></tr>
+      <tr><td>典型吞吐</td><td>纳秒级/byte</td><td>纳秒级/byte</td></tr>
     </tbody>
   </table>
 </div>
@@ -330,7 +330,7 @@
         <text x="620" y="302" fill="var(--diagram-blue-text)" font-size="10">★ 每项 16 位: table[i] 已经</text>
         <text x="620" y="320" fill="var(--diagram-blue-text)" font-size="10">  含 8 次多项式除法的累计 XOR</text>
         <text x="620" y="346" fill="var(--diagram-green-text)" font-size="11" font-weight="800">→ 1 次表查 = 8 次原始 CRC 步骤</text>
-        <text x="620" y="364" fill="var(--diagram-green-text)" font-size="11" font-weight="800">→ ~5 ns/byte (现代 CPU)</text>
+        <text x="620" y="364" fill="var(--diagram-green-text)" font-size="11" font-weight="800">→ 纳秒级/byte (依赖 CPU)</text>
         <text x="620" y="392" fill="var(--diagram-muted)" font-size="9">★ 16-bit 表大小仅 512 B,完全装入 L1</text>
         <text x="620" y="408" fill="var(--diagram-muted)" font-size="9">  现代 CPU 还可以用 PCLMULQDQ 进一步加速</text>
       </g>
@@ -368,7 +368,7 @@
   <text x="460" y="46" text-anchor="middle" font-size="14" font-weight="700" fill="var(--diagram-blue-text)">8 位表 (Redis 选择)</text>
   <text x="460" y="76" text-anchor="middle" font-size="11" fill="var(--diagram-blue-text)">预计算 256 项 × 16-bit</text>
   <text x="460" y="96" text-anchor="middle" font-size="11" fill="var(--diagram-blue-text)">每字节 1 次表查 + XOR</text>
-  <text x="460" y="130" text-anchor="middle" font-size="20" font-weight="700" fill="var(--diagram-blue-text)">~5 ns/byte</text>
+  <text x="460" y="130" text-anchor="middle" font-size="20" font-weight="700" fill="var(--diagram-blue-text)">纳秒级/byte</text>
   <text x="460" y="158" text-anchor="middle" font-size="12" font-weight="700" fill="var(--diagram-blue-text)">512 B 表 (L1 cache 完美)</text>
   <text x="460" y="194" text-anchor="middle" font-size="11" font-weight="700" fill="var(--diagram-blue-text)">★ 速度/内存最佳平衡</text>
 
@@ -651,7 +651,7 @@ uint16_t crc16(const char *buf, int len) {
         <text x="350" y="124" text-anchor="middle" fill="var(--diagram-green-text)" font-size="12" font-weight="800">B · 8 位表 ★</text>
         <text x="350" y="142" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">256 项 × bytes</text>
         <text x="350" y="160" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">1 查表 + 1 XOR</text>
-        <text x="350" y="180" text-anchor="middle" fill="var(--diagram-green-text)" font-size="13" font-weight="800">~5 ns/byte</text>
+        <text x="350" y="180" text-anchor="middle" fill="var(--diagram-green-text)" font-size="13" font-weight="800">纳秒级/byte</text>
         <text x="350" y="200" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">CRC16: 512 B</text>
         <text x="350" y="216" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">CRC64: 2 KB</text>
         <text x="350" y="244" text-anchor="middle" fill="var(--diagram-text)" font-size="10" font-weight="800">★ Redis 选择</text>
@@ -693,7 +693,7 @@ uint16_t crc16(const char *buf, int len) {
   </svg>
 </div>
 
-<p>Redis 选择 8 位表(B 方案):内存开销小(L1 cache 完全装下)、实现简单、性能足够。极端场景(如 16 GB RDB 文件)仍可接受 5 ns/byte ≈ 80 秒的全文校验时间;而且 CRC 计算与 RDB 写入<strong>并行</strong>进行,实际并不延长 BGSAVE 时间。</p>
+<p>Redis 选择 8 位表(B 方案):内存开销小(L1 cache 完全装下)、实现简单、性能足够。对大 RDB 文件,CRC64 是随 <code>rio</code> 写入流式累计的 CPU 成本,通常被顺序写盘吞吐掩盖;若 CPU 已经打满,它仍可能拉长 BGSAVE,因此不应把"校验"与"磁盘写入"混为一个指标。</p>
 
 <h3>15.4.2 CRC16 表驱动的紧凑实现</h3>
 
@@ -1091,7 +1091,7 @@ while (cur + 3 &lt;= len) {
 <h2 id="s15-8">15.8 LZF 解压流程</h2>
 <!-- ============================================================ -->
 
-<p>LZF 解压是<strong>纯顺序流式解码</strong> — 没有 hash 表、没有匹配查找,只是按 token 头字节分发到三个分支。这也是为什么解压速度 (~600 MB/s) 远快于压缩 (~200 MB/s)。但 BACKREF 的<strong>循环复制</strong>有个微妙的坑:必须逐字节 / memmove,不能 memcpy。</p>
+<p>LZF 解压是<strong>纯顺序流式解码</strong> — 没有 hash 表、没有匹配查找,只是按 token 头字节分发到三个分支。这也是为什么解压通常远快于压缩。但 BACKREF 的<strong>循环复制</strong>有个微妙的坑:当回看距离小于复制长度时,必须逐字节复制,不能把整段直接交给 <code>memcpy</code> 或 <code>memmove</code>。</p>
 
 <h3>15.8.1 LZF 解压主循环</h3>
 
@@ -1229,9 +1229,9 @@ while (cur + 3 &lt;= len) {
   <rect x="470" y="230" width="430" height="120" rx="6" fill="url(#bk-grow)" stroke="var(--diagram-green-stroke)" stroke-width="2"/>
   <text x="685" y="252" text-anchor="middle" font-size="13" font-weight="700" fill="var(--diagram-blue-text)">✓ 正确用法</text>
   <text x="490" y="276" font-size="11" fill="var(--diagram-blue-text)">① 显式 for 循环逐字节复制 (慢但对)</text>
-  <text x="490" y="296" font-size="11" fill="var(--diagram-blue-text)">② memmove() (允许重叠, 自动判方向)</text>
-  <text x="490" y="316" font-size="11" fill="var(--diagram-blue-text)">③ 优化: off ≥ 16 (SIMD 宽度) 时 memcpy</text>
-  <text x="490" y="334" font-size="11" fill="var(--diagram-blue-text)">    否则 fallback byte loop · LZ4/Snappy 均采用</text>
+  <text x="490" y="296" font-size="11" fill="var(--diagram-blue-text)">② off + 1 ≥ len 时才可整段复制</text>
+  <text x="490" y="316" font-size="11" fill="var(--diagram-blue-text)">③ 优化: 距离足够大时使用宽拷贝</text>
+  <text x="490" y="334" font-size="11" fill="var(--diagram-blue-text)">    否则 fallback byte loop · 保持 LZ77 语义</text>
 </svg>
 
 <h3>15.8.3 LZF 编解码性能特征</h3>
@@ -1596,13 +1596,13 @@ while (cur + 3 &lt;= len) {
       <tr><td>JSON 文本(高重复)</td><td>1 GB</td><td>350 MB</td><td>1 GB</td><td><strong>65%</strong></td></tr>
       <tr><td>二进制 protobuf</td><td>1 GB</td><td>750 MB</td><td>1 GB</td><td>25%</td></tr>
       <tr><td>HTML / 日志(高重复)</td><td>1 GB</td><td>280 MB</td><td>1 GB</td><td><strong>72%</strong></td></tr>
-      <tr><td>高熵随机数据</td><td>1 GB</td><td>1.05 GB(膨胀)</td><td>1 GB</td><td>-5%</td></tr>
+      <tr><td>高熵随机数据</td><td>1 GB</td><td>≈ 1 GB(压缩失败则原样保存)</td><td>1 GB</td><td>≈ 0%</td></tr>
       <tr><td>短字符串(&lt; 21 B)</td><td>1 GB</td><td>1 GB(不压缩)</td><td>1 GB</td><td>0%</td></tr>
     </tbody>
   </table>
 </div>
 
-<p><code>rdbcompression yes</code> 在 BGSAVE 时占用额外 CPU,主线程 fork 后<strong>由子进程承担</strong>,不影响主线程响应。生产推荐保持默认 <code>yes</code>。</p>
+<p><code>rdbcompression yes</code> 在 BGSAVE 时占用额外 CPU,主线程 fork 后主要由子进程承担;它通常不直接阻塞命令执行,但会与主线程争抢 CPU 调度。生产上一般保持默认 <code>yes</code>,除非数据长期高熵且 BGSAVE CPU 已成为瓶颈。</p>
 
 <!-- ============================================================ -->
 <h2 id="s15-11">15.11 陷阱速查</h2>
@@ -1663,9 +1663,9 @@ while (cur + 3 &lt;= len) {
         <text x="230" y="244" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">→ CRC16 + tag</text>
 
         <rect x="300" y="190" width="120" height="68" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
-        <text x="360" y="210" text-anchor="middle" fill="var(--diagram-orange-text)" font-weight="800">③ CRC64 拖慢 BGSAVE</text>
-        <text x="360" y="226" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">实际 fork 子进程做</text>
-        <text x="360" y="244" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">→ 不影响主线程</text>
+        <text x="360" y="210" text-anchor="middle" fill="var(--diagram-orange-text)" font-weight="800">③ CRC64 背锅</text>
+        <text x="360" y="226" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">常见瓶颈是磁盘/压缩</text>
+        <text x="360" y="244" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">→ 先 profile</text>
 
         <rect x="430" y="190" width="120" height="68" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
         <text x="490" y="210" text-anchor="middle" fill="var(--diagram-orange-text)" font-weight="800">④ CRC16 性能瓶颈</text>
@@ -1679,8 +1679,8 @@ while (cur + 3 &lt;= len) {
 
         <rect x="690" y="190" width="120" height="68" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
         <text x="750" y="210" text-anchor="middle" fill="var(--diagram-green-text)" font-weight="800">⑥ 高熵数据求压缩</text>
-        <text x="750" y="226" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">反而膨胀 5%</text>
-        <text x="750" y="244" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">→ rdbcompression no</text>
+        <text x="750" y="226" text-anchor="middle" fill="var(--diagram-green-text)" font-size="9">收益低,浪费 CPU</text>
+        <text x="750" y="244" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="9">→ 先看 BGSAVE CPU</text>
 
         <rect x="820" y="190" width="100" height="68" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-blue-stroke)"/>
         <text x="870" y="210" text-anchor="middle" fill="var(--diagram-blue-text)" font-weight="800">⑦ depth 过大</text>
@@ -1705,10 +1705,10 @@ while (cur + 3 &lt;= len) {
     <tbody>
       <tr><td>1</td><td>用 CRC 做完整性认证</td><td>攻击者伪造的 RDB 通过校验</td><td>CRC 不抗主动篡改</td><td>用 SHA-256 / HMAC 做认证</td></tr>
       <tr><td>2</td><td>错用 SipHash 算 slot</td><td>客户端与 Redis slot 不一致</td><td>SipHash 输出不可跨实例</td><td>用 CRC16 + hash tag</td></tr>
-      <tr><td>3</td><td>CRC64 拖慢 BGSAVE</td><td>BGSAVE 时间显著增长</td><td>大数据集 + 全量校验</td><td><code>rdbchecksum no</code>(谨慎)或硬件 SSD</td></tr>
+      <tr><td>3</td><td>CRC64 背锅</td><td>BGSAVE 时间显著增长</td><td>未区分磁盘写入、LZF 压缩与 CRC CPU</td><td>先 profile;生产保持 <code>rdbchecksum yes</code>,除非有完整外部校验兜底</td></tr>
       <tr><td>4</td><td>怀疑 CRC16 是热点</td><td>perf 看 CRC 占 5%</td><td>实际 RTT 占 99%</td><td>profile 端到端,非热点</td></tr>
       <tr><td>5</td><td>短字符串期望压缩</td><td>&lt; 21 B 不压缩,无节省</td><td>LZF 头部开销 &gt; 节省</td><td>不预期短字符串压缩</td></tr>
-      <tr><td>6</td><td>高熵数据(图片/视频)压缩</td><td>RDB 反而比原始大 5%</td><td>LZF 不能压缩高熵数据</td><td><code>rdbcompression no</code> 或拆离图片</td></tr>
+      <tr><td>6</td><td>高熵数据(图片/视频)压缩</td><td>文件几乎不变小,BGSAVE CPU 增加</td><td>LZF 找不到重复片段,失败后原样保存</td><td>评估 <code>rdbcompression no</code> 或将大二进制拆出 Redis</td></tr>
       <tr><td>7</td><td>list-compress-depth 过大</td><td>LRANGE 慢</td><td>中间节点频繁解压</td><td>减小 depth 或留头尾足够节点不压</td></tr>
       <tr><td>8</td><td>rdbchecksum no</td><td>RDB 损坏时静默加载错乱数据</td><td>关闭校验</td><td>生产保持默认 yes</td></tr>
     </tbody>
@@ -1817,7 +1817,7 @@ fi
 
       <rect x="40" y="380" width="860" height="68" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
       <text x="60" y="402" fill="var(--diagram-purple-text)" font-size="12" font-weight="800">★ 两条路径独立 — 不同算法/输入方向/应用场景</text>
-      <text x="60" y="422" fill="var(--diagram-blue-text)" font-size="10">• CRC16: 对 key 计算, 每次命令都跑 (热路径); ~5 ns/byte 不是瓶颈</text>
+      <text x="60" y="422" fill="var(--diagram-blue-text)" font-size="10">• CRC16: 对 key 计算, 每次命令都跑 (热路径); 通常不是瓶颈</text>
       <text x="60" y="438" fill="var(--diagram-blue-text)" font-size="10">• CRC64: 对全 RDB 计算, BGSAVE 子进程跑 (冷路径); 不影响主线程响应</text>
     </g>
   </svg>
@@ -1928,7 +1928,7 @@ fi
 
 <h4>取舍 1:CRC 表驱动 8 位 vs 16 位</h4>
 
-<p>8 位表 256 项,内存占用极小(CRC16 512 B,CRC64 2 KB),性能 5 ns/byte。16 位表性能提升至 3 ns/byte,但内存增加 256 倍(CRC64 16 位表要 512 KB,L1 cache 完全装不下,反而因 cache miss 变慢)。Redis 选择 8 位表,匹配"代码简洁优先"的设计原则。</p>
+<p>8 位表 256 项,内存占用极小(CRC16 512 B,CRC64 2 KB),性能已足够。16 位表可能减少循环次数,但内存增加 256 倍(CRC64 16 位表要 512 KB,L1 cache 完全装不下,反而可能因 cache miss 变慢)。Redis 选择 8 位表,匹配"代码简洁优先"的设计原则。</p>
 
 <h4>取舍 2:LZF 而非 LZ4 / Snappy</h4>
 
@@ -1958,10 +1958,10 @@ fi
       <tr><td>CRC 不抗主动篡改</td><td><code>crc16</code> / <code>crc64</code></td><td>完整性认证用 SHA / HMAC</td></tr>
       <tr><td>CRC16 用于 Cluster slot</td><td><code>keyHashSlot</code> + hash tag</td><td>hash tag 跨多 key 落同 slot</td></tr>
       <tr><td>CRC64 校验 RDB</td><td>RDB 末 8 字节 + rio 流式累计</td><td><code>rdbchecksum no</code> 慎关</td></tr>
-      <tr><td>8 位表驱动 CRC</td><td><code>crc16tab</code> / <code>crc64_tab</code></td><td>性能 5 ns/byte 可接受</td></tr>
-      <tr><td>LZF 是 LZ77 家族,简单 hash 链</td><td><code>lzf_c.c</code> hash 表 64K</td><td>高熵数据可能膨胀</td></tr>
+      <tr><td>8 位表驱动 CRC</td><td><code>crc16tab</code> / <code>crc64_tab</code></td><td>纳秒级/byte 已足够</td></tr>
+      <tr><td>LZF 是 LZ77 家族,简单 hash 链</td><td><code>lzf_c.c</code> hash 表 64K</td><td>高熵数据压缩收益低</td></tr>
       <tr><td>LZF 三种 token 编码</td><td>LITERAL / BACKREF 短/长</td><td>最小匹配长度 3</td></tr>
-      <tr><td>LZF 解压 BACKREF 必须 memmove</td><td><code>lzf_d.c</code></td><td>memcpy 在重叠区会出错</td></tr>
+      <tr><td>LZF 解压 BACKREF 必须逐字节展开</td><td><code>lzf_d.c</code></td><td>整段 memcpy/memmove 会破坏重叠回看语义</td></tr>
       <tr><td>quicklist <code>list-compress-depth</code></td><td><code>__quicklistCompress*</code></td><td>默认 0 不压缩,需要时设 1/2</td></tr>
       <tr><td>RDB <code>rdbcompression yes</code></td><td><code>rdbSaveLzfStringObject</code></td><td>短字符串 &lt; 21 B 不压缩</td></tr>
       <tr><td>RDB LZF type marker = 0xC3</td><td><code>rdb.c</code></td><td>变长 length encoding</td></tr>
@@ -2015,14 +2015,14 @@ yes</code></pre>
 <div class="key-insight">
   <strong>Redis 在 CRC + LZF 上的 4 个设计选择</strong>:<br>
   ① <strong>CRC16 + CRC64 而非 CRC32C</strong>:历史选择,CRC 不是热点,无强动机切换;<br>
-  ② <strong>8 位表驱动</strong>:512 B / 2 KB 内存,L1 命中,5 ns/byte 已经足够;<br>
+  ② <strong>8 位表驱动</strong>:512 B / 2 KB 内存,L1 命中,吞吐已足够;<br>
   ③ <strong>LZF 而非 LZ4 / zstd</strong>:无依赖、200 行 C、无 SIMD,跨平台一致;<br>
   ④ <strong>list-compress-depth 默认 0</strong>:延迟优先,需要内存优化时再开。
 </div>
 
 <h3>下一章预告</h3>
 
-<p>CRC 与 LZF 是<strong>确定性算法</strong>:前者保证完整性,后者保证压缩率。下一章 <strong><code>16-bloom-cms.html</code></strong> 回到<strong>概率算法</strong>:Bloom Filter 用 m 位 + k 个独立 hash 函数,以可控的<strong>假阳率</strong>换取 1 字节级别的成员存在判断;Count-Min Sketch 用 d × w 矩阵估算频次,适合 TopK 长尾场景。Bloom Filter 与 HLL 的根本不同:HLL 估"<strong>有多少不同元素</strong>",Bloom 答"<strong>某元素是否在集合中</strong>"。下一章描述 Bloom 位图的字节级布局、k 与 m 的最优关系、可扩展 Bloom 的串联结构,以及 RedisBloom 模块的命令接口。</p>
+<p>CRC 与 LZF 都是<strong>确定性算法</strong>:前者用于错误检测,后者保证可逆还原并追求轻量压缩,但不承诺固定压缩率。下一章 <strong><code>16-bloom.html</code></strong> 回到<strong>概率算法</strong>:Bloom Filter 用 m 位 + k 个独立 hash 函数,以可控的<strong>假阳率</strong>换取 1 字节级别的成员存在判断;Count-Min Sketch 用 d × w 矩阵估算频次,适合 TopK 长尾场景。Bloom Filter 与 HLL 的根本不同:HLL 估"<strong>有多少不同元素</strong>",Bloom 答"<strong>某元素是否在集合中</strong>"。下一章描述 Bloom 位图的字节级布局、k 与 m 的最优关系、可扩展 Bloom 的串联结构,以及 RedisBloom 模块的命令接口。</p>
 
 </div>
 

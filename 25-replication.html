@@ -57,9 +57,9 @@
 <div class="chapter-intro">
   <p class="lead">Redis 主从复制把主节点的写入流以 <strong>RESP 编码的命令字节流</strong>形式<strong>异步</strong>传播到从节点。设计目标包含三项:<strong>断线重连后避免重传完整数据集</strong>、<strong>故障转移后保留旧主节点身份以减少全量同步</strong>、<strong>单线程主进程不被复制路径阻塞</strong>。</p>
   <p>三项目标共同决定了 Redis 复制协议的结构:全局复制偏移量(<code>master_repl_offset</code>)、固定大小环形缓冲(<code>repl_backlog</code>)、双 Replication ID(<code>replid</code> + <code>replid2</code>)、PSYNC 2.0 握手协议。任何一个组件缺失都会让上面三个目标之一回落到"全量同步"的高代价兜底。</p>
-  <p>本章按"协议基础 → 数据结构 → 运行时行为 → 生产实践 → 源码取舍"五层组织。每一节先给出图示,再给出代码或命令验证,最后给出可直接复制到生产的容量推导公式与监控阈值。</p>
+  <p>本章按"协议基础 → 数据结构 → 运行时行为 → 生产实践 → 源码取舍"五层组织。每一节先给出图示,再给出代码或命令验证,最后给出容量推导公式与可按业务基线调整的监控阈值。</p>
   <ul class="will-learn">
-    <li>异步复制为什么不能升级为同步:<code>min-replicas-*</code> 与 <code>WAIT</code> 都只是事后检查</li>
+    <li>异步复制为什么不能升级为强同步:<code>min-replicas-*</code> 是写入前健康门槛,<code>WAIT</code> 是写入后 ACK 等待</li>
     <li>PSYNC 2.0 握手两条路径:首次连接强制全量、断线重连按 backlog 窗口判定</li>
     <li>repl_backlog 5 字段:<code>size / idx / histlen / off / master_repl_offset</code> 的语义与不变量</li>
     <li>backlog 容量公式 <strong>2 × W × T</strong>:为什么默认 1 MiB 仅适用于测试环境</li>
@@ -70,7 +70,7 @@
     <li>9 类生产陷阱与诊断:从 backlog 太小到 <code>replica-serve-stale-data</code> 默认开启</li>
     <li>4 个核心源码取舍:内存环形 vs 磁盘日志、异步 vs 同步、双 ID、命令字节流 vs 操作日志</li>
   </ul>
-  <p class="prereq">前置知识:第 22 章 RDB(全量同步底层走 BGSAVE 或 diskless fork);第 23 章 AOF(理解写命令双目的地的代价);RESP 协议基础(命令字节流是复制传输单位)。读者需要熟悉 fork / copy-on-write、TCP socket buffer、环形缓冲(ring buffer)的基本概念。</p>
+  <p class="prereq">前置知识:第 17 章 RDB(全量同步底层走 BGSAVE 或 diskless fork);第 18 章 AOF(理解写命令双目的地的代价);第 21 章 RESP(命令字节流是复制传输单位)。读者需要熟悉 fork / copy-on-write、TCP socket buffer、环形缓冲(ring buffer)的基本概念。</p>
 </div>
 
 <h3>本章全景图</h3>
@@ -251,7 +251,7 @@
       <tr><td>数据安全性</td><td>单磁盘故障即丢失</td><td>多节点冗余</td></tr>
       <tr><td>写入一致性</td><td>强一致(单节点串行)</td><td>异步复制,主从存在窗口</td></tr>
       <tr><td>提交成本</td><td>内存写入即返回</td><td>内存写入即返回(不等待 ACK)</td></tr>
-      <tr><td>min-replicas 拒写保护</td><td>不适用</td><td>可作为事后检查的写保护边界</td></tr>
+      <tr><td>min-replicas 拒写保护</td><td>不适用</td><td>基于最近 ACK 的写入前健康门槛</td></tr>
     </tbody>
   </table>
 </div>
@@ -313,7 +313,7 @@
 </div>
 
 <div class="key-insight">
-  <strong>异步复制核心权衡</strong>:写入路径的延迟<strong>不依赖</strong>从节点 ACK,代价是主节点崩溃时存在数据丢失窗口。<code>min-replicas-to-write</code> 与 <code>min-replicas-max-lag</code> 仅作为<strong>事后检查门槛</strong>——主节点检测到健康从节点数不足时拒绝<strong>新</strong>写入,但<strong>已经返回 <code>+OK</code> 的写入</strong>仍可能丢失。
+  <strong>异步复制核心权衡</strong>:写入路径默认<strong>不等待</strong>从节点 ACK,代价是主节点崩溃时存在数据丢失窗口。<code>min-replicas-to-write</code> 与 <code>min-replicas-max-lag</code> 是基于最近 ACK 的<strong>写入前健康门槛</strong>——主节点检测到健康从节点数不足时拒绝<strong>新</strong>写入,但<strong>已经返回 <code>+OK</code> 的写入</strong>仍可能丢失。
 </div>
 
 <!-- ============================================================ -->
@@ -660,9 +660,9 @@
       <text x="20" y="22" fill="var(--diagram-red-text)" font-weight="700" font-size="12">★ 死循环陷阱</text>
       <text x="20" y="44" fill="var(--diagram-blue-text)" font-size="11">期间主节点写入累积:</text>
       <text x="20" y="64" fill="var(--diagram-blue-text)" font-size="11">1 MiB/s × 77 s = 77 MiB buffer</text>
-      <text x="20" y="86" fill="var(--diagram-orange-text)" font-size="11">若 slave output-buffer 配置过低,</text>
+      <text x="20" y="86" fill="var(--diagram-orange-text)" font-size="11">若 replica output buffer 配置过低,</text>
       <text x="20" y="104" fill="var(--diagram-orange-text)" font-size="11">连接被关闭 → 必须重新全量同步</text>
-      <text x="20" y="126" fill="var(--diagram-red-text)" font-size="11" font-weight="700">→ 永远同步不完!</text>
+      <text x="20" y="126" fill="var(--diagram-red-text)" font-size="11" font-weight="700">→ 可能长期追不上!</text>
     </g>
   </svg>
 </div>
@@ -674,8 +674,8 @@
   <table>
     <thead><tr><th>配置项</th><th>默认值</th><th>建议值(中等数据集)</th><th>说明</th></tr></thead>
     <tbody>
-      <tr><td>client-output-buffer-limit slave hard</td><td>256 MiB</td><td>1 GiB 或 0(无限)</td><td>超过即关闭从节点连接</td></tr>
-      <tr><td>client-output-buffer-limit slave soft</td><td>64 MiB / 60s</td><td>256 MiB / 60s</td><td>软限制持续超过阈值即关闭</td></tr>
+      <tr><td>client-output-buffer-limit replica/slave hard</td><td>256 MiB</td><td>按 RDB 传输期间新增写入量估算,如 1 GiB</td><td>超过即关闭 replica 连接</td></tr>
+      <tr><td>client-output-buffer-limit replica/slave soft</td><td>64 MiB / 60s</td><td>按链路抖动与写入速率估算</td><td>软限制持续超过阈值即关闭</td></tr>
       <tr><td>repl-backlog-size</td><td>1 MiB</td><td>2 × W × T</td><td>见 §25.5 公式</td></tr>
       <tr><td>repl-timeout</td><td>60 s</td><td>60-120 s</td><td>心跳与传输超时</td></tr>
     </tbody>
@@ -693,7 +693,7 @@ connected_clients:5
 client_recent_max_output_buffer:0</code></pre>
 
 <div class="warning">
-  <strong>大数据集全量同步循环陷阱</strong>:<code>slave</code> 输出缓冲的硬限制(默认 256 MiB)是大数据集全量同步失败的常见原因。当主节点持续写入速率高、RDB 较大时,buffer 在传输完成前可能超限,触发连接关闭并循环全量同步,主节点永远无法把这个从节点带上线。修复方式是把 <code>slave hard</code> 提升到 1 GiB 或设为 <code>0</code>(无限),并启用 diskless 加快 RDB 传输。
+  <strong>大数据集全量同步循环陷阱</strong>:replica 输出缓冲的硬限制(默认 256 MiB)是大数据集全量同步失败的常见原因。当主节点持续写入速率高、RDB 较大时,buffer 在传输完成前可能超限,触发连接关闭并循环全量同步,主节点长时间无法把这个 replica 带上线。修复方式是按"传输期间新增写入量 + 抖动余量"提高 replica/slave hard/soft 限制,避免简单设为无限;同时启用 diskless、降低写入峰值或分片。
 </div>
 
 <!-- ============================================================ -->
@@ -763,7 +763,7 @@ struct redisServer {
       <text x="20" y="22" fill="var(--diagram-green-text)" font-size="12" font-weight="700">★ 有效部分同步区间</text>
       <text x="20" y="46" fill="var(--diagram-blue-text)" font-size="11" font-family="monospace">[repl_backlog_off, off + histlen) = [12, 28)</text>
       <text x="20" y="66" fill="var(--diagram-blue-text)" font-size="11">从节点请求的 req_offset 必须落入这 16 字节窗口才能 PSYNC,否则 FULLRESYNC</text>
-      <text x="20" y="92" fill="var(--diagram-orange-text)" font-size="11">→ 实际生产中默认 1 MiB 太小,推荐 2 × W × T(写入速率 × 最大断线时长)</text>
+      <text x="20" y="92" fill="var(--diagram-orange-text)" font-size="11">→ 默认 1 MiB 往往太小,可从 2 × W × T(写入速率 × 最大断线时长)估算</text>
     </g>
   </svg>
 </div>
@@ -909,7 +909,7 @@ j = (j + skip) % server.repl_backlog_size;
     <!-- 2x 安全余量 -->
     <g transform="translate(40, 220)">
       <rect x="0" y="0" width="840" height="44" rx="8" fill="url(#bl-safe)" opacity="0.15" stroke="var(--diagram-green-stroke)"/>
-      <text x="460" y="28" text-anchor="middle" fill="var(--diagram-green-text)" font-size="14" font-weight="700" font-family="monospace">生产推荐: repl_backlog_size = 2 × W × T  (突发峰值 + 握手开销 2x 余量)</text>
+      <text x="460" y="28" text-anchor="middle" fill="var(--diagram-green-text)" font-size="14" font-weight="700" font-family="monospace">常用估算: repl_backlog_size = 2 × W × T  (突发峰值 + 握手开销 2x 余量)</text>
     </g>
   </svg>
 </div>
@@ -917,7 +917,7 @@ j = (j + skip) % server.repl_backlog_size;
 <h3>25.5.2 不同写入压力下的容量推荐</h3>
 
 <div class="diagram">
-  <div class="diagram-title">表 25-5-1 · 4 种典型写入场景的 backlog 推荐</div>
+  <div class="diagram-title">表 25-5-1 · 4 种典型写入场景的 backlog 估算</div>
   <table>
     <thead><tr><th>场景</th><th>写入速率 W</th><th>最大断线 T</th><th>D = W × T</th><th>建议 backlog</th><th>默认 1 MiB 是否足够</th></tr></thead>
     <tbody>
@@ -940,12 +940,12 @@ j = (j + skip) % server.repl_backlog_size;
     <tbody>
       <tr><td><code>1 × W × μ</code></td><td>1.0</td><td>63.2%</td></tr>
       <tr><td><code>2 × W × μ</code></td><td>2.0</td><td>86.5%</td></tr>
-      <tr><td><code>3 × W × μ</code></td><td>3.0</td><td><strong>95.0% (生产建议)</strong></td></tr>
+      <tr><td><code>3 × W × μ</code></td><td>3.0</td><td><strong>95.0% (示例目标)</strong></td></tr>
       <tr><td><code>4 × W × μ</code></td><td>4.0</td><td>98.2%</td></tr>
       <tr><td><code>5 × W × μ</code></td><td>5.0</td><td>99.3%</td></tr>
     </tbody>
   </table>
-  <p style="color:var(--green);font-size:13px;margin:8px 0 0 0;">★ 生产建议 ≥ 3 × W × μ,达到 95% 部分同步覆盖率。</p>
+  <p style="color:var(--green);font-size:13px;margin:8px 0 0 0;">★ 示例目标:若希望约 95% 部分同步覆盖率,可评估 ≥ 3 × W × μ。</p>
 </div>
 
 <h3>25.5.4 连续采样推导写入速率</h3>
@@ -964,7 +964,7 @@ redis-cli INFO replication | grep master_repl_offset
 # Δ = 1231094100 - 923884100 = 307,210,000 字节 / 60 秒
 # W ≈ 5 MiB/s
 # 假设最大可容忍断线 T = 60 秒
-# 推荐 repl-backlog-size = 2 × W × T = 600 MiB</code></pre>
+# 估算 repl-backlog-size = 2 × W × T = 600 MiB</code></pre>
 
 <p><code>repl-backlog-size</code> 默认 1 MiB 仅适用于测试环境。生产配置应基于实测写入速率与可容忍断线窗口推导,而非凭经验估算。</p>
 
@@ -1253,13 +1253,13 @@ repl_backlog_histlen:252435456</code></pre>
       <rect x="330" y="244" width="280" height="86" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-orange-stroke)"/>
       <text x="470" y="266" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="12" font-weight="800">② min-replicas 写保护</text>
       <text x="470" y="286" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">健康从节点数 &lt; N → 拒写</text>
-      <text x="470" y="304" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">事后边界检查门槛</text>
-      <text x="470" y="322" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">⚠ 不能撤回已经返回的 +OK</text>
+      <text x="470" y="304" text-anchor="middle" fill="var(--diagram-orange-text)" font-size="10">写入前健康门槛</text>
+      <text x="470" y="322" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">基于最近 ACK,不是共识提交</text>
 
       <rect x="620" y="244" width="280" height="86" rx="8" fill="var(--diagram-blue-fill)" stroke="var(--diagram-green-stroke)"/>
       <text x="760" y="266" text-anchor="middle" fill="var(--diagram-green-text)" font-size="12" font-weight="800">③ WAIT N timeout</text>
       <text x="760" y="286" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">阻塞 client 直到 N 个 ACK</text>
-      <text x="760" y="304" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">同步语义(逐次)</text>
+      <text x="760" y="304" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">写后 ACK 等待</text>
       <text x="760" y="322" text-anchor="middle" fill="var(--diagram-muted)" font-size="9">代价:命令路径阻塞</text>
     </g>
   </svg>
@@ -1331,7 +1331,7 @@ repl_backlog_histlen:252435456</code></pre>
 </div>
 
 <div class="warning">
-  WAIT 与 min-replicas 均<strong>不提供强同步语义</strong>。两者均为事后检查:<code>WAIT</code> 用于单次写入后等待 ACK 计数,<code>min-replicas-*</code> 用于持续判断写入是否安全。两者都<strong>不能阻止</strong>已经返回 <code>+OK</code> 的写入在主节点崩溃后丢失。
+  WAIT 与 min-replicas 均<strong>不提供强同步/共识语义</strong>。<code>WAIT</code> 用于单次写入后等待 ACK 计数;如果超时返回的 ACK 数不足,写入也不会被回滚。<code>min-replicas-*</code> 是写入前的健康门槛,基于最近 ACK 时间判断是否拒写。两者都不能保证已经返回 <code>+OK</code> 的写入在主节点崩溃后完全不丢。
 </div>
 
 <h3>25.7.5 写命令传播源码片段</h3>
@@ -1666,7 +1666,7 @@ master_repl_offset:1231094100
 # 推导
 Δ = 307,210,000 字节 / 60 秒 = 5.11 MiB/s
 T_max = 60 秒(可容忍断线)
-推荐 backlog = 2 × W × T = 600 MiB
+估算 backlog = 2 × W × T = 600 MiB
 当前 repl-backlog-size = 256 MiB → 偏小</code></pre>
 
 <h3>25.9.6 masterTryPartialResynchronization 调试日志</h3>
@@ -1775,7 +1775,7 @@ CONTINUE req_offset=3620100 backlog=[3400042,3745721]</code></pre>
 
 <h3>25.11.1 全量 vs 部分同步代价对比</h3>
 
-<p>测试条件:Redis 7.2,8 GiB 数据集,4 核 CPU,2 GiB repl_backlog,10 Gbps 网络。</p>
+<p>示例测试条件:Redis 7.2,8 GiB 数据集,4 核 CPU,2 GiB repl_backlog,10 Gbps 网络。数值用于理解量级,实际需以本机压测为准。</p>
 
 <div class="diagram">
   <div class="diagram-title">表 25-11-1 · 6 维代价对比</div>
@@ -1794,7 +1794,7 @@ CONTINUE req_offset=3620100 backlog=[3400042,3745721]</code></pre>
 
 <h3>25.11.2 复制延迟与写入吞吐关系</h3>
 
-<p>测试条件:1 主 1 从,同机房,不同写入压力下的复制延迟。</p>
+<p>示例条件:1 主 1 从,同机房,不同写入压力下的复制延迟。数值用于说明趋势,不要直接作为 SLO。</p>
 
 <div class="diagram">
   <div class="diagram-title">表 25-11-2 · 写入 QPS vs 复制延迟</div>
@@ -1824,7 +1824,7 @@ CONTINUE req_offset=3620100 backlog=[3400042,3745721]</code></pre>
   </div>
   <div class="metric">
     <div class="value">600 MiB</div>
-    <div class="label">5 MiB/s × 60 s 推荐 backlog</div>
+    <div class="label">5 MiB/s × 60 s backlog 估算</div>
   </div>
 </div>
 
@@ -1860,7 +1860,7 @@ CONTINUE req_offset=3620100 backlog=[3400042,3745721]</code></pre>
       <rect x="20" y="160" width="200" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
       <text x="120" y="180" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">P11 · backlog 默认 1 MiB 太小</text>
       <rect x="20" y="200" width="200" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
-      <text x="120" y="220" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">P12 · slave output-buffer 触发</text>
+      <text x="120" y="220" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">P12 · replica output buffer 触发</text>
       <rect x="20" y="240" width="200" height="32" rx="6" fill="var(--diagram-blue-fill)" stroke="var(--diagram-purple-stroke)"/>
       <text x="120" y="260" text-anchor="middle" fill="var(--diagram-purple-text)" font-size="10">P13 · 大 RDB 加载阻塞</text>
 
@@ -1903,10 +1903,10 @@ CONTINUE req_offset=3620100 backlog=[3400042,3745721]</code></pre>
 
       <rect x="40" y="320" width="860" height="120" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
       <text x="60" y="346" fill="var(--diagram-blue-text)" font-size="13" font-weight="800">★ 命中规律</text>
-      <text x="60" y="368" fill="var(--diagram-muted)" font-size="11">· 容量(P1):默认值 = 玩具值,生产必改 — backlog/output-buffer 都按 写入速率×断线窗口 推算</text>
+      <text x="60" y="368" fill="var(--diagram-muted)" font-size="11">· 容量(P1):默认值通常不足 — backlog/output-buffer 应按 写入速率×断线窗口 推算</text>
       <text x="60" y="388" fill="var(--diagram-muted)" font-size="11">· 延迟(P2):全量同步是稀有事件但每次代价巨大 — 通过 backlog 容量与 diskless 规避</text>
       <text x="60" y="408" fill="var(--diagram-muted)" font-size="11">· 一致性(P3):异步复制本身不提供强一致 — 业务层补偿,不要靠 WAIT/min-replicas 装强同步</text>
-      <text x="60" y="428" fill="var(--diagram-muted)" font-size="11">· 运行时(P4):上线前必须接入 lag 字节数 + master_repl_offset 差监控 — 出事后再补已经晚了</text>
+      <text x="60" y="428" fill="var(--diagram-muted)" font-size="11">· 运行时(P4):上线前应接入 lag 字节数 + master_repl_offset 差监控,避免事后补监控</text>
     </g>
   </svg>
 </div>
@@ -1919,7 +1919,7 @@ CONTINUE req_offset=3620100 backlog=[3400042,3745721]</code></pre>
     <thead><tr><th>#</th><th>陷阱</th><th>症状</th><th>根因</th><th>监控指标</th><th>修复</th></tr></thead>
     <tbody>
       <tr><td>1</td><td>repl-backlog-size 默认 1 MiB</td><td>短断线即触发全量同步</td><td>默认值远小于生产写入 × 断线窗口</td><td><code>repl_backlog_histlen</code></td><td>按 2 × W × T 公式重算</td></tr>
-      <tr><td>2</td><td>client-output-buffer-limit slave 触发</td><td>全量同步循环失败</td><td>大 RDB 传输期间 buffer 超限</td><td><code>client_recent_max_output_buffer</code></td><td>提高 slave hard 限制至 1 GiB</td></tr>
+      <tr><td>2</td><td>client-output-buffer-limit replica/slave 触发</td><td>全量同步循环失败</td><td>大 RDB 传输期间 buffer 超限</td><td><code>client_recent_max_output_buffer</code></td><td>按传输期间新增写入量提高 hard/soft 限制</td></tr>
       <tr><td>3</td><td>RDB 加载阻塞从节点</td><td>从节点几十秒不可用</td><td>单核加载,默认同步刷盘</td><td>加载日志</td><td>启用 <code>replica-lazy-flush</code>、<code>repl-diskless-load swapdb</code></td></tr>
       <tr><td>4</td><td>全量同步期间从节点返回旧数据</td><td>业务读到不一致状态</td><td><code>replica-serve-stale-data yes</code> 默认</td><td>业务读延迟尖峰</td><td>严格场景设为 no,客户端 fallback</td></tr>
       <tr><td>5</td><td>fork 延迟尖峰</td><td>主节点 P99 突然飙升至几百毫秒</td><td>RDB 生成时 fork 阻塞</td><td><code>latest_fork_usec</code></td><td>优先避免 FULLRESYNC,启用 diskless</td></tr>
@@ -2104,7 +2104,7 @@ repl_backlog_size:629145600
 
 <h4>取舍 2:异步复制 vs 同步复制</h4>
 
-<p>Redis 选择异步复制,以最大化写入吞吐。代价是主节点崩溃时存在数据丢失窗口。<code>min-replicas-to-write</code> 与 <code>WAIT</code> 提供事后检查的边界,但不改变异步本质。强一致需求场景应选择具备同步复制或共识提交语义的方案(如 etcd、ZooKeeper)。</p>
+<p>Redis 选择异步复制,以最大化写入吞吐。代价是主节点崩溃时存在数据丢失窗口。<code>min-replicas-to-write</code> 提供写入前健康门槛,<code>WAIT</code> 提供写入后 ACK 等待,但二者都不改变异步复制本质。强一致需求场景应选择具备同步复制或共识提交语义的方案(如 etcd、ZooKeeper)。</p>
 
 <h4>取舍 3:replid + replid2 双身份</h4>
 
@@ -2145,7 +2145,7 @@ repl_backlog_size:629145600
       <tr><td>repl_backlog 是固定大小环形缓冲</td><td><code>feedReplicationBacklog()</code></td><td>断线时间 × 写入速率超过 size 即降级为全量</td></tr>
       <tr><td>backlog 容量公式 = 2 × W × T</td><td><code>INFO replication</code> 连续采样推导</td><td>默认 1 MiB 远不足以覆盖生产场景</td></tr>
       <tr><td>replid + replid2 处理故障转移</td><td><code>master_replid2</code> 字段</td><td>兄弟从节点的部分同步依赖该字段</td></tr>
-      <tr><td>REPLCONF ACK 提供心跳与延迟监控</td><td><code>WAIT</code> 命令、<code>min-replicas-*</code> 配置</td><td>不提供强同步,仅事后检查</td></tr>
+      <tr><td>REPLCONF ACK 提供心跳与延迟监控</td><td><code>WAIT</code> 命令、<code>min-replicas-*</code> 配置</td><td>不提供强同步;WAIT 是写后等待,min-replicas 是写前门槛</td></tr>
       <tr><td>Diskless 适合慢磁盘 + 快网络环境</td><td><code>repl-diskless-sync yes</code></td><td>多 replica 共享 RDB 需要等待 delay</td></tr>
       <tr><td>failover 后从节点可能短暂返回旧数据</td><td><code>replica-serve-stale-data</code></td><td>严格一致场景应设为 no</td></tr>
     </tbody>
@@ -2185,8 +2185,8 @@ slave_repl_offset:&lt;some-value&gt;
       <tr><td>部分同步(2 MiB 缺失)</td><td>~0.2 s</td><td>同机房 10 Gbps</td></tr>
       <tr><td>同机房复制延迟(50K QPS)</td><td>~1 ms 平均 / ~5 ms P99</td><td>1 主 1 从</td></tr>
       <tr><td>跨机房复制延迟</td><td>+RTT</td><td>RTT 主导</td></tr>
-      <tr><td>backlog 推荐(5 MiB/s × 60s)</td><td>600 MiB</td><td>2 × W × T</td></tr>
-      <tr><td>WAIT 命令额外延迟</td><td>= 最慢 replica RTT</td><td>不阻塞写入路径</td></tr>
+      <tr><td>backlog 估算(5 MiB/s × 60s)</td><td>600 MiB</td><td>2 × W × T</td></tr>
+      <tr><td>WAIT 命令额外延迟</td><td>= 最慢 replica RTT</td><td>写入已执行,客户端等待 ACK 返回</td></tr>
     </tbody>
   </table>
 </div>

@@ -54,18 +54,18 @@
 
 <div class="chapter-intro">
   <p class="lead">Redis 事务的语义边界与传统 RDBMS 事务存在<strong>显著差异</strong>。Redis 通过 <code>MULTI / EXEC / DISCARD / WATCH</code> 四个命令提供"<strong>批量提交 + 串行执行 + 乐观锁</strong>"语义,但<strong>不提供 ACID 中的回滚特性</strong>。理解 Redis 事务的关键是识别这一边界:Redis 事务的"原子性"指 EXEC 期间命令不被其他客户端命令插入,而非"全部成功或全部回滚"。</p>
-  <p>该设计选择源于<strong>单线程命令模型</strong>的内在简洁性。在单线程模型下,EXEC 阶段的所有命令在一次 <code>processCommand()</code> 调用栈内顺序完成,事件循环不返回,因此事务隔离级别天然达到 <strong>SERIALIZABLE</strong>。实现回滚则需要 undo log 或 snapshot,在单线程模型中显著增加复杂度与延迟,违背 Redis "极简高性能"的核心原则。WATCH 提供乐观锁(OCC)语义,允许客户端在 EXEC 前检测被监视 key 的修改 — 该机制利用现有写命令路径上的 <code>signalModifiedKey()</code> 钩子,无需引入额外锁结构,开销仅为单次哈希查找加链表遍历。</p>
+  <p>这套设计借助 Redis 主线程的顺序执行:EXEC 阶段的命令按队列连续执行,期间不会被其他客户端命令插入。注意,这只说明执行隔离,不等于传统数据库的"失败回滚"或提交日志。Redis 不做回滚,是为了避免在热路径维护 undo log / snapshot。WATCH 则提供乐观锁(OCC)语义,让客户端在 EXEC 前发现被监视 key 是否被其他写命令改过。</p>
   <p>本章按"<strong>语义模型 → 四个命令 → WATCH 机制 → 不回滚的工程权衡 → ACID 分析 → 部署适配 → 陷阱</strong>"组织,强调事务的边界条件与生产可观测性。</p>
   <ul class="will-learn">
     <li>"读-计算-写"竞争条件下数据丢失的具体路径,以及 WATCH 如何用 CAS 解决</li>
     <li><code>MULTI</code> 仅设置 <code>CLIENT_MULTI</code> flag、不创建任何数据结构的实现细节</li>
     <li><code>multiCmd / multiState</code> 队列结构与入队期间的 robj 引用计数管理</li>
-    <li><code>EXEC</code> 在主线程 <code>processCommand</code> 调用栈内不返回事件循环的 SERIALIZABLE 证明</li>
-    <li>入队语法错误(<code>CLIENT_DIRTY_EXEC</code>)与执行类型错误的两种处理路径区别</li>
+    <li><code>EXEC</code> 连续执行期间不被其他客户端命令插入的边界</li>
+    <li>入队语法错误(<code>CLIENT_DIRTY_EXEC</code>)与执行期类型错误的两种处理路径区别</li>
     <li><code>DISCARD</code> 清理 multiState、解除 WATCH、清除 flag 的完整资源回收</li>
     <li><code>watched_keys</code> 字典与 <code>signalModifiedKey</code> 钩子链的零成本设计</li>
     <li>WATCH 的边界条件:TTL 过期、淘汰、相同 value 写回是否触发 DIRTY_CAS</li>
-    <li>Antirez 设计依据下的"不回滚"工程权衡及 Lua 替代方案</li>
+    <li>"不回滚"的工程权衡,以及 Lua 能补上的服务端条件分支能力</li>
     <li>Redis 事务的 ACID 满足度逐项分析与与 PostgreSQL SSI 的对比</li>
     <li>主从复制流中 MULTI...EXEC 整块传播、Cluster 单 slot 强制约束、hash tag 粒度选择</li>
     <li>事务 vs Pipeline vs Lua 的吞吐基准、命令耗时分布、生产监控指标</li>
@@ -144,7 +144,7 @@
       <rect x="480" y="322" width="420" height="32" rx="5" fill="var(--diagram-blue-fill)" stroke="var(--diagram-red-stroke)"/>
       <text x="690" y="342" text-anchor="middle" fill="var(--diagram-red-text)" font-size="11">§28.11 本章要点 · 四象限速记表</text>
       <text x="60" y="380" fill="var(--diagram-muted)" font-size="10">★ 阅读路径建议:必要性(为什么) → 命令(怎么用) → CAS(怎么避免丢更新) → 工程(生产中怎么用)</text>
-      <text x="60" y="400" fill="var(--diagram-muted)" font-size="10">★ 与其他章节关联:第 5 章单线程 / 第 19 章复制 / 第 27 章 Cluster CROSSSLOT / 第 29 章 Lua 替代方案</text>
+      <text x="60" y="400" fill="var(--diagram-muted)" font-size="10">★ 与其他章节关联:第 5 章单线程 / 第 19 章复制 / 第 27 章 Cluster CROSSSLOT / 第 29 章 Lua 条件分支</text>
       <text x="60" y="420" fill="var(--diagram-muted)" font-size="10">★ 核心论点:Redis 事务 = 批量提交 + 串行执行 + 乐观锁;不等于 RDBMS 事务的"全部成功或回滚"</text>
     </g>
   </svg>
@@ -213,7 +213,7 @@
       <text x="490" y="402" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">⑨ 串行执行队列</text>
       <line x1="610" y1="428" x2="110" y2="428" stroke="var(--diagram-green-stroke)" stroke-dasharray="3,3" marker-end="url(#d-arr-g)"/>
       <text x="360" y="422" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">结果数组(每命令一项)</text>
-      <text x="60" y="468" fill="var(--diagram-green-text)" font-size="10">★ EXEC 期间事件循环不返回 → SERIALIZABLE 隔离</text>
+      <text x="60" y="468" fill="var(--diagram-green-text)" font-size="10">★ EXEC 期间不被其他客户端命令插入</text>
       <text x="60" y="482" fill="var(--diagram-green-text)" font-size="10">★ 调度原子性:其他客户端命令插不进来</text>
 
       <rect x="490" y="370" width="430" height="120" rx="8" fill="var(--diagram-red-fill)" stroke="var(--diagram-red-stroke)"/>
@@ -233,7 +233,7 @@
 <p>事务从客户端视角是三阶段:<strong>WATCH(可选注册监视) → MULTI(入队命令) → EXEC(批量提交)</strong>。EXEC 在服务端有双分支:无 dirty 标志时串行执行队列并返回结果数组;有 <code>CLIENT_DIRTY_CAS</code> 或 <code>CLIENT_DIRTY_EXEC</code> 时整体放弃,返回 <code>nil</code> 或 <code>EXECABORT</code> 错误。</p>
 
 <div class="key-insight">
-  <strong>核心洞察:</strong> Redis 事务的"原子性"是 <strong>scheduling atomicity</strong>(调度原子性) — EXEC 内部不被其他命令插入,而非 RDBMS 的 <strong>all-or-nothing atomicity</strong>(全有全无原子性)。任何把 Redis 事务等同于 RDBMS 事务的认知都会导致生产事故,常见症状是"INCR 字符串失败但前面 SET 已生效,数据出现非预期状态"。
+  <strong>核心洞察:</strong> Redis 事务的"原子性"是 <strong>scheduling atomicity</strong>(调度原子性) — EXEC 内部不被其他命令插入,而不是 RDBMS 的 <strong>all-or-nothing atomicity</strong>(全有全无原子性)。如果把 Redis 事务当成会自动回滚的数据库事务,就会误判错误处理方式:例如 <code>INCR</code> 字符串失败时,前面的 <code>SET</code> 仍可能已经生效。
 </div>
 
 <div class="diagram">
@@ -255,7 +255,7 @@
 
       <rect x="330" y="100" width="280" height="50" rx="8" fill="url(#d-green)"/>
       <text x="470" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">约束 2 · EXEC 不被插入</text>
-      <text x="470" y="140" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">SERIALIZABLE 隔离级别</text>
+      <text x="470" y="140" text-anchor="middle" fill="var(--diagram-green-text)" font-size="10">执行期间不被插入</text>
 
       <rect x="640" y="100" width="280" height="50" rx="8" fill="url(#d-red)"/>
       <text x="780" y="124" text-anchor="middle" fill="var(--diagram-text)" font-size="12" font-weight="800">约束 3 · 不回滚</text>
@@ -564,7 +564,7 @@ void execCommand(client *c) {
 
   保证: EXEC 内的所有命令构成一个原子调度单元
         任意时刻最多一个事务的 EXEC 在执行
-        多事务的 EXEC 形成全序关系 (SERIALIZABLE)
+        多事务的 EXEC 形成全序关系 (无交错执行)
 
 非原子性: 单命令失败
   call() 返回错误不会中断 for 循环
@@ -573,7 +573,7 @@ void execCommand(client *c) {
   最终 reply 数组中既有成功也可能有错误</code></pre>
 
 <div class="key-insight">
-  <strong>核心机制:</strong> EXEC 的 for 循环<strong>不调用 <code>aeProcessEvents()</code></strong>,事件循环不返回。这意味着 EXEC 期间整个 Redis 实例对其他客户端"<strong>暂停响应</strong>"。该机制是 SERIALIZABLE 隔离的物理基础,也是<strong>长事务严重影响其他客户端</strong>的根本原因 — 1000 命令的事务可能让其他客户端 P99 延迟从 1 ms 涨到 10 ms+。
+  <strong>核心机制:</strong> EXEC 的执行循环期间不会回到事件循环处理其他客户端命令。因此,事务队列越长,其他客户端等待越久。这里要区分两件事:Redis 保证 EXEC 内部不被插队;它不保证队列里每条命令都成功,也不会在后续命令失败时回滚前面的写入。
 </div>
 
 <h3>28.2.4 DISCARD - 放弃事务</h3>
@@ -888,7 +888,7 @@ void touchWatchedKey(redisDb *db, robj *key) {
     每个 watcher O(1) 设 flag</code></pre>
 
 <div class="key-insight">
-  <strong>零成本设计:</strong> <code>if (dictSize(watched_keys) == 0) return;</code> 这一行是 WATCH 机制的<strong>性能基石</strong>。绝大多数生产实例不使用 WATCH,该判断使所有写命令路径上的 OCC 钩子退化为<strong>一次条件分支</strong>(几纳秒),不引入任何额外开销。该模式是 Redis"<strong>按需付费</strong>"设计哲学的典范。
+  <strong>低成本设计:</strong> <code>if (dictSize(watched_keys) == 0) return;</code> 这一行让没有 WATCH 的写路径很快跳过 OCC 逻辑。只有真正有人监视某个 key 时,Redis 才需要查找 watcher 并标记 <code>DIRTY_CAS</code>。这体现的是"按需付费",不是"完全没有成本"。
 </div>
 
 <h3>28.4.3 WATCH + MULTI/EXEC 时间线</h3>
@@ -1139,17 +1139,17 @@ QUEUED
       <text x="500" y="394" fill="var(--diagram-red-text)" font-size="11" font-weight="700">→ 三选项都违背 Redis 极简高性能核心原则</text>
 
       <rect x="20" y="420" width="900" height="50" rx="10" fill="url(#d-orange)" filter="url(#d-shadow)"/>
-      <text x="40" y="442" fill="var(--diagram-text)" font-size="13" font-weight="800">★ 替代方案:需要"全有全无"语义 → 用 Lua 脚本前置校验</text>
+      <text x="40" y="442" fill="var(--diagram-text)" font-size="13" font-weight="800">★ 需要先读后判断再写 → 用 Lua 在服务端先校验</text>
       <text x="40" y="460" fill="var(--diagram-orange-text)" font-size="11">Lua 在脚本内 GET → 业务校验 → 决策 → 写入,失败时根本不调用写命令(自然不需要回滚)</text>
     </g>
   </svg>
 </div>
 
-<p>Antirez 在官方文档中给出的设计依据:其一,Redis 命令仅在<strong>语法错误或类型不匹配</strong>时失败,这些都是开发者代码 bug,正确编写的程序不应产生此类错误;其二,实现回滚需要 undo log 或 snapshot,在单线程模型下显著增加复杂度与延迟。Redis 选择"<strong>快速失败 + 强制业务测试</strong>"模型,优于"运行时回滚"模型。</p>
+<p>官方文档给出的设计依据可以概括为两点:常见的事务失败多来自命令写错或类型不匹配,应在上线前通过校验和测试发现;而回滚需要 undo log 或 snapshot,会显著增加复杂度与延迟。因此 Redis 选择快速暴露错误,而不是在服务端补做运行时回滚。</p>
 
 <h3>28.5.4 替代方案 - Lua 前置校验</h3>
 
-<pre><code class="language-lua">-- 转账场景:需要"全有全无"语义
+<pre><code class="language-lua">-- 转账场景:先校验余额,再执行写入
 EVAL "
   local src_balance = tonumber(redis.call('GET', KEYS[1]) or 0)
   local amount = tonumber(ARGV[1])
@@ -1177,7 +1177,7 @@ EVAL "
   <div class="compare-card">
     <h4>Lua 脚本适用场景</h4>
     <ul>
-      <li><strong>"全有全无"</strong>语义硬要求</li>
+      <li>需要基于读取结果先校验、再写入</li>
       <li>需要基于读结果做条件分支</li>
       <li>大量命令的<strong>原子打包</strong></li>
       <li>需要多次访问同一 key 的复杂计算</li>
@@ -1187,7 +1187,7 @@ EVAL "
 </div>
 
 <div class="real-world">
-  <strong>真实事故案例:</strong> 某支付平台用 MULTI/EXEC 实现转账(<code>WATCH src; GET src; if balance&gt;=amt then MULTI/DECRBY/INCRBY/EXEC</code>),客户端在网络抖动时 GET 之后立即 MULTI,但漏了"<strong>余额检查</strong>"在 MULTI 之后才入队。WATCH 不能阻止"余额校验失败但仍执行扣款" — 因为校验是<strong>客户端逻辑</strong>,WATCH 只检测服务端 key 修改。最终上线后出现负余额,改用 Lua 一次性"读 + 校验 + 写"才彻底解决。
+  <strong>典型风险案例:</strong> 用 MULTI/EXEC 实现转账时,如果余额检查留在客户端,而入队阶段只包含 <code>DECRBY/INCRBY</code>,WATCH 只能检测 key 是否被别人改过,不能替你判断余额是否足够。结果可能是"校验失败但写命令仍被提交"。这类场景更适合用 Lua / Functions 在服务端一次性完成"读 + 校验 + 写"。
 </div>
 
 <!-- ============================================================ -->
@@ -1205,15 +1205,15 @@ EVAL "
     <tbody>
       <tr><td>Atomicity (原子性)</td><td>部分满足</td><td>★★★</td><td>EXEC 不被插入(执行原子);单命令失败不回滚(结果非原子);入队错误整体拒绝</td></tr>
       <tr><td>Consistency (一致性)</td><td>满足</td><td>★★★★★</td><td>每命令独立保证类型约束;WATCH 防过期数据决策</td></tr>
-      <tr><td>Isolation (隔离性)</td><td>满足</td><td>★★★★★</td><td>单线程天然 SERIALIZABLE 级别</td></tr>
+      <tr><td>Isolation (隔离性)</td><td>满足执行隔离</td><td>★★★★☆</td><td>EXEC 阶段不被其他客户端命令插入</td></tr>
       <tr><td>Durability (持久性)</td><td>取决于配置</td><td>★★</td><td>无持久化:不持久;AOF always:持久;AOF everysec:最多丢 1s</td></tr>
     </tbody>
   </table>
 </div>
 
-<h3>28.6.2 SERIALIZABLE 隔离级别证明</h3>
+<h3>28.6.2 EXEC 的无交错执行</h3>
 
-<pre class="ascii-art"><code>定理: Redis 事务隔离级别等价于 SERIALIZABLE
+<pre class="ascii-art"><code>结论: EXEC 阶段的命令不会与其他客户端命令交错
 
 设 T_1, T_2, ..., T_n 为 n 个并发提交的事务
 
@@ -1233,11 +1233,11 @@ Redis 单线程模型保证:
   执行顺序 = 到达顺序
   执行结果等价于 (T_1, T_2, ..., T_n) 某种全排列的串行调度
 
-  根据 SERIALIZABLE 定义:
-    存在等价于事务集合的串行调度
-    Redis 事务总是产生这样的调度
+  从调度角度看:
+    多个 EXEC 可以排列成一个串行顺序
+    其他客户端命令不会插入某个 EXEC 内部
 
-  ⊢ Redis 事务隔离级别 = SERIALIZABLE  ∎</code></pre>
+  ⊢ 可以把 EXEC 看作一个连续执行片段,但不包含回滚语义  ∎</code></pre>
 
 <h3>28.6.3 与传统数据库的对比</h3>
 
@@ -1290,7 +1290,7 @@ Redis 单线程模型保证:
       <tr><th>部署模式</th><th>MULTI/EXEC</th><th>WATCH</th><th>关键约束</th></tr>
     </thead>
     <tbody>
-      <tr><td>单节点</td><td>标准 SERIALIZABLE</td><td>标准 CAS</td><td>无特殊约束</td></tr>
+      <tr><td>单节点</td><td>EXEC 无交错执行</td><td>标准 CAS</td><td>无特殊约束</td></tr>
       <tr><td>主从复制</td><td>仅主节点提交,复制流以 MULTI...EXEC 包装</td><td>仅主节点</td><td>从节点不能 WATCH</td></tr>
       <tr><td>Sentinel</td><td>同主从</td><td>同主从</td><td>failover 后事务丢失</td></tr>
       <tr><td>Cluster</td><td>所有 key 同 slot</td><td>仅本节点 key</td><td>hash tag 强制同 slot</td></tr>
@@ -1389,12 +1389,12 @@ QUEUED
       <rect x="20" y="376" width="900" height="74" rx="10" fill="var(--diagram-blue-fill)" stroke="var(--diagram-border)"/>
       <text x="40" y="398" fill="var(--diagram-blue-text)" font-size="13" font-weight="800">★ 复制语义保证</text>
       <text x="40" y="418" fill="var(--diagram-green-text)" font-size="11">✓ 整批 MULTI...EXEC 同时进入复制流,Replica 也以事务方式应用 — 主从 keyspace 永不出现中间态</text>
-      <text x="40" y="436" fill="var(--diagram-orange-text)" font-size="11">⚠ 事务期间 Replica 不响应读请求,等待整批应用完成 — 长事务对读 QPS 有影响</text>
+      <text x="40" y="436" fill="var(--diagram-orange-text)" font-size="11">⚠ Replica 应用整批事务时也会占用主线程 — 长事务会拖慢副本读延迟</text>
     </g>
   </svg>
 </div>
 
-<p>主节点将整个事务作为 <code>MULTI...EXEC</code> 块复制到从节点,确保从节点也以原子方式应用。这避免了从节点观察到事务的中间状态,但代价是<strong>事务期间从节点不响应读请求</strong>(等待整批应用完成)。</p>
+<p>主节点将事务作为 <code>MULTI...EXEC</code> 块写入复制流,副本也按同样顺序应用。这避免了副本暴露事务中间状态;代价是副本应用这批命令时会占用自己的主线程,长事务会抬高副本读请求的尾延迟。</p>
 
 <!-- ============================================================ -->
 <h2 id="s28-8">28.8 性能与基线</h2>
@@ -1866,13 +1866,13 @@ void execCommand(client *c) {
 
 <h3>28.10.5 设计取舍</h3>
 
-<p>Redis 事务选择"<strong>批量提交 + 串行执行 + 乐观锁</strong>"语义而非传统 ACID 事务的根本原因是单线程模型的<strong>内在简洁性</strong>。SERIALIZABLE 隔离级别在单线程下天然成立,无需 MVCC、锁、依赖图等复杂机制。代价是放弃回滚能力,要求业务代码在 MULTI 之前完成所有校验,运行时类型错误必须通过测试覆盖避免。</p>
+<p>Redis 事务选择"<strong>批量提交 + 连续执行 + 乐观锁</strong>"而非传统 ACID 事务,核心原因是保持单线程命令路径简单。EXEC 内部不被其他客户端命令插入,无需 MVCC、锁或依赖图;代价是没有回滚能力。业务代码应在 <code>MULTI</code> 前完成能做的校验,并用测试覆盖类型错误、参数错误等可预防问题。</p>
 
 <p>WATCH 的设计利用了写命令路径上已存在的 <code>signalModifiedKey()</code> 钩子,无需引入额外锁结构。该机制的工程亮点是"<strong>开销与监视客户端数量成正比,不监视时近零开销</strong>"。<code>if (dictSize(watched_keys) == 0) return;</code> 使绝大多数无 WATCH 场景的写命令不承担任何 OCC 开销。</p>
 
-<p>不回滚的工程权衡有其内在一致性:Redis 命令的失败模式仅限于语法错误与类型错误,这些在严格类型系统的应用代码中应通过单元测试发现。<strong>回滚机制无法修复程序 bug,仅是事故发生后的补救手段</strong>。Redis 选择"快速失败 + 强制业务测试"模型,优于"运行时回滚"模型,这是单线程极简哲学的延续。</p>
+<p>不回滚的工程权衡有其内在一致性:许多事务错误来自参数、命令或 key 类型不符合预期,这些问题更适合在测试与上线前校验中发现。回滚机制能减少部分事故影响,但也会让每次写入都背上额外记录成本。Redis 的选择是让错误尽快暴露,把补偿与重试交给业务层。</p>
 
-<p>Cluster 中事务限于单 slot 的根本原因是分布式事务的复杂度。跨节点事务需要<strong>两阶段提交(2PC)</strong>或类似协议,引入协调者、超时、部分失败处理,严重违背 Redis "无外部协调器"的核心设计。Redis 选择"<strong>单 slot 内强一致,跨 slot 应用层处理</strong>",将分布式事务的复杂度推给业务,保持 Cluster 的简洁。</p>
+<p>Cluster 中事务限于单 slot,根本原因是跨节点原子提交需要协调协议、超时处理和部分失败恢复。Redis Cluster 避免在核心路径引入这套分布式事务机制,因此选择"同一 slot 内执行,跨 slot 由应用拆分或改用其他方案"。</p>
 
 <!-- ============================================================ -->
 <h2 id="s28-summary">28.11 本章要点</h2>
@@ -1886,12 +1886,12 @@ void execCommand(client *c) {
     <tbody>
       <tr><td>1</td><td>Redis 事务的"<strong>原子性</strong>"指 EXEC 期间不被插入,而非"全部成功或全部回滚",该差异是误用根源</td></tr>
       <tr><td>2</td><td><code>MULTI</code> 仅设置 <code>CLIENT_MULTI</code> flag;命令入队为 <code>multiCmd</code> 结构;EXEC 串行执行队列</td></tr>
-      <tr><td>3</td><td>EXEC 阶段在 <code>processCommand</code> 调用栈内完成,事件循环不返回,<strong>SERIALIZABLE 隔离</strong>天然成立</td></tr>
+      <tr><td>3</td><td>EXEC 阶段连续执行,期间不处理其他客户端命令;这提供执行隔离,不提供失败回滚</td></tr>
       <tr><td>4</td><td>入队语法错误设 <code>CLIENT_DIRTY_EXEC</code>,EXEC 时整体拒绝(<code>EXECABORT</code>);执行类型错误不影响其他命令</td></tr>
       <tr><td>5</td><td>WATCH 注册 client 到 <code>db.watched_keys[key]</code> 链表,<code>signalModifiedKey</code> 钩子在写命令路径触发 DIRTY_CAS</td></tr>
       <tr><td>6</td><td>EXEC 检查 <code>DIRTY_EXEC</code> 优先于 <code>DIRTY_CAS</code>,DIRTY_EXEC → EXECABORT,DIRTY_CAS → null array</td></tr>
       <tr><td>7</td><td>不回滚的工程权衡:类型错误是代码 bug 不是运行时竞争,实现回滚需 undo log 显著增加复杂度</td></tr>
-      <tr><td>8</td><td>需要"<strong>全有全无</strong>"语义或基于读结果决策的场景应使用 Lua 脚本而非 MULTI/EXEC</td></tr>
+      <tr><td>8</td><td>需要基于读结果做条件分支时,优先用 Lua / Functions 在服务端先校验再写</td></tr>
       <tr><td>9</td><td>Cluster 模式事务要求所有 key 在同一 slot,通过 hash tag <code>{}</code> 强制,粒度选择需平衡热点与解耦</td></tr>
       <tr><td>10</td><td>生产模板:<code>WATCH + GET + MULTI + 命令 + EXEC</code> + 检查每项 reply,WatchError 重试,Exception 告警</td></tr>
     </tbody>
@@ -1944,7 +1944,7 @@ redis-cli SLOWLOG GET 10    # 检查是否有慢事务</code></pre>
 
 <ul>
   <li><strong>第 27 章</strong>(Cluster)解决"<strong>命令在哪里执行</strong>":slot 路由、hash tag、节点拓扑;</li>
-  <li><strong>第 28 章</strong>(事务)解决"<strong>多命令如何打包</strong>":MULTI/EXEC 队列、SERIALIZABLE 隔离、WATCH 乐观锁;</li>
+  <li><strong>第 28 章</strong>(事务)解决"<strong>多命令如何打包</strong>":MULTI/EXEC 队列、无交错执行、WATCH 乐观锁;</li>
   <li><strong>第 29 章</strong>(Lua / Functions)解决"<strong>如何在服务端做决策</strong>":条件分支、读后写原子、持久化业务逻辑。</li>
 </ul>
 
@@ -1952,9 +1952,7 @@ redis-cli SLOWLOG GET 10    # 检查是否有慢事务</code></pre>
 
 <h3>下一章预告</h3>
 
-<p>第 29 章深入 <strong>Lua 脚本与 Redis 7 Functions</strong>。本章看到 MULTI/EXEC 在"<strong>需要基于读结果决策</strong>"场景下的根本无力 — Lua 是这个问题的标准答案。下一章会展示 <code>EVAL / EVALSHA</code> 的脚本缓存机制、<code>redis.call / redis.pcall</code> 的错误语义差异、<code>Lua 5.1 沙箱</code>的能力边界,以及 Redis 7 引入的 <code>Functions</code> 如何把临时脚本提升为<strong>持久化的一等公民</strong>(随 RDB/AOF 持久化、随复制传播)。Lua 在原子性、条件分支、复制模式三个维度都是事务的能力扩展,但<strong>长脚本阻塞</strong>与 <code>cluster-node-timeout</code> 联动是必须正确处理的生产硬约束。</p>
-
-</div>
+<p>第 29 章深入 <strong>Lua 脚本与 Redis 7 Functions</strong>。本章看到 MULTI/EXEC 无法在队列内部根据前一条命令的返回值做分支;Lua 正是为这类"先读、判断、再写"场景准备的。下一章会展示 <code>EVAL / EVALSHA</code> 的脚本缓存机制、<code>redis.call / redis.pcall</code> 的错误语义差异、<code>Lua 5.1 沙箱</code>的能力边界,以及 Redis 7 Functions 的持久化与复制方式。Lua 能扩展事务的表达能力,但长脚本阻塞主线程,上线前必须控制耗时并理解 Cluster 超时边界。</p>
 
 <p class="footer">&copy; 2026 图解 Redis &middot; 第 28 章 &middot; 事务 MULTI/EXEC</p>
 
